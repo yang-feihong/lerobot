@@ -17,6 +17,7 @@
 import builtins
 import logging
 import math
+import types
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
@@ -339,6 +340,206 @@ def get_gemma_config(variant: str) -> GemmaConfig:  # see openpi `gemma.py: get_
         )
     else:
         raise ValueError(f"Unknown variant: {variant}")
+
+
+MEM_VIT_NUM_FRAMES = 1
+MEM_VIT_TEMPORAL_EVERY = 4
+MEM_VIT_USE_ORIGINAL_FOR_K1 = False
+
+
+def _mem_temporal_pos_emb(num_frames: int, dim: int, device, dtype):
+    """Fixed sinusoidal temporal embedding for MEM-style vision attention.
+
+    Frame order is assumed to be:
+        [oldest_history, ..., current]
+
+    The current frame is t=0 and receives exactly zero temporal embedding.
+    This introduces no learnable parameters.
+    """
+    if dim % 2 != 0:
+        raise ValueError(f"hidden dim must be even, got {dim}")
+
+    # For K=3: [-2, -1, 0], where 0 is the current frame.
+    pos = torch.arange(-(num_frames - 1), 1, device=device, dtype=torch.float32)
+
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(10000.0)
+        * torch.arange(half, device=device, dtype=torch.float32)
+        / max(half - 1, 1)
+    )
+    args = pos[:, None] * freqs[None, :]
+    emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+    # Make current frame t=0 exactly zero.
+    emb = emb - emb[-1:, :]
+    return emb.to(dtype=dtype)
+
+
+def _mem_sparse_attention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    **kwargs,
+):
+    """MEM-style sparse spatiotemporal attention for SigLIP ViT.
+
+    For K frames, this implements the sparse attention semantics:
+
+        E  O  O
+        I  E  O
+        I  I  E
+
+    where:
+        E = same-frame all-patch spatial attention
+        I = same-patch causal temporal attention
+        O = no connection
+
+    The implementation avoids dense (K*N) x (K*N) attention by computing:
+        spatial logits:  O(K * N^2)
+        temporal logits: O(N * K^2)
+
+    Spatial and temporal logits are concatenated before one shared softmax.
+    Therefore this is equivalent to sparse big-mask attention, not two
+    independent attentions.
+
+    No new learnable parameters are introduced. It reuses this SigLIP attention
+    module's original q_proj/k_proj/v_proj/out_proj.
+    """
+    num_frames = getattr(self, "mem_num_frames", MEM_VIT_NUM_FRAMES)
+
+    # Original-forward escape hatch for K=1.
+    # Default is False because we want to test whether the new forward naturally
+    # degenerates to original SigLIP attention when K=1.
+    if num_frames <= 1 and getattr(self, "mem_use_original_for_k1", MEM_VIT_USE_ORIGINAL_FOR_K1):
+        return self._original_forward(hidden_states, attention_mask=attention_mask, **kwargs)
+
+    if attention_mask is not None:
+        raise NotImplementedError(
+            "MEM sparse vision attention currently expects attention_mask=None. "
+            "Supporting arbitrary masks requires folding them into both spatial "
+            "and temporal sparse logits."
+        )
+
+    bk, num_patches, embed_dim = hidden_states.shape
+    if bk % num_frames != 0:
+        raise ValueError(
+            f"Batch dimension {bk} is not divisible by mem_num_frames={num_frames}. "
+            "For multi-frame use, pass frames flattened as (B*K, C, H, W)."
+        )
+
+    batch_size = bk // num_frames
+    num_heads = self.num_heads
+    head_dim = self.head_dim
+
+    # Shape: (B, K, N, D)
+    x = hidden_states.view(batch_size, num_frames, num_patches, embed_dim)
+
+    # Fixed temporal embedding, current frame gets zero.
+    # For K=1 this is exactly zero.
+    t_emb = _mem_temporal_pos_emb(
+        num_frames,
+        embed_dim,
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    x = x + t_emb[None, :, None, :]
+
+    # Reuse original SigLIP projections.
+    flat_x = x.reshape(bk, num_patches, embed_dim)
+    input_shape = flat_x.shape[:-1]
+    hidden_shape = (*input_shape, num_heads, head_dim)
+
+    q = self.q_proj(flat_x).view(hidden_shape).transpose(1, 2)
+    k = self.k_proj(flat_x).view(hidden_shape).transpose(1, 2)
+    v = self.v_proj(flat_x).view(hidden_shape).transpose(1, 2)
+
+    # (B*K, H, N, Dh) -> (B, H, K, N, Dh)
+    q = q.view(batch_size, num_frames, num_heads, num_patches, head_dim).permute(0, 2, 1, 3, 4)
+    k = k.view(batch_size, num_frames, num_heads, num_patches, head_dim).permute(0, 2, 1, 3, 4)
+    v = v.view(batch_size, num_frames, num_heads, num_patches, head_dim).permute(0, 2, 1, 3, 4)
+
+    # Spatial logits:
+    # query (b,h,t,p), key (b,h,t,q)
+    # Shape: (B, H, K, N, N)
+    spatial_logits = torch.einsum("bhtpd,bhtqd->bhtpq", q, k)
+
+    # Temporal logits:
+    # query (b,h,t,p), key (b,h,s,p)
+    # Shape: (B, H, K, N, K)
+    temporal_logits = torch.einsum("bhtpd,bhspd->bhtps", q, k)
+
+    # Only allow s < t.
+    # s == t is already included in the same-frame spatial E block.
+    # For K=1 this masks the whole temporal branch, leaving pure spatial attention.
+    time_mask = torch.tril(
+        torch.ones(num_frames, num_frames, device=hidden_states.device, dtype=torch.bool),
+        diagonal=-1,
+    )
+    temporal_logits = temporal_logits.masked_fill(
+        ~time_mask[None, None, :, None, :],
+        torch.finfo(temporal_logits.dtype).min,
+    )
+
+    # One shared softmax over spatial keys + temporal keys.
+    logits = torch.cat([spatial_logits, temporal_logits], dim=-1)
+    logits = logits * self.scale
+
+    weights = torch.softmax(logits, dim=-1, dtype=torch.float32).to(q.dtype)
+    weights = torch.nn.functional.dropout(
+        weights,
+        p=0.0 if not self.training else self.dropout,
+        training=self.training,
+    )
+
+    spatial_weights = weights[..., :num_patches]
+    temporal_weights = weights[..., num_patches:]
+
+    spatial_out = torch.einsum("bhtpq,bhtqd->bhtpd", spatial_weights, v)
+    temporal_out = torch.einsum("bhtps,bhspd->bhtpd", temporal_weights, v)
+
+    out = spatial_out + temporal_out
+
+    # (B, H, K, N, Dh) -> (B*K, N, D)
+    out = out.permute(0, 2, 3, 1, 4).contiguous()
+    out = out.view(bk, num_patches, embed_dim)
+
+    # Reuse original SigLIP output projection.
+    out = self.out_proj(out)
+    return out, None
+
+
+def _patch_siglip_vision_tower_for_mem_vit(
+    vision_tower,
+    num_frames: int = MEM_VIT_NUM_FRAMES,
+    temporal_every: int = MEM_VIT_TEMPORAL_EVERY,
+    use_original_for_k1: bool = MEM_VIT_USE_ORIGINAL_FOR_K1,
+):
+    """Patch every temporal_every-th SigLIP vision attention layer.
+
+    By default, K=1 still uses the new sparse attention forward, so we can test
+    whether it naturally degenerates to original ViT attention.
+    """
+    if hasattr(vision_tower, "vision_model"):
+        vision_model = vision_tower.vision_model
+    else:
+        vision_model = vision_tower
+
+    encoder = vision_model.encoder
+
+    for layer_idx, layer in enumerate(encoder.layers):
+        # 1-indexed "every 4-th layer": 4, 8, 12, ...
+        if (layer_idx + 1) % temporal_every != 0:
+            continue
+
+        attn = layer.self_attn
+
+        if not hasattr(attn, "_original_forward"):
+            attn._original_forward = attn.forward
+
+        attn.mem_num_frames = num_frames
+        attn.mem_use_original_for_k1 = use_original_for_k1
+        attn.forward = types.MethodType(_mem_sparse_attention_forward, attn)
 
 
 class PaliGemmaWithExpertModel(
