@@ -23,7 +23,7 @@ from lerobot.configs import PreTrainedConfig
 from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.transforms import ImageTransforms
-from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_PREFIX, REWARD
+from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_IMAGES, OBS_PREFIX, OBS_STATE, REWARD
 
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
@@ -52,11 +52,34 @@ def resolve_delta_timestamps(
             returns `None` if the resulting dict is empty.
     """
     delta_timestamps = {}
+    mem_vit_enabled = bool(getattr(cfg, "mem_vit_enabled", False))
+    mem_vit_num_frames = int(getattr(cfg, "mem_vit_num_frames", 1))
+    mem_vit_frame_stride = int(getattr(cfg, "mem_vit_frame_stride", 1))
+    if mem_vit_enabled and mem_vit_num_frames > 1:
+        mem_vit_delta_indices = [
+            -i * mem_vit_frame_stride for i in reversed(range(mem_vit_num_frames))
+        ]
+        image_features = getattr(cfg, "image_features", {})
+    else:
+        mem_vit_delta_indices = None
+        image_features = {}
+
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
         if key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
+        if mem_vit_delta_indices is not None and key == OBS_STATE:
+            delta_timestamps[key] = [i / ds_meta.fps for i in mem_vit_delta_indices]
+            continue
+        if (
+            mem_vit_delta_indices is not None
+            and key.startswith(OBS_IMAGES)
+            and key in ds_meta.camera_keys
+            and (not image_features or key in image_features)
+        ):
+            delta_timestamps[key] = [i / ds_meta.fps for i in mem_vit_delta_indices]
+            continue
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 

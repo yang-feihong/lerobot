@@ -87,6 +87,16 @@ class PI05Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
+    # MEM-ViT settings. Passing mem_vit_checkpoint also enables MEM-ViT.
+    mem_vit_enabled: bool = False
+    mem_vit_checkpoint: str | None = None
+    mem_vit_num_frames: int = 1
+    mem_vit_min_num_frames: int | None = None
+    mem_vit_max_num_frames: int | None = None
+    mem_vit_frame_stride: int = 1
+    mem_vit_temporal_every: int = 4
+    mem_vit_use_original_for_k1: bool = True
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -120,6 +130,27 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+        if self.mem_vit_checkpoint is not None:
+            self.mem_vit_enabled = True
+        if self.mem_vit_num_frames < 1:
+            raise ValueError(f"mem_vit_num_frames must be >= 1, got {self.mem_vit_num_frames}")
+        if (self.mem_vit_min_num_frames is None) != (self.mem_vit_max_num_frames is None):
+            raise ValueError("mem_vit_min_num_frames and mem_vit_max_num_frames must be set together")
+        if self.mem_vit_min_num_frames is not None and self.mem_vit_max_num_frames is not None:
+            if self.mem_vit_min_num_frames < 1:
+                raise ValueError(
+                    f"mem_vit_min_num_frames must be >= 1, got {self.mem_vit_min_num_frames}"
+                )
+            if self.mem_vit_max_num_frames < self.mem_vit_min_num_frames:
+                raise ValueError(
+                    "mem_vit_max_num_frames must be >= mem_vit_min_num_frames, got "
+                    f"{self.mem_vit_max_num_frames} < {self.mem_vit_min_num_frames}"
+                )
+            self.mem_vit_num_frames = self.mem_vit_max_num_frames
+        if self.mem_vit_frame_stride < 1:
+            raise ValueError(f"mem_vit_frame_stride must be >= 1, got {self.mem_vit_frame_stride}")
+        if self.mem_vit_temporal_every < 1:
+            raise ValueError(f"mem_vit_temporal_every must be >= 1, got {self.mem_vit_temporal_every}")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

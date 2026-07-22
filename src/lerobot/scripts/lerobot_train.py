@@ -19,10 +19,13 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
+import hashlib
+import json
 import logging
 import sys
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -81,6 +84,8 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     sample_weighter=None,
+    loss_scale: float = 1.0,
+    optimizer_step: bool = True,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -116,62 +121,184 @@ def update_policy(
     if sample_weighter is not None:
         sample_weights, weight_stats = sample_weighter.compute_batch_weights(batch)
 
-    # Let accelerator handle mixed precision
-    with accelerator.autocast():
-        if sample_weights is not None:
-            # Use per-sample loss for weighted training
-            # Note: Policies supporting sample weighting must implement forward(batch, reduction="none")
-            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
+    sync_context = nullcontext() if optimizer_step else accelerator.no_sync(policy)
+    with sync_context:
+        # Let accelerator handle mixed precision
+        with accelerator.autocast():
+            if sample_weights is not None:
+                # Use per-sample loss for weighted training
+                # Note: Policies supporting sample weighting must implement forward(batch, reduction="none")
+                per_sample_loss, output_dict = policy.forward(batch, reduction="none")
 
-            # Weighted loss: each sample's contribution is scaled by its weight.
-            # We divide by weight sum (not batch size) so that if some weights are zero,
-            # the remaining samples contribute proportionally more, preserving gradient scale.
-            # Weights are pre-normalized to sum to batch_size for stable training dynamics.
-            epsilon = 1e-6
-            loss = (per_sample_loss * sample_weights).sum() / (sample_weights.sum() + epsilon)
+                # Weighted loss: each sample's contribution is scaled by its weight.
+                # We divide by weight sum (not batch size) so that if some weights are zero,
+                # the remaining samples contribute proportionally more, preserving gradient scale.
+                # Weights are pre-normalized to sum to batch_size for stable training dynamics.
+                epsilon = 1e-6
+                loss = (per_sample_loss * sample_weights).sum() / (sample_weights.sum() + epsilon)
 
-            # Log weighting statistics
-            if output_dict is None:
-                output_dict = {}
-            for key, value in weight_stats.items():
-                output_dict[f"sample_weight_{key}"] = value
+                # Log weighting statistics
+                if output_dict is None:
+                    output_dict = {}
+                for key, value in weight_stats.items():
+                    output_dict[f"sample_weight_{key}"] = value
+            else:
+                loss, output_dict = policy.forward(batch)
+
+            # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+
+        # Use accelerator's backward method. Scale the loss so accumulated gradients
+        # match the mean-gradient semantics of a single larger batch.
+        accelerator.backward(loss / loss_scale)
+
+    if optimizer_step:
+        # Clip gradients if specified
+        if grad_clip_norm > 0:
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
         else:
-            loss, output_dict = policy.forward(batch)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                policy.parameters(), float("inf"), error_if_nonfinite=False
+            )
 
-        # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+        # Optimizer step
+        with lock if lock is not None else nullcontext():
+            optimizer.step()
 
-    # Use accelerator's backward method
-    accelerator.backward(loss)
+        optimizer.zero_grad()
 
-    # Clip gradients if specified
-    if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
-    else:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(), float("inf"), error_if_nonfinite=False
-        )
+        # Step through pytorch scheduler at every optimizer update instead of every micro-batch
+        if lr_scheduler is not None:
+            lr_scheduler.step()
 
-    # Optimizer step
-    with lock if lock is not None else nullcontext():
-        optimizer.step()
-
-    optimizer.zero_grad()
-
-    # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
-        lr_scheduler.step()
-
-    # Update internal buffers if policy has update method
-    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
-        accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+        # Update internal buffers if policy has update method
+        if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
+            accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+        train_metrics.grad_norm = grad_norm.item()
 
     train_metrics.loss = loss.item()
-    train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     if torch.cuda.is_available():
         train_metrics.gpu_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
     return train_metrics, output_dict
+
+
+def _resolve_task_variants_path(dataset_root: Path, configured_path: str | None) -> Path | None:
+    if configured_path:
+        path = Path(configured_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"Task variants file does not exist: {path}")
+        return path
+    default_path = dataset_root / "meta" / "task_variants.json"
+    return default_path if default_path.exists() else None
+
+
+def load_task_variants(dataset_root: Path, configured_path: str | None) -> dict[int, list[str]]:
+    """Load optional episode-level task rephrasings.
+
+    Expected format:
+        {
+          "0": ["instruction A", "instruction B"],
+          "1": ["instruction C", "instruction D"]
+        }
+
+    For convenience, values may also be {"tasks": [...]} or {"variants": [...]}.
+    """
+    path = _resolve_task_variants_path(dataset_root, configured_path)
+    if path is None:
+        return {}
+
+    raw = json.loads(path.read_text())
+    if isinstance(raw, dict) and "episodes" in raw and isinstance(raw["episodes"], dict):
+        raw = raw["episodes"]
+    if not isinstance(raw, dict):
+        raise ValueError(f"Task variants file must contain a JSON object: {path}")
+
+    variants: dict[int, list[str]] = {}
+    for ep_key, value in raw.items():
+        if isinstance(value, str):
+            candidates = [value]
+        elif isinstance(value, dict):
+            nested = value.get("tasks", value.get("variants"))
+            candidates = nested if isinstance(nested, list) else []
+        elif isinstance(value, list):
+            candidates = value
+        else:
+            candidates = []
+        candidates = [str(item).strip() for item in candidates if isinstance(item, str) and item.strip()]
+        if candidates:
+            variants[int(ep_key)] = candidates
+    if not variants:
+        raise ValueError(f"Task variants file contains no usable episode variants: {path}")
+
+    logging.info("Loaded task variants from %s for %d episode(s)", path, len(variants))
+    return variants
+
+
+def _to_int_list(value: Any) -> list[int]:
+    if isinstance(value, torch.Tensor):
+        return [int(item) for item in value.detach().cpu().view(-1).tolist()]
+    return [int(item) for item in value]
+
+
+def _batch_tasks_as_list(task_value: Any, batch_size: int) -> list[str]:
+    if isinstance(task_value, str):
+        return [task_value] * batch_size
+    if isinstance(task_value, (list, tuple)):
+        return [str(item) for item in task_value]
+    return [""] * batch_size
+
+
+def _select_task_variant(
+    candidates: list[str],
+    *,
+    seed: int,
+    step: int,
+    sample_index: int,
+    episode_index: int,
+    randomize: bool,
+) -> str:
+    if not randomize or len(candidates) == 1:
+        return candidates[0]
+    digest = hashlib.blake2b(
+        f"{seed}:{step}:{sample_index}:{episode_index}".encode(),
+        digest_size=8,
+    ).digest()
+    variant_index = int.from_bytes(digest, "big") % len(candidates)
+    return candidates[variant_index]
+
+
+def apply_task_variants_to_batch(
+    batch: dict[str, Any],
+    task_variants: dict[int, list[str]],
+    *,
+    step: int,
+    seed: int | None,
+    randomize: bool,
+) -> int:
+    if not task_variants or "episode_index" not in batch:
+        return 0
+    episode_indices = _to_int_list(batch["episode_index"])
+    sample_indices = _to_int_list(batch["index"]) if "index" in batch else list(range(len(episode_indices)))
+    tasks = _batch_tasks_as_list(batch.get("task"), len(episode_indices))
+
+    applied = 0
+    for i, episode_index in enumerate(episode_indices):
+        candidates = task_variants.get(episode_index)
+        if not candidates:
+            continue
+        tasks[i] = _select_task_variant(
+            candidates,
+            seed=seed if seed is not None else 0,
+            step=step,
+            sample_index=sample_indices[i],
+            episode_index=episode_index,
+            randomize=randomize,
+        )
+        applied += 1
+    if applied:
+        batch["task"] = tasks
+    return applied
 
 
 @parser.wrap()
@@ -272,6 +399,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info("Creating env")
         eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
+    task_variants = load_task_variants(dataset.root, cfg.dataset.task_variants_path)
+
     if cfg.is_reward_model_training:
         if is_main_process:
             logging.info("Creating reward model")
@@ -294,6 +423,34 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             cfg=cfg.policy,
             ds_meta=dataset.meta,
             rename_map=cfg.rename_map,
+        )
+
+    if is_main_process and wandb_logger:
+        wandb_logger.update_config(
+            {
+                "runtime/dataset_num_frames": int(dataset.num_frames),
+                "runtime/dataset_num_episodes": int(dataset.num_episodes),
+                "runtime/dataset_camera_keys": list(dataset.meta.camera_keys),
+                "runtime/dataset_features": dataset.meta.features,
+                "runtime/task_variants_enabled": bool(task_variants),
+                "runtime/task_variant_episodes": len(task_variants),
+                "runtime/random_task_variant": cfg.dataset.random_task_variant,
+                "runtime/eval_task_variant": cfg.dataset.eval_task_variant,
+                "runtime/policy_input_features": {
+                    key: {"type": value.type.value, "shape": list(value.shape)}
+                    for key, value in policy.config.input_features.items()
+                }
+                if not cfg.is_reward_model_training
+                else None,
+                "runtime/policy_output_features": {
+                    key: {"type": value.type.value, "shape": list(value.shape)}
+                    for key, value in policy.config.output_features.items()
+                }
+                if not cfg.is_reward_model_training
+                else None,
+                "runtime/effective_batch_size": cfg.batch_size * accelerator.num_processes,
+                "runtime/num_processes": accelerator.num_processes,
+            }
         )
 
     if cfg.peft is not None:
@@ -405,8 +562,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
         num_processes = accelerator.num_processes
-        effective_bs = cfg.batch_size * num_processes
-        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
+        effective_bs = cfg.batch_size * cfg.gradient_accumulation_steps * num_processes
+        logging.info(
+            "Effective batch size: "
+            f"{cfg.batch_size} x grad_accum {cfg.gradient_accumulation_steps} x {num_processes} = "
+            f"{effective_bs}"
+        )
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
@@ -433,18 +594,22 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             saved_num_processes = load_training_num_processes(cfg.checkpoint_path)
             saved_batch_size = load_training_batch_size(cfg.checkpoint_path)
             ckpt_num_processes = saved_num_processes or accelerator.num_processes
-            ckpt_batch_size = saved_batch_size or cfg.batch_size
+            current_sampler_batch_size = cfg.batch_size * cfg.gradient_accumulation_steps
+            ckpt_batch_size = saved_batch_size or current_sampler_batch_size
             if is_main_process and saved_num_processes not in (None, accelerator.num_processes):
                 logging.warning(
                     f"Resuming with num_processes={accelerator.num_processes} but the checkpoint was "
                     f"written with num_processes={saved_num_processes}. The data order resumes at the "
                     "right epoch/offset, but per-rank sample-exactness requires the same world size."
                 )
-            if is_main_process and saved_batch_size not in (None, cfg.batch_size):
+            if is_main_process and saved_batch_size not in (None, current_sampler_batch_size):
                 logging.warning(
-                    f"Resuming with batch_size={cfg.batch_size} but the checkpoint was written with "
-                    f"batch_size={saved_batch_size}. The data order resumes at the right epoch/offset, "
-                    "but per-rank sample-exactness requires the same batch size."
+                    f"Resuming with per-step sampler batch size={current_sampler_batch_size} "
+                    f"(batch_size={cfg.batch_size}, "
+                    f"gradient_accumulation_steps={cfg.gradient_accumulation_steps}) but the checkpoint "
+                    f"was written with batch_size={saved_batch_size}. The data order resumes at the "
+                    "right epoch/offset, but per-rank sample-exactness requires the same per-step "
+                    "sampler batch size."
                 )
             sampler_state = compute_sampler_state(step, len(sampler), ckpt_batch_size, ckpt_num_processes)
             sampler.load_state_dict(sampler_state)
@@ -534,15 +699,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         "dataloading_s": AverageMeter("data_s", ":.3f", reduction="max"),
         # Derived from the post-reduce max step time; set once per log window on the main rank.
         "samples_per_s": AverageMeter("smp/s", ":.0f"),
+        "task_variant_applied": AverageMeter("task_var", ":.0f", reduction="sum"),
     }
     if torch.cuda.is_available():
         # max() because headroom is gated by the worst-case rank.
         train_metrics["gpu_mem_gb"] = AverageMeter("mem_gb", ":.2f", reduction="max")
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
-    effective_batch_size = cfg.batch_size * accelerator.num_processes
+    effective_batch_size = cfg.batch_size * cfg.gradient_accumulation_steps * accelerator.num_processes
     train_tracker = MetricsTracker(
-        cfg.batch_size,
+        cfg.batch_size * cfg.gradient_accumulation_steps,
         dataset.num_frames,
         dataset.num_episodes,
         train_metrics,
@@ -565,23 +731,36 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
-        batch = next(dl_iter)
-        for cam_key in dataset.meta.camera_keys:
-            if cam_key in batch and batch[cam_key].dtype == torch.uint8:
-                batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
-        batch = preprocessor(batch)
-        train_tracker.dataloading_s = time.perf_counter() - start_time
+        output_dict = None
+        optimizer.zero_grad()
+        for accum_idx in range(cfg.gradient_accumulation_steps):
+            batch = next(dl_iter)
+            for cam_key in dataset.meta.camera_keys:
+                if cam_key in batch and batch[cam_key].dtype == torch.uint8:
+                    batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+            train_tracker.task_variant_applied = apply_task_variants_to_batch(
+                batch,
+                task_variants,
+                step=step * cfg.gradient_accumulation_steps + accum_idx,
+                seed=cfg.seed,
+                randomize=cfg.dataset.random_task_variant,
+            )
+            batch = preprocessor(batch)
+            train_tracker.dataloading_s = time.perf_counter() - start_time
 
-        train_tracker, output_dict = update_policy(
-            train_tracker,
-            policy,
-            batch,
-            optimizer,
-            cfg.optimizer.grad_clip_norm,
-            accelerator=accelerator,
-            lr_scheduler=lr_scheduler,
-            sample_weighter=sample_weighter,
-        )
+            train_tracker, output_dict = update_policy(
+                train_tracker,
+                policy,
+                batch,
+                optimizer,
+                cfg.optimizer.grad_clip_norm,
+                accelerator=accelerator,
+                lr_scheduler=lr_scheduler,
+                sample_weighter=sample_weighter,
+                loss_scale=float(cfg.gradient_accumulation_steps),
+                optimizer_step=accum_idx == cfg.gradient_accumulation_steps - 1,
+            )
+            start_time = time.perf_counter()
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -600,7 +779,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if is_main_process:
                 # Cluster-wide throughput, derived from the already-reduced (max) step time so it
                 # reflects the slowest rank — which is what actually gates the next iteration.
-                step_time = train_tracker.update_s.avg + train_tracker.dataloading_s.avg
+                step_time = (
+                    train_tracker.update_s.avg + train_tracker.dataloading_s.avg
+                ) * cfg.gradient_accumulation_steps
                 if step_time > 0:
                     train_tracker.samples_per_s = effective_batch_size / step_time
                 logging.info(train_tracker)
@@ -624,6 +805,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     for cam_key in dataset.meta.camera_keys:
                         if cam_key in eval_batch and eval_batch[cam_key].dtype == torch.uint8:
                             eval_batch[cam_key] = eval_batch[cam_key].to(dtype=torch.float32) / 255.0
+                    if cfg.dataset.eval_task_variant:
+                        apply_task_variants_to_batch(
+                            eval_batch,
+                            task_variants,
+                            step=step,
+                            seed=cfg.seed,
+                            randomize=False,
+                        )
                     eval_batch = preprocessor(eval_batch)
                     loss, _ = policy.forward(eval_batch)
                     eval_loss_sum += loss.item()
@@ -636,7 +825,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if is_main_process:
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
                 if wandb_logger:
-                    wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+                    wandb_logger.log_dict(
+                        {"eval_loss": eval_loss, "eval_batches": n_eval_batches},
+                        step=step,
+                        mode="eval",
+                    )
 
         if cfg.save_checkpoint and is_saving_step:
             # Under FSDP, gathering the full model + optimizer state dicts is a cross-rank collective,
@@ -660,7 +853,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
                     num_processes=accelerator.num_processes,
-                    batch_size=cfg.batch_size,
+                    batch_size=cfg.batch_size * cfg.gradient_accumulation_steps,
                     model_state_dict=model_state_dict,
                     optim_state_dict=optim_state_dict,
                 )

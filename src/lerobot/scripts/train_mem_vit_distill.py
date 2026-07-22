@@ -670,6 +670,7 @@ def init_wandb(
     run.define_metric("train/global_step")
     run.define_metric("train/*", step_metric="train/global_step")
     run.define_metric("val/*", step_metric="train/global_step")
+    run.define_metric("test/*", step_metric="train/global_step")
     run.define_metric("data/*", step_metric="train/global_step")
     logger.info("W&B logging enabled: %s", run.url or f"mode={args.wandb_mode}")
     return run

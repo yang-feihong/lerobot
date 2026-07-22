@@ -6,11 +6,13 @@ ROS installation; it reads ROS1 bags with the pure Python ``rosbags`` package.
 
 Default semantics match the current B2+Z1 teleoperation logs:
 
-* wrist RGB image: RealSense wrist camera
-* front/rear fisheye images: configurable USB cameras
+* Pi0.5-native camera keys:
+  - ``observation.images.base_0_rgb``: primary/front view camera
+  - ``observation.images.left_wrist_0_rgb``: wrist/arm-mounted view camera
+  - ``observation.images.right_wrist_0_rgb``: optional secondary/rear view camera
 * state: arm q/qd/gripper + B2 joint pos/vel + trunk roll/pitch/height
-* action: height-invariant EE target [roll,pitch,yaw,x,y,z] + B2 [vx,vy,wz]
-  + gripper target
+* action: raw height-invariant EE target converted from [roll,pitch,yaw,x,y,z]
+  to [6D rotation representation, x, y, z] + B2 [vx,vy,wz] + gripper target
 
 Install-free invocation example:
 
@@ -26,14 +28,17 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import json
 import logging
 import shutil
-import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.spatial.transform import Rotation
+from tqdm.auto import tqdm
 
 try:
     from rosbags.rosbag1 import Reader
@@ -52,9 +57,11 @@ LOG = logging.getLogger("convert_rosbag_vla_to_lerobot")
 
 STATE_KEY = "observation.state"
 ACTION_KEY = "action"
-WRIST_IMAGE_KEY = "observation.images.wrist"
-FRONT_FISHEYE_KEY = "observation.images.front_fisheye"
-REAR_FISHEYE_KEY = "observation.images.rear_fisheye"
+BASE_IMAGE_KEY = "observation.images.base_0_rgb"
+WRIST_IMAGE_KEY = "observation.images.left_wrist_0_rgb"
+RIGHT_WRIST_IMAGE_KEY = "observation.images.right_wrist_0_rgb"
+DEFAULT_ARM_ACTION_TOPIC = "/height_invariant_raw_ee_target_pose"
+DEFAULT_EPISODE_BOUNDARY_ARM_TOPIC = "/arm_target_pos"
 
 
 @dataclass(frozen=True)
@@ -87,6 +94,12 @@ class TopicSeries:
 
 
 @dataclass(frozen=True)
+class ResetSeries:
+    times: np.ndarray
+    reset: np.ndarray
+
+
+@dataclass(frozen=True)
 class BagContext:
     path: Path
     typestore: Any
@@ -94,6 +107,12 @@ class BagContext:
     start_time_ns: int
     end_time_ns: int
 
+def optional_topic(value: str) -> str | None:
+    """Parse a ROS topic argument, allowing None to disable the topic."""
+    value = value.strip()
+    if value.lower() in {"none", "null", ""}:
+        return None
+    return value
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -104,16 +123,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--task", default="b2 z1 teleoperation")
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--wrist-camera-topic", default="/camera/color/image_raw")
-    parser.add_argument("--front-fisheye-topic", default="/camera0/usb_cam_node/image_raw")
-    parser.add_argument("--rear-fisheye-topic", default="/camera1/usb_cam_node/image_raw")
+    parser.add_argument("--resume", action="store_true", help="Append only bags not marked done in the sidecar manifest.")
+    parser.add_argument(
+        "--wrist-camera-topic",
+        type=optional_topic,
+        default="/camera/color/image_raw",
+        help="Wrist/arm-mounted camera topic, or None to disable this camera.",
+    )
+    parser.add_argument(
+        "--base-camera-topic",
+        type=optional_topic,
+        default="/camera0/usb_cam_node/image_raw",
+        help="Primary/front camera topic, or None to disable this camera.",
+    )
+    parser.add_argument(
+        "--right-wrist-camera-topic",
+        type=optional_topic,
+        default="/camera1/usb_cam_node/image_raw",
+        help="Optional secondary/rear camera topic, or None to disable this camera.",
+    )
 
     parser.add_argument("--arm-state-topic", default="/arm_current_state")
     parser.add_argument("--b2-joint-state-topic", default="/b2_joint_states")
     parser.add_argument("--trunk-state-topic", default="/b2_body_rp_height")
-    parser.add_argument("--arm-action-topic", default="/height_invariant_ee_target_pose")
+    parser.add_argument("--arm-action-topic", default=DEFAULT_ARM_ACTION_TOPIC)
     parser.add_argument("--base-action-topic", default="/b2_target_velocity")
     parser.add_argument("--gripper-action-topic", default="/gripper_target_pos")
+    parser.add_argument(
+        "--episode-boundary-arm-topic",
+        default=DEFAULT_EPISODE_BOUNDARY_ARM_TOPIC,
+        help=(
+            "Z1ArmTarget topic used only to choose the valid episode interval. "
+            "Start considers the first reset=false message; end considers the last message on this topic."
+        ),
+    )
+    parser.add_argument(
+        "--base-action-nonzero-eps",
+        type=float,
+        default=1e-6,
+        help="Absolute threshold used to decide whether base velocity is non-zero for episode end selection.",
+    )
 
     parser.add_argument(
         "--codec",
@@ -125,6 +174,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-gop", type=int, default=10, help="Video GOP/keyframe interval.")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
+    if args.overwrite and args.resume:
+        parser.error("--overwrite and --resume are mutually exclusive")
     args.bag = resolve_bag_paths(args.bag_dir, args.bag_glob)
     return args
 
@@ -199,6 +250,19 @@ def read_series(ctx: BagContext, topic: str, vectorizer) -> TopicSeries:
     return TopicSeries(np.asarray(times, dtype=np.int64), np.stack(values).astype(np.float32))
 
 
+def read_reset_series(ctx: BagContext, topic: str) -> ResetSeries:
+    times: list[int] = []
+    reset: list[bool] = []
+    for timestamp_ns, msg in iter_topic_messages(ctx, topic):
+        if not hasattr(msg, "reset"):
+            raise RuntimeError(f"Topic {topic} messages do not have a reset field")
+        times.append(timestamp_ns)
+        reset.append(bool(msg.reset))
+    if not times:
+        raise RuntimeError(f"No messages in topic: {topic}")
+    return ResetSeries(np.asarray(times, dtype=np.int64), np.asarray(reset, dtype=bool))
+
+
 def rel_sec(ctx: BagContext, timestamp_ns: int) -> float:
     return (int(timestamp_ns) - ctx.start_time_ns) / 1e9
 
@@ -268,7 +332,10 @@ def vector_arm_action(msg: Any) -> np.ndarray:
     value = np.asarray(msg.joint_pos, dtype=np.float32)
     if value.shape != (6,):
         raise RuntimeError(f"Expected arm EE action dim 6, got {value.shape}")
-    return value
+    roll, pitch, yaw = value[:3]
+    rotation_matrix = Rotation.from_euler("xyz", [float(roll), float(pitch), float(yaw)]).as_matrix()
+    rotation_6d = rotation_matrix[:, :2].reshape(-1, order="F")
+    return np.concatenate([rotation_6d, value[3:6]]).astype(np.float32)
 
 
 def vector_base_action(msg: Any) -> np.ndarray:
@@ -304,27 +371,30 @@ def image_to_rgb_array(msg: Any) -> np.ndarray:
     raise RuntimeError(f"Unsupported image encoding for RGB conversion: {msg.encoding!r}")
 
 
-def sample_images(ctx: BagContext, topic: str, sample_times_ns: np.ndarray) -> list[np.ndarray]:
+def sample_images(ctx: BagContext, topic: str, sample_times_ns: np.ndarray, *, label: str) -> list[np.ndarray]:
     samples: list[np.ndarray | None] = [None] * len(sample_times_ns)
     target_index = 0
     previous: tuple[int, Any] | None = None
 
-    for timestamp_ns, msg in iter_topic_messages(ctx, topic):
-        while target_index < len(sample_times_ns) and timestamp_ns >= int(sample_times_ns[target_index]):
-            target = int(sample_times_ns[target_index])
-            if previous is None:
-                chosen = msg
-            else:
-                prev_ts, prev_msg = previous
-                chosen = prev_msg if abs(prev_ts - target) <= abs(timestamp_ns - target) else msg
-            samples[target_index] = image_to_rgb_array(chosen)
-            target_index += 1
-        previous = (timestamp_ns, msg)
+    with tqdm(total=len(sample_times_ns), desc=f"sample {label}", unit="frame") as progress:
+        for timestamp_ns, msg in iter_topic_messages(ctx, topic):
+            while target_index < len(sample_times_ns) and timestamp_ns >= int(sample_times_ns[target_index]):
+                target = int(sample_times_ns[target_index])
+                if previous is None:
+                    chosen = msg
+                else:
+                    prev_ts, prev_msg = previous
+                    chosen = prev_msg if abs(prev_ts - target) <= abs(timestamp_ns - target) else msg
+                samples[target_index] = image_to_rgb_array(chosen)
+                target_index += 1
+                progress.update(1)
+            previous = (timestamp_ns, msg)
 
-    if previous is not None:
-        while target_index < len(sample_times_ns):
-            samples[target_index] = image_to_rgb_array(previous[1])
-            target_index += 1
+        if previous is not None:
+            while target_index < len(sample_times_ns):
+                samples[target_index] = image_to_rgb_array(previous[1])
+                target_index += 1
+                progress.update(1)
 
     missing = [idx for idx, value in enumerate(samples) if value is None]
     if missing:
@@ -341,13 +411,97 @@ def sample_images(ctx: BagContext, topic: str, sample_times_ns: np.ndarray) -> l
     return [value for value in samples if value is not None]
 
 
-def make_sample_times(arm_action: TopicSeries, *, fps: int) -> np.ndarray:
-    start_ns = int(arm_action.times[0])
-    end_ns = int(arm_action.times[-1])
+def select_episode_interval(
+    ctx: BagContext,
+    *,
+    boundary_arm: ResetSeries,
+    base_action: TopicSeries,
+    base_action_nonzero_eps: float,
+) -> tuple[int, int, dict[str, Any]]:
+    arm_non_reset_indices = np.flatnonzero(~boundary_arm.reset)
+    first_arm_non_reset_ns = (
+        int(boundary_arm.times[int(arm_non_reset_indices[0])]) if len(arm_non_reset_indices) else None
+    )
+    last_arm_target_ns = int(boundary_arm.times[-1])
+    base_nonzero = np.any(np.abs(base_action.values) > base_action_nonzero_eps, axis=1)
+    base_nonzero_indices = np.flatnonzero(base_nonzero)
+    first_base_nonzero_ns = (
+        int(base_action.times[int(base_nonzero_indices[0])]) if len(base_nonzero_indices) else None
+    )
+    last_base_nonzero_ns = (
+        int(base_action.times[int(base_nonzero_indices[-1])]) if len(base_nonzero_indices) else None
+    )
+    start_candidates = []
+    if first_arm_non_reset_ns is not None:
+        start_candidates.append(("first_boundary_arm_reset_false", first_arm_non_reset_ns))
+    if first_base_nonzero_ns is not None:
+        start_candidates.append(("first_nonzero_base_action", first_base_nonzero_ns))
+    if not start_candidates:
+        raise RuntimeError(
+            "Cannot select episode start: no reset=false boundary arm messages and no non-zero base action messages"
+        )
+    start_source, start_ns = min(start_candidates, key=lambda item: item[1])
+
+    end_candidates = [last_arm_target_ns]
+    if last_base_nonzero_ns is not None:
+        end_candidates.append(last_base_nonzero_ns)
+    end_ns = max(end_candidates)
+    if end_ns <= start_ns:
+        raise RuntimeError(
+            "Invalid selected episode interval: "
+            f"start={rel_sec(ctx, start_ns):.3f}s end={rel_sec(ctx, end_ns):.3f}s"
+        )
+    info = {
+        "start_source": start_source,
+        "end_source": "max(last_boundary_arm_message,last_nonzero_base_action)",
+        "start_s": rel_sec(ctx, start_ns),
+        "end_s": rel_sec(ctx, end_ns),
+        "first_boundary_arm_reset_false_s": rel_sec(ctx, first_arm_non_reset_ns)
+        if first_arm_non_reset_ns is not None
+        else None,
+        "first_nonzero_base_action_s": rel_sec(ctx, first_base_nonzero_ns)
+        if first_base_nonzero_ns is not None
+        else None,
+        "last_boundary_arm_s": rel_sec(ctx, last_arm_target_ns),
+        "last_nonzero_base_action_s": rel_sec(ctx, last_base_nonzero_ns)
+        if last_base_nonzero_ns is not None
+        else None,
+    }
+    return start_ns, end_ns, info
+
+
+def make_sample_times(start_ns: int, end_ns: int, *, fps: int) -> np.ndarray:
     if end_ns <= start_ns:
         raise RuntimeError("Invalid conversion interval")
     step_ns = int(round(1e9 / fps))
     return np.arange(start_ns, end_ns + 1, step_ns, dtype=np.int64)
+
+
+ACTION_NAMES = (
+    "height_invariant_ee_rot6d_col0_x",
+    "height_invariant_ee_rot6d_col0_y",
+    "height_invariant_ee_rot6d_col0_z",
+    "height_invariant_ee_rot6d_col1_x",
+    "height_invariant_ee_rot6d_col1_y",
+    "height_invariant_ee_rot6d_col1_z",
+    "height_invariant_ee_x",
+    "height_invariant_ee_y",
+    "height_invariant_ee_z",
+    "b2_vx",
+    "b2_vy",
+    "b2_omega_z",
+    "gripper_target",
+)
+TRUNK_STATE_NAMES = ("b2_trunk_roll", "b2_trunk_pitch", "b2_body_height")
+ARM_STATE_7D_NAMES = (
+    "arm_q_1",
+    "arm_q_2",
+    "arm_q_3",
+    "arm_q_4",
+    "arm_q_5",
+    "arm_q_6",
+    "arm_gripper_feedback",
+)
 
 
 def build_features(image_shapes: dict[str, tuple[int, int]]) -> dict[str, dict[str, Any]]:
@@ -368,19 +522,8 @@ def build_features(image_shapes: dict[str, tuple[int, int]]) -> dict[str, dict[s
         },
         ACTION_KEY: {
             "dtype": "float32",
-            "shape": (10,),
-            "names": [
-                "hi_ee_roll",
-                "hi_ee_pitch",
-                "hi_ee_yaw",
-                "hi_ee_x",
-                "hi_ee_y",
-                "hi_ee_z",
-                "b2_vx",
-                "b2_vy",
-                "b2_omega_z",
-                "gripper_target",
-            ],
+            "shape": (len(ACTION_NAMES),),
+            "names": list(ACTION_NAMES),
         },
     }
     for key, (height, width) in image_shapes.items():
@@ -408,7 +551,155 @@ B2_JOINT_NAMES = (
 )
 
 
-def convert_bag_episode(dataset: LeRobotDataset, ctx: BagContext, args: argparse.Namespace) -> None:
+def diagnostic_filename(path: Path) -> str:
+    safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in path.stem)
+    return f"{safe}_timeseries.png"
+
+
+def manifest_path(output_root: Path) -> Path:
+    return output_root / "diagnostics" / "conversion_manifest.json"
+
+
+def load_manifest(output_root: Path) -> dict[str, Any]:
+    path = manifest_path(output_root)
+    if not path.exists():
+        return {"version": 1, "bags": {}}
+    with path.open("r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    manifest.setdefault("version", 1)
+    manifest.setdefault("bags", {})
+    return manifest
+
+
+def save_manifest(output_root: Path, manifest: dict[str, Any]) -> None:
+    path = manifest_path(output_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+        f.write("\n")
+    tmp_path.replace(path)
+
+
+def bag_manifest_key(path: Path) -> str:
+    return str(path.resolve())
+
+
+def bag_fingerprint(path: Path) -> dict[str, Any]:
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def manifest_done_for_bag(manifest: dict[str, Any], bag: Path) -> bool:
+    entry = manifest.get("bags", {}).get(bag_manifest_key(bag))
+    if not entry or entry.get("status") != "done":
+        return False
+    return entry.get("fingerprint") == bag_fingerprint(bag)
+
+
+def update_manifest_entry(output_root: Path, manifest: dict[str, Any], bag: Path, **updates: Any) -> None:
+    bags = manifest.setdefault("bags", {})
+    key = bag_manifest_key(bag)
+    entry = dict(bags.get(key, {}))
+    entry.update(
+        {
+            "bag_path": str(bag.resolve()),
+            "bag_name": bag.name,
+            "fingerprint": bag_fingerprint(bag),
+            "updated_unix": time.time(),
+        }
+    )
+    entry.update(updates)
+    bags[key] = entry
+    save_manifest(output_root, manifest)
+
+
+def validate_resume_features(dataset: LeRobotDataset, expected_features: dict[str, dict[str, Any]]) -> None:
+    for key, expected in expected_features.items():
+        actual = dataset.meta.features.get(key)
+        if actual is None:
+            raise RuntimeError(f"Cannot resume: existing dataset is missing feature {key!r}")
+        if tuple(actual["shape"]) != tuple(expected["shape"]):
+            raise RuntimeError(
+                f"Cannot resume: feature {key!r} shape mismatch: existing={actual['shape']} expected={expected['shape']}"
+            )
+        if actual["dtype"] != expected["dtype"]:
+            raise RuntimeError(
+                f"Cannot resume: feature {key!r} dtype mismatch: existing={actual['dtype']} expected={expected['dtype']}"
+            )
+
+
+def save_timeseries_diagnostic(
+    *,
+    output_root: Path,
+    ctx: BagContext,
+    sample_times: np.ndarray,
+    state_array: np.ndarray,
+    action_array: np.ndarray,
+) -> Path:
+    """Save a sidecar diagnostic plot without touching the LeRobot dataset schema."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if state_array.shape[1] != 40:
+        raise RuntimeError(f"Expected state dim 40 for diagnostic plot, got {state_array.shape[1]}")
+    if action_array.shape[1] != len(ACTION_NAMES):
+        raise RuntimeError(f"Expected action dim {len(ACTION_NAMES)} for diagnostic plot, got {action_array.shape[1]}")
+
+    time_s = (sample_times.astype(np.float64) - float(sample_times[0])) / 1e9
+    arm_state_7d = np.concatenate([state_array[:, :6], state_array[:, 12:13]], axis=1)
+    trunk_state = state_array[:, 37:40]
+
+    diagnostics_dir = output_root / "diagnostics"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    output_path = diagnostics_dir / diagnostic_filename(ctx.path)
+
+    if len(time_s) > 1:
+        sampled_hz = 1 / float(np.median(np.diff(time_s)))
+    else:
+        sampled_hz = 0.0
+    plot_specs = [
+        *[(name, action_array[:, index], "action") for index, name in enumerate(ACTION_NAMES)],
+        *[(name, trunk_state[:, index], "trunk") for index, name in enumerate(TRUNK_STATE_NAMES)],
+        *[(name, arm_state_7d[:, index], "arm") for index, name in enumerate(ARM_STATE_7D_NAMES)],
+    ]
+    expected_diagnostic_signals = len(ACTION_NAMES) + len(TRUNK_STATE_NAMES) + len(ARM_STATE_7D_NAMES)
+    if len(plot_specs) != expected_diagnostic_signals:
+        raise RuntimeError(f"Expected {expected_diagnostic_signals} diagnostic signals, got {len(plot_specs)}")
+
+    ncols = 5
+    nrows = int(np.ceil(len(plot_specs) / ncols))
+    fig, axes_grid = plt.subplots(nrows, ncols, figsize=(25, 3.2 * nrows), sharex=True, constrained_layout=True)
+    axes = axes_grid.reshape(-1)
+    fig.suptitle(f"{ctx.path.name} sampled @ {sampled_hz:.1f}Hz", fontsize=13)
+
+    for axis, (name, values, group) in zip(axes[: len(plot_specs)], plot_specs, strict=True):
+        axis.plot(time_s, values, linewidth=0.9)
+        axis.set_title(f"{group}: {name}", fontsize=9)
+        axis.grid(True, alpha=0.3)
+        axis.tick_params(axis="both", labelsize=8)
+
+    for axis in axes[len(plot_specs) :]:
+        axis.set_visible(False)
+
+    last_row_start = (nrows - 1) * ncols
+    for axis in axes[last_row_start : last_row_start + ncols]:
+        if axis.get_visible():
+            axis.set_xlabel("time (s)", fontsize=8)
+
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    LOG.info("Saved diagnostic timeseries plot: %s", output_path)
+    return output_path
+
+
+def convert_bag_episode(dataset: LeRobotDataset, ctx: BagContext, args: argparse.Namespace) -> dict[str, Any]:
     LOG.info("========== Converting bag: %s ==========", ctx.path)
     LOG.info(
         "Bag time: start=0.000s end=%.3fs duration=%.3fs",
@@ -422,6 +713,7 @@ def convert_bag_episode(dataset: LeRobotDataset, ctx: BagContext, args: argparse
     arm_action = read_series(ctx, args.arm_action_topic, vector_arm_action)
     base_action = read_series(ctx, args.base_action_topic, vector_base_action)
     gripper_action = read_series(ctx, args.gripper_action_topic, vector_gripper_action)
+    boundary_arm = read_reset_series(ctx, args.episode_boundary_arm_topic)
 
     log_series_summary(ctx, "arm_state", args.arm_state_topic, arm_state)
     log_series_summary(ctx, "b2_joint_state", args.b2_joint_state_topic, b2_joint_state)
@@ -429,18 +721,44 @@ def convert_bag_episode(dataset: LeRobotDataset, ctx: BagContext, args: argparse
     log_series_summary(ctx, "arm_action", args.arm_action_topic, arm_action)
     log_series_summary(ctx, "base_action", args.base_action_topic, base_action)
     log_series_summary(ctx, "gripper_action", args.gripper_action_topic, gripper_action)
-
-    sample_times = make_sample_times(arm_action, fps=args.fps)
-    full_start_s = rel_sec(ctx, int(sample_times[0]))
-    full_end_s = rel_sec(ctx, int(sample_times[-1]))
     LOG.info(
-        "Selected sampling interval: start=%.3fs end=%.3fs fps=%d -> candidate_frames=%d "
-        "(from first to last %s message)",
-        full_start_s,
-        full_end_s,
+        "episode_boundary_arm topic=%s count=%d reset_false=%d time=[%.3fs, %.3fs]",
+        args.episode_boundary_arm_topic,
+        len(boundary_arm.times),
+        int(np.count_nonzero(~boundary_arm.reset)),
+        rel_sec(ctx, int(boundary_arm.times[0])),
+        rel_sec(ctx, int(boundary_arm.times[-1])),
+    )
+
+    start_ns, end_ns, interval_info = select_episode_interval(
+        ctx,
+        boundary_arm=boundary_arm,
+        base_action=base_action,
+        base_action_nonzero_eps=args.base_action_nonzero_eps,
+    )
+    sample_times = make_sample_times(start_ns, end_ns, fps=args.fps)
+    LOG.info(
+        "Selected sampling interval: start=%.3fs end=%.3fs fps=%d -> candidate_frames=%d",
+        interval_info["start_s"],
+        interval_info["end_s"],
         args.fps,
         len(sample_times),
-        args.arm_action_topic,
+    )
+    LOG.info(
+        "Interval details: start_source=%s first_boundary_arm_reset_false=%s first_nonzero_base_action=%s "
+        "end_source=%s last_boundary_arm=%.3fs last_nonzero_base_action=%s",
+        interval_info["start_source"],
+        "None"
+        if interval_info["first_boundary_arm_reset_false_s"] is None
+        else f"{interval_info['first_boundary_arm_reset_false_s']:.3f}s",
+        "None"
+        if interval_info["first_nonzero_base_action_s"] is None
+        else f"{interval_info['first_nonzero_base_action_s']:.3f}s",
+        interval_info["end_source"],
+        interval_info["last_boundary_arm_s"],
+        "None"
+        if interval_info["last_nonzero_base_action_s"] is None
+        else f"{interval_info['last_nonzero_base_action_s']:.3f}s",
     )
     if len(sample_times) == 0:
         raise RuntimeError("No sample times selected")
@@ -453,18 +771,32 @@ def convert_bag_episode(dataset: LeRobotDataset, ctx: BagContext, args: argparse
         len(sample_times) / float(args.fps),
         args.fps,
     )
-    camera_topics = {
-        WRIST_IMAGE_KEY: args.wrist_camera_topic,
-        FRONT_FISHEYE_KEY: args.front_fisheye_topic,
-        REAR_FISHEYE_KEY: args.rear_fisheye_topic,
+    camera_topics: dict[str, str] = {}
+    for key, topic in (
+        (WRIST_IMAGE_KEY, args.wrist_camera_topic),
+        (BASE_IMAGE_KEY, args.base_camera_topic),
+        (RIGHT_WRIST_IMAGE_KEY, args.right_wrist_camera_topic),
+    ):
+        if topic is not None:
+            camera_topics[key] = topic
+    if camera_topics:
+        LOG.info(
+            "Sampling %d image topic(s): %s",
+            len(camera_topics),
+            ", ".join(camera_topics.values()),
+        )
+    else:
+        LOG.info("No image topics enabled; converting state/action-only dataset")
+    sampled_images = {
+        key: sample_images(ctx, topic, sample_times, label=key)
+        for key, topic in camera_topics.items()
     }
-    LOG.info("Sampling image topics")
-    sampled_images = {key: sample_images(ctx, topic, sample_times) for key, topic in camera_topics.items()}
 
     zero_gripper = np.zeros(1, dtype=np.float32)
     state_values: list[np.ndarray] = []
     action_values: list[np.ndarray] = []
-    for frame_index, timestamp_ns in enumerate(sample_times):
+    episode_index = int(dataset.meta.total_episodes)
+    for frame_index, timestamp_ns in enumerate(tqdm(sample_times, desc="write episode frames", unit="frame")):
         state = np.concatenate(
             [
                 arm_state.nearest(int(timestamp_ns)),
@@ -474,7 +806,7 @@ def convert_bag_episode(dataset: LeRobotDataset, ctx: BagContext, args: argparse
         ).astype(np.float32)
         action = np.concatenate(
             [
-                arm_action.ffill(int(timestamp_ns)),
+                arm_action.ffill(int(timestamp_ns), default=arm_action.values[0]),
                 base_action.ffill(int(timestamp_ns), default=np.zeros(3, dtype=np.float32)),
                 gripper_action.ffill(int(timestamp_ns), default=zero_gripper),
             ]
@@ -484,15 +816,21 @@ def convert_bag_episode(dataset: LeRobotDataset, ctx: BagContext, args: argparse
         frame = {
             STATE_KEY: state,
             ACTION_KEY: action,
-            WRIST_IMAGE_KEY: sampled_images[WRIST_IMAGE_KEY][frame_index],
-            FRONT_FISHEYE_KEY: sampled_images[FRONT_FISHEYE_KEY][frame_index],
-            REAR_FISHEYE_KEY: sampled_images[REAR_FISHEYE_KEY][frame_index],
             "task": args.task,
         }
+        for image_key in camera_topics:
+            frame[image_key] = sampled_images[image_key][frame_index]
         dataset.add_frame(frame)
-    dataset.save_episode()
     state_array = np.stack(state_values)
     action_array = np.stack(action_values)
+    diagnostic_path = save_timeseries_diagnostic(
+        output_root=args.output_root,
+        ctx=ctx,
+        sample_times=sample_times,
+        state_array=state_array,
+        action_array=action_array,
+    )
+    dataset.save_episode()
     LOG.info(
         "Saved episode: frames=%d state_dim=%d action_dim=%d",
         len(sample_times),
@@ -511,6 +849,13 @@ def convert_bag_episode(dataset: LeRobotDataset, ctx: BagContext, args: argparse
         format_vector(state_array.max(axis=0)),
         format_vector(state_array.std(axis=0)),
     )
+    return {
+        "episode_index": episode_index,
+        "num_frames": len(sample_times),
+        "state_dim": int(state_array.shape[1]),
+        "action_dim": int(action_array.shape[1]),
+        "diagnostic_path": str(diagnostic_path),
+    }
 
 
 def main() -> None:
@@ -529,9 +874,17 @@ def main() -> None:
     if args.fps < 1:
         raise ValueError("--fps must be positive")
     if args.output_root.exists():
-        if not args.overwrite:
+        if args.overwrite:
+            shutil.rmtree(args.output_root)
+        elif not args.resume:
             raise FileExistsError(f"Output exists; pass --overwrite to replace it: {args.output_root}")
-        shutil.rmtree(args.output_root)
+        elif not manifest_path(args.output_root).exists():
+            raise FileExistsError(
+                f"Output exists but has no resume manifest: {manifest_path(args.output_root)}. "
+                "Use --overwrite to rebuild it from scratch."
+            )
+    elif args.resume:
+        raise FileNotFoundError(f"Cannot resume because output does not exist: {args.output_root}")
 
     LOG.info("Resolved %d bag(s) for conversion", len(args.bag))
     for idx, bag in enumerate(args.bag[:10]):
@@ -539,25 +892,90 @@ def main() -> None:
     if len(args.bag) > 10:
         LOG.info("  ... %d more bag(s)", len(args.bag) - 10)
 
-    first_ctx = open_bag_context(args.bag[0])
-    image_shapes = {
-        WRIST_IMAGE_KEY: image_metadata(first_ctx, args.wrist_camera_topic)[:2],
-        FRONT_FISHEYE_KEY: image_metadata(first_ctx, args.front_fisheye_topic)[:2],
-        REAR_FISHEYE_KEY: image_metadata(first_ctx, args.rear_fisheye_topic)[:2],
-    }
-    dataset = LeRobotDataset.create(
-        repo_id=args.repo_id,
-        fps=args.fps,
-        features=build_features(image_shapes),
-        root=args.output_root,
-        robot_type="b2_z1",
-        use_videos=True,
-        rgb_encoder=RGBEncoderConfig(vcodec=args.codec, crf=args.video_crf, preset=args.video_preset, g=args.video_gop),
-    )
+    manifest = load_manifest(args.output_root)
+    pending_bags = [bag for bag in args.bag if not (args.resume and manifest_done_for_bag(manifest, bag))]
+    skipped_bags = len(args.bag) - len(pending_bags)
+    if skipped_bags:
+        LOG.info("Resume: skipping %d already completed bag(s)", skipped_bags)
+    if not pending_bags:
+        LOG.info("No pending bags to convert; manifest already marks all matched bags as done.")
+        return
 
-    for bag in args.bag:
+    first_ctx = open_bag_context(args.bag[0])
+    configured_camera_topics: dict[str, str] = {}
+    for key, topic in (
+        (WRIST_IMAGE_KEY, args.wrist_camera_topic),
+        (BASE_IMAGE_KEY, args.base_camera_topic),
+        (RIGHT_WRIST_IMAGE_KEY, args.right_wrist_camera_topic),
+    ):
+        if topic is not None:
+            configured_camera_topics[key] = topic
+    image_shapes = {
+        key: image_metadata(first_ctx, topic)[:2]
+        for key, topic in configured_camera_topics.items()
+    }
+    expected_features = build_features(image_shapes)
+    rgb_encoder = RGBEncoderConfig(vcodec=args.codec, crf=args.video_crf, preset=args.video_preset, g=args.video_gop)
+    if args.resume:
+        dataset = LeRobotDataset.resume(
+            repo_id=args.repo_id,
+            root=args.output_root,
+            rgb_encoder=rgb_encoder,
+        )
+        if dataset.meta.fps != args.fps:
+            raise RuntimeError(f"Cannot resume: existing fps={dataset.meta.fps} but requested fps={args.fps}")
+        validate_resume_features(dataset, expected_features)
+    else:
+        manifest = {
+            "version": 1,
+            "repo_id": args.repo_id,
+            "fps": args.fps,
+            "action_names": list(ACTION_NAMES),
+            "image_keys": list(configured_camera_topics.keys()),
+            "episode_boundary_arm_topic": args.episode_boundary_arm_topic,
+            "base_action_nonzero_eps": args.base_action_nonzero_eps,
+            "bags": {},
+        }
+        dataset = LeRobotDataset.create(
+            repo_id=args.repo_id,
+            fps=args.fps,
+            features=expected_features,
+            root=args.output_root,
+            robot_type="b2_z1",
+            use_videos=True,
+            rgb_encoder=rgb_encoder,
+        )
+        save_manifest(args.output_root, manifest)
+
+    for bag in pending_bags:
+        update_manifest_entry(
+            args.output_root,
+            manifest,
+            bag,
+            status="running",
+            episode_index=int(dataset.meta.total_episodes),
+            action_dim=len(ACTION_NAMES),
+        )
         ctx = open_bag_context(bag)
-        convert_bag_episode(dataset, ctx, args)
+        try:
+            episode_info = convert_bag_episode(dataset, ctx, args)
+        except Exception as exc:
+            update_manifest_entry(
+                args.output_root,
+                manifest,
+                bag,
+                status="failed",
+                error=repr(exc),
+                action_dim=len(ACTION_NAMES),
+            )
+            raise
+        update_manifest_entry(
+            args.output_root,
+            manifest,
+            bag,
+            status="done",
+            **episode_info,
+        )
 
     dataset.finalize()
     LOG.info("Conversion complete: root=%s episodes=%d frames=%d", args.output_root, dataset.num_episodes, dataset.num_frames)
@@ -566,13 +984,47 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# Batch conversion: one LeRobot episode per bag. Each bag's interval is selected automatically
-# from its first arm action timestamp to its last arm action timestamp.
+# Current full command template. Every ROS topic used by the converter can be
+# overridden from the command line.
 #
 # uv run --with rosbags python -m lerobot.scripts.convert_rosbag_vla_to_lerobot \
-#   --bag-dir /data/rosbag \
-#   --bag-glob '*.bag' \
-#   --output-root /data/b2_z1_vla_lerobot \
+#   --bag-dir /data/rosbag/rosbags_0721 \
+#   --bag-glob '*.bag*' \
+#   --output-root /data/b2_z1_vla_lerobot_0721 \
 #   --repo-id local/b2_z1_vla \
-#   --fps 10
+#   --fps 10 \
+#   --base-camera-topic /camera_usb_0_4_1_2/usb_cam_node/image_raw \
+#   --wrist-camera-topic /camera_usb_0_4_1_1/usb_cam_node/image_raw \
+#   --right-wrist-camera-topic None \
+#   --arm-state-topic /arm_current_state \
+#   --b2-joint-state-topic /b2_joint_states \
+#   --trunk-state-topic /b2_body_rp_height \
+#   --arm-action-topic /height_invariant_raw_ee_target_pose \
+#   --base-action-topic /b2_target_velocity \
+#   --gripper-action-topic /gripper_target_pos \
+#   --episode-boundary-arm-topic /arm_target_pos \
+#   --overwrite
 #
+# The converter automatically selects the usable interval for each bag:
+#   start = min(first reset=false message on --episode-boundary-arm-topic,
+#               first non-zero message on --base-action-topic)
+#   end   = max(last message on --episode-boundary-arm-topic,
+#               last non-zero message on --base-action-topic)
+#
+# Camera data are written with Pi0.5-native keys:
+#   primary/front view          -> observation.images.base_0_rgb
+#   wrist/arm-mounted view      -> observation.images.left_wrist_0_rgb
+#   optional secondary/rear view -> observation.images.right_wrist_0_rgb, if enabled
+#
+# If a large conversion is interrupted, re-run the same command with --resume
+# instead of --overwrite. The converter skips bags marked done in:
+#   <output-root>/diagnostics/conversion_manifest.json
+#
+# The arm action topic is read as [roll, pitch, yaw, x, y, z]. The converter
+# stores action orientation as the 6D rotation representation from the first
+# two columns of:
+#   scipy.spatial.transform.Rotation.from_euler("xyz", [roll, pitch, yaw]).as_matrix()
+#
+# For each converted bag, a sidecar diagnostic plot is saved under:
+#   <output-root>/diagnostics/<bag-stem>_timeseries.png
+# This plot is not part of the LeRobot dataset schema.

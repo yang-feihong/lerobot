@@ -102,6 +102,7 @@ class TrainPipelineConfig(HubMixin):
     prefetch_factor: int = 4
     persistent_workers: bool = True
     steps: int = 100_000
+    gradient_accumulation_steps: int = 1
     # Run policy in the simulation environment every N steps to measure reward/success (0 = disabled).
     env_eval_freq: int = 20_000
     log_freq: int = 200
@@ -254,6 +255,10 @@ class TrainPipelineConfig(HubMixin):
 
         if self.eval_steps > 0 and self.dataset.eval_split == 0.0:
             raise ValueError("eval_steps > 0 requires dataset.eval_split > 0.0 to hold out eval data.")
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError(
+                f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"
+            )
 
         # Remote runs auto-generate the repo_id in submit_to_hf (the policy may only be
         # resolved here, from --policy.path), so don't demand it up front for them.

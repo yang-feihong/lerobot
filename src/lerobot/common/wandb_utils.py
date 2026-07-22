@@ -118,9 +118,21 @@ class WandBLogger:
         cfg.wandb.run_id = run_id
         # Handle custom step key for rl asynchronous training.
         self._wandb_custom_step_key: set[str] | None = None
+        self._wandb = wandb
+        self._define_default_metrics()
         logging.info(colored("Logs will be synced with wandb.", "blue", attrs=["bold"]))
         logging.info(f"Track this run --> {colored(wandb.run.get_url(), 'yellow', attrs=['bold'])}")
-        self._wandb = wandb
+
+    def _define_default_metrics(self) -> None:
+        """Use explicit train/eval step axes so charts do not depend on wandb's internal _step."""
+        self._wandb.define_metric("train/step", hidden=True)
+        self._wandb.define_metric("train/*", step_metric="train/step")
+        self._wandb.define_metric("eval/step", hidden=True)
+        self._wandb.define_metric("eval/*", step_metric="eval/step")
+
+    def update_config(self, d: dict, *, allow_val_change: bool = True) -> None:
+        """Add runtime-derived metadata that is not known when wandb.init receives the CLI config."""
+        self._wandb.config.update(d, allow_val_change=allow_val_change)
 
     def log_policy(self, checkpoint_dir: Path):
         """Checkpoints the policy to wandb."""
@@ -187,6 +199,10 @@ class WandBLogger:
                 continue
 
             if not isinstance(v, (int | float | str)):
+                if isinstance(v, (list | tuple)) and all(isinstance(item, (int | float)) for item in v):
+                    for idx, item in enumerate(v):
+                        batch_data[f"{mode}/{k}/{idx}"] = item
+                    continue
                 logging.warning(
                     f'WandB logging of key "{k}" was ignored as its type "{type(v)}" is not handled by this wrapper.'
                 )
@@ -199,6 +215,7 @@ class WandBLogger:
                 batch_data[f"{mode}/{custom_step_key}"] = d[custom_step_key]
                 self._wandb.log(batch_data)
             else:
+                batch_data[f"{mode}/step"] = step
                 self._wandb.log(data=batch_data, step=step)
 
     def log_video(self, video_path: str, step: int, mode: str = "train"):

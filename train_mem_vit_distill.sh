@@ -11,7 +11,7 @@ gpu_devices="0,1,2"
 batch_size="4"
 gradient_accumulation_steps="4"
 learning_rate="1e-6"
-max_steps="5000"
+max_steps="25000"
 IFS=',' read -r -a gpu_array <<< "$gpu_devices"
 nproc_per_node="${#gpu_array[@]}"
 

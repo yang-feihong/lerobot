@@ -53,6 +53,7 @@ from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
@@ -65,6 +66,9 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    state: Tensor | None
+    image_memory_masks: list[Tensor | None] | None
+    state_memory_mask: Tensor | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -417,7 +421,7 @@ def _mem_sparse_attention_forward(
     if attention_mask is not None:
         raise NotImplementedError(
             "MEM sparse vision attention currently expects attention_mask=None. "
-            "Supporting arbitrary masks requires folding them into both spatial "
+            "Supporting arbitrary patch masks requires folding them into both spatial "
             "and temporal sparse logits."
         )
 
@@ -431,6 +435,14 @@ def _mem_sparse_attention_forward(
     batch_size = bk // num_frames
     num_heads = self.num_heads
     head_dim = self.head_dim
+    frame_mask = getattr(self, "mem_frame_mask", None)
+    if frame_mask is not None:
+        frame_mask = frame_mask.to(device=hidden_states.device, dtype=torch.bool)
+        if tuple(frame_mask.shape) != (batch_size, num_frames):
+            raise ValueError(
+                f"MEM frame mask shape {tuple(frame_mask.shape)} does not match "
+                f"(batch_size, num_frames)=({batch_size}, {num_frames})."
+            )
 
     # Shape: (B, K, N, D)
     x = hidden_states.view(batch_size, num_frames, num_patches, embed_dim)
@@ -480,6 +492,11 @@ def _mem_sparse_attention_forward(
         ~time_mask[None, None, :, None, :],
         torch.finfo(temporal_logits.dtype).min,
     )
+    if frame_mask is not None:
+        temporal_logits = temporal_logits.masked_fill(
+            ~frame_mask[:, None, None, None, :],
+            torch.finfo(temporal_logits.dtype).min,
+        )
 
     # One shared softmax over spatial keys + temporal keys.
     logits = torch.cat([spatial_logits, temporal_logits], dim=-1)
@@ -520,10 +537,7 @@ def _patch_siglip_vision_tower_for_mem_vit(
     By default, K=1 still uses the new sparse attention forward, so we can test
     whether it naturally degenerates to original ViT attention.
     """
-    if hasattr(vision_tower, "vision_model"):
-        vision_model = vision_tower.vision_model
-    else:
-        vision_model = vision_tower
+    vision_model = vision_tower.vision_model if hasattr(vision_tower, "vision_model") else vision_tower
 
     encoder = vision_model.encoder
 
@@ -542,6 +556,29 @@ def _patch_siglip_vision_tower_for_mem_vit(
         attn.forward = types.MethodType(_mem_sparse_attention_forward, attn)
 
 
+def _load_mem_vit_vision_checkpoint(vision_tower: nn.Module, checkpoint_path: str | Path) -> None:
+    path = Path(checkpoint_path).expanduser()
+    if path.is_dir():
+        path = path / "mem_vit_distill_latest.pt"
+    if not path.is_file():
+        raise FileNotFoundError(f"MEM-ViT checkpoint not found: {path}")
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "student_vision_tower" not in checkpoint:
+        raise RuntimeError(f"Invalid MEM-ViT checkpoint, missing 'student_vision_tower': {path}")
+
+    missing_keys, unexpected_keys = vision_tower.load_state_dict(
+        checkpoint["student_vision_tower"],
+        strict=True,
+    )
+    if missing_keys or unexpected_keys:
+        raise RuntimeError(
+            f"Failed to load MEM-ViT checkpoint {path}: "
+            f"{len(missing_keys)} missing keys, {len(unexpected_keys)} unexpected keys"
+        )
+    logging.info("Loaded MEM-ViT vision tower from %s (distill step=%s)", path, checkpoint.get("step"))
+
+
 class PaliGemmaWithExpertModel(
     nn.Module
 ):  # see openpi `gemma_pytorch.py: PaliGemmaWithExpertModel` this class is almost a exact copy of PaliGemmaWithExpertModel in openpi
@@ -556,12 +593,18 @@ class PaliGemmaWithExpertModel(
         image_size: int = DEFAULT_IMAGE_SIZE,
         freeze_vision_encoder: bool = False,
         train_expert_only: bool = False,
+        mem_vit_enabled: bool = False,
+        mem_vit_num_frames: int = 1,
+        mem_vit_temporal_every: int = 4,
+        mem_vit_use_original_for_k1: bool = True,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
         super().__init__()
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
+        self.mem_vit_enabled = mem_vit_enabled
+        self.mem_vit_num_frames = mem_vit_num_frames
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
         vlm_config_hf._vocab_size = 257152  # noqa: SLF001
@@ -600,6 +643,14 @@ class PaliGemmaWithExpertModel(
         self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(config=vlm_config_hf)
         self.gemma_expert = PiGemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
+
+        if self.mem_vit_enabled:
+            _patch_siglip_vision_tower_for_mem_vit(
+                self.paligemma.model.vision_tower,
+                num_frames=self.mem_vit_num_frames,
+                temporal_every=mem_vit_temporal_every,
+                use_original_for_k1=mem_vit_use_original_for_k1,
+            )
 
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
@@ -644,16 +695,77 @@ class PaliGemmaWithExpertModel(
         if self.train_expert_only:
             self.paligemma.eval()
 
-    def embed_image(self, image: torch.Tensor):
+    def embed_image(self, image: torch.Tensor, memory_mask: torch.Tensor | None = None):
         # Vision tower and multi_modal_projector are kept in float32 (params_to_keep_float32).
         out_dtype = image.dtype
         if image.dtype != torch.float32:
             image = image.to(torch.float32)
+        if image.ndim == 5:
+            if not self.mem_vit_enabled:
+                image = image[:, -1]
+            else:
+                if memory_mask is None:
+                    raise ValueError("MEM-ViT 5D image input requires a [B,K] memory mask.")
+                if memory_mask.shape != image.shape[:2]:
+                    raise ValueError(
+                        f"MEM-ViT image memory mask shape {tuple(memory_mask.shape)} does not match "
+                        f"image window shape {tuple(image.shape[:2])}."
+                    )
+                if not memory_mask.bool().any(dim=1).all():
+                    raise ValueError("Every MEM-ViT sample must have at least one valid frame.")
+                batch_size, num_frames = image.shape[:2]
+                self.set_mem_vit_num_frames(num_frames)
+                self.set_mem_vit_frame_mask(memory_mask)
+                image = image.flatten(0, 1)
+                try:
+                    image_outputs = self.paligemma.model.get_image_features(image)
+                    features = image_outputs.pooler_output.view(
+                        batch_size, num_frames, *image_outputs.pooler_output.shape[1:]
+                    )[:, -1]
+                finally:
+                    self.set_mem_vit_frame_mask(None)
+                if features.dtype != out_dtype:
+                    features = features.to(out_dtype)
+                return features
+
+        num_frames = self.mem_vit_num_frames if self.mem_vit_enabled else 1
+        if num_frames > 1 and image.shape[0] % num_frames != 0:
+            raise ValueError(
+                f"MEM-ViT image batch dimension {image.shape[0]} is not divisible by "
+                f"mem_vit_num_frames={num_frames}. The dataloader must provide exactly that many frames "
+                "per sample for each image feature."
+            )
         image_outputs = self.paligemma.model.get_image_features(image)
         features = image_outputs.pooler_output
+        if num_frames > 1:
+            batch_size = image.shape[0] // num_frames
+            features = features.view(batch_size, num_frames, *features.shape[1:])[:, -1]
         if features.dtype != out_dtype:
             features = features.to(out_dtype)
         return features
+
+    def set_mem_vit_num_frames(self, num_frames: int) -> None:
+        if not self.mem_vit_enabled:
+            return
+        if num_frames < 1:
+            raise ValueError(f"num_frames must be >= 1, got {num_frames}")
+        self.mem_vit_num_frames = num_frames
+        vision_tower = self.paligemma.model.vision_tower
+        vision_model = vision_tower.vision_model if hasattr(vision_tower, "vision_model") else vision_tower
+        for layer in vision_model.encoder.layers:
+            attn = layer.self_attn
+            if hasattr(attn, "_original_forward"):
+                attn.mem_num_frames = num_frames
+
+    def set_mem_vit_frame_mask(self, frame_mask: torch.Tensor | None) -> None:
+        if not self.mem_vit_enabled:
+            return
+        vision_tower = self.paligemma.model.vision_tower
+        vision_model = vision_tower.vision_model if hasattr(vision_tower, "vision_model") else vision_tower
+        for layer in vision_model.encoder.layers:
+            attn = layer.self_attn
+            if hasattr(attn, "_original_forward"):
+                attn.mem_frame_mask = frame_mask
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.model.language_model.get_input_embeddings()(tokens)
@@ -785,6 +897,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
+            mem_vit_enabled=config.mem_vit_enabled,
+            mem_vit_num_frames=config.mem_vit_num_frames,
+            mem_vit_temporal_every=config.mem_vit_temporal_every,
+            mem_vit_use_original_for_k1=config.mem_vit_use_original_for_k1,
         )
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
@@ -792,6 +908,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+        if config.mem_vit_enabled:
+            self.state_memory_proj = nn.Linear(config.max_state_dim, paligemma_config.width)
+            self.state_memory_temporal_embedding = nn.Parameter(
+                torch.zeros(config.mem_vit_num_frames, paligemma_config.width)
+            )
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -851,8 +972,54 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
 
+    def embed_state_memory(
+        self, state: torch.Tensor | None, state_memory_mask: torch.Tensor | None = None
+    ) -> torch.Tensor | None:
+        if not self.config.mem_vit_enabled:
+            return None
+        if state is None:
+            raise ValueError("MEM-ViT PI05 requires observation.state for continuous state memory.")
+        if state.ndim == 2:
+            state = state[:, None, :]
+        if state.ndim != 3:
+            raise ValueError(
+                f"Expected MEM state memory as [B,K,D] or [B,D], got {tuple(state.shape)}"
+            )
+        num_frames = state.shape[1]
+        if state_memory_mask is not None and state_memory_mask.shape != state.shape[:2]:
+            raise ValueError(
+                f"State memory mask shape {tuple(state_memory_mask.shape)} does not match "
+                f"state window shape {tuple(state.shape[:2])}."
+            )
+        if num_frames > self.config.mem_vit_num_frames:
+            raise ValueError(
+                f"State memory has {num_frames} frames per sample, but "
+                f"configured max mem_vit_num_frames={self.config.mem_vit_num_frames}."
+            )
+
+        state = pad_vector(state, self.config.max_state_dim)
+        if self.state_memory_proj.weight.dtype == torch.float32:
+            state = state.to(torch.float32)
+
+        def state_memory_proj_func(state):
+            return self.state_memory_proj(state)
+
+        state_emb = self._apply_checkpoint(state_memory_proj_func, state)
+        temporal_emb = self.state_memory_temporal_embedding[-num_frames:][None, :, :].to(
+            device=state_emb.device,
+            dtype=state_emb.dtype,
+        )
+        return state_emb + temporal_emb
+
     def embed_prefix(
-        self, images, img_masks, tokens, masks
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        state: torch.Tensor | None = None,
+        image_memory_masks=None,
+        state_memory_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
@@ -860,10 +1027,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = []
 
         # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        if image_memory_masks is None:
+            image_memory_masks = [None] * len(images)
 
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+        for img, img_mask, image_memory_mask in zip(images, img_masks, image_memory_masks, strict=True):
+
+            def image_embed_func(img, image_memory_mask=image_memory_mask):
+                return self.paligemma_with_expert.embed_image(img, memory_mask=image_memory_mask)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
             bsize, num_img_embs = img_emb.shape[:2]
@@ -871,6 +1041,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
             att_masks += [0] * num_img_embs
+
+        state_emb = self.embed_state_memory(state, state_memory_mask=state_memory_mask)
+        if state_emb is not None:
+            bsize, num_state_tokens = state_emb.shape[:2]
+            embs.append(state_emb)
+            if state_memory_mask is None:
+                state_memory_mask = torch.ones(
+                    bsize, num_state_tokens, dtype=torch.bool, device=state_emb.device
+                )
+            else:
+                state_memory_mask = state_memory_mask.to(device=state_emb.device, dtype=torch.bool)
+            pad_masks.append(state_memory_mask)
+            att_masks += [0] * num_state_tokens
 
         # Process language tokens
         def lang_embed_func(tokens):
@@ -940,13 +1123,33 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise, time) -> Tensor:
+    def forward(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        actions,
+        noise,
+        time,
+        state=None,
+        image_memory_masks=None,
+        state_memory_mask=None,
+    ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            state,
+            image_memory_masks=image_memory_masks,
+            state_memory_mask=state_memory_mask,
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         if (
@@ -1016,7 +1219,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        state = kwargs.get("state")
+        image_memory_masks = kwargs.get("image_memory_masks")
+        state_memory_mask = kwargs.get("state_memory_mask")
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            state,
+            image_memory_masks=image_memory_masks,
+            state_memory_mask=state_memory_mask,
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -1228,8 +1442,13 @@ class PI05Policy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            # MEM mode adds a small continuous state-memory projection that is not present
+            # in the base PI0.5 checkpoint, so allow those new parameters to initialize
+            # from scratch while still reporting all missing/unexpected keys.
+            effective_strict = strict and not getattr(model.config, "mem_vit_enabled", False)
+            missing_keys, unexpected_keys = model.load_state_dict(
+                remapped_state_dict, strict=effective_strict
+            )
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1256,6 +1475,12 @@ class PI05Policy(PreTrainedPolicy):
 
         except Exception as e:
             print(f"Warning: Could not load state dict: {e}")
+
+        if getattr(model.config, "mem_vit_checkpoint", None) is not None:
+            _load_mem_vit_vision_checkpoint(
+                model.model.paligemma_with_expert.paligemma.model.vision_tower,
+                model.config.mem_vit_checkpoint,
+            )
 
         return model
 
@@ -1347,7 +1572,59 @@ class PI05Policy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
-    def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+    def _mem_vit_window_plan(
+        self, batch: dict[str, Tensor], *, randomize: bool
+    ) -> tuple[int, Tensor, Tensor]:
+        if not self.config.mem_vit_enabled:
+            device = next(self.parameters()).device
+            lengths = torch.ones(batch[ACTION].shape[0], dtype=torch.long, device=device)
+            mask = torch.ones(batch[ACTION].shape[0], 1, dtype=torch.bool, device=device)
+            return 1, lengths, mask
+
+        state = batch.get(OBS_STATE)
+        if state is None:
+            raise ValueError("MEM-ViT PI05 requires observation.state for memory-window planning.")
+        batch_size = state.shape[0]
+        device = state.device
+        max_frames = self.config.mem_vit_num_frames
+
+        if randomize and self.config.mem_vit_min_num_frames is not None:
+            min_frames = self.config.mem_vit_min_num_frames
+            target_lengths = torch.randint(min_frames, max_frames + 1, (batch_size,), device=device)
+        else:
+            target_lengths = torch.full((batch_size,), max_frames, dtype=torch.long, device=device)
+
+        if state.ndim < 3:
+            available_lengths = torch.ones(batch_size, dtype=torch.long, device=device)
+        else:
+            available_lengths = torch.full((batch_size,), state.shape[1], dtype=torch.long, device=device)
+            state_pad = batch.get(f"{OBS_STATE}_is_pad")
+            if state_pad is not None:
+                available_lengths = (~state_pad.to(device=device).bool()).sum(dim=1)
+
+        lengths = torch.minimum(target_lengths, available_lengths).clamp_min(1)
+        window_num_frames = int(lengths.max().item())
+        positions = torch.arange(window_num_frames, device=device)[None, :]
+        memory_mask = positions >= (window_num_frames - lengths[:, None])
+        return window_num_frames, lengths, memory_mask
+
+    def _prepare_mem_state(self, batch: dict[str, Tensor], window_num_frames: int) -> Tensor | None:
+        if not self.config.mem_vit_enabled:
+            return None
+        state = batch[OBS_STATE]
+        if state.ndim == 2:
+            return state[:, None, :]
+        if state.ndim != 3:
+            raise ValueError(f"Expected observation.state as [B,K,D] or [B,D], got {tuple(state.shape)}")
+        return state[:, -window_num_frames:, :]
+
+    def _preprocess_images(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        mem_vit_window_num_frames: int | None = None,
+        mem_vit_memory_mask: Tensor | None = None,
+    ) -> tuple[list[Tensor], list[Tensor], list[Tensor | None]]:
         """Preprocess images for the model.
 
         Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
@@ -1355,6 +1632,7 @@ class PI05Policy(PreTrainedPolicy):
         """
         images = []
         img_masks = []
+        image_memory_masks = []
 
         # Get device from model parameters
         device = next(self.parameters()).device
@@ -1371,6 +1649,37 @@ class PI05Policy(PreTrainedPolicy):
         # Preprocess image features present in the batch
         for key in present_img_keys:
             img = batch[key]
+            if img.ndim not in (4, 5):
+                raise ValueError(
+                    f"Expected image feature {key} to be 4D [B,C,H,W]/[B,H,W,C] or "
+                    f"5D [B,K,C,H,W]/[B,K,H,W,C], got {tuple(img.shape)}"
+                )
+
+            original_batch_size = img.shape[0]
+            if img.ndim == 5:
+                num_frames = img.shape[1]
+                if not self.config.mem_vit_enabled:
+                    img = img[:, -1]
+                elif mem_vit_window_num_frames is None or mem_vit_memory_mask is None:
+                    raise ValueError(
+                        "mem_vit_window_num_frames and mem_vit_memory_mask must be provided "
+                        "when MEM-ViT image windows are used."
+                    )
+                elif mem_vit_window_num_frames > num_frames:
+                    raise ValueError(
+                        f"Requested {mem_vit_window_num_frames} MEM-ViT frames for image feature {key}, "
+                        f"but the batch only contains {num_frames} frames."
+                    )
+                elif num_frames != mem_vit_window_num_frames:
+                    img = img[:, -mem_vit_window_num_frames:]
+                    num_frames = mem_vit_window_num_frames
+                if self.config.mem_vit_enabled and num_frames != mem_vit_window_num_frames:
+                    raise ValueError(
+                        f"Image feature {key} has {num_frames} frames per sample, but "
+                        f"runtime window has {mem_vit_window_num_frames}."
+                    )
+                if not (img.shape[2] == 3 or img.shape[-1] <= 4):
+                    raise ValueError(f"Could not infer channel dimension for image feature {key}: {tuple(img.shape)}")
 
             # Ensure tensor is on the same device as the model
             if img.device != device:
@@ -1379,6 +1688,11 @@ class PI05Policy(PreTrainedPolicy):
             # Ensure float32 dtype for consistency
             if img.dtype != torch.float32:
                 img = img.to(torch.float32)
+
+            restore_mem_window_shape = img.ndim == 5 and self.config.mem_vit_enabled
+            if restore_mem_window_shape:
+                window_shape = img.shape[:2]
+                img = img.flatten(0, 1)
 
             # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
             is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
@@ -1398,11 +1712,16 @@ class PI05Policy(PreTrainedPolicy):
             if is_channels_first:
                 img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
 
+            if restore_mem_window_shape:
+                img = img.view(*window_shape, *img.shape[1:])
+
             images.append(img)
             # Create mask (all ones for real images)
-            bsize = img.shape[0]
-            mask = torch.ones(bsize, dtype=torch.bool, device=device)
+            mask = torch.ones(original_batch_size, dtype=torch.bool, device=device)
             img_masks.append(mask)
+            image_memory_masks.append(
+                mem_vit_memory_mask.to(device=device) if restore_mem_window_shape else None
+            )
 
         # Create image features not present in the batch as fully 0 padded images
         for _num_empty_cameras in range(len(missing_img_keys)):
@@ -1410,8 +1729,13 @@ class PI05Policy(PreTrainedPolicy):
             mask = torch.zeros_like(mask)  # Mask is zero for empty cameras
             images.append(img)
             img_masks.append(mask)
+            image_memory_masks.append(
+                mem_vit_memory_mask.to(device=device)
+                if self.config.mem_vit_enabled and img.ndim == 5 and mem_vit_memory_mask is not None
+                else None
+            )
 
-        return images, img_masks
+        return images, img_masks, image_memory_masks
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -1441,10 +1765,21 @@ class PI05Policy(PreTrainedPolicy):
         self.eval()
 
         # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
+        mem_vit_window_num_frames, _mem_vit_lengths, mem_vit_memory_mask = self._mem_vit_window_plan(
+            batch, randomize=False
+        )
+        images, img_masks, image_memory_masks = self._preprocess_images(
+            batch,
+            mem_vit_window_num_frames=mem_vit_window_num_frames,
+            mem_vit_memory_mask=mem_vit_memory_mask,
+        )
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
+        if self.config.mem_vit_enabled:
+            kwargs["state"] = self._prepare_mem_state(batch, mem_vit_window_num_frames)
+            kwargs["image_memory_masks"] = image_memory_masks
+            kwargs["state_memory_mask"] = mem_vit_memory_mask
         actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
 
         # Unpad actions to actual action dimension
@@ -1463,16 +1798,35 @@ class PI05Policy(PreTrainedPolicy):
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
         """
         # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
+        mem_vit_window_num_frames, mem_vit_lengths, mem_vit_memory_mask = self._mem_vit_window_plan(
+            batch, randomize=self.training
+        )
+        images, img_masks, image_memory_masks = self._preprocess_images(
+            batch,
+            mem_vit_window_num_frames=mem_vit_window_num_frames,
+            mem_vit_memory_mask=mem_vit_memory_mask,
+        )
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
+        state = self._prepare_mem_state(batch, mem_vit_window_num_frames)
 
         noise = self.model.sample_noise(actions.shape, actions.device)
         time = self.model.sample_time(actions.shape[0], actions.device)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions, noise, time)
+        losses = self.model.forward(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            actions,
+            noise,
+            time,
+            state=state,
+            image_memory_masks=image_memory_masks,
+            state_memory_mask=mem_vit_memory_mask,
+        )
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1481,6 +1835,9 @@ class PI05Policy(PreTrainedPolicy):
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
         }
+        if self.config.mem_vit_enabled:
+            loss_dict["mem_vit_num_frames"] = float(mem_vit_lengths.float().mean().item())
+            loss_dict["mem_vit_window_num_frames"] = float(mem_vit_window_num_frames)
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims

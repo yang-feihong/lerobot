@@ -46,6 +46,13 @@ class DatasetConfig:
     streaming: bool = False
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
+    # Optional JSON mapping episode_index to multiple natural-language task variants.
+    # If None, training auto-detects '<dataset.root>/meta/task_variants.json' when present.
+    task_variants_path: str | None = None
+    # When task variants are available, sample one variant per training sample.
+    random_task_variant: bool = True
+    # Keep eval deterministic by default; set True to apply task variants during eval loss too.
+    eval_task_variant: bool = False
 
     def __post_init__(self) -> None:
         if self.depth_output_unit not in (DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT):
