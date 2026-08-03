@@ -352,7 +352,7 @@ MEM_VIT_USE_ORIGINAL_FOR_K1 = False
 
 
 def _mem_temporal_pos_emb(num_frames: int, dim: int, device, dtype):
-    """Fixed sinusoidal temporal embedding for MEM-style vision attention.
+    """Fixed sinusoidal temporal embedding for MEM-style memory tokens.
 
     Frame order is assumed to be:
         [oldest_history, ..., current]
@@ -368,9 +368,7 @@ def _mem_temporal_pos_emb(num_frames: int, dim: int, device, dtype):
 
     half = dim // 2
     freqs = torch.exp(
-        -math.log(10000.0)
-        * torch.arange(half, device=device, dtype=torch.float32)
-        / max(half - 1, 1)
+        -math.log(10000.0) * torch.arange(half, device=device, dtype=torch.float32) / max(half - 1, 1)
     )
     args = pos[:, None] * freqs[None, :]
     emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
@@ -687,6 +685,10 @@ class PaliGemmaWithExpertModel(
             self.paligemma.eval()
             for param in self.paligemma.parameters():
                 param.requires_grad = False
+            if self.mem_vit_enabled and not self.freeze_vision_encoder:
+                self.paligemma.model.vision_tower.train()
+                for param in self.paligemma.model.vision_tower.parameters():
+                    param.requires_grad = True
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -694,6 +696,8 @@ class PaliGemmaWithExpertModel(
             self.paligemma.model.vision_tower.eval()
         if self.train_expert_only:
             self.paligemma.eval()
+            if mode and self.mem_vit_enabled and not self.freeze_vision_encoder:
+                self.paligemma.model.vision_tower.train()
 
     def embed_image(self, image: torch.Tensor, memory_mask: torch.Tensor | None = None):
         # Vision tower and multi_modal_projector are kept in float32 (params_to_keep_float32).
@@ -910,9 +914,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
         if config.mem_vit_enabled:
             self.state_memory_proj = nn.Linear(config.max_state_dim, paligemma_config.width)
-            self.state_memory_temporal_embedding = nn.Parameter(
-                torch.zeros(config.mem_vit_num_frames, paligemma_config.width)
-            )
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -982,9 +983,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if state.ndim == 2:
             state = state[:, None, :]
         if state.ndim != 3:
-            raise ValueError(
-                f"Expected MEM state memory as [B,K,D] or [B,D], got {tuple(state.shape)}"
-            )
+            raise ValueError(f"Expected MEM state memory as [B,K,D] or [B,D], got {tuple(state.shape)}")
         num_frames = state.shape[1]
         if state_memory_mask is not None and state_memory_mask.shape != state.shape[:2]:
             raise ValueError(
@@ -1005,11 +1004,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             return self.state_memory_proj(state)
 
         state_emb = self._apply_checkpoint(state_memory_proj_func, state)
-        temporal_emb = self.state_memory_temporal_embedding[-num_frames:][None, :, :].to(
+        temporal_emb = _mem_temporal_pos_emb(
+            num_frames,
+            state_emb.shape[-1],
             device=state_emb.device,
             dtype=state_emb.dtype,
         )
-        return state_emb + temporal_emb
+        return state_emb + temporal_emb[None, :, :]
 
     def embed_prefix(
         self,
@@ -1355,6 +1356,43 @@ class PI05Policy(PreTrainedPolicy):
 
         self.reset()
 
+    def _enable_lora_full_finetuning_modules(self) -> None:
+        """Keep full-trained VLA adaptation modules trainable after PEFT freezes the base policy."""
+        full_train_modules = [
+            self.model.paligemma_with_expert.gemma_expert,
+            self.model.action_in_proj,
+            self.model.action_out_proj,
+            self.model.time_mlp_in,
+            self.model.time_mlp_out,
+        ]
+        if self.config.mem_vit_enabled:
+            full_train_modules.append(self.model.state_memory_proj)
+        for module in full_train_modules:
+            module.train()
+            for param in module.parameters():
+                param.requires_grad = True
+
+    def _enable_mem_vit_full_finetuning(self) -> None:
+        """Keep MEM-ViT trainable when PEFT freezes the rest of the base policy."""
+        vision_tower = self.model.paligemma_with_expert.paligemma.model.vision_tower
+        vision_tower.train()
+        for param in vision_tower.parameters():
+            param.requires_grad = True
+
+    def wrap_with_peft(
+        self,
+        peft_config=None,
+        peft_cli_overrides: dict | None = None,
+    ) -> PreTrainedPolicy:
+        peft_model = super().wrap_with_peft(
+            peft_config=peft_config,
+            peft_cli_overrides=peft_cli_overrides,
+        )
+        self._enable_lora_full_finetuning_modules()
+        if self.config.mem_vit_enabled and not self.config.freeze_vision_encoder:
+            self._enable_mem_vit_full_finetuning()
+        return peft_model
+
     @classmethod
     def from_pretrained(
         cls: builtins.type[T],
@@ -1577,8 +1615,9 @@ class PI05Policy(PreTrainedPolicy):
     ) -> tuple[int, Tensor, Tensor]:
         if not self.config.mem_vit_enabled:
             device = next(self.parameters()).device
-            lengths = torch.ones(batch[ACTION].shape[0], dtype=torch.long, device=device)
-            mask = torch.ones(batch[ACTION].shape[0], 1, dtype=torch.bool, device=device)
+            batch_size = batch[OBS_STATE].shape[0]
+            lengths = torch.ones(batch_size, dtype=torch.long, device=device)
+            mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
             return 1, lengths, mask
 
         state = batch.get(OBS_STATE)
@@ -1679,7 +1718,9 @@ class PI05Policy(PreTrainedPolicy):
                         f"runtime window has {mem_vit_window_num_frames}."
                     )
                 if not (img.shape[2] == 3 or img.shape[-1] <= 4):
-                    raise ValueError(f"Could not infer channel dimension for image feature {key}: {tuple(img.shape)}")
+                    raise ValueError(
+                        f"Could not infer channel dimension for image feature {key}: {tuple(img.shape)}"
+                    )
 
             # Ensure tensor is on the same device as the model
             if img.device != device:
@@ -1741,6 +1782,130 @@ class PI05Policy(PreTrainedPolicy):
         """Pad action"""
         actions = pad_vector(batch[ACTION], self.config.max_action_dim)
         return actions
+
+    def _use_b2_z1_gate_action_loss(self, action_dim: int) -> bool:
+        schema = getattr(self.config, "action_loss_schema", "auto")
+        if schema == "off":
+            return False
+        if schema == "always":
+            return True
+        if schema != "auto":
+            raise ValueError(
+                f"Unsupported action_loss_schema={schema!r}. Expected one of: 'auto', 'always', 'off'."
+            )
+        return action_dim == 16
+
+    @staticmethod
+    def _normalized_bool_mask(actions: Tensor, dim: int, true_side: str = "positive") -> Tensor:
+        """Infer a bool label from a normalized two-valued action dimension.
+
+        PI0.5 receives actions after the policy preprocessor normalization step. For a raw 0/1 gate,
+        identity/min-max/quantile normalization keeps the true class on the positive side. This is more
+        robust than a batch-local midpoint because a small batch may contain only one class.
+
+        Some binary targets are stored as 0 vs negative raw command values. For those, quantile
+        normalization puts the active/event class on the negative side, so callers can pass
+        true_side="negative".
+        """
+        if true_side == "positive":
+            return actions[:, :, dim] > 0
+        if true_side == "negative":
+            return actions[:, :, dim] < 0
+        raise ValueError(f"Unsupported true_side={true_side!r}. Expected 'positive' or 'negative'.")
+
+    def _balanced_bool_weights(self, target_true: Tensor) -> Tensor:
+        """Return per-element weights that give true/false classes comparable total mass."""
+        target_true = target_true.to(dtype=torch.bool)
+        eps = getattr(self.config, "action_bool_balance_eps", 1e-3)
+        true_frac = target_true.float().mean().clamp(min=eps, max=1.0 - eps)
+        false_frac = 1.0 - true_frac
+        true_weight = 0.5 / true_frac
+        false_weight = 0.5 / false_frac
+        return torch.where(target_true, true_weight, false_weight)
+
+    def _masked_dim_loss(
+        self,
+        losses: Tensor,
+        dim_indices: list[int],
+        active_mask: Tensor,
+        base_weight: float,
+    ) -> tuple[Tensor, Tensor]:
+        """Return weighted losses and weights for selected continuous dimensions."""
+        if not dim_indices:
+            empty = losses.new_zeros((0,))
+            return empty, empty
+        dim_losses = losses[:, :, dim_indices]
+        weights = active_mask.to(dtype=dim_losses.dtype).unsqueeze(-1).expand_as(dim_losses)
+        min_weight = getattr(self.config, "action_masked_continuous_min_weight", 0.0)
+        if min_weight > 0:
+            weights = torch.clamp(weights, min=min_weight)
+        weights = weights * base_weight
+        return dim_losses * weights, weights
+
+    def _b2_z1_gate_action_loss(self, losses: Tensor, actions: Tensor, reduction: str) -> tuple[Tensor, dict]:
+        """Reduce PI0.5 action losses with the B2+Z1 16D gate-aware schema."""
+        bool_weight = float(getattr(self.config, "action_bool_loss_weight", 4.0))
+        continuous_weight = float(getattr(self.config, "action_continuous_loss_weight", 1.0))
+
+        b2_active = self._normalized_bool_mask(actions, 0)
+        arm_active = self._normalized_bool_mask(actions, 4)
+        arm_reset = self._normalized_bool_mask(actions, 5)
+        gripper_active = self._normalized_bool_mask(
+            actions,
+            15,
+            true_side=getattr(self.config, "action_gripper_target_true_side", "negative"),
+        )
+
+        weighted_parts: list[Tensor] = []
+        weight_parts: list[Tensor] = []
+        bool_dim_stats: dict[str, float] = {}
+        for name, dim, target in [
+            ("b2_active", 0, b2_active),
+            ("arm_active", 4, arm_active),
+            ("arm_reset", 5, arm_reset),
+            ("gripper_target", 15, gripper_active),
+        ]:
+            weights = self._balanced_bool_weights(target) * bool_weight
+            dim_losses = losses[:, :, dim]
+            weighted_parts.append(dim_losses * weights)
+            weight_parts.append(weights)
+            bool_dim_stats[f"gate_true_frac/{name}"] = float(target.float().mean().detach().cpu().item())
+            bool_dim_stats[f"gate_loss/{name}"] = float(
+                ((dim_losses * weights).sum() / weights.sum().clamp_min(1e-6)).detach().cpu().item()
+            )
+
+        for dim_losses, weights in [
+            self._masked_dim_loss(losses, [1, 2, 3], b2_active, continuous_weight),
+            self._masked_dim_loss(losses, list(range(6, 15)), arm_active & ~arm_reset, continuous_weight),
+        ]:
+            weighted_parts.append(dim_losses)
+            weight_parts.append(weights)
+
+        weighted = torch.cat([part.reshape(losses.shape[0], -1) for part in weighted_parts], dim=1)
+        weights = torch.cat([part.reshape(losses.shape[0], -1) for part in weight_parts], dim=1)
+        per_sample_loss = weighted.sum(dim=1) / weights.sum(dim=1).clamp_min(1e-6)
+
+        loss_dict = {
+            "gate_aware_action_loss": 1.0,
+            "gate_true_frac/b2_active": bool_dim_stats["gate_true_frac/b2_active"],
+            "gate_true_frac/arm_active": bool_dim_stats["gate_true_frac/arm_active"],
+            "gate_true_frac/arm_reset": bool_dim_stats["gate_true_frac/arm_reset"],
+            "gate_true_frac/gripper_target": bool_dim_stats["gate_true_frac/gripper_target"],
+            "gate_loss/b2_active": bool_dim_stats["gate_loss/b2_active"],
+            "gate_loss/arm_active": bool_dim_stats["gate_loss/arm_active"],
+            "gate_loss/arm_reset": bool_dim_stats["gate_loss/arm_reset"],
+            "gate_loss/gripper_target": bool_dim_stats["gate_loss/gripper_target"],
+            "continuous_mask_frac/b2_velocity": float(b2_active.float().mean().detach().cpu().item()),
+            "continuous_mask_frac/ee_pose": float(
+                (arm_active & ~arm_reset).float().mean().detach().cpu().item()
+            ),
+        }
+        if reduction == "none":
+            loss_dict["loss"] = per_sample_loss.mean().item()
+            return per_sample_loss, loss_dict
+        loss = per_sample_loss.mean()
+        loss_dict["loss"] = loss.item()
+        return loss, loss_dict
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -1839,6 +2004,15 @@ class PI05Policy(PreTrainedPolicy):
             loss_dict["mem_vit_num_frames"] = float(mem_vit_lengths.float().mean().item())
             loss_dict["mem_vit_window_num_frames"] = float(mem_vit_window_num_frames)
 
+        if self._use_b2_z1_gate_action_loss(original_action_dim):
+            loss, gate_loss_dict = self._b2_z1_gate_action_loss(
+                losses,
+                actions[:, :, :original_action_dim],
+                reduction,
+            )
+            loss_dict.update(gate_loss_dict)
+            return loss, loss_dict
+
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
             per_sample_loss = losses.mean(dim=(1, 2))
@@ -1851,12 +2025,31 @@ class PI05Policy(PreTrainedPolicy):
             return loss, loss_dict
 
     def _get_default_peft_targets(self) -> dict[str, any]:
-        """Return default PEFT target modules for PI0.5 fine-tuning."""
-        common_projections = (
-            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
+        """Return default PEFT target modules for PI0.5 VLA fine-tuning.
+
+        LoRA is the low-rank adaptation on top of expert fine-tuning: the
+        action expert and PI0.5 action/state/time projection layers are full
+        fine-tuned and saved, while the PaliGemma/VLM backbone receives LoRA
+        adapters. In non-MEM mode this includes ViT LoRA. In MEM mode, MEM-ViT
+        is full fine-tuned instead of receiving LoRA adapters.
+        """
+        transformer_projections = (
+            "q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|fc1|fc2|patch_embedding|linear"
         )
-        target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
-        return {
+        target_modules = rf".*\.paligemma_with_expert\.paligemma\..*\.({transformer_projections})"
+        modules_to_save = [
+            "model.paligemma_with_expert.gemma_expert",
+            "model.action_in_proj",
+            "model.action_out_proj",
+            "model.time_mlp_in",
+            "model.time_mlp_out",
+        ]
+        if self.config.mem_vit_enabled:
+            modules_to_save.append("model.state_memory_proj")
+        peft_targets = {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            "modules_to_save": modules_to_save,
         }
+        if self.config.mem_vit_enabled:
+            peft_targets["exclude_modules"] = r".*\.paligemma_with_expert\.paligemma\.model\.vision_tower\..*"
+        return peft_targets

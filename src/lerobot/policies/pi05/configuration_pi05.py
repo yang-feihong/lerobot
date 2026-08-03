@@ -87,6 +87,31 @@ class PI05Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
+    # B2+Z1 VLA gate-aware action loss.
+    #
+    # When enabled with the 16D action schema below, PI0.5 keeps the original
+    # flow-matching output head but changes how per-action losses are reduced:
+    #
+    #   [0]      b2_active              bool/gate, class-balanced
+    #   [1:4]    b2_vx, b2_vy, omega    continuous, trained only when b2_active=true
+    #   [4]      arm_active             bool/gate, class-balanced
+    #   [5]      arm_reset              bool/gate, class-balanced
+    #   [6:15]   EE rot6d + xyz         continuous, trained only when arm_active=true and arm_reset=false
+    #   [15]     gripper_target         bool/gate, class-balanced
+    #            Current B2+Z1 data stores gripper as two raw values (0 and a negative
+    #            target position), so its active/event class lives on the negative side
+    #            after quantile normalization. Override action_gripper_target_true_side
+    #            if a future dataset stores gripper differently.
+    #
+    # "auto" applies this only when the action dim is exactly 16; "always"
+    # forces it; "off" restores the original unweighted mean.
+    action_loss_schema: str = "auto"  # "auto", "always", or "off"
+    action_bool_loss_weight: float = 4.0
+    action_continuous_loss_weight: float = 1.0
+    action_masked_continuous_min_weight: float = 0.0
+    action_bool_balance_eps: float = 1e-3
+    action_gripper_target_true_side: str = "negative"  # "negative" or "positive"
+
     # MEM-ViT settings. Passing mem_vit_checkpoint also enables MEM-ViT.
     mem_vit_enabled: bool = False
     mem_vit_checkpoint: str | None = None
@@ -130,6 +155,26 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+        if self.action_loss_schema not in ["auto", "always", "off"]:
+            raise ValueError(
+                f"Invalid action_loss_schema: {self.action_loss_schema}. Expected 'auto', 'always', or 'off'."
+            )
+        if self.action_bool_loss_weight <= 0:
+            raise ValueError(f"action_bool_loss_weight must be > 0, got {self.action_bool_loss_weight}")
+        if self.action_continuous_loss_weight <= 0:
+            raise ValueError(
+                f"action_continuous_loss_weight must be > 0, got {self.action_continuous_loss_weight}"
+            )
+        if self.action_masked_continuous_min_weight < 0:
+            raise ValueError(
+                "action_masked_continuous_min_weight must be >= 0, got "
+                f"{self.action_masked_continuous_min_weight}"
+            )
+        if self.action_gripper_target_true_side not in ["negative", "positive"]:
+            raise ValueError(
+                "Invalid action_gripper_target_true_side: "
+                f"{self.action_gripper_target_true_side}. Expected 'negative' or 'positive'."
+            )
         if self.mem_vit_checkpoint is not None:
             self.mem_vit_enabled = True
         if self.mem_vit_num_frames < 1:
@@ -138,9 +183,7 @@ class PI05Config(PreTrainedConfig):
             raise ValueError("mem_vit_min_num_frames and mem_vit_max_num_frames must be set together")
         if self.mem_vit_min_num_frames is not None and self.mem_vit_max_num_frames is not None:
             if self.mem_vit_min_num_frames < 1:
-                raise ValueError(
-                    f"mem_vit_min_num_frames must be >= 1, got {self.mem_vit_min_num_frames}"
-                )
+                raise ValueError(f"mem_vit_min_num_frames must be >= 1, got {self.mem_vit_min_num_frames}")
             if self.mem_vit_max_num_frames < self.mem_vit_min_num_frames:
                 raise ValueError(
                     "mem_vit_max_num_frames must be >= mem_vit_min_num_frames, got "

@@ -12,17 +12,38 @@ cd "$repo_root"
 
 enable_mem="false"
 
-dataset_repo_id="local/b2_z1_vla"
-dataset_root="/data/b2_z1_vla_lerobot_0721"
-base_policy="/data/checkpoints/lerobot_pi05_base_local_tokenizer"
+# GPUs are selected here. Examples:
+#   gpu_ids="0"      -> single GPU
+#   gpu_ids="0,1,2"  -> 3-GPU DDP via accelerate
+# batch_size is per GPU/process. Effective global batch size is:
+#   batch_size * gradient_accumulation_steps * number_of_gpu_ids
+gpu_ids="0,1,2"
 
-steps="10000"
+# Choose exactly one fine-tuning mode:
+#   expert = freeze PaliGemma/VLM and full fine-tune only the action expert/projections.
+#            Measured peak, batch_size=2/grad_accum=4:
+#              non-MEM ≈ 11.0GB; MEM(K=6, full MEM-ViT) ≈ 17.2GB.
+#   lora   = full fine-tune the action expert/projections, plus LoRA on the
+#            PaliGemma/VLM backbone. Recommended on this RTX 4090 machine.
+#            Measured peak, batch_size=2/grad_accum=4:
+#              non-MEM ≈ 13.4GB; MEM(K=6, full MEM-ViT) ≈ 19.0GB.
+#   full   = full VLA fine-tuning without LoRA.
+#            Does not fit on this RTX 4090 with AdamW: batch_size=1 OOM at ≈23.5GB
+#            during optimizer-state initialization. Plan for at least 32GB, preferably
+#            40GB/48GB or multi-GPU/ZeRO/FSDP/8-bit optimizer.
+finetune_mode="lora"
+
+dataset_repo_id="local/b2_z1_vla"
+dataset_root="/data/b2_z1_vla_lerobot"
+base_policy="/data/checkpoints/lerobot_pi05_base_local_tokenizer"
+max_state_dim="46"
+
+steps="25000"
 batch_size="2"
 gradient_accumulation_steps="4"
 num_workers="4"
 
-# With 29 episodes and a single task, eval_split=0.1 holds out ceil(29*0.1)=3
-# episodes for validation and leaves 26 episodes for training.
+# Fraction of episodes held out for periodic validation.
 eval_split="0.1"
 eval_steps="500"
 max_eval_samples="512"
@@ -32,6 +53,12 @@ save_freq="2000"
 wandb_project="b2-z1-vla"
 
 output_root="/data/b2_z1_vla_pi05_outputs"
+
+# Used only when finetune_mode="lora". Action expert/projections are full fine-tuned;
+# PaliGemma/VLM backbone uses LoRA. In non-MEM mode, ViT also uses LoRA.
+# In MEM mode, MEM-ViT is full fine-tuned instead of using LoRA adapters.
+lora_rank="16"
+lora_alpha="32"
 
 # MEM-only configuration. Used only when enable_mem="true".
 mem_vit_checkpoint="/data/mem_vit_distill_outputs/mem_vit_distill_20260716_142702/mem_vit_distill_latest.pt"
@@ -78,21 +105,56 @@ if [[ "$enable_mem" == "true" ]]; then
   fi
 fi
 
+peft_args=()
+case "$finetune_mode" in
+  lora)
+    train_expert_only="false"
+    peft_args+=(--peft.method_type=LORA)
+    peft_args+=(--peft.r="$lora_rank")
+    peft_args+=(--peft.lora_alpha="$lora_alpha")
+    ;;
+  expert)
+    train_expert_only="true"
+    ;;
+  full)
+    train_expert_only="false"
+    ;;
+  *)
+    echo "Unknown finetune_mode=$finetune_mode. Expected one of: lora, expert, full." >&2
+    exit 1
+    ;;
+esac
+
 mkdir -p "$log_dir" "$output_root"
 
-setsid uv run python -u -m lerobot.scripts.lerobot_train \
+if [[ -z "$gpu_ids" ]]; then
+  echo "gpu_ids must not be empty." >&2
+  exit 1
+fi
+
+IFS=',' read -r -a gpu_id_array <<<"$gpu_ids"
+num_gpus="${#gpu_id_array[@]}"
+for gpu_id in "${gpu_id_array[@]}"; do
+  if [[ ! "$gpu_id" =~ ^[0-9]+$ ]]; then
+    echo "Invalid gpu_ids=$gpu_ids. Use a comma-separated list like 0,1,2." >&2
+    exit 1
+  fi
+done
+
+train_args=(
   --dataset.repo_id="$dataset_repo_id" \
   --dataset.root="$dataset_root" \
   --dataset.eval_split="$eval_split" \
   --policy.path="$base_policy" \
   --policy.input_features=null \
   --policy.output_features=null \
-  --policy.max_state_dim=40 \
+  --policy.max_state_dim="$max_state_dim" \
   --policy.dtype=bfloat16 \
   --policy.gradient_checkpointing=true \
-  --policy.train_expert_only=true \
+  --policy.train_expert_only="$train_expert_only" \
   "${policy_mem_args[@]}" \
   --policy.push_to_hub=false \
+  "${peft_args[@]}" \
   --output_dir="$output_dir" \
   --job_name="${job_prefix}_${timestamp}" \
   --steps="$steps" \
@@ -106,8 +168,25 @@ setsid uv run python -u -m lerobot.scripts.lerobot_train \
   --save_checkpoint=true \
   --save_freq="$save_freq" \
   --wandb.enable=true \
-  --wandb.project="$wandb_project" \
-  >"$log_file" 2>&1 </dev/null &
+  --wandb.project="$wandb_project"
+)
+
+if (( num_gpus > 1 )); then
+  setsid env CUDA_VISIBLE_DEVICES="$gpu_ids" uv run accelerate launch \
+    --multi_gpu \
+    --num_processes "$num_gpus" \
+    --num_machines 1 \
+    --gpu_ids "$gpu_ids" \
+    --mixed_precision bf16 \
+    --dynamo_backend no \
+    -m lerobot.scripts.lerobot_train \
+    "${train_args[@]}" \
+    >"$log_file" 2>&1 </dev/null &
+else
+  setsid env CUDA_VISIBLE_DEVICES="$gpu_ids" uv run python -u -m lerobot.scripts.lerobot_train \
+    "${train_args[@]}" \
+    >"$log_file" 2>&1 </dev/null &
+fi
 
 pid=$!
 echo "$pid" >"$pid_file"
@@ -115,10 +194,13 @@ echo "$pid" >"$pid_file"
 echo "VLA training started"
 echo "PID:              $pid"
 echo "MEM:              $enable_mem"
+echo "Finetune mode:    $finetune_mode"
+echo "Train expert only: $train_expert_only"
+echo "GPUs:             $gpu_ids ($num_gpus process(es))"
 echo "Dataset:          $dataset_root"
-echo "Train/eval split: 26 train episodes / 3 eval episodes (eval_split=$eval_split)"
+echo "Train/eval split: eval_split=$eval_split"
 echo "Steps:            $steps optimizer updates"
-echo "Batch:            $batch_size x $gradient_accumulation_steps accumulation"
+echo "Batch:            $batch_size per GPU x $gradient_accumulation_steps accumulation x $num_gpus GPU(s)"
 echo "Log:              $log_file"
 echo "Output:           $output_dir"
 echo "Watch:            tail -f '$log_file'"
