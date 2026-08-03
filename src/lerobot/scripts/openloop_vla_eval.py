@@ -10,10 +10,12 @@ compares it with the dataset action at the same frame.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import logging
 import math
+import multiprocessing
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,13 @@ from lerobot.datasets import LeRobotDataset
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.policies import make_policy, make_pre_post_processors
+from lerobot.policies.pi05.b2_action_transform import (
+    B2_TRAJECTORY_NAMES,
+    TASK_COMPLETE_NAME,
+    completion_from_padding,
+    encode_b2_action_chunk,
+    make_b2_trajectory_stats,
+)
 from lerobot.scripts.lerobot_train import apply_task_variants_to_batch, load_task_variants
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import ACTION
@@ -170,6 +179,54 @@ def _normalize_action_array(actions: np.ndarray, meta: LeRobotDatasetMetadata) -
     return 2.0 * (actions - q01) / denom - 1.0
 
 
+def _normalize_execution_action_array(
+    actions: np.ndarray, meta: LeRobotDatasetMetadata
+) -> np.ndarray:
+    """Normalize raw 16D actions plus the derived task_complete bit."""
+    raw_dim = int(meta.features[ACTION]["shape"][0])
+    normalized = _normalize_action_array(actions[..., :raw_dim], meta)
+    if actions.shape[-1] == raw_dim:
+        return normalized
+    if actions.shape[-1] != raw_dim + 1:
+        raise ValueError(f"Expected {raw_dim} or {raw_dim + 1} execution dims, got {actions.shape[-1]}")
+    completion = 2.0 * actions[..., raw_dim : raw_dim + 1] - 1.0
+    return np.concatenate((normalized, completion), axis=-1)
+
+
+def _normalize_with_stats(actions: np.ndarray, stats: dict[str, Any]) -> np.ndarray:
+    q01 = np.asarray(stats["q01"], dtype=np.float32).reshape(-1)
+    q99 = np.asarray(stats["q99"], dtype=np.float32).reshape(-1)
+    denom = np.where(q99 == q01, 1e-8, q99 - q01)
+    return 2.0 * (actions - q01) / denom - 1.0
+
+
+def _append_expert_completion(action: torch.Tensor, is_pad: torch.Tensor | None) -> torch.Tensor:
+    if is_pad is None:
+        complete = torch.zeros(action.shape[:-1], dtype=action.dtype, device=action.device)
+    else:
+        complete = completion_from_padding(is_pad).to(device=action.device, dtype=action.dtype)
+    return torch.cat((action, complete.unsqueeze(-1)), dim=-1)
+
+
+def _combined_base_plot_arrays(
+    execution: np.ndarray,
+    trajectory: np.ndarray,
+) -> np.ndarray:
+    """Show velocity and integrated position together while retaining all other actions."""
+    return np.concatenate(
+        (
+            execution[..., :4],
+            trajectory[..., 1:4],
+            execution[..., 4:],
+        ),
+        axis=-1,
+    )
+
+
+def _combined_base_plot_names(execution_names: list[str]) -> list[str]:
+    return execution_names[:4] + list(B2_TRAJECTORY_NAMES) + execution_names[4:]
+
+
 def _padded_limits(low: float, high: float, *, padding_fraction: float = 0.08) -> tuple[float, float]:
     """Return stable plot limits instead of allowing per-subplot autoscaling."""
     span = high - low
@@ -251,7 +308,7 @@ def _plot_episode(
     import matplotlib.pyplot as plt
 
     action_dim = expert.shape[1]
-    ncols = min(4, action_dim)
+    ncols = min(5, action_dim)
     nrows = math.ceil(action_dim / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(4.6 * ncols, 2.4 * nrows), squeeze=False)
     x = frame_index
@@ -308,7 +365,7 @@ def _plot_episode_rolling_chunks(
 
     action_dim = expert_chunks.shape[2]
     horizon = expert_chunks.shape[1]
-    ncols = min(4, action_dim)
+    ncols = min(5, action_dim)
     nrows = math.ceil(action_dim / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(4.8 * ncols, 2.5 * nrows), squeeze=False)
 
@@ -368,7 +425,7 @@ def _plot_single_chunk(
 
     action_dim = expert_chunk.shape[1]
     horizon = expert_chunk.shape[0]
-    ncols = min(4, action_dim)
+    ncols = min(5, action_dim)
     nrows = math.ceil(action_dim / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(4.8 * ncols, 2.5 * nrows), squeeze=False)
     x = int(start_frame_index) + np.arange(horizon)
@@ -393,6 +450,21 @@ def _plot_single_chunk(
     fig.tight_layout(rect=(0, 0, 0.98, 0.97))
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
+
+
+def _plot_single_chunk_job(
+    job: tuple[
+        Path,
+        int,
+        int,
+        np.ndarray,
+        np.ndarray,
+        list[str],
+        list[tuple[float, float]],
+    ],
+) -> None:
+    """Process-pool entry point for one independent action-chunk plot."""
+    _plot_single_chunk(*job)
 
 
 def _batch_to_device_and_float_images(batch: dict[str, Any], camera_keys: list[str]) -> dict[str, Any]:
@@ -459,7 +531,15 @@ def main() -> None:
     parser.add_argument("--eval-split", type=float, default=0.1)
     parser.add_argument("--episodes", default=None, help="Comma/range list, e.g. 1,5,9-12. Overrides split.")
     parser.add_argument("--max-episodes", type=int, default=8, help="0 means no limit.")
-    parser.add_argument("--max-frames-per-episode", type=int, default=300, help="0 means no limit.")
+    parser.add_argument(
+        "--max-frames-per-episode",
+        type=int,
+        default=None,
+        help=(
+            "Maximum frames per episode. 0 means no limit. By default, explicitly selected "
+            "--episodes are evaluated in full; split-based evaluation is limited to 300 frames."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--device", default="cuda")
@@ -468,12 +548,25 @@ def main() -> None:
     parser.add_argument(
         "--max-chunk-plots-per-episode",
         type=int,
-        default=20,
-        help="Maximum number of per-inference 50-step chunk plots to save per episode. 0 means no limit.",
+        default=None,
+        help=(
+            "Maximum number of per-inference 50-step chunk plots to save per episode. 0 means no "
+            "limit. By default, every inference is plotted for explicitly selected --episodes; "
+            "split-based evaluation saves at most 20 plots per episode."
+        ),
     )
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--video-backend", default="torchcodec")
+    parser.add_argument(
+        "--plot-workers",
+        type=int,
+        default=1,
+        help="Processes used for independent chunk plots. Use more than 1 for large full episodes.",
+    )
     args = parser.parse_args()
+
+    if args.plot_workers < 1:
+        raise ValueError(f"plot_workers must be at least 1, got {args.plot_workers}")
 
     init_logging()
 
@@ -498,15 +591,35 @@ def main() -> None:
     policy_cfg.device = args.device
 
     meta = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
+    b2_trajectory_enabled = bool(getattr(policy_cfg, "b2_local_trajectory_enabled", False))
+    b2_trajectory_dt = getattr(policy_cfg, "b2_local_trajectory_dt", None)
+    if b2_trajectory_enabled:
+        expected_dt = 1.0 / float(meta.fps)
+        if b2_trajectory_dt is None:
+            raise ValueError("Trajectory checkpoint is missing b2_local_trajectory_dt")
+        if abs(float(b2_trajectory_dt) - expected_dt) > 1e-9:
+            raise ValueError(
+                f"Trajectory checkpoint dt={b2_trajectory_dt} does not match dataset fps={meta.fps}"
+            )
     delta_timestamps = resolve_delta_timestamps(policy_cfg, meta)
 
     episodes = _parse_episodes(args.episodes)
+    explicit_episode_selection = episodes is not None
+    if args.max_frames_per_episode is None:
+        args.max_frames_per_episode = 0 if explicit_episode_selection else 300
+    if args.max_chunk_plots_per_episode is None:
+        args.max_chunk_plots_per_episode = 0 if explicit_episode_selection else 20
     if episodes is None:
         episodes = _split_episodes(meta, args.split, args.eval_split)
     episodes = _limit_episodes(episodes, args.max_episodes)
     if not episodes:
         raise ValueError("No episodes selected for open-loop evaluation.")
     logging.info("Selected %d episode(s): %s", len(episodes), episodes)
+    logging.info(
+        "Per-episode limits: frames=%s, chunk_plots=%s",
+        "all" if args.max_frames_per_episode == 0 else args.max_frames_per_episode,
+        "all" if args.max_chunk_plots_per_episode == 0 else args.max_chunk_plots_per_episode,
+    )
 
     dataset = LeRobotDataset(
         args.dataset_repo_id,
@@ -518,9 +631,38 @@ def main() -> None:
         return_uint8=True,
     )
 
-    action_dim = int(meta.features[ACTION]["shape"][0])
-    action_names = _default_action_names(meta, action_dim)
-    plot_y_limits = _action_plot_y_limits(meta, action_names)
+    dataset_action_dim = int(meta.features[ACTION]["shape"][0])
+    dataset_action_names = _default_action_names(meta, dataset_action_dim)
+    execution_action_names = list(dataset_action_names)
+    trajectory_action_names = list(dataset_action_names)
+    trajectory_stats = None
+    if b2_trajectory_enabled:
+        if dataset_action_dim != 16:
+            raise ValueError(
+                f"B2 local trajectory evaluation expects a 16D dataset action, got {dataset_action_dim}"
+            )
+        execution_action_names.append(TASK_COMPLETE_NAME)
+        trajectory_action_names[1:4] = list(B2_TRAJECTORY_NAMES)
+        trajectory_action_names.append(TASK_COMPLETE_NAME)
+        transformed_stats = make_b2_trajectory_stats(
+            meta.stats,
+            dt=float(b2_trajectory_dt),
+            chunk_size=int(policy_cfg.chunk_size),
+        )
+        assert transformed_stats is not None
+        trajectory_stats = transformed_stats[ACTION]
+
+        execution_limits = _action_plot_y_limits(meta, dataset_action_names) + [(-0.1, 1.1)]
+        trajectory_q01 = np.asarray(trajectory_stats["q01"], dtype=np.float32)
+        trajectory_q99 = np.asarray(trajectory_stats["q99"], dtype=np.float32)
+        trajectory_limits = [
+            _padded_limits(float(trajectory_q01[i]), float(trajectory_q99[i])) for i in range(1, 4)
+        ]
+        plot_action_names = _combined_base_plot_names(execution_action_names)
+        plot_y_limits = execution_limits[:4] + trajectory_limits + execution_limits[4:]
+    else:
+        plot_action_names = execution_action_names
+        plot_y_limits = _action_plot_y_limits(meta, execution_action_names)
     collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
     dataloader = DataLoader(
         dataset,
@@ -540,6 +682,7 @@ def main() -> None:
         policy_cfg=policy_cfg,
         pretrained_path=str(policy_path),
         pretrained_revision=getattr(policy_cfg, "pretrained_revision", None),
+        dataset_stats=dataset.meta.stats,
         preprocessor_overrides={
             "device_processor": {"device": torch.device(args.device).type},
             "normalizer_processor": {
@@ -565,6 +708,10 @@ def main() -> None:
             "pred": [],
             "expert_chunk": [],
             "pred_chunk": [],
+            "expert_trajectory": [],
+            "pred_trajectory": [],
+            "expert_trajectory_chunk": [],
+            "pred_trajectory_chunk": [],
             "task": [],
         }
     )
@@ -576,8 +723,7 @@ def main() -> None:
             if batch is None:
                 continue
 
-            expert_chunk = _as_action_chunk(batch[ACTION].detach().cpu().to(torch.float32))
-            expert_action = _first_action(expert_chunk)
+            dataset_expert_chunk = _as_action_chunk(batch[ACTION].detach().cpu().to(torch.float32))
             episode_indices = batch["episode_index"].detach().cpu().view(-1).tolist()
             keep = []
             for i, ep_idx in enumerate(episode_indices):
@@ -599,8 +745,7 @@ def main() -> None:
                     else:
                         filtered[key] = value
                 batch = filtered
-                expert_chunk = expert_chunk.index_select(0, keep_t)
-                expert_action = expert_action.index_select(0, keep_t)
+                dataset_expert_chunk = dataset_expert_chunk.index_select(0, keep_t)
 
             if args.task_variant != "dataset":
                 apply_task_variants_to_batch(
@@ -613,10 +758,34 @@ def main() -> None:
 
             batch = _batch_to_device_and_float_images(batch, dataset.meta.camera_keys)
             processed = preprocessor(batch)
-            pred_chunk = (
+            pred_execution_chunk = (
                 postprocessor(policy.predict_action_chunk(processed)).detach().cpu().to(torch.float32)
             )
+            if b2_trajectory_enabled:
+                action_is_pad = batch.get(f"{ACTION}_is_pad")
+                if action_is_pad is not None:
+                    action_is_pad = action_is_pad.detach().cpu().to(torch.bool)
+                expert_chunk = _append_expert_completion(dataset_expert_chunk, action_is_pad)
+                expert_trajectory_chunk = encode_b2_action_chunk(
+                    dataset_expert_chunk,
+                    dt=float(b2_trajectory_dt),
+                    is_pad=action_is_pad,
+                )
+                pred_chunk = pred_execution_chunk
+                pred_trajectory_chunk = encode_b2_action_chunk(
+                    pred_execution_chunk,
+                    dt=float(b2_trajectory_dt),
+                    append_completion=False,
+                )
+            else:
+                expert_chunk = dataset_expert_chunk
+                pred_chunk = pred_execution_chunk
+                expert_trajectory_chunk = expert_chunk
+                pred_trajectory_chunk = pred_chunk
+            expert_action = _first_action(expert_chunk)
             pred_action = _first_action(pred_chunk)
+            expert_trajectory_action = _first_action(expert_trajectory_chunk)
+            pred_trajectory_action = _first_action(pred_trajectory_chunk)
 
             ep_np = _to_numpy_1d(batch["episode_index"]).astype(np.int64)
             frame_np = _to_numpy_1d(batch["frame_index"]).astype(np.int64)
@@ -631,6 +800,8 @@ def main() -> None:
 
             expert_np = expert_action.numpy()
             pred_np = pred_action.numpy()
+            expert_trajectory_np = expert_trajectory_action.numpy()
+            pred_trajectory_np = pred_trajectory_action.numpy()
             for i, ep_idx in enumerate(ep_np.tolist()):
                 ep_store = per_episode[int(ep_idx)]
                 ep_store["frame_index"].append(int(frame_np[i]))
@@ -639,6 +810,10 @@ def main() -> None:
                 ep_store["pred"].append(pred_np[i])
                 ep_store["expert_chunk"].append(expert_chunk[i].numpy())
                 ep_store["pred_chunk"].append(pred_chunk[i].numpy())
+                ep_store["expert_trajectory"].append(expert_trajectory_np[i])
+                ep_store["pred_trajectory"].append(pred_trajectory_np[i])
+                ep_store["expert_trajectory_chunk"].append(expert_trajectory_chunk[i].numpy())
+                ep_store["pred_trajectory_chunk"].append(pred_trajectory_chunk[i].numpy())
                 ep_store["task"].append(task_list[i])
 
                 row: dict[str, Any] = {
@@ -648,7 +823,7 @@ def main() -> None:
                     "task": task_list[i],
                 }
                 err = pred_np[i] - expert_np[i]
-                for j, name in enumerate(action_names):
+                for j, name in enumerate(execution_action_names):
                     row[f"expert/{name}"] = float(expert_np[i, j])
                     row[f"pred/{name}"] = float(pred_np[i, j])
                     row[f"error/{name}"] = float(err[j])
@@ -666,9 +841,26 @@ def main() -> None:
     chunk_metrics_rows: list[dict[str, Any]] = []
     normalized_metrics_rows: list[dict[str, Any]] = []
     normalized_chunk_metrics_rows: list[dict[str, Any]] = []
+    trajectory_metrics_rows: list[dict[str, Any]] = []
+    normalized_trajectory_metrics_rows: list[dict[str, Any]] = []
+    trajectory_chunk_metrics_rows: list[dict[str, Any]] = []
+    normalized_trajectory_chunk_metrics_rows: list[dict[str, Any]] = []
     all_expert, all_pred = [], []
     all_expert_chunks, all_pred_chunks = [], []
+    all_expert_trajectories, all_pred_trajectories = [], []
+    all_expert_trajectory_chunks, all_pred_trajectory_chunks = [], []
     npz_payload: dict[str, np.ndarray] = {}
+    single_chunk_plot_jobs: list[
+        tuple[
+            Path,
+            int,
+            int,
+            np.ndarray,
+            np.ndarray,
+            list[str],
+            list[tuple[float, float]],
+        ]
+    ] = []
     for ep_idx in sorted(per_episode):
         item = per_episode[ep_idx]
         frame_index = np.asarray(item["frame_index"], dtype=np.int64)
@@ -676,6 +868,10 @@ def main() -> None:
         pred = np.stack(item["pred"]).astype(np.float32)
         expert_chunks = np.stack(item["expert_chunk"]).astype(np.float32)
         pred_chunks = np.stack(item["pred_chunk"]).astype(np.float32)
+        expert_trajectory = np.stack(item["expert_trajectory"]).astype(np.float32)
+        pred_trajectory = np.stack(item["pred_trajectory"]).astype(np.float32)
+        expert_trajectory_chunks = np.stack(item["expert_trajectory_chunk"]).astype(np.float32)
+        pred_trajectory_chunks = np.stack(item["pred_trajectory_chunk"]).astype(np.float32)
         valid_chunk_lengths = _valid_chunk_lengths(
             meta,
             ep_idx,
@@ -684,17 +880,27 @@ def main() -> None:
         )
         valid_expert_chunks = _flatten_valid_chunks(expert_chunks, valid_chunk_lengths)
         valid_pred_chunks = _flatten_valid_chunks(pred_chunks, valid_chunk_lengths)
+        valid_expert_trajectory_chunks = _flatten_valid_chunks(
+            expert_trajectory_chunks, valid_chunk_lengths
+        )
+        valid_pred_trajectory_chunks = _flatten_valid_chunks(
+            pred_trajectory_chunks, valid_chunk_lengths
+        )
         all_expert.append(expert)
         all_pred.append(pred)
         all_expert_chunks.append(valid_expert_chunks)
         all_pred_chunks.append(valid_pred_chunks)
-        metrics_rows.append(_compute_metrics(ep_idx, expert, pred, action_names))
+        all_expert_trajectories.append(expert_trajectory)
+        all_pred_trajectories.append(pred_trajectory)
+        all_expert_trajectory_chunks.append(valid_expert_trajectory_chunks)
+        all_pred_trajectory_chunks.append(valid_pred_trajectory_chunks)
+        metrics_rows.append(_compute_metrics(ep_idx, expert, pred, execution_action_names))
         normalized_metrics_rows.append(
             _compute_metrics(
                 ep_idx,
-                _normalize_action_array(expert, meta),
-                _normalize_action_array(pred, meta),
-                action_names,
+                _normalize_execution_action_array(expert, meta),
+                _normalize_execution_action_array(pred, meta),
+                execution_action_names,
             )
         )
         chunk_metrics_rows.append(
@@ -702,33 +908,88 @@ def main() -> None:
                 ep_idx,
                 valid_expert_chunks,
                 valid_pred_chunks,
-                action_names,
+                execution_action_names,
             )
         )
         normalized_chunk_metrics_rows.append(
             _compute_metrics(
                 ep_idx,
-                _normalize_action_array(valid_expert_chunks, meta),
-                _normalize_action_array(valid_pred_chunks, meta),
-                action_names,
+                _normalize_execution_action_array(valid_expert_chunks, meta),
+                _normalize_execution_action_array(valid_pred_chunks, meta),
+                execution_action_names,
             )
+        )
+        trajectory_metrics_rows.append(
+            _compute_metrics(
+                ep_idx,
+                expert_trajectory,
+                pred_trajectory,
+                trajectory_action_names,
+            )
+        )
+        trajectory_chunk_metrics_rows.append(
+            _compute_metrics(
+                ep_idx,
+                valid_expert_trajectory_chunks,
+                valid_pred_trajectory_chunks,
+                trajectory_action_names,
+            )
+        )
+        if trajectory_stats is not None:
+            normalized_trajectory_metrics_rows.append(
+                _compute_metrics(
+                    ep_idx,
+                    _normalize_with_stats(expert_trajectory, trajectory_stats),
+                    _normalize_with_stats(pred_trajectory, trajectory_stats),
+                    trajectory_action_names,
+                )
+            )
+            normalized_trajectory_chunk_metrics_rows.append(
+                _compute_metrics(
+                    ep_idx,
+                    _normalize_with_stats(valid_expert_trajectory_chunks, trajectory_stats),
+                    _normalize_with_stats(valid_pred_trajectory_chunks, trajectory_stats),
+                    trajectory_action_names,
+                )
+            )
+        else:
+            normalized_trajectory_metrics_rows.append(normalized_metrics_rows[-1].copy())
+            normalized_trajectory_chunk_metrics_rows.append(normalized_chunk_metrics_rows[-1].copy())
+
+        plot_expert = (
+            _combined_base_plot_arrays(expert, expert_trajectory)
+            if b2_trajectory_enabled
+            else expert
+        )
+        plot_pred = (
+            _combined_base_plot_arrays(pred, pred_trajectory) if b2_trajectory_enabled else pred
+        )
+        plot_expert_chunks = (
+            _combined_base_plot_arrays(expert_chunks, expert_trajectory_chunks)
+            if b2_trajectory_enabled
+            else expert_chunks
+        )
+        plot_pred_chunks = (
+            _combined_base_plot_arrays(pred_chunks, pred_trajectory_chunks)
+            if b2_trajectory_enabled
+            else pred_chunks
         )
         _plot_episode(
             plot_dir / f"episode_{ep_idx:06d}.png",
             ep_idx,
             frame_index,
-            expert,
-            pred,
-            action_names,
+            plot_expert,
+            plot_pred,
+            plot_action_names,
             plot_y_limits,
         )
         _plot_episode_rolling_chunks(
             chunk_plot_dir / f"episode_{ep_idx:06d}_rolling_chunks.png",
             ep_idx,
             frame_index,
-            expert_chunks,
-            pred_chunks,
-            action_names,
+            plot_expert_chunks,
+            plot_pred_chunks,
+            plot_action_names,
             plot_y_limits,
             valid_chunk_lengths,
         )
@@ -738,56 +999,153 @@ def main() -> None:
         if args.max_chunk_plots_per_episode > 0:
             n_single_plots = min(n_single_plots, args.max_chunk_plots_per_episode)
         for i in range(n_single_plots):
-            _plot_single_chunk(
-                ep_single_dir / f"chunk_start_{int(frame_index[i]):06d}.png",
-                ep_idx,
-                int(frame_index[i]),
-                expert_chunks[i, : valid_chunk_lengths[i]],
-                pred_chunks[i, : valid_chunk_lengths[i]],
-                action_names,
-                plot_y_limits,
+            single_chunk_plot_jobs.append(
+                (
+                    ep_single_dir / f"chunk_start_{int(frame_index[i]):06d}.png",
+                    ep_idx,
+                    int(frame_index[i]),
+                    plot_expert_chunks[i, : valid_chunk_lengths[i]],
+                    plot_pred_chunks[i, : valid_chunk_lengths[i]],
+                    plot_action_names,
+                    plot_y_limits,
+                )
             )
         npz_payload[f"episode_{ep_idx:06d}_frame_index"] = frame_index
         npz_payload[f"episode_{ep_idx:06d}_expert"] = expert
         npz_payload[f"episode_{ep_idx:06d}_pred"] = pred
         npz_payload[f"episode_{ep_idx:06d}_expert_chunk"] = expert_chunks
         npz_payload[f"episode_{ep_idx:06d}_pred_chunk"] = pred_chunks
+        npz_payload[f"episode_{ep_idx:06d}_expert_trajectory"] = expert_trajectory
+        npz_payload[f"episode_{ep_idx:06d}_pred_trajectory"] = pred_trajectory
+        npz_payload[f"episode_{ep_idx:06d}_expert_trajectory_chunk"] = expert_trajectory_chunks
+        npz_payload[f"episode_{ep_idx:06d}_pred_trajectory_chunk"] = pred_trajectory_chunks
         npz_payload[f"episode_{ep_idx:06d}_valid_chunk_length"] = valid_chunk_lengths
+
+    logging.info(
+        "Generating %d independent action-chunk plot(s) with %d worker(s)",
+        len(single_chunk_plot_jobs),
+        args.plot_workers,
+    )
+    if args.plot_workers == 1:
+        for job in tqdm(single_chunk_plot_jobs, desc="Chunk plots", unit="plot"):
+            _plot_single_chunk_job(job)
+    else:
+        # Spawn avoids forking a process after CUDA has been initialized by policy inference.
+        mp_context = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=args.plot_workers,
+            mp_context=mp_context,
+        ) as executor:
+            results = executor.map(_plot_single_chunk_job, single_chunk_plot_jobs, chunksize=1)
+            for _ in tqdm(results, total=len(single_chunk_plot_jobs), desc="Chunk plots", unit="plot"):
+                pass
 
     all_expert_arr = np.concatenate(all_expert, axis=0)
     all_pred_arr = np.concatenate(all_pred, axis=0)
     all_expert_chunk_arr = np.concatenate(all_expert_chunks, axis=0)
     all_pred_chunk_arr = np.concatenate(all_pred_chunks, axis=0)
-    metrics_rows.insert(0, _compute_metrics("all", all_expert_arr, all_pred_arr, action_names))
+    all_expert_trajectory_arr = np.concatenate(all_expert_trajectories, axis=0)
+    all_pred_trajectory_arr = np.concatenate(all_pred_trajectories, axis=0)
+    all_expert_trajectory_chunk_arr = np.concatenate(all_expert_trajectory_chunks, axis=0)
+    all_pred_trajectory_chunk_arr = np.concatenate(all_pred_trajectory_chunks, axis=0)
+    metrics_rows.insert(
+        0, _compute_metrics("all", all_expert_arr, all_pred_arr, execution_action_names)
+    )
     normalized_metrics_rows.insert(
         0,
         _compute_metrics(
             "all",
-            _normalize_action_array(all_expert_arr, meta),
-            _normalize_action_array(all_pred_arr, meta),
-            action_names,
+            _normalize_execution_action_array(all_expert_arr, meta),
+            _normalize_execution_action_array(all_pred_arr, meta),
+            execution_action_names,
         ),
     )
     chunk_metrics_rows.insert(
-        0, _compute_metrics("all", all_expert_chunk_arr, all_pred_chunk_arr, action_names)
+        0,
+        _compute_metrics(
+            "all", all_expert_chunk_arr, all_pred_chunk_arr, execution_action_names
+        ),
     )
     normalized_chunk_metrics_rows.insert(
         0,
         _compute_metrics(
             "all",
-            _normalize_action_array(all_expert_chunk_arr, meta),
-            _normalize_action_array(all_pred_chunk_arr, meta),
-            action_names,
+            _normalize_execution_action_array(all_expert_chunk_arr, meta),
+            _normalize_execution_action_array(all_pred_chunk_arr, meta),
+            execution_action_names,
         ),
     )
 
-    _write_metrics_csv(output_dir / "metrics.csv", metrics_rows, action_names)
-    _write_metrics_csv(output_dir / "normalized_metrics.csv", normalized_metrics_rows, action_names)
-    _write_metrics_csv(output_dir / "chunk_metrics.csv", chunk_metrics_rows, action_names)
-    _write_metrics_csv(
-        output_dir / "normalized_chunk_metrics.csv", normalized_chunk_metrics_rows, action_names
+    trajectory_metrics_rows.insert(
+        0,
+        _compute_metrics(
+            "all",
+            all_expert_trajectory_arr,
+            all_pred_trajectory_arr,
+            trajectory_action_names,
+        ),
     )
-    _write_predictions_csv(output_dir / "predictions.csv", prediction_rows, action_names)
+    trajectory_chunk_metrics_rows.insert(
+        0,
+        _compute_metrics(
+            "all",
+            all_expert_trajectory_chunk_arr,
+            all_pred_trajectory_chunk_arr,
+            trajectory_action_names,
+        ),
+    )
+    if trajectory_stats is not None:
+        normalized_trajectory_metrics_rows.insert(
+            0,
+            _compute_metrics(
+                "all",
+                _normalize_with_stats(all_expert_trajectory_arr, trajectory_stats),
+                _normalize_with_stats(all_pred_trajectory_arr, trajectory_stats),
+                trajectory_action_names,
+            ),
+        )
+        normalized_trajectory_chunk_metrics_rows.insert(
+            0,
+            _compute_metrics(
+                "all",
+                _normalize_with_stats(all_expert_trajectory_chunk_arr, trajectory_stats),
+                _normalize_with_stats(all_pred_trajectory_chunk_arr, trajectory_stats),
+                trajectory_action_names,
+            ),
+        )
+    else:
+        normalized_trajectory_metrics_rows.insert(0, normalized_metrics_rows[0].copy())
+        normalized_trajectory_chunk_metrics_rows.insert(0, normalized_chunk_metrics_rows[0].copy())
+
+    _write_metrics_csv(output_dir / "metrics.csv", metrics_rows, execution_action_names)
+    _write_metrics_csv(
+        output_dir / "normalized_metrics.csv", normalized_metrics_rows, execution_action_names
+    )
+    _write_metrics_csv(output_dir / "chunk_metrics.csv", chunk_metrics_rows, execution_action_names)
+    _write_metrics_csv(
+        output_dir / "normalized_chunk_metrics.csv",
+        normalized_chunk_metrics_rows,
+        execution_action_names,
+    )
+    _write_metrics_csv(
+        output_dir / "trajectory_metrics.csv", trajectory_metrics_rows, trajectory_action_names
+    )
+    _write_metrics_csv(
+        output_dir / "normalized_trajectory_metrics.csv",
+        normalized_trajectory_metrics_rows,
+        trajectory_action_names,
+    )
+    _write_metrics_csv(
+        output_dir / "trajectory_chunk_metrics.csv",
+        trajectory_chunk_metrics_rows,
+        trajectory_action_names,
+    )
+    _write_metrics_csv(
+        output_dir / "normalized_trajectory_chunk_metrics.csv",
+        normalized_trajectory_chunk_metrics_rows,
+        trajectory_action_names,
+    )
+    _write_predictions_csv(output_dir / "predictions.csv", prediction_rows, execution_action_names)
     np.savez_compressed(output_dir / "predictions.npz", **npz_payload)
 
     summary = {
@@ -798,15 +1156,23 @@ def main() -> None:
         "eval_split": args.eval_split,
         "episodes": sorted(per_episode),
         "num_frames": int(all_expert_arr.shape[0]),
-        "action_names": action_names,
+        "b2_local_trajectory_enabled": b2_trajectory_enabled,
+        "b2_local_trajectory_dt": b2_trajectory_dt,
+        "execution_action_names": execution_action_names,
+        "trajectory_action_names": trajectory_action_names,
+        "plot_action_names": plot_action_names,
         "plot_y_limits": {
             name: [float(low), float(high)]
-            for name, (low, high) in zip(action_names, plot_y_limits, strict=True)
+            for name, (low, high) in zip(plot_action_names, plot_y_limits, strict=True)
         },
         "metrics": metrics_rows[0],
         "normalized_metrics": normalized_metrics_rows[0],
         "chunk_metrics": chunk_metrics_rows[0],
         "normalized_chunk_metrics": normalized_chunk_metrics_rows[0],
+        "trajectory_metrics": trajectory_metrics_rows[0],
+        "normalized_trajectory_metrics": normalized_trajectory_metrics_rows[0],
+        "trajectory_chunk_metrics": trajectory_chunk_metrics_rows[0],
+        "normalized_trajectory_chunk_metrics": normalized_trajectory_chunk_metrics_rows[0],
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -818,6 +1184,12 @@ def main() -> None:
     logging.info("Chunk RMSE mean: %.6f", chunk_metrics_rows[0]["rmse_mean"])
     logging.info("Normalized chunk MAE mean: %.6f", normalized_chunk_metrics_rows[0]["mae_mean"])
     logging.info("Normalized chunk RMSE mean: %.6f", normalized_chunk_metrics_rows[0]["rmse_mean"])
+    if b2_trajectory_enabled:
+        logging.info("Trajectory chunk MAE mean: %.6f", trajectory_chunk_metrics_rows[0]["mae_mean"])
+        logging.info(
+            "Normalized trajectory chunk MAE mean: %.6f",
+            normalized_trajectory_chunk_metrics_rows[0]["mae_mean"],
+        )
     logging.info("Metrics: %s", output_dir / "metrics.csv")
     logging.info("Plots: %s", plot_dir)
 

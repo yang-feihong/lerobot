@@ -38,14 +38,114 @@ from lerobot.processor import (
     policy_action_to_transition,
     transition_to_policy_action,
 )
+from lerobot.processor.normalize_processor import hotswap_stats
 from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
+    ACTION,
     OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
+from .b2_action_transform import (
+    decode_b2_action_chunk,
+    encode_b2_action_chunk,
+    make_b2_trajectory_stats,
+)
 from .configuration_pi05 import PI05Config
+
+
+@ProcessorStepRegistry.register(name="pi05_b2_local_trajectory_processor")
+@dataclass
+class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
+    """Convert between dataset B2 twist and the model's local trajectory."""
+
+    dt: float = 0.1
+    inverse: bool = False
+    append_task_complete: bool = True
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        action = transition.get(TransitionKey.ACTION)
+        if action is None:
+            return transition
+        if not isinstance(action, torch.Tensor):
+            raise ValueError(f"B2 local trajectory expects a tensor action, got {type(action)}")
+
+        new_transition = transition.copy()
+        if self.inverse:
+            transformed = decode_b2_action_chunk(
+                action,
+                dt=self.dt,
+                has_completion=self.append_task_complete,
+            )
+        else:
+            complementary = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
+            is_pad = complementary.get(f"{ACTION}_is_pad")
+            transformed = encode_b2_action_chunk(
+                action,
+                dt=self.dt,
+                is_pad=is_pad,
+                append_completion=self.append_task_complete,
+            )
+        new_transition[TransitionKey.ACTION] = transformed
+        return new_transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "dt": self.dt,
+            "inverse": self.inverse,
+            "append_task_complete": self.append_task_complete,
+        }
+
+
+def reconcile_pi05_b2_trajectory_processors(
+    config: PI05Config,
+    preprocessor: PolicyProcessorPipeline,
+    postprocessor: PolicyProcessorPipeline,
+    dataset_stats: dict[str, dict[str, Any]] | None,
+) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
+    """Insert/refresh B2 trajectory steps when fine-tuning a pretrained PI0.5."""
+    if not config.b2_local_trajectory_enabled:
+        return preprocessor, postprocessor
+    if config.b2_local_trajectory_dt is None:
+        raise ValueError("b2_local_trajectory_dt must be resolved from the dataset fps")
+
+    transformed_stats = make_b2_trajectory_stats(
+        dataset_stats,
+        dt=config.b2_local_trajectory_dt,
+        chunk_size=config.chunk_size,
+    )
+    if transformed_stats is not None:
+        preprocessor = hotswap_stats(preprocessor, transformed_stats)
+        postprocessor = hotswap_stats(postprocessor, transformed_stats)
+
+    if not any(isinstance(step, Pi05B2LocalTrajectoryProcessorStep) for step in preprocessor.steps):
+        steps = list(preprocessor.steps)
+        normalizer_index = next(
+            i for i, step in enumerate(steps) if isinstance(step, NormalizerProcessorStep)
+        )
+        steps.insert(
+            normalizer_index,
+            Pi05B2LocalTrajectoryProcessorStep(dt=config.b2_local_trajectory_dt),
+        )
+        preprocessor.steps = steps
+
+    if not any(isinstance(step, Pi05B2LocalTrajectoryProcessorStep) for step in postprocessor.steps):
+        steps = list(postprocessor.steps)
+        unnormalizer_index = next(
+            i for i, step in enumerate(steps) if isinstance(step, UnnormalizerProcessorStep)
+        )
+        steps.insert(
+            unnormalizer_index + 1,
+            Pi05B2LocalTrajectoryProcessorStep(dt=config.b2_local_trajectory_dt, inverse=True),
+        )
+        postprocessor.steps = steps
+    return preprocessor, postprocessor
 
 
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
@@ -136,6 +236,15 @@ def make_pi05_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
+    if config.b2_local_trajectory_enabled:
+        if config.b2_local_trajectory_dt is None:
+            raise ValueError("b2_local_trajectory_dt must be resolved from the dataset fps")
+        dataset_stats = make_b2_trajectory_stats(
+            dataset_stats,
+            dt=config.b2_local_trajectory_dt,
+            chunk_size=config.chunk_size,
+        )
+
     relative_step = RelativeActionsProcessorStep(
         enabled=config.use_relative_actions,
         exclude_joints=getattr(config, "relative_exclude_joints", []),
@@ -167,6 +276,15 @@ def make_pi05_pre_post_processors(
         DeviceProcessorStep(device=config.device),
     ]
 
+    if config.b2_local_trajectory_enabled:
+        normalizer_index = next(
+            i for i, step in enumerate(input_steps) if isinstance(step, NormalizerProcessorStep)
+        )
+        input_steps.insert(
+            normalizer_index,
+            Pi05B2LocalTrajectoryProcessorStep(dt=config.b2_local_trajectory_dt),
+        )
+
     output_steps: list[ProcessorStep] = [
         UnnormalizerProcessorStep(
             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
@@ -174,6 +292,11 @@ def make_pi05_pre_post_processors(
         AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
         DeviceProcessorStep(device="cpu"),
     ]
+    if config.b2_local_trajectory_enabled:
+        output_steps.insert(
+            1,
+            Pi05B2LocalTrajectoryProcessorStep(dt=config.b2_local_trajectory_dt, inverse=True),
+        )
 
     return (
         PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](

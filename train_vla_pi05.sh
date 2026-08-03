@@ -12,11 +12,14 @@ cd "$repo_root"
 
 enable_mem="false"
 
+# Learn a chunk-local SE(2) base trajectory instead of discontinuous
+# vx/vy/omega commands. The loader also derives task_complete from each episode
+# boundary; the checkpoint postprocessor converts predictions back to velocity.
+b2_local_trajectory="true"
+
 # GPUs are selected here. Examples:
 #   gpu_ids="0"      -> single GPU
 #   gpu_ids="0,1,2"  -> 3-GPU DDP via accelerate
-# batch_size is per GPU/process. Effective global batch size is:
-#   batch_size * gradient_accumulation_steps * number_of_gpu_ids
 gpu_ids="0,1,2"
 
 # Choose exactly one fine-tuning mode:
@@ -39,8 +42,12 @@ base_policy="/data/checkpoints/lerobot_pi05_base_local_tokenizer"
 max_state_dim="46"
 
 steps="25000"
-batch_size="2"
-gradient_accumulation_steps="4"
+# Training batch semantics are independent of the selected GPU count:
+#   global_batch_size = batch_size_per_gpu * number_of_gpus * computed_grad_accum
+# Keeping global_batch_size / batch_size_per_gpu a multiple of 24 supports the
+# common 1/2/3/4/6/8/12/24-GPU counts without changing the effective batch.
+batch_size_per_gpu="2"
+global_batch_size="48"
 num_workers="4"
 
 # Fraction of episodes held out for periodic validation.
@@ -141,6 +148,26 @@ for gpu_id in "${gpu_id_array[@]}"; do
   fi
 done
 
+if [[ ! "$batch_size_per_gpu" =~ ^[1-9][0-9]*$ ]]; then
+  echo "batch_size_per_gpu must be a positive integer, got $batch_size_per_gpu." >&2
+  exit 1
+fi
+if [[ ! "$global_batch_size" =~ ^[1-9][0-9]*$ ]]; then
+  echo "global_batch_size must be a positive integer, got $global_batch_size." >&2
+  exit 1
+fi
+
+batch_per_micro_step=$((batch_size_per_gpu * num_gpus))
+if (( global_batch_size % batch_per_micro_step != 0 )); then
+  echo "global_batch_size=$global_batch_size must be divisible by " \
+    "batch_size_per_gpu=$batch_size_per_gpu x num_gpus=$num_gpus " \
+    "(micro-step global batch=$batch_per_micro_step)." >&2
+  echo "Choose a global_batch_size / batch_size_per_gpu ratio divisible by $num_gpus; " \
+    "a multiple of 24 supports common GPU counts." >&2
+  exit 1
+fi
+gradient_accumulation_steps=$((global_batch_size / batch_per_micro_step))
+
 train_args=(
   --dataset.repo_id="$dataset_repo_id" \
   --dataset.root="$dataset_root" \
@@ -149,6 +176,7 @@ train_args=(
   --policy.input_features=null \
   --policy.output_features=null \
   --policy.max_state_dim="$max_state_dim" \
+  --policy.b2_local_trajectory_enabled="$b2_local_trajectory" \
   --policy.dtype=bfloat16 \
   --policy.gradient_checkpointing=true \
   --policy.train_expert_only="$train_expert_only" \
@@ -158,7 +186,7 @@ train_args=(
   --output_dir="$output_dir" \
   --job_name="${job_prefix}_${timestamp}" \
   --steps="$steps" \
-  --batch_size="$batch_size" \
+  --batch_size="$batch_size_per_gpu" \
   --gradient_accumulation_steps="$gradient_accumulation_steps" \
   --num_workers="$num_workers" \
   --log_freq="$log_freq" \
@@ -194,13 +222,16 @@ echo "$pid" >"$pid_file"
 echo "VLA training started"
 echo "PID:              $pid"
 echo "MEM:              $enable_mem"
+echo "B2 trajectory:    $b2_local_trajectory"
 echo "Finetune mode:    $finetune_mode"
 echo "Train expert only: $train_expert_only"
 echo "GPUs:             $gpu_ids ($num_gpus process(es))"
 echo "Dataset:          $dataset_root"
 echo "Train/eval split: eval_split=$eval_split"
 echo "Steps:            $steps optimizer updates"
-echo "Batch:            $batch_size per GPU x $gradient_accumulation_steps accumulation x $num_gpus GPU(s)"
+echo "Batch per GPU:    $batch_size_per_gpu"
+echo "Gradient accum:   $gradient_accumulation_steps (computed)"
+echo "Global batch:     $batch_size_per_gpu x $num_gpus GPU(s) x $gradient_accumulation_steps = $global_batch_size"
 echo "Log:              $log_file"
 echo "Output:           $output_dir"
 echo "Watch:            tail -f '$log_file'"

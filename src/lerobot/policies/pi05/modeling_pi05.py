@@ -1793,6 +1793,8 @@ class PI05Policy(PreTrainedPolicy):
             raise ValueError(
                 f"Unsupported action_loss_schema={schema!r}. Expected one of: 'auto', 'always', 'off'."
             )
+        if getattr(self.config, "b2_local_trajectory_enabled", False):
+            return action_dim == 17
         return action_dim == 16
 
     @staticmethod
@@ -1813,15 +1815,25 @@ class PI05Policy(PreTrainedPolicy):
             return actions[:, :, dim] < 0
         raise ValueError(f"Unsupported true_side={true_side!r}. Expected 'positive' or 'negative'.")
 
-    def _balanced_bool_weights(self, target_true: Tensor) -> Tensor:
+    def _balanced_bool_weights(self, target_true: Tensor, valid_mask: Tensor | None = None) -> Tensor:
         """Return per-element weights that give true/false classes comparable total mass."""
         target_true = target_true.to(dtype=torch.bool)
+        if valid_mask is None:
+            balance_target = target_true
+        else:
+            valid_mask = valid_mask.to(device=target_true.device, dtype=torch.bool)
+            balance_target = target_true[valid_mask]
+            if balance_target.numel() == 0:
+                return torch.zeros_like(target_true, dtype=torch.float32)
         eps = getattr(self.config, "action_bool_balance_eps", 1e-3)
-        true_frac = target_true.float().mean().clamp(min=eps, max=1.0 - eps)
+        true_frac = balance_target.float().mean().clamp(min=eps, max=1.0 - eps)
         false_frac = 1.0 - true_frac
         true_weight = 0.5 / true_frac
         false_weight = 0.5 / false_frac
-        return torch.where(target_true, true_weight, false_weight)
+        weights = torch.where(target_true, true_weight, false_weight)
+        if valid_mask is not None:
+            weights = weights * valid_mask
+        return weights
 
     def _masked_dim_loss(
         self,
@@ -1842,10 +1854,26 @@ class PI05Policy(PreTrainedPolicy):
         weights = weights * base_weight
         return dim_losses * weights, weights
 
-    def _b2_z1_gate_action_loss(self, losses: Tensor, actions: Tensor, reduction: str) -> tuple[Tensor, dict]:
-        """Reduce PI0.5 action losses with the B2+Z1 16D gate-aware schema."""
+    def _b2_z1_gate_action_loss(
+        self,
+        losses: Tensor,
+        actions: Tensor,
+        reduction: str,
+        action_is_pad: Tensor | None = None,
+    ) -> tuple[Tensor, dict]:
+        """Reduce PI0.5 action losses with the B2+Z1 gate-aware schema."""
         bool_weight = float(getattr(self.config, "action_bool_loss_weight", 4.0))
         continuous_weight = float(getattr(self.config, "action_continuous_loss_weight", 1.0))
+
+        if action_is_pad is None:
+            valid_mask = torch.ones(actions.shape[:2], dtype=torch.bool, device=actions.device)
+        else:
+            valid_mask = ~action_is_pad.to(device=actions.device, dtype=torch.bool)
+            if valid_mask.shape != actions.shape[:2]:
+                raise ValueError(
+                    f"action_is_pad shape {tuple(valid_mask.shape)} does not match action chunk "
+                    f"shape {tuple(actions.shape[:2])}"
+                )
 
         b2_active = self._normalized_bool_mask(actions, 0)
         arm_active = self._normalized_bool_mask(actions, 4)
@@ -1865,7 +1893,7 @@ class PI05Policy(PreTrainedPolicy):
             ("arm_reset", 5, arm_reset),
             ("gripper_target", 15, gripper_active),
         ]:
-            weights = self._balanced_bool_weights(target) * bool_weight
+            weights = self._balanced_bool_weights(target, valid_mask) * bool_weight
             dim_losses = losses[:, :, dim]
             weighted_parts.append(dim_losses * weights)
             weight_parts.append(weights)
@@ -1874,12 +1902,56 @@ class PI05Policy(PreTrainedPolicy):
                 ((dim_losses * weights).sum() / weights.sum().clamp_min(1e-6)).detach().cpu().item()
             )
 
+        b2_continuous_mask = (
+            valid_mask
+            if getattr(self.config, "b2_local_trajectory_enabled", False)
+            else (b2_active & valid_mask)
+        )
         for dim_losses, weights in [
-            self._masked_dim_loss(losses, [1, 2, 3], b2_active, continuous_weight),
-            self._masked_dim_loss(losses, list(range(6, 15)), arm_active & ~arm_reset, continuous_weight),
+            self._masked_dim_loss(losses, [1, 2, 3], b2_continuous_mask, continuous_weight),
+            self._masked_dim_loss(
+                losses,
+                list(range(6, 15)),
+                arm_active & ~arm_reset & valid_mask,
+                continuous_weight,
+            ),
         ]:
             weighted_parts.append(dim_losses)
             weight_parts.append(weights)
+
+        completion_target = None
+        if getattr(self.config, "b2_local_trajectory_enabled", False):
+            if actions.shape[-1] != 17:
+                raise ValueError(
+                    f"B2 local trajectory loss expects 17D model action, got {actions.shape[-1]}"
+                )
+            completion_target = self._normalized_bool_mask(actions, 16)
+            # Completion at step k is known from whether k+1 crosses the
+            # episode boundary. The final slot of a completely unpadded chunk
+            # has no k+1 observation, so exclude that single unknown label.
+            completion_valid = torch.ones_like(completion_target, dtype=torch.bool)
+            if action_is_pad is not None:
+                completion_valid[:, -1] = action_is_pad.to(
+                    device=actions.device, dtype=torch.bool
+                )[:, -1]
+            completion_weights = (
+                self._balanced_bool_weights(completion_target, completion_valid) * bool_weight
+            )
+            completion_losses = losses[:, :, 16]
+            weighted_parts.append(completion_losses * completion_weights)
+            weight_parts.append(completion_weights)
+            bool_dim_stats["gate_true_frac/task_complete"] = float(
+                completion_target[completion_valid].float().mean().detach().cpu().item()
+            )
+            bool_dim_stats["gate_loss/task_complete"] = float(
+                (
+                    (completion_losses * completion_weights).sum()
+                    / completion_weights.sum().clamp_min(1e-6)
+                )
+                .detach()
+                .cpu()
+                .item()
+            )
 
         weighted = torch.cat([part.reshape(losses.shape[0], -1) for part in weighted_parts], dim=1)
         weights = torch.cat([part.reshape(losses.shape[0], -1) for part in weight_parts], dim=1)
@@ -1895,11 +1967,18 @@ class PI05Policy(PreTrainedPolicy):
             "gate_loss/arm_active": bool_dim_stats["gate_loss/arm_active"],
             "gate_loss/arm_reset": bool_dim_stats["gate_loss/arm_reset"],
             "gate_loss/gripper_target": bool_dim_stats["gate_loss/gripper_target"],
-            "continuous_mask_frac/b2_velocity": float(b2_active.float().mean().detach().cpu().item()),
+            "continuous_mask_frac/b2_trajectory": float(
+                b2_continuous_mask.float().mean().detach().cpu().item()
+            ),
             "continuous_mask_frac/ee_pose": float(
                 (arm_active & ~arm_reset).float().mean().detach().cpu().item()
             ),
         }
+        if completion_target is not None:
+            loss_dict["gate_true_frac/task_complete"] = bool_dim_stats[
+                "gate_true_frac/task_complete"
+            ]
+            loss_dict["gate_loss/task_complete"] = bool_dim_stats["gate_loss/task_complete"]
         if reduction == "none":
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
@@ -2009,6 +2088,7 @@ class PI05Policy(PreTrainedPolicy):
                 losses,
                 actions[:, :, :original_action_dim],
                 reduction,
+                batch.get(f"{ACTION}_is_pad"),
             )
             loss_dict.update(gate_loss_dict)
             return loss, loss_dict

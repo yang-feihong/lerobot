@@ -98,19 +98,30 @@ class PI05Config(PreTrainedConfig):
     #   [5]      arm_reset              bool/gate, class-balanced
     #   [6:15]   EE rot6d + xyz         continuous, trained only when arm_active=true and arm_reset=false
     #   [15]     gripper_target         bool/gate, class-balanced
+    #   [16]     task_complete          bool/gate derived at load time from episode boundary
     #            Current B2+Z1 data stores gripper as two raw values (0 and a negative
     #            target position), so its active/event class lives on the negative side
     #            after quantile normalization. Override action_gripper_target_true_side
     #            if a future dataset stores gripper differently.
     #
-    # "auto" applies this only when the action dim is exactly 16; "always"
-    # forces it; "off" restores the original unweighted mean.
+    # "auto" applies this to the raw 16D schema or the derived 17D trajectory
+    # schema; "always" forces it; "off" restores the original unweighted mean.
     action_loss_schema: str = "auto"  # "auto", "always", or "off"
     action_bool_loss_weight: float = 4.0
     action_continuous_loss_weight: float = 1.0
     action_masked_continuous_min_weight: float = 0.0
     action_bool_balance_eps: float = 1e-3
     action_gripper_target_true_side: str = "negative"  # "negative" or "positive"
+
+    # B2 high-level action representation. The dataset remains 16D and stores
+    # [vx, vy, omega_z]. At load time these three dimensions are converted into
+    # a chunk-local SE(2) trajectory, and task_complete is derived from the
+    # episode padding mask as a seventeenth model output. The postprocessor
+    # differentiates the predicted trajectory back into executable body twist.
+    b2_local_trajectory_enabled: bool = False
+    # Resolved automatically as 1 / dataset fps by make_policy. It is persisted
+    # in checkpoints so inference uses exactly the training discretization.
+    b2_local_trajectory_dt: float | None = None
 
     # MEM-ViT settings. Passing mem_vit_checkpoint also enables MEM-ViT.
     mem_vit_enabled: bool = False
@@ -174,6 +185,10 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 "Invalid action_gripper_target_true_side: "
                 f"{self.action_gripper_target_true_side}. Expected 'negative' or 'positive'."
+            )
+        if self.b2_local_trajectory_dt is not None and self.b2_local_trajectory_dt <= 0:
+            raise ValueError(
+                f"b2_local_trajectory_dt must be positive, got {self.b2_local_trajectory_dt}"
             )
         if self.mem_vit_checkpoint is not None:
             self.mem_vit_enabled = True

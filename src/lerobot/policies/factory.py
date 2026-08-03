@@ -25,7 +25,7 @@ import torch
 if TYPE_CHECKING:
     from lerobot.datasets import LeRobotDatasetMetadata
 
-from lerobot.configs import FeatureType, PreTrainedConfig
+from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.envs import EnvConfig, env_to_policy_features
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
@@ -302,6 +302,11 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
+        # Register PI0.5-specific processor steps before deserializing a
+        # checkpoint that may contain them.
+        if isinstance(policy_cfg, PI05Config):
+            from .pi05 import processor_pi05 as _pi05_processor  # noqa: F401
+
         if isinstance(policy_cfg, GrootConfig):
             from .groot.processor_groot import make_groot_pre_post_processors_from_pretrained
 
@@ -341,6 +346,15 @@ def make_pre_post_processors(
             revision=pretrained_revision,
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
+        if isinstance(policy_cfg, PI05Config):
+            from .pi05.processor_pi05 import reconcile_pi05_b2_trajectory_processors
+
+            preprocessor, postprocessor = reconcile_pi05_b2_trajectory_processors(
+                policy_cfg,
+                preprocessor,
+                postprocessor,
+                kwargs.get("dataset_stats"),
+            )
         if isinstance(policy_cfg, Evo1Config):
             from .evo1.processor_evo1 import reconcile_evo1_processors
 
@@ -586,6 +600,25 @@ def make_policy(
         action_names = ds_meta.features.get(ACTION, {}).get("names")
         if action_names is not None:
             cfg.action_feature_names = list(action_names)
+    if isinstance(cfg, PI05Config) and cfg.b2_local_trajectory_enabled:
+        from .pi05.b2_action_transform import b2_trajectory_action_names
+
+        dataset_action = cfg.output_features.get(ACTION)
+        if dataset_action is None or dataset_action.shape != (16,):
+            raise ValueError(
+                "PI0.5 B2 local trajectory requires the 16D B2+Z1 dataset action schema; "
+                f"got {None if dataset_action is None else dataset_action.shape}"
+            )
+        cfg.output_features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(17,))
+        cfg.action_feature_names = b2_trajectory_action_names(cfg.action_feature_names)
+        resolved_dt = 1.0 / float(ds_meta.fps)
+        if cfg.b2_local_trajectory_dt is None:
+            cfg.b2_local_trajectory_dt = resolved_dt
+        elif abs(cfg.b2_local_trajectory_dt - resolved_dt) > 1e-9:
+            raise ValueError(
+                "Checkpoint B2 trajectory dt does not match dataset fps: "
+                f"dt={cfg.b2_local_trajectory_dt}, fps={ds_meta.fps}"
+            )
     if ds_meta is not None:
         set_dataset_feature_metadata = getattr(cfg, "set_dataset_feature_metadata", None)
         if callable(set_dataset_feature_metadata):

@@ -448,7 +448,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 }
                 if not cfg.is_reward_model_training
                 else None,
-                "runtime/effective_batch_size": cfg.batch_size * accelerator.num_processes,
+                "runtime/per_device_batch_size": cfg.batch_size,
+                "runtime/gradient_accumulation_steps": cfg.gradient_accumulation_steps,
+                "runtime/effective_batch_size": (
+                    cfg.batch_size * cfg.gradient_accumulation_steps * accelerator.num_processes
+                ),
                 "runtime/num_processes": accelerator.num_processes,
             }
         )
@@ -473,6 +477,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     processor_kwargs = {}
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
+        processor_kwargs["dataset_stats"] = dataset.meta.stats
+    # The B2 trajectory representation derives 17D normalization statistics
+    # from the unchanged 16D dataset stats. This is also required on resume,
+    # because the generic checkpoint overrides below are built from raw stats.
+    if getattr(active_cfg, "b2_local_trajectory_enabled", False):
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
     if cfg.is_reward_model_training:
