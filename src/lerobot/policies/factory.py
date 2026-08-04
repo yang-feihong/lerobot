@@ -39,6 +39,7 @@ from lerobot.processor import (
 from lerobot.types import PolicyAction
 from lerobot.utils.constants import (
     ACTION,
+    OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
@@ -600,25 +601,123 @@ def make_policy(
         action_names = ds_meta.features.get(ACTION, {}).get("names")
         if action_names is not None:
             cfg.action_feature_names = list(action_names)
-    if isinstance(cfg, PI05Config) and cfg.b2_local_trajectory_enabled:
-        from .pi05.b2_action_transform import b2_trajectory_action_names
+    if isinstance(cfg, PI05Config) and ds_meta is not None:
+        from .pi05.b2_action_transform import (
+            B2_GLOBAL_POSE_STATE_NAMES,
+            action_schema_kwargs,
+            b2_execution_action_names,
+            b2_trajectory_action_names,
+        )
+
+        resolved_dataset_frequency = float(ds_meta.fps)
+        resolved_control_frequency = float(cfg.control_frequency_hz or resolved_dataset_frequency)
+        resolved_camera_keys = list(ds_meta.camera_keys)
+        if cfg.io_schema_resolved:
+            if cfg.control_frequency_hz is None:
+                raise ValueError("Checkpoint deployment metadata is missing control_frequency_hz")
+            if cfg.dataset_camera_keys != resolved_camera_keys:
+                raise ValueError(
+                    "Checkpoint camera-key contract does not match dataset: "
+                    f"checkpoint={cfg.dataset_camera_keys}, dataset={resolved_camera_keys}"
+                )
+        if not cfg.io_schema_resolved:
+            cfg.dataset_frequency_hz = resolved_dataset_frequency
+        elif (
+            cfg.dataset_frequency_hz is not None
+            and abs(cfg.dataset_frequency_hz - resolved_dataset_frequency) > 1e-9
+        ):
+            logging.warning(
+                "Checkpoint was trained from %.3f Hz data; current dataset is %.3f Hz and will be "
+                "resampled to the checkpoint control frequency %.3f Hz.",
+                cfg.dataset_frequency_hz,
+                resolved_dataset_frequency,
+                resolved_control_frequency,
+            )
+        cfg.control_frequency_hz = resolved_control_frequency
+        cfg.dataset_camera_keys = resolved_camera_keys
 
         dataset_action = cfg.output_features.get(ACTION)
-        if dataset_action is None or dataset_action.shape != (16,):
-            raise ValueError(
-                "PI0.5 B2 local trajectory requires the 16D B2+Z1 dataset action schema; "
-                f"got {None if dataset_action is None else dataset_action.shape}"
+        dataset_action_names = ds_meta.features.get(ACTION, {}).get("names")
+        dataset_state_names = ds_meta.features.get(OBS_STATE, {}).get("names")
+        is_b2_schema = (
+            dataset_action is not None
+            and dataset_action.shape == (16,)
+            and dataset_action_names is not None
+            and {"b2_active", "b2_vx", "b2_vy", "b2_omega_z", "arm_active", "arm_reset"}
+            <= set(dataset_action_names)
+        )
+        if not is_b2_schema:
+            cfg.io_schema_resolved = False
+        elif dataset_state_names is None:
+            raise ValueError("PI0.5 configurable B2+Z1 I/O requires named observation.state dimensions")
+        else:
+            checkpoint_schema_resolved = cfg.io_schema_resolved
+            if cfg.io_schema_resolved and cfg.dataset_action_feature_names not in (
+                None,
+                list(dataset_action_names),
+            ):
+                raise ValueError(
+                    "Checkpoint action semantics do not match this dataset: "
+                    f"checkpoint={cfg.dataset_action_feature_names}, dataset={list(dataset_action_names)}"
+                )
+            if cfg.io_schema_resolved and cfg.dataset_state_feature_names not in (
+                None,
+                list(dataset_state_names),
+            ):
+                raise ValueError("Checkpoint state semantics do not match this dataset")
+            resolved_state_names = cfg.resolve_state_feature_names(list(dataset_state_names))
+            if cfg.io_schema_resolved and cfg.resolved_state_feature_names not in (
+                None,
+                resolved_state_names,
+            ):
+                raise ValueError("Checkpoint state switches disagree with its resolved state semantics")
+            if len(resolved_state_names) > cfg.max_state_dim:
+                raise ValueError(
+                    f"Selected {len(resolved_state_names)} state dims but max_state_dim={cfg.max_state_dim}"
+                )
+            cfg.io_schema_resolved = True
+            cfg.dataset_action_feature_names = list(dataset_action_names)
+            cfg.dataset_state_feature_names = list(dataset_state_names)
+            cfg.resolved_state_feature_names = resolved_state_names
+            cfg.state_feature_indices = [dataset_state_names.index(name) for name in resolved_state_names]
+            resolved_global_pose_indices = (
+                [dataset_state_names.index(name) for name in B2_GLOBAL_POSE_STATE_NAMES]
+                if cfg.b2_action_representation == "local_trajectory"
+                and all(name in dataset_state_names for name in B2_GLOBAL_POSE_STATE_NAMES)
+                else None
             )
-        cfg.output_features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(17,))
-        cfg.action_feature_names = b2_trajectory_action_names(cfg.action_feature_names)
-        resolved_dt = 1.0 / float(ds_meta.fps)
-        if cfg.b2_local_trajectory_dt is None:
-            cfg.b2_local_trajectory_dt = resolved_dt
-        elif abs(cfg.b2_local_trajectory_dt - resolved_dt) > 1e-9:
-            raise ValueError(
-                "Checkpoint B2 trajectory dt does not match dataset fps: "
-                f"dt={cfg.b2_local_trajectory_dt}, fps={ds_meta.fps}"
+            if (
+                checkpoint_schema_resolved
+                and cfg.b2_global_pose_state_indices != resolved_global_pose_indices
+            ):
+                raise ValueError("Checkpoint B2 global-pose trajectory semantics do not match this dataset")
+            cfg.b2_global_pose_state_indices = resolved_global_pose_indices
+            cfg.input_features[OBS_STATE] = PolicyFeature(
+                type=FeatureType.STATE, shape=(len(resolved_state_names),)
             )
+            schema_kwargs = action_schema_kwargs(cfg)
+            name_fn = (
+                b2_trajectory_action_names
+                if cfg.b2_action_representation == "local_trajectory"
+                else b2_execution_action_names
+            )
+            cfg.action_feature_names = name_fn(list(dataset_action_names), **schema_kwargs)
+            assert cfg.action_feature_names is not None
+            if len(cfg.action_feature_names) > cfg.max_action_dim:
+                raise ValueError(
+                    f"Selected {len(cfg.action_feature_names)} action dims but max_action_dim={cfg.max_action_dim}"
+                )
+            cfg.output_features[ACTION] = PolicyFeature(
+                type=FeatureType.ACTION, shape=(len(cfg.action_feature_names),)
+            )
+            resolved_dt = 1.0 / resolved_control_frequency
+            if cfg.b2_local_trajectory_dt is None:
+                cfg.b2_local_trajectory_dt = resolved_dt
+            elif abs(cfg.b2_local_trajectory_dt - resolved_dt) > 1e-9:
+                raise ValueError(
+                    "Checkpoint B2 action dt does not match model control frequency: "
+                    f"dt={cfg.b2_local_trajectory_dt}, control_frequency_hz={resolved_control_frequency}"
+                )
     if ds_meta is not None:
         set_dataset_feature_metadata = getattr(cfg, "set_dataset_feature_metadata", None)
         if callable(set_dataset_feature_metadata):

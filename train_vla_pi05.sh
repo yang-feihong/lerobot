@@ -12,10 +12,23 @@ cd "$repo_root"
 
 enable_mem="false"
 
-# Learn a chunk-local SE(2) base trajectory instead of discontinuous
-# vx/vy/omega commands. The loader also derives task_complete from each episode
-# boundary; the checkpoint postprocessor converts predictions back to velocity.
-b2_local_trajectory="true"
+# Physical I/O schema. These values are persisted in every checkpoint and are
+# automatically restored by resume and open-loop evaluation.
+state_use_arm_joint_positions="true"
+state_use_arm_joint_velocities="false"
+state_use_arm_gripper_feedback="true"
+state_use_b2_joint_positions="false"
+state_use_b2_joint_velocities="false"
+state_use_b2_trunk_pose="true"
+state_use_b2_linear_velocity="false"
+state_use_b2_angular_velocity="false"
+b2_action_representation="local_trajectory" # "velocity" or "local_trajectory"
+predict_b2_active="false"
+predict_arm_active="false"
+predict_arm_reset="true"
+predict_ee_pose="true"
+predict_gripper="true"
+predict_task_complete="true"
 
 # GPUs are selected here. Examples:
 #   gpu_ids="0"      -> single GPU
@@ -39,9 +52,16 @@ finetune_mode="lora"
 dataset_repo_id="local/b2_z1_vla"
 dataset_root="/data/b2_z1_vla_lerobot"
 base_policy="/data/checkpoints/lerobot_pi05_base_local_tokenizer"
-max_state_dim="46"
+max_state_dim="32"
 
-steps="25000"
+steps="20000"
+# Temporal semantics for the planned 50 Hz dataset. A chunk covers one second,
+# while deployment requests a fresh observation/chunk after executing 0.5 s.
+# A dataset at another FPS is timestamp-resampled to this model frequency;
+# lower-frequency data is allowed with a strong warning because frames repeat.
+action_chunk_size="50"
+action_steps_to_execute="25"
+control_frequency_hz="50"
 # Training batch semantics are independent of the selected GPU count:
 #   global_batch_size = batch_size_per_gpu * number_of_gpus * computed_grad_accum
 # Keeping global_batch_size / batch_size_per_gpu a multiple of 24 supports the
@@ -56,10 +76,15 @@ eval_steps="500"
 max_eval_samples="512"
 
 log_freq="10"
-save_freq="2000"
+save_freq="500"
 wandb_project="b2-z1-vla"
 
 output_root="/data/b2_z1_vla_pi05_outputs"
+
+# Leave empty for a new run. To resume in place, point this at a complete
+# numeric checkpoint directory or its `last` symlink. The checkpoint's saved
+# optimizer, scheduler, RNG, data-order and W&B run state are restored.
+resume_checkpoint=""
 
 # Used only when finetune_mode="lora". Action expert/projections are full fine-tuned;
 # PaliGemma/VLM backbone uses LoRA. In non-MEM mode, ViT also uses LoRA.
@@ -74,6 +99,9 @@ mem_vit_checkpoint="/data/mem_vit_distill_outputs/mem_vit_distill_20260716_14270
 mem_fixed_num_frames="6"
 mem_random_min_num_frames=""
 mem_random_max_num_frames=""
+# Sample one MEM history frame every 0.5 seconds. The loader converts this
+# physical interval to dataset rows (25 rows for a 50 Hz dataset).
+mem_frame_interval_seconds="0.5"
 
 # =========================
 # Launch
@@ -89,9 +117,52 @@ if [[ "$enable_mem" == "true" ]]; then
   wandb_project="b2-z1-mem-vla"
 fi
 
-output_dir="$output_root/${job_prefix}_${timestamp}"
-log_file="$log_dir/${job_prefix}_${timestamp}.log"
-pid_file="$log_dir/${job_prefix}_${timestamp}.pid"
+resume_args=()
+policy_source_args=(--policy.path="$base_policy")
+if [[ -n "$resume_checkpoint" ]]; then
+  resume_checkpoint="$(readlink -f "$resume_checkpoint")"
+  resume_config="$resume_checkpoint/pretrained_model/train_config.json"
+  if [[ ! -f "$resume_config" ]]; then
+    echo "Resume train config not found: $resume_config" >&2
+    exit 1
+  fi
+  output_dir="$(dirname "$(dirname "$resume_checkpoint")")"
+  job_name="$(basename "$output_dir")"
+  resume_args+=(--config_path="$resume_config" --resume=true)
+  policy_source_args=()
+  log_file="$log_dir/${job_name}_resume_${timestamp}.log"
+  pid_file="$log_dir/${job_name}_resume_${timestamp}.pid"
+else
+  output_dir="$output_root/${job_prefix}_${timestamp}"
+  job_name="${job_prefix}_${timestamp}"
+  log_file="$log_dir/${job_name}.log"
+  pid_file="$log_dir/${job_name}.pid"
+fi
+
+policy_io_args=()
+if [[ -z "$resume_checkpoint" ]]; then
+  policy_io_args+=(
+    --policy.max_state_dim="$max_state_dim"
+    --policy.state_use_arm_joint_positions="$state_use_arm_joint_positions"
+    --policy.state_use_arm_joint_velocities="$state_use_arm_joint_velocities"
+    --policy.state_use_arm_gripper_feedback="$state_use_arm_gripper_feedback"
+    --policy.state_use_b2_joint_positions="$state_use_b2_joint_positions"
+    --policy.state_use_b2_joint_velocities="$state_use_b2_joint_velocities"
+    --policy.state_use_b2_trunk_pose="$state_use_b2_trunk_pose"
+    --policy.state_use_b2_linear_velocity="$state_use_b2_linear_velocity"
+    --policy.state_use_b2_angular_velocity="$state_use_b2_angular_velocity"
+    --policy.b2_action_representation="$b2_action_representation"
+    --policy.action_predict_b2_active="$predict_b2_active"
+    --policy.action_predict_arm_active="$predict_arm_active"
+    --policy.action_predict_arm_reset="$predict_arm_reset"
+    --policy.action_predict_ee_pose="$predict_ee_pose"
+    --policy.action_predict_gripper="$predict_gripper"
+    --policy.action_predict_task_complete="$predict_task_complete"
+    --policy.chunk_size="$action_chunk_size"
+    --policy.n_action_steps="$action_steps_to_execute"
+    --policy.control_frequency_hz="$control_frequency_hz"
+  )
+fi
 
 policy_mem_args=()
 if [[ "$enable_mem" == "true" ]]; then
@@ -100,6 +171,7 @@ if [[ "$enable_mem" == "true" ]]; then
     exit 1
   fi
   policy_mem_args+=(--policy.mem_vit_checkpoint="$mem_vit_checkpoint")
+  policy_mem_args+=(--policy.mem_vit_frame_interval_seconds="$mem_frame_interval_seconds")
   if [[ -n "$mem_random_min_num_frames" || -n "$mem_random_max_num_frames" ]]; then
     if [[ -z "$mem_random_min_num_frames" || -z "$mem_random_max_num_frames" ]]; then
       echo "mem_random_min_num_frames and mem_random_max_num_frames must be set together." >&2
@@ -169,14 +241,15 @@ fi
 gradient_accumulation_steps=$((global_batch_size / batch_per_micro_step))
 
 train_args=(
+  "${resume_args[@]}" \
   --dataset.repo_id="$dataset_repo_id" \
   --dataset.root="$dataset_root" \
   --dataset.eval_split="$eval_split" \
-  --policy.path="$base_policy" \
+  "${policy_source_args[@]}" \
   --policy.input_features=null \
   --policy.output_features=null \
-  --policy.max_state_dim="$max_state_dim" \
-  --policy.b2_local_trajectory_enabled="$b2_local_trajectory" \
+  "${policy_io_args[@]}" \
+  --policy.device=cuda \
   --policy.dtype=bfloat16 \
   --policy.gradient_checkpointing=true \
   --policy.train_expert_only="$train_expert_only" \
@@ -184,7 +257,7 @@ train_args=(
   --policy.push_to_hub=false \
   "${peft_args[@]}" \
   --output_dir="$output_dir" \
-  --job_name="${job_prefix}_${timestamp}" \
+  --job_name="$job_name" \
   --steps="$steps" \
   --batch_size="$batch_size_per_gpu" \
   --gradient_accumulation_steps="$gradient_accumulation_steps" \
@@ -196,7 +269,8 @@ train_args=(
   --save_checkpoint=true \
   --save_freq="$save_freq" \
   --wandb.enable=true \
-  --wandb.project="$wandb_project"
+  --wandb.project="$wandb_project" \
+  --wandb.disable_artifact=true
 )
 
 if (( num_gpus > 1 )); then
@@ -221,12 +295,24 @@ echo "$pid" >"$pid_file"
 
 echo "VLA training started"
 echo "PID:              $pid"
+echo "Resume checkpoint: ${resume_checkpoint:-none}"
 echo "MEM:              $enable_mem"
-echo "B2 trajectory:    $b2_local_trajectory"
+if [[ -n "$resume_checkpoint" ]]; then
+  echo "Deployment metadata: restored from $resume_checkpoint/pretrained_model/pi05_deployment_metadata.json"
+else
+  echo "B2 action:        $b2_action_representation"
+  echo "State arm q/qd/gripper: $state_use_arm_joint_positions/$state_use_arm_joint_velocities/$state_use_arm_gripper_feedback"
+  echo "State B2 q/qd/trunk/v/w: $state_use_b2_joint_positions/$state_use_b2_joint_velocities/$state_use_b2_trunk_pose/$state_use_b2_linear_velocity/$state_use_b2_angular_velocity"
+fi
 echo "Finetune mode:    $finetune_mode"
 echo "Train expert only: $train_expert_only"
 echo "GPUs:             $gpu_ids ($num_gpus process(es))"
 echo "Dataset:          $dataset_root"
+if [[ -z "$resume_checkpoint" ]]; then
+  echo "Action timing:    ${control_frequency_hz}Hz, chunk=$action_chunk_size, execute=$action_steps_to_execute (dt derived automatically)"
+else
+  echo "Action timing:    restored from checkpoint deployment metadata"
+fi
 echo "Train/eval split: eval_split=$eval_split"
 echo "Steps:            $steps optimizer updates"
 echo "Batch per GPU:    $batch_size_per_gpu"

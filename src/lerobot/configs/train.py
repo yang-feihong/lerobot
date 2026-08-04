@@ -209,6 +209,17 @@ class TrainPipelineConfig(HubMixin):
 
         if self.policy is not None:
             self.policy.pretrained_path = policy_dir
+            deployment_metadata = getattr(self.policy, "deployment_metadata", None)
+            if callable(deployment_metadata) and getattr(self.policy, "io_schema_resolved", False):
+                metadata_path = policy_dir / "pi05_deployment_metadata.json"
+                if not metadata_path.exists():
+                    raise FileNotFoundError(
+                        f"Resume checkpoint is missing required deployment metadata: {metadata_path}"
+                    )
+                with metadata_path.open() as f:
+                    saved_metadata = json.load(f)
+                if saved_metadata != deployment_metadata():
+                    raise ValueError("Resume checkpoint deployment metadata disagrees with policy config")
         if self.reward_model is not None:
             self.reward_model.pretrained_path = str(policy_dir)
 

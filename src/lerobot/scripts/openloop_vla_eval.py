@@ -32,14 +32,18 @@ from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.pi05.b2_action_transform import (
     B2_TRAJECTORY_NAMES,
-    TASK_COMPLETE_NAME,
-    completion_from_padding,
+    action_dataset_indices,
+    action_schema_kwargs,
+    b2_execution_action_names,
+    b2_trajectory_action_names,
+    decode_b2_action_chunk,
     encode_b2_action_chunk,
+    integrate_b2_execution_chunk,
     make_b2_trajectory_stats,
 )
 from lerobot.scripts.lerobot_train import apply_task_variants_to_batch, load_task_variants
 from lerobot.utils.collate import lerobot_collate_fn
-from lerobot.utils.constants import ACTION
+from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.utils import init_logging
 
 
@@ -180,17 +184,14 @@ def _normalize_action_array(actions: np.ndarray, meta: LeRobotDatasetMetadata) -
 
 
 def _normalize_execution_action_array(
-    actions: np.ndarray, meta: LeRobotDatasetMetadata
+    actions: np.ndarray,
+    meta: LeRobotDatasetMetadata,
+    execution_stats: dict[str, Any] | None = None,
 ) -> np.ndarray:
-    """Normalize raw 16D actions plus the derived task_complete bit."""
-    raw_dim = int(meta.features[ACTION]["shape"][0])
-    normalized = _normalize_action_array(actions[..., :raw_dim], meta)
-    if actions.shape[-1] == raw_dim:
-        return normalized
-    if actions.shape[-1] != raw_dim + 1:
-        raise ValueError(f"Expected {raw_dim} or {raw_dim + 1} execution dims, got {actions.shape[-1]}")
-    completion = 2.0 * actions[..., raw_dim : raw_dim + 1] - 1.0
-    return np.concatenate((normalized, completion), axis=-1)
+    """Normalize the compact action against corresponding raw-dataset stats."""
+    if execution_stats is not None:
+        return _normalize_with_stats(actions, execution_stats)
+    return _normalize_action_array(actions, meta)
 
 
 def _normalize_with_stats(actions: np.ndarray, stats: dict[str, Any]) -> np.ndarray:
@@ -200,31 +201,24 @@ def _normalize_with_stats(actions: np.ndarray, stats: dict[str, Any]) -> np.ndar
     return 2.0 * (actions - q01) / denom - 1.0
 
 
-def _append_expert_completion(action: torch.Tensor, is_pad: torch.Tensor | None) -> torch.Tensor:
-    if is_pad is None:
-        complete = torch.zeros(action.shape[:-1], dtype=action.dtype, device=action.device)
-    else:
-        complete = completion_from_padding(is_pad).to(device=action.device, dtype=action.dtype)
-    return torch.cat((action, complete.unsqueeze(-1)), dim=-1)
-
-
 def _combined_base_plot_arrays(
     execution: np.ndarray,
     trajectory: np.ndarray,
+    b2_start: int = 0,
 ) -> np.ndarray:
     """Show velocity and integrated position together while retaining all other actions."""
     return np.concatenate(
         (
-            execution[..., :4],
-            trajectory[..., 1:4],
-            execution[..., 4:],
+            execution[..., : b2_start + 3],
+            trajectory[..., b2_start : b2_start + 3],
+            execution[..., b2_start + 3 :],
         ),
         axis=-1,
     )
 
 
-def _combined_base_plot_names(execution_names: list[str]) -> list[str]:
-    return execution_names[:4] + list(B2_TRAJECTORY_NAMES) + execution_names[4:]
+def _combined_base_plot_names(execution_names: list[str], b2_start: int = 0) -> list[str]:
+    return execution_names[: b2_start + 3] + list(B2_TRAJECTORY_NAMES) + execution_names[b2_start + 3 :]
 
 
 def _padded_limits(low: float, high: float, *, padding_fraction: float = 0.08) -> tuple[float, float]:
@@ -589,17 +583,30 @@ def main() -> None:
     policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
     policy_cfg.pretrained_path = policy_path
     policy_cfg.device = args.device
+    deployment_metadata_path = policy_path / "pi05_deployment_metadata.json"
+    if getattr(policy_cfg, "io_schema_resolved", False):
+        if not deployment_metadata_path.exists():
+            raise FileNotFoundError(
+                f"Checkpoint is missing required deployment metadata: {deployment_metadata_path}"
+            )
+        saved_deployment_metadata = json.loads(deployment_metadata_path.read_text(encoding="utf-8"))
+        if saved_deployment_metadata != policy_cfg.deployment_metadata():
+            raise ValueError("pi05_deployment_metadata.json disagrees with the checkpoint policy config")
 
     meta = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
-    b2_trajectory_enabled = bool(getattr(policy_cfg, "b2_local_trajectory_enabled", False))
+    io_schema_enabled = bool(getattr(policy_cfg, "io_schema_resolved", False))
     b2_trajectory_dt = getattr(policy_cfg, "b2_local_trajectory_dt", None)
-    if b2_trajectory_enabled:
-        expected_dt = 1.0 / float(meta.fps)
+    if io_schema_enabled:
+        control_frequency_hz = getattr(policy_cfg, "control_frequency_hz", None)
+        if control_frequency_hz is None:
+            raise ValueError("B2+Z1 checkpoint is missing control_frequency_hz")
+        expected_dt = 1.0 / float(control_frequency_hz)
         if b2_trajectory_dt is None:
-            raise ValueError("Trajectory checkpoint is missing b2_local_trajectory_dt")
+            raise ValueError("B2+Z1 checkpoint is missing b2_local_trajectory_dt")
         if abs(float(b2_trajectory_dt) - expected_dt) > 1e-9:
             raise ValueError(
-                f"Trajectory checkpoint dt={b2_trajectory_dt} does not match dataset fps={meta.fps}"
+                f"Trajectory checkpoint dt={b2_trajectory_dt} does not match "
+                f"control_frequency_hz={control_frequency_hz}"
             )
     delta_timestamps = resolve_delta_timestamps(policy_cfg, meta)
 
@@ -636,30 +643,58 @@ def main() -> None:
     execution_action_names = list(dataset_action_names)
     trajectory_action_names = list(dataset_action_names)
     trajectory_stats = None
-    if b2_trajectory_enabled:
+    execution_stats = None
+    schema_kwargs = action_schema_kwargs(policy_cfg) if io_schema_enabled else {}
+    if io_schema_enabled:
         if dataset_action_dim != 16:
             raise ValueError(
                 f"B2 local trajectory evaluation expects a 16D dataset action, got {dataset_action_dim}"
             )
-        execution_action_names.append(TASK_COMPLETE_NAME)
-        trajectory_action_names[1:4] = list(B2_TRAJECTORY_NAMES)
-        trajectory_action_names.append(TASK_COMPLETE_NAME)
+        execution_action_names = b2_execution_action_names(dataset_action_names, **schema_kwargs)
+        trajectory_action_names = b2_trajectory_action_names(dataset_action_names, **schema_kwargs)
+        assert execution_action_names is not None
+        assert trajectory_action_names is not None
+        trajectory_schema = {**schema_kwargs, "representation": "local_trajectory"}
         transformed_stats = make_b2_trajectory_stats(
             meta.stats,
             dt=float(b2_trajectory_dt),
             chunk_size=int(policy_cfg.chunk_size),
+            **trajectory_schema,
         )
         assert transformed_stats is not None
         trajectory_stats = transformed_stats[ACTION]
+        execution_schema = {**schema_kwargs, "representation": "velocity"}
+        execution_transformed_stats = make_b2_trajectory_stats(
+            meta.stats,
+            dt=float(b2_trajectory_dt),
+            chunk_size=int(policy_cfg.chunk_size),
+            **execution_schema,
+        )
+        assert execution_transformed_stats is not None
+        execution_stats = execution_transformed_stats[ACTION]
 
-        execution_limits = _action_plot_y_limits(meta, dataset_action_names) + [(-0.1, 1.1)]
+        raw_limits = _action_plot_y_limits(meta, dataset_action_names)
+        selected_indices = action_dataset_indices(
+            predict_b2_active=policy_cfg.action_predict_b2_active,
+            predict_arm_active=policy_cfg.action_predict_arm_active,
+            predict_arm_reset=policy_cfg.action_predict_arm_reset,
+            predict_ee_pose=policy_cfg.action_predict_ee_pose,
+            predict_gripper=policy_cfg.action_predict_gripper,
+        )
+        execution_limits = [raw_limits[i] for i in selected_indices]
+        if policy_cfg.action_predict_task_complete:
+            execution_limits.append((-0.1, 1.1))
         trajectory_q01 = np.asarray(trajectory_stats["q01"], dtype=np.float32)
         trajectory_q99 = np.asarray(trajectory_stats["q99"], dtype=np.float32)
+        b2_start = int(policy_cfg.action_predict_b2_active)
         trajectory_limits = [
-            _padded_limits(float(trajectory_q01[i]), float(trajectory_q99[i])) for i in range(1, 4)
+            _padded_limits(float(trajectory_q01[i]), float(trajectory_q99[i]))
+            for i in range(b2_start, b2_start + 3)
         ]
-        plot_action_names = _combined_base_plot_names(execution_action_names)
-        plot_y_limits = execution_limits[:4] + trajectory_limits + execution_limits[4:]
+        plot_action_names = _combined_base_plot_names(execution_action_names, b2_start)
+        plot_y_limits = (
+            execution_limits[: b2_start + 3] + trajectory_limits + execution_limits[b2_start + 3 :]
+        )
     else:
         plot_action_names = execution_action_names
         plot_y_limits = _action_plot_y_limits(meta, execution_action_names)
@@ -761,21 +796,39 @@ def main() -> None:
             pred_execution_chunk = (
                 postprocessor(policy.predict_action_chunk(processed)).detach().cpu().to(torch.float32)
             )
-            if b2_trajectory_enabled:
+            if io_schema_enabled:
                 action_is_pad = batch.get(f"{ACTION}_is_pad")
                 if action_is_pad is not None:
                     action_is_pad = action_is_pad.detach().cpu().to(torch.bool)
-                expert_chunk = _append_expert_completion(dataset_expert_chunk, action_is_pad)
+                global_pose = None
+                global_pose_indices = getattr(policy_cfg, "b2_global_pose_state_indices", None)
+                if global_pose_indices is not None:
+                    raw_state = batch[OBS_STATE].detach().cpu().to(torch.float32)
+                    history_length = policy_cfg.mem_vit_num_frames if policy_cfg.mem_vit_enabled else 1
+                    current_pose = raw_state[
+                        ..., history_length - 1 : history_length, list(global_pose_indices)
+                    ]
+                    future_pose = raw_state[..., history_length:, list(global_pose_indices)]
+                    global_pose = torch.cat((current_pose, future_pose), dim=-2)
                 expert_trajectory_chunk = encode_b2_action_chunk(
                     dataset_expert_chunk,
                     dt=float(b2_trajectory_dt),
                     is_pad=action_is_pad,
+                    global_pose=global_pose,
+                    **trajectory_schema,
+                )
+                expert_chunk = decode_b2_action_chunk(
+                    expert_trajectory_chunk,
+                    dt=float(b2_trajectory_dt),
+                    representation="local_trajectory",
+                    predict_b2_active=policy_cfg.action_predict_b2_active,
+                    has_completion=policy_cfg.action_predict_task_complete,
                 )
                 pred_chunk = pred_execution_chunk
-                pred_trajectory_chunk = encode_b2_action_chunk(
+                pred_trajectory_chunk = integrate_b2_execution_chunk(
                     pred_execution_chunk,
                     dt=float(b2_trajectory_dt),
-                    append_completion=False,
+                    predict_b2_active=policy_cfg.action_predict_b2_active,
                 )
             else:
                 expert_chunk = dataset_expert_chunk
@@ -880,12 +933,8 @@ def main() -> None:
         )
         valid_expert_chunks = _flatten_valid_chunks(expert_chunks, valid_chunk_lengths)
         valid_pred_chunks = _flatten_valid_chunks(pred_chunks, valid_chunk_lengths)
-        valid_expert_trajectory_chunks = _flatten_valid_chunks(
-            expert_trajectory_chunks, valid_chunk_lengths
-        )
-        valid_pred_trajectory_chunks = _flatten_valid_chunks(
-            pred_trajectory_chunks, valid_chunk_lengths
-        )
+        valid_expert_trajectory_chunks = _flatten_valid_chunks(expert_trajectory_chunks, valid_chunk_lengths)
+        valid_pred_trajectory_chunks = _flatten_valid_chunks(pred_trajectory_chunks, valid_chunk_lengths)
         all_expert.append(expert)
         all_pred.append(pred)
         all_expert_chunks.append(valid_expert_chunks)
@@ -898,8 +947,8 @@ def main() -> None:
         normalized_metrics_rows.append(
             _compute_metrics(
                 ep_idx,
-                _normalize_execution_action_array(expert, meta),
-                _normalize_execution_action_array(pred, meta),
+                _normalize_execution_action_array(expert, meta, execution_stats),
+                _normalize_execution_action_array(pred, meta, execution_stats),
                 execution_action_names,
             )
         )
@@ -914,8 +963,8 @@ def main() -> None:
         normalized_chunk_metrics_rows.append(
             _compute_metrics(
                 ep_idx,
-                _normalize_execution_action_array(valid_expert_chunks, meta),
-                _normalize_execution_action_array(valid_pred_chunks, meta),
+                _normalize_execution_action_array(valid_expert_chunks, meta, execution_stats),
+                _normalize_execution_action_array(valid_pred_chunks, meta, execution_stats),
                 execution_action_names,
             )
         )
@@ -957,21 +1006,17 @@ def main() -> None:
             normalized_trajectory_chunk_metrics_rows.append(normalized_chunk_metrics_rows[-1].copy())
 
         plot_expert = (
-            _combined_base_plot_arrays(expert, expert_trajectory)
-            if b2_trajectory_enabled
-            else expert
+            _combined_base_plot_arrays(expert, expert_trajectory, b2_start) if io_schema_enabled else expert
         )
-        plot_pred = (
-            _combined_base_plot_arrays(pred, pred_trajectory) if b2_trajectory_enabled else pred
-        )
+        plot_pred = _combined_base_plot_arrays(pred, pred_trajectory, b2_start) if io_schema_enabled else pred
         plot_expert_chunks = (
-            _combined_base_plot_arrays(expert_chunks, expert_trajectory_chunks)
-            if b2_trajectory_enabled
+            _combined_base_plot_arrays(expert_chunks, expert_trajectory_chunks, b2_start)
+            if io_schema_enabled
             else expert_chunks
         )
         plot_pred_chunks = (
-            _combined_base_plot_arrays(pred_chunks, pred_trajectory_chunks)
-            if b2_trajectory_enabled
+            _combined_base_plot_arrays(pred_chunks, pred_trajectory_chunks, b2_start)
+            if io_schema_enabled
             else pred_chunks
         )
         _plot_episode(
@@ -1048,30 +1093,26 @@ def main() -> None:
     all_pred_trajectory_arr = np.concatenate(all_pred_trajectories, axis=0)
     all_expert_trajectory_chunk_arr = np.concatenate(all_expert_trajectory_chunks, axis=0)
     all_pred_trajectory_chunk_arr = np.concatenate(all_pred_trajectory_chunks, axis=0)
-    metrics_rows.insert(
-        0, _compute_metrics("all", all_expert_arr, all_pred_arr, execution_action_names)
-    )
+    metrics_rows.insert(0, _compute_metrics("all", all_expert_arr, all_pred_arr, execution_action_names))
     normalized_metrics_rows.insert(
         0,
         _compute_metrics(
             "all",
-            _normalize_execution_action_array(all_expert_arr, meta),
-            _normalize_execution_action_array(all_pred_arr, meta),
+            _normalize_execution_action_array(all_expert_arr, meta, execution_stats),
+            _normalize_execution_action_array(all_pred_arr, meta, execution_stats),
             execution_action_names,
         ),
     )
     chunk_metrics_rows.insert(
         0,
-        _compute_metrics(
-            "all", all_expert_chunk_arr, all_pred_chunk_arr, execution_action_names
-        ),
+        _compute_metrics("all", all_expert_chunk_arr, all_pred_chunk_arr, execution_action_names),
     )
     normalized_chunk_metrics_rows.insert(
         0,
         _compute_metrics(
             "all",
-            _normalize_execution_action_array(all_expert_chunk_arr, meta),
-            _normalize_execution_action_array(all_pred_chunk_arr, meta),
+            _normalize_execution_action_array(all_expert_chunk_arr, meta, execution_stats),
+            _normalize_execution_action_array(all_pred_chunk_arr, meta, execution_stats),
             execution_action_names,
         ),
     )
@@ -1118,9 +1159,7 @@ def main() -> None:
         normalized_trajectory_chunk_metrics_rows.insert(0, normalized_chunk_metrics_rows[0].copy())
 
     _write_metrics_csv(output_dir / "metrics.csv", metrics_rows, execution_action_names)
-    _write_metrics_csv(
-        output_dir / "normalized_metrics.csv", normalized_metrics_rows, execution_action_names
-    )
+    _write_metrics_csv(output_dir / "normalized_metrics.csv", normalized_metrics_rows, execution_action_names)
     _write_metrics_csv(output_dir / "chunk_metrics.csv", chunk_metrics_rows, execution_action_names)
     _write_metrics_csv(
         output_dir / "normalized_chunk_metrics.csv",
@@ -1152,11 +1191,13 @@ def main() -> None:
         "policy_path": str(policy_path),
         "dataset_repo_id": args.dataset_repo_id,
         "dataset_root": args.dataset_root,
+        "evaluation_dataset_frequency_hz": float(meta.fps),
+        "model_control_frequency_hz": getattr(policy_cfg, "control_frequency_hz", None),
         "split": args.split,
         "eval_split": args.eval_split,
         "episodes": sorted(per_episode),
         "num_frames": int(all_expert_arr.shape[0]),
-        "b2_local_trajectory_enabled": b2_trajectory_enabled,
+        "deployment_metadata": policy_cfg.deployment_metadata() if io_schema_enabled else None,
         "b2_local_trajectory_dt": b2_trajectory_dt,
         "execution_action_names": execution_action_names,
         "trajectory_action_names": trajectory_action_names,
@@ -1184,7 +1225,7 @@ def main() -> None:
     logging.info("Chunk RMSE mean: %.6f", chunk_metrics_rows[0]["rmse_mean"])
     logging.info("Normalized chunk MAE mean: %.6f", normalized_chunk_metrics_rows[0]["mae_mean"])
     logging.info("Normalized chunk RMSE mean: %.6f", normalized_chunk_metrics_rows[0]["rmse_mean"])
-    if b2_trajectory_enabled:
+    if io_schema_enabled:
         logging.info("Trajectory chunk MAE mean: %.6f", trajectory_chunk_metrics_rows[0]["mae_mean"])
         logging.info(
             "Normalized trajectory chunk MAE mean: %.6f",

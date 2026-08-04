@@ -48,6 +48,7 @@ from lerobot.utils.constants import (
 )
 
 from .b2_action_transform import (
+    action_schema_kwargs,
     decode_b2_action_chunk,
     encode_b2_action_chunk,
     make_b2_trajectory_stats,
@@ -60,22 +61,72 @@ from .configuration_pi05 import PI05Config
 class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
     """Convert between dataset B2 twist and the model's local trajectory."""
 
-    dt: float = 0.1
+    # Deliberately has no implicit fallback: this comes from the configured
+    # model control frequency and is persisted for inference.
+    dt: float
     inverse: bool = False
     append_task_complete: bool = True
+    representation: str = "local_trajectory"
+    predict_b2_active: bool = False
+    predict_arm_active: bool = False
+    predict_arm_reset: bool = True
+    predict_ee_pose: bool = True
+    predict_gripper: bool = True
+    state_indices: tuple[int, ...] = ()
+    global_pose_state_indices: tuple[int, ...] = ()
+    state_history_length: int = 1
+    keep_state_history: bool = False
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
-        action = transition.get(TransitionKey.ACTION)
-        if action is None:
-            return transition
-        if not isinstance(action, torch.Tensor):
-            raise ValueError(f"B2 local trajectory expects a tensor action, got {type(action)}")
-
         new_transition = transition.copy()
+        action = transition.get(TransitionKey.ACTION)
+        if action is not None and not isinstance(action, torch.Tensor):
+            raise ValueError(f"B2 action schema expects a tensor action, got {type(action)}")
+        global_pose = None
+        if not self.inverse and self.state_indices:
+            observations = dict(new_transition.get(TransitionKey.OBSERVATION, {}))
+            state = observations.get(OBS_STATE)
+            if state is not None:
+                if self.global_pose_state_indices and action is not None:
+                    expected_length = self.state_history_length + action.shape[-2]
+                    if state.ndim < 3 or state.shape[-2] != expected_length:
+                        raise ValueError(
+                            "Global-pose trajectory requires state history + future chunk: "
+                            f"expected time length {expected_length}, got {tuple(state.shape)}"
+                        )
+                    current_pose = state[
+                        ...,
+                        self.state_history_length - 1 : self.state_history_length,
+                        list(self.global_pose_state_indices),
+                    ]
+                    future_pose = state[
+                        ..., self.state_history_length :, list(self.global_pose_state_indices)
+                    ]
+                    global_pose = torch.cat((current_pose, future_pose), dim=-2)
+                    model_state = state[..., : self.state_history_length, list(self.state_indices)]
+                    observations[OBS_STATE] = (
+                        model_state if self.keep_state_history else model_state[..., 0, :]
+                    )
+                    complementary = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {})
+                    state_pad_key = f"{OBS_STATE}_is_pad"
+                    if state_pad_key in complementary:
+                        state_pad = complementary[state_pad_key][..., : self.state_history_length]
+                        complementary[state_pad_key] = (
+                            state_pad if self.keep_state_history else state_pad[..., 0]
+                        )
+                    new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary
+                else:
+                    observations[OBS_STATE] = state[..., list(self.state_indices)]
+                new_transition[TransitionKey.OBSERVATION] = observations
+
+        if action is None:
+            return new_transition
         if self.inverse:
             transformed = decode_b2_action_chunk(
                 action,
                 dt=self.dt,
+                representation=self.representation,
+                predict_b2_active=self.predict_b2_active,
                 has_completion=self.append_task_complete,
             )
         else:
@@ -85,6 +136,13 @@ class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
                 action,
                 dt=self.dt,
                 is_pad=is_pad,
+                global_pose=global_pose,
+                representation=self.representation,
+                predict_b2_active=self.predict_b2_active,
+                predict_arm_active=self.predict_arm_active,
+                predict_arm_reset=self.predict_arm_reset,
+                predict_ee_pose=self.predict_ee_pose,
+                predict_gripper=self.predict_gripper,
                 append_completion=self.append_task_complete,
             )
         new_transition[TransitionKey.ACTION] = transformed
@@ -100,6 +158,16 @@ class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
             "dt": self.dt,
             "inverse": self.inverse,
             "append_task_complete": self.append_task_complete,
+            "representation": self.representation,
+            "predict_b2_active": self.predict_b2_active,
+            "predict_arm_active": self.predict_arm_active,
+            "predict_arm_reset": self.predict_arm_reset,
+            "predict_ee_pose": self.predict_ee_pose,
+            "predict_gripper": self.predict_gripper,
+            "state_indices": list(self.state_indices),
+            "global_pose_state_indices": list(self.global_pose_state_indices),
+            "state_history_length": self.state_history_length,
+            "keep_state_history": self.keep_state_history,
         }
 
 
@@ -110,41 +178,64 @@ def reconcile_pi05_b2_trajectory_processors(
     dataset_stats: dict[str, dict[str, Any]] | None,
 ) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
     """Insert/refresh B2 trajectory steps when fine-tuning a pretrained PI0.5."""
-    if not config.b2_local_trajectory_enabled:
+    if not config.io_schema_resolved:
         return preprocessor, postprocessor
     if config.b2_local_trajectory_dt is None:
-        raise ValueError("b2_local_trajectory_dt must be resolved from the dataset fps")
+        raise ValueError("b2_local_trajectory_dt must be resolved from the model control frequency")
 
     transformed_stats = make_b2_trajectory_stats(
         dataset_stats,
         dt=config.b2_local_trajectory_dt,
         chunk_size=config.chunk_size,
+        state_indices=tuple(config.state_feature_indices or ()),
+        **action_schema_kwargs(config),
     )
     if transformed_stats is not None:
         preprocessor = hotswap_stats(preprocessor, transformed_stats)
         postprocessor = hotswap_stats(postprocessor, transformed_stats)
 
-    if not any(isinstance(step, Pi05B2LocalTrajectoryProcessorStep) for step in preprocessor.steps):
-        steps = list(preprocessor.steps)
+    desired_pre_step = Pi05B2LocalTrajectoryProcessorStep(
+        dt=config.b2_local_trajectory_dt,
+        state_indices=tuple(config.state_feature_indices or ()),
+        global_pose_state_indices=tuple(config.b2_global_pose_state_indices or ()),
+        state_history_length=config.mem_vit_num_frames if config.mem_vit_enabled else 1,
+        keep_state_history=config.mem_vit_enabled,
+        representation=config.b2_action_representation,
+        predict_b2_active=config.action_predict_b2_active,
+        predict_arm_active=config.action_predict_arm_active,
+        predict_arm_reset=config.action_predict_arm_reset,
+        predict_ee_pose=config.action_predict_ee_pose,
+        predict_gripper=config.action_predict_gripper,
+        append_task_complete=config.action_predict_task_complete,
+    )
+    steps = [
+        desired_pre_step if isinstance(step, Pi05B2LocalTrajectoryProcessorStep) else step
+        for step in preprocessor.steps
+    ]
+    if not any(isinstance(step, Pi05B2LocalTrajectoryProcessorStep) for step in steps):
         normalizer_index = next(
             i for i, step in enumerate(steps) if isinstance(step, NormalizerProcessorStep)
         )
-        steps.insert(
-            normalizer_index,
-            Pi05B2LocalTrajectoryProcessorStep(dt=config.b2_local_trajectory_dt),
-        )
-        preprocessor.steps = steps
+        steps.insert(normalizer_index, desired_pre_step)
+    preprocessor.steps = steps
 
-    if not any(isinstance(step, Pi05B2LocalTrajectoryProcessorStep) for step in postprocessor.steps):
-        steps = list(postprocessor.steps)
+    desired_post_step = Pi05B2LocalTrajectoryProcessorStep(
+        dt=config.b2_local_trajectory_dt,
+        inverse=True,
+        representation=config.b2_action_representation,
+        predict_b2_active=config.action_predict_b2_active,
+        append_task_complete=config.action_predict_task_complete,
+    )
+    steps = [
+        desired_post_step if isinstance(step, Pi05B2LocalTrajectoryProcessorStep) else step
+        for step in postprocessor.steps
+    ]
+    if not any(isinstance(step, Pi05B2LocalTrajectoryProcessorStep) for step in steps):
         unnormalizer_index = next(
             i for i, step in enumerate(steps) if isinstance(step, UnnormalizerProcessorStep)
         )
-        steps.insert(
-            unnormalizer_index + 1,
-            Pi05B2LocalTrajectoryProcessorStep(dt=config.b2_local_trajectory_dt, inverse=True),
-        )
-        postprocessor.steps = steps
+        steps.insert(unnormalizer_index + 1, desired_post_step)
+    postprocessor.steps = steps
     return preprocessor, postprocessor
 
 
@@ -236,13 +327,15 @@ def make_pi05_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
-    if config.b2_local_trajectory_enabled:
+    if config.io_schema_resolved:
         if config.b2_local_trajectory_dt is None:
-            raise ValueError("b2_local_trajectory_dt must be resolved from the dataset fps")
+            raise ValueError("b2_local_trajectory_dt must be resolved from the model control frequency")
         dataset_stats = make_b2_trajectory_stats(
             dataset_stats,
             dt=config.b2_local_trajectory_dt,
             chunk_size=config.chunk_size,
+            state_indices=tuple(config.state_feature_indices or ()),
+            **action_schema_kwargs(config),
         )
 
     relative_step = RelativeActionsProcessorStep(
@@ -276,13 +369,26 @@ def make_pi05_pre_post_processors(
         DeviceProcessorStep(device=config.device),
     ]
 
-    if config.b2_local_trajectory_enabled:
+    if config.io_schema_resolved:
         normalizer_index = next(
             i for i, step in enumerate(input_steps) if isinstance(step, NormalizerProcessorStep)
         )
         input_steps.insert(
             normalizer_index,
-            Pi05B2LocalTrajectoryProcessorStep(dt=config.b2_local_trajectory_dt),
+            Pi05B2LocalTrajectoryProcessorStep(
+                dt=config.b2_local_trajectory_dt,
+                state_indices=tuple(config.state_feature_indices or ()),
+                global_pose_state_indices=tuple(config.b2_global_pose_state_indices or ()),
+                state_history_length=config.mem_vit_num_frames if config.mem_vit_enabled else 1,
+                keep_state_history=config.mem_vit_enabled,
+                representation=config.b2_action_representation,
+                predict_b2_active=config.action_predict_b2_active,
+                predict_arm_active=config.action_predict_arm_active,
+                predict_arm_reset=config.action_predict_arm_reset,
+                predict_ee_pose=config.action_predict_ee_pose,
+                predict_gripper=config.action_predict_gripper,
+                append_task_complete=config.action_predict_task_complete,
+            ),
         )
 
     output_steps: list[ProcessorStep] = [
@@ -292,10 +398,16 @@ def make_pi05_pre_post_processors(
         AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
         DeviceProcessorStep(device="cpu"),
     ]
-    if config.b2_local_trajectory_enabled:
+    if config.io_schema_resolved:
         output_steps.insert(
             1,
-            Pi05B2LocalTrajectoryProcessorStep(dt=config.b2_local_trajectory_dt, inverse=True),
+            Pi05B2LocalTrajectoryProcessorStep(
+                dt=config.b2_local_trajectory_dt,
+                inverse=True,
+                representation=config.b2_action_representation,
+                predict_b2_active=config.action_predict_b2_active,
+                append_task_complete=config.action_predict_task_complete,
+            ),
         )
 
     return (

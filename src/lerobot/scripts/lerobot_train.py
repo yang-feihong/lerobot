@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from accelerate import Accelerator
 
+import numpy as np
 import torch
 from termcolor import colored
 from torch.optim import Optimizer
@@ -60,6 +61,7 @@ from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
+from lerobot.utils.constants import ACTION
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -301,6 +303,118 @@ def apply_task_variants_to_batch(
     return applied
 
 
+def configure_action_bool_balance(
+    cfg: TrainPipelineConfig, dataset
+) -> dict[str, dict[str, int | float]] | None:
+    """Resolve fixed class priors for every enabled boolean action from the train split."""
+    policy_cfg = cfg.trainable_config
+    action_names = dataset.meta.features.get(ACTION, {}).get("names") or []
+    if not {"b2_active", "b2_vx", "b2_vy", "b2_omega_z", "arm_active", "arm_reset"} <= set(action_names):
+        return None
+
+    enabled = {
+        "b2_active": bool(getattr(policy_cfg, "action_predict_b2_active", False)),
+        "arm_active": bool(getattr(policy_cfg, "action_predict_arm_active", False)),
+        "arm_reset": bool(getattr(policy_cfg, "action_predict_arm_reset", False)),
+        "gripper_target": bool(getattr(policy_cfg, "action_predict_gripper", False)),
+        "task_complete": bool(getattr(policy_cfg, "action_predict_task_complete", False)),
+    }
+    enabled_names = [name for name, is_enabled in enabled.items() if is_enabled]
+    if not enabled_names:
+        return None
+
+    # Keep the generic training entry point free of eager PI0.5 imports.
+    from lerobot.policies.pi05.b2_action_transform import (
+        action_label_multiplicity,
+        action_sample_offsets,
+        task_complete_class_counts,
+    )
+
+    episode_indices = dataset.episodes if dataset.episodes is not None else list(range(dataset.num_episodes))
+    episodes_meta = dataset.meta.episodes
+    lengths = [
+        int(episodes_meta[episode_index]["dataset_to_index"])
+        - int(episodes_meta[episode_index]["dataset_from_index"])
+        for episode_index in episode_indices
+    ]
+    control_frequency_hz = float(getattr(policy_cfg, "control_frequency_hz", None) or dataset.meta.fps)
+    offsets = action_sample_offsets(
+        policy_cfg.chunk_size,
+        float(dataset.meta.fps),
+        control_frequency_hz,
+    )
+    episode_multiplicities = {
+        episode_index: action_label_multiplicity(length, offsets).numpy()
+        for episode_index, length in zip(episode_indices, lengths, strict=True)
+    }
+    counts: dict[str, list[int]] = {name: [0, 0] for name in enabled_names if name != "task_complete"}
+    if counts:
+        missing_names = [name for name in counts if name not in action_names]
+        if missing_names:
+            raise ValueError(f"Enabled boolean actions are absent from the dataset: {missing_names}")
+        action_indices = {name: action_names.index(name) for name in counts}
+        columns = dataset.hf_dataset.select_columns([ACTION, "episode_index", "frame_index"]).with_format(
+            "numpy"
+        )
+        for batch in columns.iter(batch_size=65_536):
+            actions = np.asarray(batch[ACTION])
+            batch_episode_indices = np.asarray(batch["episode_index"], dtype=np.int64)
+            frame_indices = np.asarray(batch["frame_index"], dtype=np.int64)
+            label_multiplicity = np.fromiter(
+                (
+                    episode_multiplicities[int(episode_index)][int(frame_index)]
+                    for episode_index, frame_index in zip(batch_episode_indices, frame_indices, strict=True)
+                ),
+                dtype=np.int64,
+                count=len(frame_indices),
+            )
+            for name, dim in action_indices.items():
+                if (
+                    name == "gripper_target"
+                    and getattr(policy_cfg, "action_gripper_target_true_side", "negative") == "negative"
+                ):
+                    target_true = actions[:, dim] < 0
+                else:
+                    target_true = actions[:, dim] > 0
+                positive = int(label_multiplicity[target_true].sum())
+                counts[name][0] += positive
+                counts[name][1] += int(label_multiplicity.sum()) - positive
+
+    if enabled["task_complete"]:
+        positive, negative = task_complete_class_counts(lengths, policy_cfg.chunk_size, offsets=offsets)
+        counts["task_complete"] = [positive, negative]
+
+    stats: dict[str, dict[str, int | float]] = {}
+    true_fractions: dict[str, float] = {}
+    bool_weight = float(policy_cfg.action_bool_loss_weight)
+    for name, (positive, negative) in counts.items():
+        if positive == 0 or negative == 0:
+            raise ValueError(
+                f"Cannot class-balance {name}: the train split must contain both classes, "
+                f"got positive={positive}, negative={negative}."
+            )
+        known = positive + negative
+        true_fraction = positive / known
+        true_fractions[name] = true_fraction
+        stats[name] = {
+            "positive_labels": positive,
+            "negative_labels": negative,
+            "known_labels": known,
+            "true_fraction": true_fraction,
+            "true_weight": bool_weight * 0.5 / true_fraction,
+            "false_weight": bool_weight * 0.5 / (1.0 - true_fraction),
+        }
+
+    saved_fractions = dict(getattr(policy_cfg, "action_bool_true_fractions", {}))
+    if cfg.resume and saved_fractions and saved_fractions != true_fractions:
+        raise ValueError(
+            "Resume train-split boolean priors disagree with the checkpoint: "
+            f"checkpoint={saved_fractions}, current={true_fractions}"
+        )
+    policy_cfg.action_bool_true_fractions = true_fractions
+    return stats
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     """
@@ -400,6 +514,19 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
     task_variants = load_task_variants(dataset.root, cfg.dataset.task_variants_path)
+    action_bool_balance = configure_action_bool_balance(cfg, dataset)
+    if is_main_process and action_bool_balance is not None:
+        for name, balance in action_bool_balance.items():
+            logging.info(
+                "%s train-split balance: positive=%d, negative=%d, true_fraction=%.6f, "
+                "effective_true_weight=%.4f, effective_false_weight=%.4f",
+                name,
+                balance["positive_labels"],
+                balance["negative_labels"],
+                balance["true_fraction"],
+                balance["true_weight"],
+                balance["false_weight"],
+            )
 
     if cfg.is_reward_model_training:
         if is_main_process:
@@ -424,12 +551,45 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             ds_meta=dataset.meta,
             rename_map=cfg.rename_map,
         )
+        deployment_metadata = getattr(policy.config, "deployment_metadata", None)
+        if is_main_process and callable(deployment_metadata):
+            resolved_deployment_metadata = deployment_metadata()
+            logging.info("PI0.5 deployment metadata: %s", resolved_deployment_metadata)
+            cfg.output_dir.mkdir(parents=True, exist_ok=True)
+            (cfg.output_dir / "pi05_deployment_metadata.json").write_text(
+                json.dumps(resolved_deployment_metadata, indent=2), encoding="utf-8"
+            )
+
+        if is_main_process:
+            action_chunk_size = int(policy.config.chunk_size)
+            action_steps_to_execute = int(policy.config.n_action_steps)
+            control_frequency_hz = float(policy.config.control_frequency_hz)
+            action_dt = 1.0 / control_frequency_hz
+            logging.info(
+                "Policy temporal semantics: dataset_fps=%g, control_frequency_hz=%g, action_dt=%.6fs, "
+                "chunk_size=%d (%.3fs horizon), n_action_steps=%d (%.3fs before replanning)",
+                float(dataset.meta.fps),
+                control_frequency_hz,
+                action_dt,
+                action_chunk_size,
+                action_chunk_size * action_dt,
+                action_steps_to_execute,
+                action_steps_to_execute * action_dt,
+            )
+            if getattr(policy.config, "b2_action_representation", None) == "local_trajectory":
+                logging.info(
+                    "B2 local-trajectory source: %s",
+                    "global observation.state pose transform"
+                    if getattr(policy.config, "b2_global_pose_state_indices", None) is not None
+                    else "SE(2) integration of commanded body twist",
+                )
 
     if is_main_process and wandb_logger:
         wandb_logger.update_config(
             {
                 "runtime/dataset_num_frames": int(dataset.num_frames),
                 "runtime/dataset_num_episodes": int(dataset.num_episodes),
+                "runtime/dataset_fps": float(dataset.meta.fps),
                 "runtime/dataset_camera_keys": list(dataset.meta.camera_keys),
                 "runtime/dataset_features": dataset.meta.features,
                 "runtime/task_variants_enabled": bool(task_variants),
@@ -448,12 +608,50 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 }
                 if not cfg.is_reward_model_training
                 else None,
+                "runtime/pi05_deployment_metadata": (
+                    policy.config.deployment_metadata()
+                    if not cfg.is_reward_model_training
+                    and callable(getattr(policy.config, "deployment_metadata", None))
+                    else None
+                ),
                 "runtime/per_device_batch_size": cfg.batch_size,
                 "runtime/gradient_accumulation_steps": cfg.gradient_accumulation_steps,
                 "runtime/effective_batch_size": (
                     cfg.batch_size * cfg.gradient_accumulation_steps * accelerator.num_processes
                 ),
                 "runtime/num_processes": accelerator.num_processes,
+                "runtime/action_bool_balance": action_bool_balance,
+                "runtime/action_dt_seconds": (
+                    1.0 / float(policy.config.control_frequency_hz)
+                    if not cfg.is_reward_model_training
+                    else None
+                ),
+                "runtime/action_chunk_size": (
+                    int(policy.config.chunk_size) if not cfg.is_reward_model_training else None
+                ),
+                "runtime/action_horizon_seconds": (
+                    int(policy.config.chunk_size) / float(policy.config.control_frequency_hz)
+                    if not cfg.is_reward_model_training
+                    else None
+                ),
+                "runtime/action_steps_to_execute": (
+                    int(policy.config.n_action_steps) if not cfg.is_reward_model_training else None
+                ),
+                "runtime/replan_interval_seconds": (
+                    int(policy.config.n_action_steps) / float(policy.config.control_frequency_hz)
+                    if not cfg.is_reward_model_training
+                    else None
+                ),
+                "runtime/b2_trajectory_source": (
+                    (
+                        "global_pose_transform"
+                        if getattr(policy.config, "b2_global_pose_state_indices", None) is not None
+                        else "twist_integration"
+                    )
+                    if not cfg.is_reward_model_training
+                    and getattr(policy.config, "b2_action_representation", None) == "local_trajectory"
+                    else None
+                ),
             }
         )
 
@@ -478,10 +676,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     processor_kwargs = {}
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         processor_kwargs["dataset_stats"] = dataset.meta.stats
-    # The B2 trajectory representation derives 17D normalization statistics
-    # from the unchanged 16D dataset stats. This is also required on resume,
-    # because the generic checkpoint overrides below are built from raw stats.
-    if getattr(active_cfg, "b2_local_trajectory_enabled", False):
+    # The configured PI0.5 I/O schema derives selected state/action statistics
+    # from the unchanged dataset stats. This is also required on resume because
+    # the generic checkpoint overrides below are built from raw stats.
+    if getattr(active_cfg, "io_schema_resolved", False):
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
     if cfg.is_reward_model_training:

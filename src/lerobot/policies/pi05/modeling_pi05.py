@@ -1793,9 +1793,9 @@ class PI05Policy(PreTrainedPolicy):
             raise ValueError(
                 f"Unsupported action_loss_schema={schema!r}. Expected one of: 'auto', 'always', 'off'."
             )
-        if getattr(self.config, "b2_local_trajectory_enabled", False):
-            return action_dim == 17
-        return action_dim == 16
+        return bool(getattr(self.config, "io_schema_resolved", False)) and action_dim == len(
+            self.config.action_feature_names or []
+        )
 
     @staticmethod
     def _normalized_bool_mask(actions: Tensor, dim: int, true_side: str = "positive") -> Tensor:
@@ -1835,6 +1835,17 @@ class PI05Policy(PreTrainedPolicy):
             weights = weights * valid_mask
         return weights
 
+    def _global_bool_weights(self, name: str, target_true: Tensor, valid_mask: Tensor) -> Tensor:
+        """Use a fixed train-split class prior for an enabled boolean action."""
+        true_fraction = getattr(self.config, "action_bool_true_fractions", {}).get(name)
+        if true_fraction is None:
+            return self._balanced_bool_weights(target_true, valid_mask)
+        true_weight = 0.5 / true_fraction
+        false_weight = 0.5 / (1.0 - true_fraction)
+        return torch.where(target_true, true_weight, false_weight).to(dtype=torch.float32) * valid_mask.to(
+            dtype=torch.float32
+        )
+
     def _masked_dim_loss(
         self,
         losses: Tensor,
@@ -1862,6 +1873,12 @@ class PI05Policy(PreTrainedPolicy):
         action_is_pad: Tensor | None = None,
     ) -> tuple[Tensor, dict]:
         """Reduce PI0.5 action losses with the B2+Z1 gate-aware schema."""
+        names = list(self.config.action_feature_names or [])
+        if actions.shape[-1] != len(names):
+            raise ValueError(
+                f"B2+Z1 action names ({len(names)}) do not match model action width {actions.shape[-1]}"
+            )
+        name_to_dim = {name: i for i, name in enumerate(names)}
         bool_weight = float(getattr(self.config, "action_bool_loss_weight", 4.0))
         continuous_weight = float(getattr(self.config, "action_continuous_loss_weight", 1.0))
 
@@ -1875,25 +1892,22 @@ class PI05Policy(PreTrainedPolicy):
                     f"shape {tuple(actions.shape[:2])}"
                 )
 
-        b2_active = self._normalized_bool_mask(actions, 0)
-        arm_active = self._normalized_bool_mask(actions, 4)
-        arm_reset = self._normalized_bool_mask(actions, 5)
-        gripper_active = self._normalized_bool_mask(
-            actions,
-            15,
-            true_side=getattr(self.config, "action_gripper_target_true_side", "negative"),
-        )
-
         weighted_parts: list[Tensor] = []
         weight_parts: list[Tensor] = []
         bool_dim_stats: dict[str, float] = {}
-        for name, dim, target in [
-            ("b2_active", 0, b2_active),
-            ("arm_active", 4, arm_active),
-            ("arm_reset", 5, arm_reset),
-            ("gripper_target", 15, gripper_active),
-        ]:
-            weights = self._balanced_bool_weights(target, valid_mask) * bool_weight
+        bool_targets: dict[str, Tensor] = {}
+        for name in ("b2_active", "arm_active", "arm_reset", "gripper_target"):
+            if name not in name_to_dim:
+                continue
+            true_side = (
+                getattr(self.config, "action_gripper_target_true_side", "negative")
+                if name == "gripper_target"
+                else "positive"
+            )
+            dim = name_to_dim[name]
+            target = self._normalized_bool_mask(actions, dim, true_side=true_side)
+            bool_targets[name] = target
+            weights = self._global_bool_weights(name, target, valid_mask) * bool_weight
             dim_losses = losses[:, :, dim]
             weighted_parts.append(dim_losses * weights)
             weight_parts.append(weights)
@@ -1901,18 +1915,36 @@ class PI05Policy(PreTrainedPolicy):
             bool_dim_stats[f"gate_loss/{name}"] = float(
                 ((dim_losses * weights).sum() / weights.sum().clamp_min(1e-6)).detach().cpu().item()
             )
+            global_true_fraction = getattr(self.config, "action_bool_true_fractions", {}).get(name)
+            if global_true_fraction is not None:
+                bool_dim_stats[f"gate_global_true_frac/{name}"] = float(global_true_fraction)
+                bool_dim_stats[f"gate_weight/{name}_true"] = float(bool_weight * 0.5 / global_true_fraction)
+                bool_dim_stats[f"gate_weight/{name}_false"] = float(
+                    bool_weight * 0.5 / (1.0 - global_true_fraction)
+                )
 
-        b2_continuous_mask = (
-            valid_mask
-            if getattr(self.config, "b2_local_trajectory_enabled", False)
-            else (b2_active & valid_mask)
+        b2_active = bool_targets.get("b2_active")
+        arm_active = bool_targets.get("arm_active")
+        arm_reset = bool_targets.get("arm_reset")
+        b2_continuous_mask = valid_mask if b2_active is None else (b2_active & valid_mask)
+        ee_continuous_mask = valid_mask
+        if arm_active is not None:
+            ee_continuous_mask = ee_continuous_mask & arm_active
+        if arm_reset is not None:
+            ee_continuous_mask = ee_continuous_mask & ~arm_reset
+        b2_names = (
+            ["b2_local_x", "b2_local_y", "b2_local_yaw"]
+            if self.config.b2_action_representation == "local_trajectory"
+            else ["b2_vx", "b2_vy", "b2_omega_z"]
         )
+        b2_dims = [name_to_dim[name] for name in b2_names]
+        ee_dims = [i for i, name in enumerate(names) if name.startswith("height_invariant_ee_")]
         for dim_losses, weights in [
-            self._masked_dim_loss(losses, [1, 2, 3], b2_continuous_mask, continuous_weight),
+            self._masked_dim_loss(losses, b2_dims, b2_continuous_mask, continuous_weight),
             self._masked_dim_loss(
                 losses,
-                list(range(6, 15)),
-                arm_active & ~arm_reset & valid_mask,
+                ee_dims,
+                ee_continuous_mask,
                 continuous_weight,
             ),
         ]:
@@ -1920,65 +1952,62 @@ class PI05Policy(PreTrainedPolicy):
             weight_parts.append(weights)
 
         completion_target = None
-        if getattr(self.config, "b2_local_trajectory_enabled", False):
-            if actions.shape[-1] != 17:
-                raise ValueError(
-                    f"B2 local trajectory loss expects 17D model action, got {actions.shape[-1]}"
-                )
-            completion_target = self._normalized_bool_mask(actions, 16)
+        if "task_complete" in name_to_dim:
+            completion_dim = name_to_dim["task_complete"]
+            completion_target = self._normalized_bool_mask(actions, completion_dim)
             # Completion at step k is known from whether k+1 crosses the
             # episode boundary. The final slot of a completely unpadded chunk
             # has no k+1 observation, so exclude that single unknown label.
             completion_valid = torch.ones_like(completion_target, dtype=torch.bool)
             if action_is_pad is not None:
-                completion_valid[:, -1] = action_is_pad.to(
-                    device=actions.device, dtype=torch.bool
-                )[:, -1]
+                completion_valid[:, -1] = action_is_pad.to(device=actions.device, dtype=torch.bool)[:, -1]
             completion_weights = (
-                self._balanced_bool_weights(completion_target, completion_valid) * bool_weight
+                self._global_bool_weights("task_complete", completion_target, completion_valid) * bool_weight
             )
-            completion_losses = losses[:, :, 16]
+            completion_losses = losses[:, :, completion_dim]
             weighted_parts.append(completion_losses * completion_weights)
             weight_parts.append(completion_weights)
             bool_dim_stats["gate_true_frac/task_complete"] = float(
                 completion_target[completion_valid].float().mean().detach().cpu().item()
             )
             bool_dim_stats["gate_loss/task_complete"] = float(
-                (
-                    (completion_losses * completion_weights).sum()
-                    / completion_weights.sum().clamp_min(1e-6)
-                )
+                ((completion_losses * completion_weights).sum() / completion_weights.sum().clamp_min(1e-6))
                 .detach()
                 .cpu()
                 .item()
             )
+            global_true_fraction = getattr(self.config, "action_bool_true_fractions", {}).get("task_complete")
+            if global_true_fraction is not None:
+                bool_dim_stats["gate_global_true_frac/task_complete"] = float(global_true_fraction)
+                bool_dim_stats["gate_weight/task_complete_true"] = float(
+                    bool_weight * 0.5 / global_true_fraction
+                )
+                bool_dim_stats["gate_weight/task_complete_false"] = float(
+                    bool_weight * 0.5 / (1.0 - global_true_fraction)
+                )
 
         weighted = torch.cat([part.reshape(losses.shape[0], -1) for part in weighted_parts], dim=1)
         weights = torch.cat([part.reshape(losses.shape[0], -1) for part in weight_parts], dim=1)
         per_sample_loss = weighted.sum(dim=1) / weights.sum(dim=1).clamp_min(1e-6)
 
-        loss_dict = {
+        loss_dict: dict[str, float] = {
             "gate_aware_action_loss": 1.0,
-            "gate_true_frac/b2_active": bool_dim_stats["gate_true_frac/b2_active"],
-            "gate_true_frac/arm_active": bool_dim_stats["gate_true_frac/arm_active"],
-            "gate_true_frac/arm_reset": bool_dim_stats["gate_true_frac/arm_reset"],
-            "gate_true_frac/gripper_target": bool_dim_stats["gate_true_frac/gripper_target"],
-            "gate_loss/b2_active": bool_dim_stats["gate_loss/b2_active"],
-            "gate_loss/arm_active": bool_dim_stats["gate_loss/arm_active"],
-            "gate_loss/arm_reset": bool_dim_stats["gate_loss/arm_reset"],
-            "gate_loss/gripper_target": bool_dim_stats["gate_loss/gripper_target"],
-            "continuous_mask_frac/b2_trajectory": float(
+            f"continuous_mask_frac/b2_{self.config.b2_action_representation}": float(
                 b2_continuous_mask.float().mean().detach().cpu().item()
             ),
-            "continuous_mask_frac/ee_pose": float(
-                (arm_active & ~arm_reset).float().mean().detach().cpu().item()
-            ),
+            "continuous_mask_frac/ee_pose": float(ee_continuous_mask.float().mean().detach().cpu().item()),
         }
+        loss_dict.update(bool_dim_stats)
         if completion_target is not None:
-            loss_dict["gate_true_frac/task_complete"] = bool_dim_stats[
-                "gate_true_frac/task_complete"
-            ]
+            loss_dict["gate_true_frac/task_complete"] = bool_dim_stats["gate_true_frac/task_complete"]
             loss_dict["gate_loss/task_complete"] = bool_dim_stats["gate_loss/task_complete"]
+            for key in (
+                "gate_global_true_frac/task_complete",
+                "gate_weight/task_complete_true",
+                "gate_weight/task_complete_false",
+            ):
+                if key in bool_dim_stats:
+                    loss_dict[key] = bool_dim_stats[key]
         if reduction == "none":
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
