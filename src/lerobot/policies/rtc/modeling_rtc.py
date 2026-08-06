@@ -209,14 +209,15 @@ class RTCProcessor:
             .unsqueeze(-1)
         )
 
-        with torch.enable_grad():
-            v_t = original_denoise_step_partial(x_t)
-            x_t.requires_grad_(True)
-
-            x1_t = x_t - time * v_t  # noqa: N806
-            err = (prev_chunk_left_over - x1_t) * weights
-            grad_outputs = err.clone().detach()
-            correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
+        # ``v_t`` is intentionally evaluated from detached ``x_t`` in the
+        # original implementation, so the VJP below is exactly the identity:
+        # d(x_t - time * v_t) / d(x_t) == I.  Use that closed form directly;
+        # launching an autograd pass for every denoising step roughly doubles
+        # RTC latency without changing the result.
+        v_t = original_denoise_step_partial(x_t)
+        x1_t = x_t - time * v_t  # noqa: N806
+        err = (prev_chunk_left_over - x1_t) * weights
+        correction = err.clone().detach()
 
         max_guidance_weight = torch.as_tensor(self.rtc_config.max_guidance_weight)
         tau_tensor = torch.as_tensor(tau)

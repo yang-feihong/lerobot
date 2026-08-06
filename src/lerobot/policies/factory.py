@@ -604,6 +604,7 @@ def make_policy(
     if isinstance(cfg, PI05Config) and ds_meta is not None:
         from .pi05.b2_action_transform import (
             B2_GLOBAL_POSE_STATE_NAMES,
+            DATASET_ACTION_NAMES,
             action_schema_kwargs,
             b2_execution_action_names,
             b2_trajectory_action_names,
@@ -643,8 +644,7 @@ def make_policy(
             dataset_action is not None
             and dataset_action.shape == (16,)
             and dataset_action_names is not None
-            and {"b2_active", "b2_vx", "b2_vy", "b2_omega_z", "arm_active", "arm_reset"}
-            <= set(dataset_action_names)
+            and tuple(dataset_action_names) == DATASET_ACTION_NAMES
         )
         if not is_b2_schema:
             cfg.io_schema_resolved = False

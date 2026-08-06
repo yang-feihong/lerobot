@@ -1896,7 +1896,12 @@ class PI05Policy(PreTrainedPolicy):
         weight_parts: list[Tensor] = []
         bool_dim_stats: dict[str, float] = {}
         bool_targets: dict[str, Tensor] = {}
-        for name in ("b2_active", "arm_active", "arm_reset", "gripper_target"):
+        completion_target = None
+        if "task_complete" in name_to_dim:
+            completion_target = self._normalized_bool_mask(actions, name_to_dim["task_complete"])
+        execution_valid = valid_mask if completion_target is None else (valid_mask & ~completion_target)
+
+        for name in ("arm_teleop_inactive", "arm_reset", "gripper_target"):
             if name not in name_to_dim:
                 continue
             true_side = (
@@ -1907,11 +1912,13 @@ class PI05Policy(PreTrainedPolicy):
             dim = name_to_dim[name]
             target = self._normalized_bool_mask(actions, dim, true_side=true_side)
             bool_targets[name] = target
-            weights = self._global_bool_weights(name, target, valid_mask) * bool_weight
+            weights = self._global_bool_weights(name, target, execution_valid) * bool_weight
             dim_losses = losses[:, :, dim]
             weighted_parts.append(dim_losses * weights)
             weight_parts.append(weights)
-            bool_dim_stats[f"gate_true_frac/{name}"] = float(target.float().mean().detach().cpu().item())
+            bool_dim_stats[f"gate_true_frac/{name}"] = float(
+                target[execution_valid].float().mean().detach().cpu().item()
+            )
             bool_dim_stats[f"gate_loss/{name}"] = float(
                 ((dim_losses * weights).sum() / weights.sum().clamp_min(1e-6)).detach().cpu().item()
             )
@@ -1923,13 +1930,12 @@ class PI05Policy(PreTrainedPolicy):
                     bool_weight * 0.5 / (1.0 - global_true_fraction)
                 )
 
-        b2_active = bool_targets.get("b2_active")
-        arm_active = bool_targets.get("arm_active")
+        arm_teleop_inactive = bool_targets.get("arm_teleop_inactive")
         arm_reset = bool_targets.get("arm_reset")
-        b2_continuous_mask = valid_mask if b2_active is None else (b2_active & valid_mask)
-        ee_continuous_mask = valid_mask
-        if arm_active is not None:
-            ee_continuous_mask = ee_continuous_mask & arm_active
+        b2_continuous_mask = execution_valid
+        ee_continuous_mask = execution_valid
+        if arm_teleop_inactive is not None:
+            ee_continuous_mask = ee_continuous_mask & ~arm_teleop_inactive
         if arm_reset is not None:
             ee_continuous_mask = ee_continuous_mask & ~arm_reset
         b2_names = (
@@ -1951,16 +1957,9 @@ class PI05Policy(PreTrainedPolicy):
             weighted_parts.append(dim_losses)
             weight_parts.append(weights)
 
-        completion_target = None
-        if "task_complete" in name_to_dim:
+        if completion_target is not None:
             completion_dim = name_to_dim["task_complete"]
-            completion_target = self._normalized_bool_mask(actions, completion_dim)
-            # Completion at step k is known from whether k+1 crosses the
-            # episode boundary. The final slot of a completely unpadded chunk
-            # has no k+1 observation, so exclude that single unknown label.
-            completion_valid = torch.ones_like(completion_target, dtype=torch.bool)
-            if action_is_pad is not None:
-                completion_valid[:, -1] = action_is_pad.to(device=actions.device, dtype=torch.bool)[:, -1]
+            completion_valid = valid_mask
             completion_weights = (
                 self._global_bool_weights("task_complete", completion_target, completion_valid) * bool_weight
             )

@@ -18,32 +18,50 @@ from torch import Tensor
 
 from lerobot.utils.constants import ACTION
 
-DATASET_ACTION_DIM = 16
-DATASET_B2_TWIST_SLICE = slice(1, 4)
+DATASET_ACTION_NAMES = (
+    "b2_vx",
+    "b2_vy",
+    "b2_omega_z",
+    "arm_teleop_inactive",
+    "arm_reset",
+    "height_invariant_ee_rot6d_col0_x",
+    "height_invariant_ee_rot6d_col0_y",
+    "height_invariant_ee_rot6d_col0_z",
+    "height_invariant_ee_rot6d_col1_x",
+    "height_invariant_ee_rot6d_col1_y",
+    "height_invariant_ee_rot6d_col1_z",
+    "height_invariant_ee_x",
+    "height_invariant_ee_y",
+    "height_invariant_ee_z",
+    "gripper_target",
+    "task_complete",
+)
+DATASET_ACTION_DIM = len(DATASET_ACTION_NAMES)
+DATASET_B2_TWIST_SLICE = slice(0, 3)
 B2_TRAJECTORY_NAMES = ("b2_local_x", "b2_local_y", "b2_local_yaw")
 B2_GLOBAL_POSE_STATE_NAMES = ("b2_position_x", "b2_position_y", "b2_yaw")
+ARM_TELEOP_INACTIVE_NAME = "arm_teleop_inactive"
 TASK_COMPLETE_NAME = "task_complete"
 
 
 def action_dataset_indices(
     *,
-    predict_b2_active: bool = False,
-    predict_arm_active: bool = False,
+    predict_arm_teleop_inactive: bool = True,
     predict_arm_reset: bool = True,
     predict_ee_pose: bool = True,
     predict_gripper: bool = True,
+    include_task_complete: bool = True,
 ) -> tuple[int, ...]:
-    indices: list[int] = []
-    if predict_b2_active:
-        indices.append(0)
-    indices.extend(range(1, 4))
-    if predict_arm_active:
-        indices.append(4)
+    indices: list[int] = [0, 1, 2]
+    if predict_arm_teleop_inactive:
+        indices.append(3)
     if predict_arm_reset:
-        indices.append(5)
+        indices.append(4)
     if predict_ee_pose:
-        indices.extend(range(6, 15))
+        indices.extend(range(5, 14))
     if predict_gripper:
+        indices.append(14)
+    if include_task_complete:
         indices.append(15)
     return tuple(indices)
 
@@ -52,12 +70,11 @@ def action_schema_kwargs(config: Any) -> dict[str, bool | str]:
     """Extract the persisted action-schema switches from a PI0.5 config."""
     return {
         "representation": config.b2_action_representation,
-        "predict_b2_active": config.action_predict_b2_active,
-        "predict_arm_active": config.action_predict_arm_active,
+        "predict_arm_teleop_inactive": config.action_predict_arm_teleop_inactive,
         "predict_arm_reset": config.action_predict_arm_reset,
         "predict_ee_pose": config.action_predict_ee_pose,
         "predict_gripper": config.action_predict_gripper,
-        "append_completion": config.action_predict_task_complete,
+        "include_task_complete": config.action_predict_task_complete,
     }
 
 
@@ -68,51 +85,21 @@ def action_sample_offsets(chunk_size: int, dataset_fps: float, control_frequency
     return [round(index * dataset_fps / control_frequency_hz) for index in range(chunk_size)]
 
 
-def action_label_multiplicity(episode_length: int, offsets: list[int]) -> Tensor:
+def action_label_multiplicity(
+    episode_length: int, offsets: list[int], *, num_start_frames: int | None = None
+) -> Tensor:
     """Count how often each native action appears as a valid chunk label."""
     multiplicity = torch.zeros(episode_length, dtype=torch.int64)
-    starts = torch.arange(episode_length, dtype=torch.int64)
+    if num_start_frames is None:
+        num_start_frames = episode_length
+    if not 0 <= num_start_frames <= episode_length:
+        raise ValueError(f"num_start_frames={num_start_frames} is outside [0, {episode_length}]")
+    starts = torch.arange(num_start_frames, dtype=torch.int64)
     for offset in offsets:
         targets = starts + offset
         targets = targets[targets < episode_length]
         multiplicity.scatter_add_(0, targets, torch.ones_like(targets))
     return multiplicity
-
-
-def task_complete_class_counts(
-    episode_lengths: list[int], chunk_size: int, offsets: list[int] | None = None
-) -> tuple[int, int]:
-    """Count known positive and negative completion labels produced by action chunks.
-
-    Every frame is a possible chunk start. ``task_complete`` becomes true at
-    the final valid action and remains true in right-padding. For a completely
-    unpadded chunk its last label is unknown (there is no next action in the
-    chunk), matching the validity mask used by PI0.5's gate-aware loss.
-    """
-    if chunk_size < 1:
-        raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
-    offsets = list(range(chunk_size)) if offsets is None else offsets
-    if len(offsets) != chunk_size:
-        raise ValueError(f"Expected {chunk_size} action offsets, got {len(offsets)}")
-
-    positive = 0
-    negative = 0
-    for length in episode_lengths:
-        if length < 1:
-            raise ValueError(f"Episode lengths must be >= 1, got {length}")
-        starts = torch.arange(length, dtype=torch.int64).unsqueeze(1)
-        targets = starts + torch.tensor(offsets, dtype=torch.int64).unsqueeze(0)
-        pad = targets >= length
-        complete = pad.clone()
-        if chunk_size > 1:
-            complete[:, :-1] = pad[:, 1:]
-        complete[:, -1] = pad[:, -1]
-        known = torch.ones_like(complete)
-        known[:, -1] = pad[:, -1]
-        positive += int((complete & known).sum())
-        negative += int((~complete & known).sum())
-
-    return positive, negative
 
 
 def _sinc_and_cosc(angle: Tensor) -> tuple[Tensor, Tensor]:
@@ -225,20 +212,6 @@ def differentiate_local_trajectory(trajectory: Tensor, dt: float) -> Tensor:
     return torch.stack((vx, vy, omega), dim=-1)
 
 
-def completion_from_padding(is_pad: Tensor) -> Tensor:
-    """Mark the last valid action and all post-episode padding as complete."""
-    pad = torch.as_tensor(is_pad, dtype=torch.bool)
-    if pad.ndim < 1:
-        raise ValueError(f"Expected padding mask with a time dimension, got {tuple(pad.shape)}")
-    complete = pad.clone()
-    if pad.shape[-1] > 1:
-        complete[..., :-1] = pad[..., 1:]
-    # When the final slot is valid we do not know whether the episode ends at
-    # the following (unloaded) step, so it must remain false.
-    complete[..., -1] = pad[..., -1]
-    return complete
-
-
 def encode_b2_action_chunk(
     action: Tensor,
     *,
@@ -246,18 +219,17 @@ def encode_b2_action_chunk(
     is_pad: Tensor | None = None,
     global_pose: Tensor | None = None,
     representation: str = "local_trajectory",
-    predict_b2_active: bool = False,
-    predict_arm_active: bool = False,
+    predict_arm_teleop_inactive: bool = True,
     predict_arm_reset: bool = True,
     predict_ee_pose: bool = True,
     predict_gripper: bool = True,
-    append_completion: bool = True,
+    include_task_complete: bool = True,
 ) -> Tensor:
-    """Convert the raw 16D dataset action into the compact model action.
+    """Convert the raw 16D action into the model action.
 
-    ``b2_active`` and ``arm_active`` are deliberately dropped. The three B2
-    twist dimensions are replaced by a local trajectory and ``task_complete``
-    is optionally appended, producing 15 model dimensions in the normal path.
+    The three B2 twist dimensions are replaced by a local trajectory. The
+    explicit ``arm_teleop_inactive`` and ``task_complete`` dataset labels are
+    retained; completion is never inferred from episode padding.
     """
     if action.ndim < 2 or action.shape[-1] != DATASET_ACTION_DIM:
         raise ValueError(
@@ -273,30 +245,22 @@ def encode_b2_action_chunk(
             )
 
     indices = action_dataset_indices(
-        predict_b2_active=predict_b2_active,
-        predict_arm_active=predict_arm_active,
+        predict_arm_teleop_inactive=predict_arm_teleop_inactive,
         predict_arm_reset=predict_arm_reset,
         predict_ee_pose=predict_ee_pose,
         predict_gripper=predict_gripper,
+        include_task_complete=include_task_complete,
     )
     result = action[..., indices].clone()
-    b2_start = int(predict_b2_active)
     if representation == "local_trajectory":
-        result[..., b2_start : b2_start + 3] = (
+        result[..., :3] = (
             global_pose_to_local_trajectory(global_pose, pad)
             if global_pose is not None
             else integrate_body_twist(action[..., DATASET_B2_TWIST_SLICE], dt, pad)
         )
     elif representation != "velocity":
         raise ValueError(f"Unknown B2 action representation: {representation!r}")
-    if not append_completion:
-        return result
-
-    if pad is None:
-        complete = torch.zeros(action.shape[:-1], dtype=action.dtype, device=action.device)
-    else:
-        complete = completion_from_padding(pad).to(device=action.device, dtype=action.dtype)
-    return torch.cat((result, complete.unsqueeze(-1)), dim=-1)
+    return result
 
 
 def decode_b2_action_chunk(
@@ -304,18 +268,13 @@ def decode_b2_action_chunk(
     *,
     dt: float,
     representation: str = "local_trajectory",
-    predict_b2_active: bool = False,
-    has_completion: bool = True,
 ) -> Tensor:
     """Replace the compact predicted trajectory with executable body twist."""
     if action.ndim < 2:
         raise ValueError(f"Expected an action chunk, got {tuple(action.shape)}")
     result = action.clone()
-    b2_start = int(predict_b2_active)
     if representation == "local_trajectory":
-        result[..., b2_start : b2_start + 3] = differentiate_local_trajectory(
-            action[..., b2_start : b2_start + 3], dt
-        )
+        result[..., :3] = differentiate_local_trajectory(action[..., :3], dt)
     elif representation != "velocity":
         raise ValueError(f"Unknown B2 action representation: {representation!r}")
     return result
@@ -325,17 +284,13 @@ def integrate_b2_execution_chunk(
     action: Tensor,
     *,
     dt: float,
-    predict_b2_active: bool = False,
     is_pad: Tensor | None = None,
 ) -> Tensor:
     """Convert a compact executable B2 twist chunk back to trajectory space."""
     if action.ndim < 2:
         raise ValueError(f"Expected a compact executable action chunk, got {tuple(action.shape)}")
     result = action.clone()
-    b2_start = int(predict_b2_active)
-    result[..., b2_start : b2_start + 3] = integrate_body_twist(
-        action[..., b2_start : b2_start + 3], dt, is_pad
-    )
+    result[..., :3] = integrate_body_twist(action[..., :3], dt, is_pad)
     return result
 
 
@@ -343,12 +298,11 @@ def b2_execution_action_names(
     dataset_names: list[str] | None,
     *,
     representation: str = "velocity",
-    predict_b2_active: bool = False,
-    predict_arm_active: bool = False,
+    predict_arm_teleop_inactive: bool = True,
     predict_arm_reset: bool = True,
     predict_ee_pose: bool = True,
     predict_gripper: bool = True,
-    append_completion: bool = True,
+    include_task_complete: bool = True,
 ) -> list[str] | None:
     del representation
     if dataset_names is None:
@@ -356,24 +310,20 @@ def b2_execution_action_names(
     if len(dataset_names) != DATASET_ACTION_DIM:
         raise ValueError(f"B2 compact action expects the 16D B2+Z1 schema, got {len(dataset_names)} names")
     indices = action_dataset_indices(
-        predict_b2_active=predict_b2_active,
-        predict_arm_active=predict_arm_active,
+        predict_arm_teleop_inactive=predict_arm_teleop_inactive,
         predict_arm_reset=predict_arm_reset,
         predict_ee_pose=predict_ee_pose,
         predict_gripper=predict_gripper,
+        include_task_complete=include_task_complete,
     )
-    names = [dataset_names[i] for i in indices]
-    if append_completion:
-        names.append(TASK_COMPLETE_NAME)
-    return names
+    return [dataset_names[i] for i in indices]
 
 
 def b2_trajectory_action_names(dataset_names: list[str] | None, **kwargs: Any) -> list[str] | None:
     names = b2_execution_action_names(dataset_names, **kwargs)
     if names is None:
         return None
-    b2_start = int(bool(kwargs.get("predict_b2_active", False)))
-    names[b2_start : b2_start + 3] = list(B2_TRAJECTORY_NAMES)
+    names[:3] = list(B2_TRAJECTORY_NAMES)
     return names
 
 
@@ -383,15 +333,14 @@ def make_b2_trajectory_stats(
     dt: float,
     chunk_size: int,
     representation: str = "local_trajectory",
-    predict_b2_active: bool = False,
-    predict_arm_active: bool = False,
+    predict_arm_teleop_inactive: bool = True,
     predict_arm_reset: bool = True,
     predict_ee_pose: bool = True,
     predict_gripper: bool = True,
-    append_completion: bool = True,
+    include_task_complete: bool = True,
     state_indices: tuple[int, ...] | None = None,
 ) -> dict[str, dict[str, Any]] | None:
-    """Build normalization stats for the compact 15D trajectory representation.
+    """Build normalization stats for the compact trajectory representation.
 
     Dataset statistics remain untouched on disk.  The trajectory bounds use the
     robust per-step velocity quantiles over the full chunk duration; x/y share
@@ -415,12 +364,16 @@ def make_b2_trajectory_stats(
     xy_scale = max(float(torch.linalg.vector_norm(velocity_extent[:2]).item() * duration), 1e-3)
     yaw_scale = max(float(velocity_extent[2].item() * duration), 1e-3)
     action_indices = action_dataset_indices(
-        predict_b2_active=predict_b2_active,
-        predict_arm_active=predict_arm_active,
+        predict_arm_teleop_inactive=predict_arm_teleop_inactive,
         predict_arm_reset=predict_arm_reset,
         predict_ee_pose=predict_ee_pose,
         predict_gripper=predict_gripper,
+        include_task_complete=include_task_complete,
     )
+    gripper_min = float(torch.as_tensor(action_stats.get("min", q01)).reshape(-1)[14])
+    gripper_max = float(torch.as_tensor(action_stats.get("max", q99)).reshape(-1)[14])
+    if gripper_max <= gripper_min:
+        raise ValueError("gripper_target must contain two distinct classes in dataset statistics")
 
     def converted(name: str, value: Any) -> Any:
         tensor = torch.as_tensor(value, dtype=torch.float32).reshape(-1).clone()
@@ -430,26 +383,36 @@ def make_b2_trajectory_stats(
             raise ValueError(f"Action stat {name!r} has {tensor.numel()} dims, expected 16")
         if representation == "local_trajectory" and name in {"q01", "min", "q10"}:
             tensor[DATASET_B2_TWIST_SLICE] = torch.tensor([-xy_scale, -xy_scale, -yaw_scale])
-            completion_value = 0.0
         elif representation == "local_trajectory" and name in {"q99", "max", "q90"}:
             tensor[DATASET_B2_TWIST_SLICE] = torch.tensor([xy_scale, xy_scale, yaw_scale])
-            completion_value = 1.0
         elif representation == "local_trajectory" and name == "std":
             tensor[DATASET_B2_TWIST_SLICE] = torch.tensor([xy_scale / 2, xy_scale / 2, yaw_scale / 2])
-            completion_value = 0.5
         elif representation == "local_trajectory":
             tensor[DATASET_B2_TWIST_SLICE] = 0.0
-            completion_value = 0.5 if name == "mean" else 0.0
-        else:
-            if name in {"q99", "max", "q90"}:
-                completion_value = 1.0
-            elif name in {"mean", "std"}:
-                completion_value = 0.5
-            else:
-                completion_value = 0.0
         tensor = tensor[list(action_indices)]
-        if append_completion:
-            tensor = torch.cat((tensor, tensor.new_tensor([completion_value])))
+        selected_names = [DATASET_ACTION_NAMES[index] for index in action_indices]
+        # Quantile normalization must remain well-defined even when a boolean is
+        # extremely imbalanced and both empirical quantiles collapse to one class.
+        positive_bool_names = {ARM_TELEOP_INACTIVE_NAME, "arm_reset", TASK_COMPLETE_NAME}
+        for index, selected_name in enumerate(selected_names):
+            if selected_name not in positive_bool_names:
+                continue
+            if name in {"q01", "min", "q10"}:
+                tensor[index] = 0.0
+            elif name in {"q99", "max", "q90"}:
+                tensor[index] = 1.0
+            elif name in {"mean", "std"}:
+                tensor[index] = 0.5
+        if "gripper_target" in selected_names:
+            index = selected_names.index("gripper_target")
+            if name in {"q01", "min", "q10"}:
+                tensor[index] = gripper_min
+            elif name in {"q99", "max", "q90"}:
+                tensor[index] = gripper_max
+            elif name == "mean":
+                tensor[index] = (gripper_min + gripper_max) / 2
+            elif name == "std":
+                tensor[index] = (gripper_max - gripper_min) / 2
         if isinstance(value, Tensor):
             return tensor.to(device=value.device, dtype=value.dtype)
         return tensor.numpy()

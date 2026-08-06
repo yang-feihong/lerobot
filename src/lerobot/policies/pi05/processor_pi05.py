@@ -65,10 +65,9 @@ class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
     # model control frequency and is persisted for inference.
     dt: float
     inverse: bool = False
-    append_task_complete: bool = True
+    include_task_complete: bool = True
     representation: str = "local_trajectory"
-    predict_b2_active: bool = False
-    predict_arm_active: bool = False
+    predict_arm_teleop_inactive: bool = True
     predict_arm_reset: bool = True
     predict_ee_pose: bool = True
     predict_gripper: bool = True
@@ -126,8 +125,6 @@ class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
                 action,
                 dt=self.dt,
                 representation=self.representation,
-                predict_b2_active=self.predict_b2_active,
-                has_completion=self.append_task_complete,
             )
         else:
             complementary = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
@@ -138,12 +135,11 @@ class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
                 is_pad=is_pad,
                 global_pose=global_pose,
                 representation=self.representation,
-                predict_b2_active=self.predict_b2_active,
-                predict_arm_active=self.predict_arm_active,
+                predict_arm_teleop_inactive=self.predict_arm_teleop_inactive,
                 predict_arm_reset=self.predict_arm_reset,
                 predict_ee_pose=self.predict_ee_pose,
                 predict_gripper=self.predict_gripper,
-                append_completion=self.append_task_complete,
+                include_task_complete=self.include_task_complete,
             )
         new_transition[TransitionKey.ACTION] = transformed
         return new_transition
@@ -157,10 +153,9 @@ class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
         return {
             "dt": self.dt,
             "inverse": self.inverse,
-            "append_task_complete": self.append_task_complete,
+            "include_task_complete": self.include_task_complete,
             "representation": self.representation,
-            "predict_b2_active": self.predict_b2_active,
-            "predict_arm_active": self.predict_arm_active,
+            "predict_arm_teleop_inactive": self.predict_arm_teleop_inactive,
             "predict_arm_reset": self.predict_arm_reset,
             "predict_ee_pose": self.predict_ee_pose,
             "predict_gripper": self.predict_gripper,
@@ -201,12 +196,11 @@ def reconcile_pi05_b2_trajectory_processors(
         state_history_length=config.mem_vit_num_frames if config.mem_vit_enabled else 1,
         keep_state_history=config.mem_vit_enabled,
         representation=config.b2_action_representation,
-        predict_b2_active=config.action_predict_b2_active,
-        predict_arm_active=config.action_predict_arm_active,
+        predict_arm_teleop_inactive=config.action_predict_arm_teleop_inactive,
         predict_arm_reset=config.action_predict_arm_reset,
         predict_ee_pose=config.action_predict_ee_pose,
         predict_gripper=config.action_predict_gripper,
-        append_task_complete=config.action_predict_task_complete,
+        include_task_complete=config.action_predict_task_complete,
     )
     steps = [
         desired_pre_step if isinstance(step, Pi05B2LocalTrajectoryProcessorStep) else step
@@ -223,8 +217,8 @@ def reconcile_pi05_b2_trajectory_processors(
         dt=config.b2_local_trajectory_dt,
         inverse=True,
         representation=config.b2_action_representation,
-        predict_b2_active=config.action_predict_b2_active,
-        append_task_complete=config.action_predict_task_complete,
+        predict_arm_teleop_inactive=config.action_predict_arm_teleop_inactive,
+        include_task_complete=config.action_predict_task_complete,
     )
     steps = [
         desired_post_step if isinstance(step, Pi05B2LocalTrajectoryProcessorStep) else step
@@ -382,12 +376,11 @@ def make_pi05_pre_post_processors(
                 state_history_length=config.mem_vit_num_frames if config.mem_vit_enabled else 1,
                 keep_state_history=config.mem_vit_enabled,
                 representation=config.b2_action_representation,
-                predict_b2_active=config.action_predict_b2_active,
-                predict_arm_active=config.action_predict_arm_active,
+                predict_arm_teleop_inactive=config.action_predict_arm_teleop_inactive,
                 predict_arm_reset=config.action_predict_arm_reset,
                 predict_ee_pose=config.action_predict_ee_pose,
                 predict_gripper=config.action_predict_gripper,
-                append_task_complete=config.action_predict_task_complete,
+                include_task_complete=config.action_predict_task_complete,
             ),
         )
 
@@ -405,8 +398,8 @@ def make_pi05_pre_post_processors(
                 dt=config.b2_local_trajectory_dt,
                 inverse=True,
                 representation=config.b2_action_representation,
-                predict_b2_active=config.action_predict_b2_active,
-                append_task_complete=config.action_predict_task_complete,
+                predict_arm_teleop_inactive=config.action_predict_arm_teleop_inactive,
+                include_task_complete=config.action_predict_task_complete,
             ),
         )
 

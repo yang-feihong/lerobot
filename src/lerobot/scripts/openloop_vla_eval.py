@@ -253,7 +253,7 @@ def _action_plot_y_limits(meta: LeRobotDatasetMetadata, action_names: list[str])
             if index is not None:
                 limits[index] = group_limits
 
-    set_group(["b2_active", "arm_active", "arm_reset"], (-0.1, 1.1))
+    set_group(["arm_teleop_inactive", "arm_reset", "task_complete"], (-0.1, 1.1))
 
     velocity_names = ["b2_vx", "b2_vy", "b2_omega_z"]
     velocity_indices = [name_to_index[name] for name in velocity_names if name in name_to_index]
@@ -675,18 +675,16 @@ def main() -> None:
 
         raw_limits = _action_plot_y_limits(meta, dataset_action_names)
         selected_indices = action_dataset_indices(
-            predict_b2_active=policy_cfg.action_predict_b2_active,
-            predict_arm_active=policy_cfg.action_predict_arm_active,
+            predict_arm_teleop_inactive=policy_cfg.action_predict_arm_teleop_inactive,
             predict_arm_reset=policy_cfg.action_predict_arm_reset,
             predict_ee_pose=policy_cfg.action_predict_ee_pose,
             predict_gripper=policy_cfg.action_predict_gripper,
+            include_task_complete=policy_cfg.action_predict_task_complete,
         )
         execution_limits = [raw_limits[i] for i in selected_indices]
-        if policy_cfg.action_predict_task_complete:
-            execution_limits.append((-0.1, 1.1))
         trajectory_q01 = np.asarray(trajectory_stats["q01"], dtype=np.float32)
         trajectory_q99 = np.asarray(trajectory_stats["q99"], dtype=np.float32)
-        b2_start = int(policy_cfg.action_predict_b2_active)
+        b2_start = 0
         trajectory_limits = [
             _padded_limits(float(trajectory_q01[i]), float(trajectory_q99[i]))
             for i in range(b2_start, b2_start + 3)
@@ -821,14 +819,11 @@ def main() -> None:
                     expert_trajectory_chunk,
                     dt=float(b2_trajectory_dt),
                     representation="local_trajectory",
-                    predict_b2_active=policy_cfg.action_predict_b2_active,
-                    has_completion=policy_cfg.action_predict_task_complete,
                 )
                 pred_chunk = pred_execution_chunk
                 pred_trajectory_chunk = integrate_b2_execution_chunk(
                     pred_execution_chunk,
                     dt=float(b2_trajectory_dt),
-                    predict_b2_active=policy_cfg.action_predict_b2_active,
                 )
             else:
                 expert_chunk = dataset_expert_chunk

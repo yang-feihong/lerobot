@@ -82,8 +82,7 @@ class PI05Config(PreTrainedConfig):
     state_use_b2_linear_velocity: bool = False
     state_use_b2_angular_velocity: bool = False
     b2_action_representation: str = "local_trajectory"  # "velocity" or "local_trajectory"
-    action_predict_b2_active: bool = False
-    action_predict_arm_active: bool = False
+    action_predict_arm_teleop_inactive: bool = True
     action_predict_arm_reset: bool = True
     action_predict_ee_pose: bool = True
     action_predict_gripper: bool = True
@@ -122,15 +121,16 @@ class PI05Config(PreTrainedConfig):
 
     # B2+Z1 VLA gate-aware action loss.
     #
-    # The raw dataset is 16D. The default switches above produce this compact
-    # 15D model schema; enabling/disabling groups updates names and indices at
+    # The raw dataset is 16D. The default switches above keep a 16D model
+    # schema; disabling optional groups updates names and indices at
     # runtime while keeping the same flow-matching head:
     #
     #   [0:3]    B2 local x, y, yaw     continuous, always supervised
-    #   [3]      arm_reset              bool/gate, class-balanced
-    #   [4:13]   EE rot6d + xyz         continuous, trained only when arm_reset=false
-    #   [13]     gripper_target         bool/gate, class-balanced
-    #   [14]     task_complete          bool/gate derived at load time from episode boundary
+    #   [3]      arm_teleop_inactive    bool/gate, class-balanced
+    #   [4]      arm_reset              bool/gate, class-balanced
+    #   [5:14]   EE rot6d + xyz         continuous, trained only when teleop is active and not reset
+    #   [14]     gripper_target         bool/gate, class-balanced
+    #   [15]     task_complete          explicit bool/gate, class-balanced
     #            Current B2+Z1 data stores gripper as two raw values (0 and a negative
     #            target position), so its active/event class lives on the negative side
     #            after quantile normalization. Override action_gripper_target_true_side
@@ -147,11 +147,15 @@ class PI05Config(PreTrainedConfig):
     # Every enabled bool uses the same fixed prior on every rank/microbatch.
     action_bool_true_fractions: dict[str, float] = field(default_factory=dict)
     action_gripper_target_true_side: str = "negative"  # "negative" or "positive"
+    # Keep a bounded number of chunk starts whose current input is already in
+    # the explicit completion tail. This teaches stable stopping without letting
+    # arbitrarily long post-task bag tails dominate training and validation.
+    task_complete_sample_tail_seconds: float | None = 2.0
 
     # B2 high-level action representation. The dataset remains 16D and stores
     # [vx, vy, omega_z]. At load time the configured groups are selected, B2
     # motion can stay as velocity or become a chunk-local SE(2) trajectory, and
-    # task_complete can be derived from the episode boundary. The postprocessor
+    # task_complete remains the dataset's explicit completion label. The postprocessor
     # converts local trajectories back into executable body twist when needed.
     # Resolved automatically as 1 / model control frequency by make_policy. It is persisted
     # in checkpoints so inference uses exactly the training discretization.
@@ -219,6 +223,8 @@ class PI05Config(PreTrainedConfig):
             raise ValueError("At least one state_use_* switch must be true")
         if self.action_bool_loss_weight <= 0:
             raise ValueError(f"action_bool_loss_weight must be > 0, got {self.action_bool_loss_weight}")
+        if self.task_complete_sample_tail_seconds is not None and self.task_complete_sample_tail_seconds < 0:
+            raise ValueError("task_complete_sample_tail_seconds must be >= 0 or None")
         invalid_bool_fractions = {
             name: fraction
             for name, fraction in self.action_bool_true_fractions.items()
@@ -410,8 +416,7 @@ class PI05Config(PreTrainedConfig):
                 "local_trajectory_reference": "current_body_frame",
                 "local_trajectory_samples": "interval_end_t_plus_1_through_t_plus_chunk_size",
                 "predict": {
-                    "b2_active": self.action_predict_b2_active,
-                    "arm_active": self.action_predict_arm_active,
+                    "arm_teleop_inactive": self.action_predict_arm_teleop_inactive,
                     "arm_reset": self.action_predict_arm_reset,
                     "ee_pose": self.action_predict_ee_pose,
                     "gripper": self.action_predict_gripper,
@@ -422,15 +427,14 @@ class PI05Config(PreTrainedConfig):
                     "threshold_domain": "normalized_model_action_before_unnormalization",
                     "postprocessed_threshold": "inverse_normalization_of_zero",
                     "true_side": {
-                        "b2_active": "positive",
-                        "arm_active": "positive",
+                        "arm_teleop_inactive": "positive",
                         "arm_reset": "positive",
                         "gripper_target": self.action_gripper_target_true_side,
                         "task_complete": "positive",
                     },
                 },
                 "task_complete_semantics": (
-                    "true_at_final_valid_action_and_after_episode_boundary"
+                    "explicit_true_in_the_post_task_tail_until_ros_bag_end"
                     if self.action_predict_task_complete
                     else None
                 ),

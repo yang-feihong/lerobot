@@ -303,18 +303,75 @@ def apply_task_variants_to_batch(
     return applied
 
 
+def resolve_task_complete_sampling(dataset, policy_cfg) -> tuple[list[int], dict[int, int]] | None:
+    """Cap post-completion chunk starts while retaining the full episode as label context."""
+    from lerobot.policies.pi05.b2_action_transform import DATASET_ACTION_NAMES, TASK_COMPLETE_NAME
+
+    action_names = dataset.meta.features.get(ACTION, {}).get("names") or []
+    if tuple(action_names) != DATASET_ACTION_NAMES:
+        return None
+    tail_seconds = getattr(policy_cfg, "task_complete_sample_tail_seconds", 2.0)
+    tail_frames = None if tail_seconds is None else int(np.ceil(float(tail_seconds) * dataset.meta.fps))
+    selected_episodes = set(dataset.episodes or range(dataset.num_episodes))
+    first_complete: dict[int, int] = {}
+    seen_incomplete_after_complete: set[int] = set()
+    dim = action_names.index(TASK_COMPLETE_NAME)
+    columns = dataset.hf_dataset.select_columns([ACTION, "episode_index", "frame_index"]).with_format("numpy")
+    for batch in columns.iter(batch_size=65_536):
+        actions = np.asarray(batch[ACTION])
+        episode_indices = np.asarray(batch["episode_index"], dtype=np.int64)
+        frame_indices = np.asarray(batch["frame_index"], dtype=np.int64)
+        complete = actions[:, dim] > 0
+        for episode_index, frame_index, is_complete in zip(
+            episode_indices, frame_indices, complete, strict=True
+        ):
+            episode_index = int(episode_index)
+            if episode_index not in selected_episodes:
+                continue
+            if is_complete:
+                first_complete.setdefault(episode_index, int(frame_index))
+            elif episode_index in first_complete:
+                seen_incomplete_after_complete.add(episode_index)
+    if seen_incomplete_after_complete:
+        raise ValueError(
+            "task_complete must be monotonic within every episode; false follows true in episodes "
+            f"{sorted(seen_incomplete_after_complete)[:10]}"
+        )
+    missing = sorted(selected_episodes - first_complete.keys())
+    if missing:
+        raise ValueError(
+            f"Every selected episode must contain an explicit task_complete tail; missing {missing[:10]}"
+        )
+
+    from_indices = [int(value) for value in dataset.meta.episodes["dataset_from_index"]]
+    original_to = [int(value) for value in dataset.meta.episodes["dataset_to_index"]]
+    capped_to = list(original_to)
+    start_counts: dict[int, int] = {}
+    for episode_index in selected_episodes:
+        episode_length = original_to[episode_index] - from_indices[episode_index]
+        count = (
+            episode_length
+            if tail_frames is None
+            else min(episode_length, first_complete[episode_index] + 1 + tail_frames)
+        )
+        start_counts[episode_index] = count
+        capped_to[episode_index] = from_indices[episode_index] + count
+    return capped_to, start_counts
+
+
 def configure_action_bool_balance(
-    cfg: TrainPipelineConfig, dataset
+    cfg: TrainPipelineConfig, dataset, start_counts: dict[int, int] | None = None
 ) -> dict[str, dict[str, int | float]] | None:
     """Resolve fixed class priors for every enabled boolean action from the train split."""
     policy_cfg = cfg.trainable_config
     action_names = dataset.meta.features.get(ACTION, {}).get("names") or []
-    if not {"b2_active", "b2_vx", "b2_vy", "b2_omega_z", "arm_active", "arm_reset"} <= set(action_names):
+    from lerobot.policies.pi05.b2_action_transform import DATASET_ACTION_NAMES
+
+    if tuple(action_names) != DATASET_ACTION_NAMES:
         return None
 
     enabled = {
-        "b2_active": bool(getattr(policy_cfg, "action_predict_b2_active", False)),
-        "arm_active": bool(getattr(policy_cfg, "action_predict_arm_active", False)),
+        "arm_teleop_inactive": bool(getattr(policy_cfg, "action_predict_arm_teleop_inactive", False)),
         "arm_reset": bool(getattr(policy_cfg, "action_predict_arm_reset", False)),
         "gripper_target": bool(getattr(policy_cfg, "action_predict_gripper", False)),
         "task_complete": bool(getattr(policy_cfg, "action_predict_task_complete", False)),
@@ -327,7 +384,6 @@ def configure_action_bool_balance(
     from lerobot.policies.pi05.b2_action_transform import (
         action_label_multiplicity,
         action_sample_offsets,
-        task_complete_class_counts,
     )
 
     episode_indices = dataset.episodes if dataset.episodes is not None else list(range(dataset.num_episodes))
@@ -344,15 +400,20 @@ def configure_action_bool_balance(
         control_frequency_hz,
     )
     episode_multiplicities = {
-        episode_index: action_label_multiplicity(length, offsets).numpy()
+        episode_index: action_label_multiplicity(
+            length,
+            offsets,
+            num_start_frames=None if start_counts is None else start_counts[episode_index],
+        ).numpy()
         for episode_index, length in zip(episode_indices, lengths, strict=True)
     }
-    counts: dict[str, list[int]] = {name: [0, 0] for name in enabled_names if name != "task_complete"}
+    counts: dict[str, list[int]] = {name: [0, 0] for name in enabled_names}
     if counts:
         missing_names = [name for name in counts if name not in action_names]
         if missing_names:
             raise ValueError(f"Enabled boolean actions are absent from the dataset: {missing_names}")
         action_indices = {name: action_names.index(name) for name in counts}
+        completion_dim = action_names.index("task_complete")
         columns = dataset.hf_dataset.select_columns([ACTION, "episode_index", "frame_index"]).with_format(
             "numpy"
         )
@@ -369,6 +430,9 @@ def configure_action_bool_balance(
                 count=len(frame_indices),
             )
             for name, dim in action_indices.items():
+                applicable = np.ones(len(actions), dtype=bool)
+                if name != "task_complete":
+                    applicable = actions[:, completion_dim] <= 0
                 if (
                     name == "gripper_target"
                     and getattr(policy_cfg, "action_gripper_target_true_side", "negative") == "negative"
@@ -376,13 +440,10 @@ def configure_action_bool_balance(
                     target_true = actions[:, dim] < 0
                 else:
                     target_true = actions[:, dim] > 0
-                positive = int(label_multiplicity[target_true].sum())
+                applicable_multiplicity = label_multiplicity[applicable]
+                positive = int(label_multiplicity[target_true & applicable].sum())
                 counts[name][0] += positive
-                counts[name][1] += int(label_multiplicity.sum()) - positive
-
-    if enabled["task_complete"]:
-        positive, negative = task_complete_class_counts(lengths, policy_cfg.chunk_size, offsets=offsets)
-        counts["task_complete"] = [positive, negative]
+                counts[name][1] += int(applicable_multiplicity.sum()) - positive
 
     stats: dict[str, dict[str, int | float]] = {}
     true_fractions: dict[str, float] = {}
@@ -514,7 +575,19 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
     task_variants = load_task_variants(dataset.root, cfg.dataset.task_variants_path)
-    action_bool_balance = configure_action_bool_balance(cfg, dataset)
+    completion_sampling = resolve_task_complete_sampling(dataset, cfg.trainable_config)
+    capped_train_to = completion_sampling[0] if completion_sampling is not None else None
+    train_start_counts = completion_sampling[1] if completion_sampling is not None else None
+    if is_main_process and train_start_counts is not None:
+        retained = sum(train_start_counts.values())
+        logging.info(
+            "Explicit task-completion sampling: retained %d chunk starts across %d train episodes "
+            "(post-completion input tail cap=%s seconds)",
+            retained,
+            len(train_start_counts),
+            cfg.trainable_config.task_complete_sample_tail_seconds,
+        )
+    action_bool_balance = configure_action_bool_balance(cfg, dataset, train_start_counts)
     if is_main_process and action_bool_balance is not None:
         for name, balance in action_bool_balance.items():
             logging.info(
@@ -787,7 +860,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         shuffle = False
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
+            capped_train_to or dataset.meta.episodes["dataset_to_index"],
             episode_indices_to_use=dataset.episodes,
             drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
             shuffle=True,
@@ -850,15 +923,31 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     eval_dataloader = None
     if eval_dataset is not None:
         eval_ds = eval_dataset
+        eval_completion_sampling = resolve_task_complete_sampling(eval_dataset, cfg.trainable_config)
+        eligible_eval_indices = None
+        if eval_completion_sampling is not None:
+            eligible_eval_indices = EpisodeAwareSampler(
+                eval_dataset.meta.episodes["dataset_from_index"],
+                eval_completion_sampling[0],
+                episode_indices_to_use=eval_dataset.episodes,
+                absolute_to_relative_idx=eval_dataset.absolute_to_relative_idx,
+            ).indices
         if cfg.max_eval_samples > 0 and hasattr(eval_dataset, "hf_dataset"):
             task_arr = eval_dataset.hf_dataset.data.column("task_index").to_numpy()
             unique_tasks = sorted(set(task_arr.tolist()))
             per_task = max(1, cfg.max_eval_samples // len(unique_tasks))
             selected: list[int] = []
             for t in unique_tasks:
-                frames = (task_arr == t).nonzero()[0][:per_task]
+                candidates = (
+                    np.asarray(eligible_eval_indices, dtype=np.int64)
+                    if eligible_eval_indices is not None
+                    else np.arange(len(task_arr))
+                )
+                frames = candidates[task_arr[candidates] == t][:per_task]
                 selected.extend(frames.tolist())
             eval_ds = torch.utils.data.Subset(eval_dataset, selected)
+        elif eligible_eval_indices is not None:
+            eval_ds = torch.utils.data.Subset(eval_dataset, eligible_eval_indices)
 
         eval_collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
         eval_dataloader = torch.utils.data.DataLoader(
