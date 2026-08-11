@@ -15,24 +15,29 @@ cd "$repo_root"
 #   2) a checkpoint step dir, e.g. .../checkpoints/012000
 #   3) a pretrained_model dir, e.g. .../checkpoints/012000/pretrained_model
 # If this is a run dir, the latest numeric checkpoint is used automatically.
-policy_path="/data/b2_z1_vla_pi05_outputs/pi05_b2_z1_vla_20260731_152045/checkpoints/025000"
+policy_path="/data/b2_z1_vla_pi05_outputs/pi05_b2_z1_vla_20260806_131138/checkpoints/004500"
 
 dataset_repo_id="local/b2_z1_vla"
 dataset_root="/data/b2_z1_vla_lerobot"
 
 eval_split="0.1"
 
-# Both sets are evaluated sequentially. Explicit episode selections are run in
-# full and replace their corresponding local output directories.
+# This checkpoint was trained with the first 327 episodes: 0-293 train and
+# 294-326 validation. Evaluate fixed representatives from those exact splits,
+# even if more episodes are appended to dataset_root later.
 train_episodes="0-3"
-eval_episodes="629-632"
+eval_episodes="294-297"
 
 # Number of complete episodes to evaluate. Set 0 for all selected episodes.
 max_episodes="4"
 # Set 0 to evaluate every frame through the end of each selected episode.
 max_frames_per_episode="0"
-# Set 0 to save one independent 50-step action-chunk plot for every inference frame.
+# Run one inference every N source frames.
+frame_stride="10"
+# Set 0 for no maximum; chunk_plot_stride below still controls sampling.
 max_chunk_plots_per_episode="0"
+# Save one independent 50-step plot every N inferences (5 × 10 = 50 source frames).
+chunk_plot_stride="5"
 
 # Use a single idle GPU if available. Use "cpu" only for tiny sanity checks.
 device="cuda"
@@ -42,7 +47,7 @@ batch_size="2"
 num_workers="2"
 plot_workers="8"
 
-output_root="/data/b2_z1_vla_openloop_eval"
+output_root="/data/b2_z1_vla_openloop_eval/pi05_b2_z1_vla_20260806_131138_004500"
 
 # =========================
 # Launch
@@ -51,7 +56,7 @@ output_root="/data/b2_z1_vla_openloop_eval"
 run_openloop() {
   local split="$1"
   local episodes="$2"
-  local output_dir="$output_root/new_action_025000_${split}"
+  local output_dir="$output_root/$split"
 
   # Each directory represents one complete run. Remove stale partial plots and
   # metrics before writing the replacement.
@@ -68,7 +73,9 @@ run_openloop() {
     --episodes "$episodes"
     --max-episodes "$max_episodes"
     --max-frames-per-episode "$max_frames_per_episode"
+    --frame-stride "$frame_stride"
     --max-chunk-plots-per-episode "$max_chunk_plots_per_episode"
+    --chunk-plot-stride "$chunk_plot_stride"
     --batch-size "$batch_size"
     --num-workers "$num_workers"
     --device "$device"

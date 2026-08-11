@@ -560,8 +560,15 @@ def make_policy(
         NotImplementedError: If attempting to use an unsupported policy-backend
                              combination (e.g., VQBeT with 'mps').
     """
-    if bool(ds_meta) == bool(env_cfg):
-        raise ValueError("Either one of a dataset metadata or a sim env must be provided.")
+    if ds_meta is not None and env_cfg is not None:
+        raise ValueError("Provide at most one of dataset metadata or a sim env.")
+    checkpoint_only = ds_meta is None and env_cfg is None
+    if checkpoint_only and (
+        not cfg.pretrained_path or not cfg.input_features or not cfg.output_features
+    ):
+        raise ValueError(
+            "Checkpoint-only policy loading requires pretrained_path and persisted input/output features."
+        )
 
     # NOTE: Currently, if you try to run vqbet with mps backend, you'll get this error.
     # TODO(aliberts, rcadene): Implement a check_backend_compatibility in policies?
@@ -579,7 +586,9 @@ def make_policy(
     policy_cls = get_policy_class(cfg.type)
 
     kwargs = {}
-    if ds_meta is not None:
+    if checkpoint_only:
+        features = {**cfg.input_features, **cfg.output_features}
+    elif ds_meta is not None:
         features = dataset_to_policy_features(ds_meta.features)
     else:
         if not cfg.pretrained_path:

@@ -61,13 +61,17 @@ from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 
+OBS_ACTION_HISTORY = "observation.action_history"
+
 
 class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
     state: Tensor | None
+    action_history: Tensor | None
     image_memory_masks: list[Tensor | None] | None
+    action_history_mask: Tensor | None
     state_memory_mask: Tensor | None
 
 
@@ -351,7 +355,15 @@ MEM_VIT_TEMPORAL_EVERY = 4
 MEM_VIT_USE_ORIGINAL_FOR_K1 = False
 
 
-def _mem_temporal_pos_emb(num_frames: int, dim: int, device, dtype):
+def _mem_temporal_pos_emb(
+    num_frames: int,
+    dim: int,
+    device,
+    dtype,
+    *,
+    step_scale: float = 1.0,
+    include_current: bool = True,
+):
     """Fixed sinusoidal temporal embedding for MEM-style memory tokens.
 
     Frame order is assumed to be:
@@ -363,8 +375,9 @@ def _mem_temporal_pos_emb(num_frames: int, dim: int, device, dtype):
     if dim % 2 != 0:
         raise ValueError(f"hidden dim must be even, got {dim}")
 
-    # For K=3: [-2, -1, 0], where 0 is the current frame.
-    pos = torch.arange(-(num_frames - 1), 1, device=device, dtype=torch.float32)
+    stop = 1 if include_current else 0
+    start = -(num_frames - 1) if include_current else -num_frames
+    pos = torch.arange(start, stop, device=device, dtype=torch.float32) * step_scale
 
     half = dim // 2
     freqs = torch.exp(
@@ -374,7 +387,8 @@ def _mem_temporal_pos_emb(num_frames: int, dim: int, device, dtype):
     emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
     # Make current frame t=0 exactly zero.
-    emb = emb - emb[-1:, :]
+    if include_current:
+        emb = emb - emb[-1:, :]
     return emb.to(dtype=dtype)
 
 
@@ -912,8 +926,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
-        if config.mem_vit_enabled:
+        if config.state_action_encoding == "continuous":
             self.state_memory_proj = nn.Linear(config.max_state_dim, paligemma_config.width)
+        if config.action_history_enabled:
+            self.action_memory_proj = nn.Linear(config.max_action_dim, paligemma_config.width)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -976,10 +992,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     def embed_state_memory(
         self, state: torch.Tensor | None, state_memory_mask: torch.Tensor | None = None
     ) -> torch.Tensor | None:
-        if not self.config.mem_vit_enabled:
+        if self.config.state_action_encoding != "continuous":
             return None
         if state is None:
-            raise ValueError("MEM-ViT PI05 requires observation.state for continuous state memory.")
+            raise ValueError("Continuous PI0.5 state encoding requires observation.state.")
         if state.ndim == 2:
             state = state[:, None, :]
         if state.ndim != 3:
@@ -990,10 +1006,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 f"State memory mask shape {tuple(state_memory_mask.shape)} does not match "
                 f"state window shape {tuple(state.shape[:2])}."
             )
-        if num_frames > self.config.mem_vit_num_frames:
+        if num_frames > self.config.state_num_frames:
             raise ValueError(
                 f"State memory has {num_frames} frames per sample, but "
-                f"configured max mem_vit_num_frames={self.config.mem_vit_num_frames}."
+                f"configured state_num_frames={self.config.state_num_frames}."
             )
 
         state = pad_vector(state, self.config.max_state_dim)
@@ -1009,8 +1025,48 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             state_emb.shape[-1],
             device=state_emb.device,
             dtype=state_emb.dtype,
+            step_scale=self.config.state_history_frame_interval_seconds,
         )
         return state_emb + temporal_emb[None, :, :]
+
+    def embed_action_memory(
+        self, action_history: torch.Tensor | None, action_history_mask: torch.Tensor | None = None
+    ) -> torch.Tensor | None:
+        if not self.config.action_history_enabled:
+            return None
+        if action_history is None:
+            raise ValueError(
+                "action_history_enabled=true requires observation.action_history. "
+                "Training obtains it from the dataset; deployment must provide previously executed actions."
+            )
+        if action_history.ndim == 2:
+            action_history = action_history[:, None, :]
+        if action_history.ndim != 3:
+            raise ValueError(
+                f"Expected action history as [B,K,D] or [B,D], got {tuple(action_history.shape)}"
+            )
+        num_frames = action_history.shape[1]
+        max_frames = self.config.state_num_frames - 1
+        if num_frames > max_frames:
+            raise ValueError(f"Action history has {num_frames} frames, configured maximum is {max_frames}.")
+        if action_history_mask is not None and action_history_mask.shape != action_history.shape[:2]:
+            raise ValueError(
+                f"Action history mask shape {tuple(action_history_mask.shape)} does not match "
+                f"history shape {tuple(action_history.shape[:2])}."
+            )
+        action_history = pad_vector(action_history, self.config.max_action_dim)
+        if self.action_memory_proj.weight.dtype == torch.float32:
+            action_history = action_history.to(torch.float32)
+        action_emb = self._apply_checkpoint(self.action_memory_proj, action_history)
+        temporal_emb = _mem_temporal_pos_emb(
+            num_frames,
+            action_emb.shape[-1],
+            device=action_emb.device,
+            dtype=action_emb.dtype,
+            step_scale=self.config.state_history_frame_interval_seconds,
+            include_current=False,
+        )
+        return action_emb + temporal_emb[None, :, :]
 
     def embed_prefix(
         self,
@@ -1019,8 +1075,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         tokens,
         masks,
         state: torch.Tensor | None = None,
+        action_history: torch.Tensor | None = None,
         image_memory_masks=None,
         state_memory_mask: torch.Tensor | None = None,
+        action_history_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
@@ -1055,6 +1113,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 state_memory_mask = state_memory_mask.to(device=state_emb.device, dtype=torch.bool)
             pad_masks.append(state_memory_mask)
             att_masks += [0] * num_state_tokens
+
+        action_memory_emb = self.embed_action_memory(action_history, action_history_mask=action_history_mask)
+        if action_memory_emb is not None:
+            bsize, num_action_tokens = action_memory_emb.shape[:2]
+            embs.append(action_memory_emb)
+            if action_history_mask is None:
+                action_history_mask = torch.ones(
+                    bsize, num_action_tokens, dtype=torch.bool, device=action_memory_emb.device
+                )
+            else:
+                action_history_mask = action_history_mask.to(
+                    device=action_memory_emb.device, dtype=torch.bool
+                )
+            pad_masks.append(action_history_mask)
+            att_masks += [0] * num_action_tokens
 
         # Process language tokens
         def lang_embed_func(tokens):
@@ -1134,8 +1207,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         noise,
         time,
         state=None,
+        action_history=None,
         image_memory_masks=None,
         state_memory_mask=None,
+        action_history_mask=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         time_expanded = time[:, None, None]
@@ -1148,8 +1223,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             tokens,
             masks,
             state,
+            action_history,
             image_memory_masks=image_memory_masks,
             state_memory_mask=state_memory_mask,
+            action_history_mask=action_history_mask,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
@@ -1221,16 +1298,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             noise = self.sample_noise(actions_shape, device)
 
         state = kwargs.get("state")
+        action_history = kwargs.get("action_history")
         image_memory_masks = kwargs.get("image_memory_masks")
         state_memory_mask = kwargs.get("state_memory_mask")
+        action_history_mask = kwargs.get("action_history_mask")
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images,
             img_masks,
             tokens,
             masks,
             state,
+            action_history,
             image_memory_masks=image_memory_masks,
             state_memory_mask=state_memory_mask,
+            action_history_mask=action_history_mask,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -1365,8 +1446,10 @@ class PI05Policy(PreTrainedPolicy):
             self.model.time_mlp_in,
             self.model.time_mlp_out,
         ]
-        if self.config.mem_vit_enabled:
+        if self.config.state_action_encoding == "continuous":
             full_train_modules.append(self.model.state_memory_proj)
+        if self.config.action_history_enabled:
+            full_train_modules.append(self.model.action_memory_proj)
         for module in full_train_modules:
             module.train()
             for param in module.parameters():
@@ -1483,7 +1566,12 @@ class PI05Policy(PreTrainedPolicy):
             # MEM mode adds a small continuous state-memory projection that is not present
             # in the base PI0.5 checkpoint, so allow those new parameters to initialize
             # from scratch while still reporting all missing/unexpected keys.
-            effective_strict = strict and not getattr(model.config, "mem_vit_enabled", False)
+            has_new_observation_modules = (
+                getattr(model.config, "mem_vit_enabled", False)
+                or getattr(model.config, "state_action_encoding", "text") == "continuous"
+                or getattr(model.config, "action_history_enabled", False)
+            )
+            effective_strict = strict and not has_new_observation_modules
             missing_keys, unexpected_keys = model.load_state_dict(
                 remapped_state_dict, strict=effective_strict
             )
@@ -1620,11 +1708,12 @@ class PI05Policy(PreTrainedPolicy):
             mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
             return 1, lengths, mask
 
-        state = batch.get(OBS_STATE)
-        if state is None:
-            raise ValueError("MEM-ViT PI05 requires observation.state for memory-window planning.")
-        batch_size = state.shape[0]
-        device = state.device
+        image_key = next((key for key in self.config.image_features if key in batch), None)
+        if image_key is None:
+            raise ValueError("MEM-ViT PI05 requires at least one configured image for window planning.")
+        image = batch[image_key]
+        batch_size = image.shape[0]
+        device = image.device
         max_frames = self.config.mem_vit_num_frames
 
         if randomize and self.config.mem_vit_min_num_frames is not None:
@@ -1633,13 +1722,13 @@ class PI05Policy(PreTrainedPolicy):
         else:
             target_lengths = torch.full((batch_size,), max_frames, dtype=torch.long, device=device)
 
-        if state.ndim < 3:
+        if image.ndim < 5:
             available_lengths = torch.ones(batch_size, dtype=torch.long, device=device)
         else:
-            available_lengths = torch.full((batch_size,), state.shape[1], dtype=torch.long, device=device)
-            state_pad = batch.get(f"{OBS_STATE}_is_pad")
-            if state_pad is not None:
-                available_lengths = (~state_pad.to(device=device).bool()).sum(dim=1)
+            available_lengths = torch.full((batch_size,), image.shape[1], dtype=torch.long, device=device)
+            image_pad = batch.get(f"{image_key}_is_pad")
+            if image_pad is not None:
+                available_lengths = (~image_pad.to(device=device).bool()).sum(dim=1)
 
         lengths = torch.minimum(target_lengths, available_lengths).clamp_min(1)
         window_num_frames = int(lengths.max().item())
@@ -1647,8 +1736,34 @@ class PI05Policy(PreTrainedPolicy):
         memory_mask = positions >= (window_num_frames - lengths[:, None])
         return window_num_frames, lengths, memory_mask
 
-    def _prepare_mem_state(self, batch: dict[str, Tensor], window_num_frames: int) -> Tensor | None:
-        if not self.config.mem_vit_enabled:
+    def _fixed_memory_window_plan(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        key: str,
+        max_frames: int,
+        allow_empty: bool = False,
+    ) -> tuple[int, Tensor, Tensor]:
+        value = batch.get(key)
+        if value is None:
+            raise ValueError(f"MEM input requires {key}.")
+        batch_size = value.shape[0]
+        device = value.device
+        available = torch.ones(batch_size, dtype=torch.long, device=device)
+        if value.ndim >= 3:
+            available.fill_(value.shape[1])
+            pad = batch.get(f"{key}_is_pad")
+            if pad is not None:
+                available = (~pad.to(device=device).bool()).sum(dim=1)
+        minimum = 0 if allow_empty else 1
+        lengths = available.clamp(min=minimum, max=max_frames)
+        window_num_frames = max(1, int(lengths.max().item()))
+        positions = torch.arange(window_num_frames, device=device)[None, :]
+        mask = positions >= (window_num_frames - lengths[:, None])
+        return window_num_frames, lengths, mask
+
+    def _prepare_state_history(self, batch: dict[str, Tensor], window_num_frames: int) -> Tensor | None:
+        if self.config.state_action_encoding != "continuous":
             return None
         state = batch[OBS_STATE]
         if state.ndim == 2:
@@ -1656,6 +1771,18 @@ class PI05Policy(PreTrainedPolicy):
         if state.ndim != 3:
             raise ValueError(f"Expected observation.state as [B,K,D] or [B,D], got {tuple(state.shape)}")
         return state[:, -window_num_frames:, :]
+
+    def _prepare_action_history(self, batch: dict[str, Tensor], window_num_frames: int) -> Tensor | None:
+        if not self.config.action_history_enabled:
+            return None
+        action_history = batch[OBS_ACTION_HISTORY]
+        if action_history.ndim == 2:
+            return action_history[:, None, :]
+        if action_history.ndim != 3:
+            raise ValueError(
+                f"Expected {OBS_ACTION_HISTORY} as [B,K,D] or [B,D], got {tuple(action_history.shape)}"
+            )
+        return action_history[:, -window_num_frames:, :]
 
     def _preprocess_images(
         self,
@@ -1939,7 +2066,7 @@ class PI05Policy(PreTrainedPolicy):
         if arm_reset is not None:
             ee_continuous_mask = ee_continuous_mask & ~arm_reset
         b2_names = (
-            ["b2_local_x", "b2_local_y", "b2_local_yaw"]
+            ["b2_delta_x", "b2_delta_y", "b2_delta_yaw"]
             if self.config.b2_action_representation == "local_trajectory"
             else ["b2_vx", "b2_vy", "b2_omega_z"]
         )
@@ -2040,6 +2167,15 @@ class PI05Policy(PreTrainedPolicy):
         mem_vit_window_num_frames, _mem_vit_lengths, mem_vit_memory_mask = self._mem_vit_window_plan(
             batch, randomize=False
         )
+        state_window_num_frames, _state_lengths, state_memory_mask = (
+            self._fixed_memory_window_plan(
+                batch,
+                key=OBS_STATE,
+                max_frames=self.config.state_num_frames,
+            )
+            if self.config.state_action_encoding == "continuous"
+            else (1, None, None)
+        )
         images, img_masks, image_memory_masks = self._preprocess_images(
             batch,
             mem_vit_window_num_frames=mem_vit_window_num_frames,
@@ -2048,10 +2184,20 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
+        if self.config.state_action_encoding == "continuous":
+            kwargs["state"] = self._prepare_state_history(batch, state_window_num_frames)
+            kwargs["state_memory_mask"] = state_memory_mask
         if self.config.mem_vit_enabled:
-            kwargs["state"] = self._prepare_mem_state(batch, mem_vit_window_num_frames)
             kwargs["image_memory_masks"] = image_memory_masks
-            kwargs["state_memory_mask"] = mem_vit_memory_mask
+        if self.config.action_history_enabled:
+            action_window, _action_lengths, action_mask = self._fixed_memory_window_plan(
+                batch,
+                key=OBS_ACTION_HISTORY,
+                max_frames=self.config.state_num_frames - 1,
+                allow_empty=True,
+            )
+            kwargs["action_history"] = self._prepare_action_history(batch, action_window)
+            kwargs["action_history_mask"] = action_mask
         actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
 
         # Unpad actions to actual action dimension
@@ -2073,6 +2219,15 @@ class PI05Policy(PreTrainedPolicy):
         mem_vit_window_num_frames, mem_vit_lengths, mem_vit_memory_mask = self._mem_vit_window_plan(
             batch, randomize=self.training
         )
+        state_window_num_frames, state_history_lengths, state_memory_mask = (
+            self._fixed_memory_window_plan(
+                batch,
+                key=OBS_STATE,
+                max_frames=self.config.state_num_frames,
+            )
+            if self.config.state_action_encoding == "continuous"
+            else (1, None, None)
+        )
         images, img_masks, image_memory_masks = self._preprocess_images(
             batch,
             mem_vit_window_num_frames=mem_vit_window_num_frames,
@@ -2081,7 +2236,18 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
-        state = self._prepare_mem_state(batch, mem_vit_window_num_frames)
+        state = self._prepare_state_history(batch, state_window_num_frames)
+        action_history = None
+        action_history_mask = None
+        action_history_lengths = None
+        if self.config.action_history_enabled:
+            action_window, action_history_lengths, action_history_mask = self._fixed_memory_window_plan(
+                batch,
+                key=OBS_ACTION_HISTORY,
+                max_frames=self.config.state_num_frames - 1,
+                allow_empty=True,
+            )
+            action_history = self._prepare_action_history(batch, action_window)
 
         noise = self.model.sample_noise(actions.shape, actions.device)
         time = self.model.sample_time(actions.shape[0], actions.device)
@@ -2096,8 +2262,10 @@ class PI05Policy(PreTrainedPolicy):
             noise,
             time,
             state=state,
+            action_history=action_history,
             image_memory_masks=image_memory_masks,
-            state_memory_mask=mem_vit_memory_mask,
+            state_memory_mask=state_memory_mask,
+            action_history_mask=action_history_mask,
         )
 
         # Truncate losses to actual action dimensions
@@ -2108,8 +2276,13 @@ class PI05Policy(PreTrainedPolicy):
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
         }
         if self.config.mem_vit_enabled:
-            loss_dict["mem_vit_num_frames"] = float(mem_vit_lengths.float().mean().item())
-            loss_dict["mem_vit_window_num_frames"] = float(mem_vit_window_num_frames)
+            loss_dict["mem_image_num_frames"] = float(mem_vit_lengths.float().mean().item())
+            loss_dict["mem_image_window_num_frames"] = float(mem_vit_window_num_frames)
+        if state_history_lengths is not None:
+            loss_dict["state_num_frames"] = float(state_history_lengths.float().mean().item())
+            loss_dict["state_window_num_frames"] = float(state_window_num_frames)
+        if action_history_lengths is not None:
+            loss_dict["action_history_num_frames"] = float(action_history_lengths.float().mean().item())
 
         if self._use_b2_z1_gate_action_loss(original_action_dim):
             loss, gate_loss_dict = self._b2_z1_gate_action_loss(
@@ -2152,8 +2325,10 @@ class PI05Policy(PreTrainedPolicy):
             "model.time_mlp_in",
             "model.time_mlp_out",
         ]
-        if self.config.mem_vit_enabled:
+        if self.config.state_action_encoding == "continuous":
             modules_to_save.append("model.state_memory_proj")
+        if self.config.action_history_enabled:
+            modules_to_save.append("model.action_memory_proj")
         peft_targets = {
             "target_modules": target_modules,
             "modules_to_save": modules_to_save,

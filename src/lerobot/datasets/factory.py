@@ -65,21 +65,52 @@ def resolve_delta_timestamps(
     def model_steps_to_dataset_timestamps(indices: list[int]) -> list[float]:
         return [round(index * dataset_fps / model_fps) / dataset_fps for index in indices]
 
+    def resolve_history_stride(interval_seconds: float | None, fallback: int, label: str) -> int:
+        if interval_seconds is None:
+            return fallback
+        exact_stride = float(interval_seconds) * dataset_fps
+        stride = max(1, round(exact_stride))
+        if abs(exact_stride - stride) > 1e-6:
+            logging.warning(
+                "%s interval %.6fs is not an integer number of %.3fHz dataset frames; "
+                "using %d frames (%.6fs).",
+                label,
+                interval_seconds,
+                dataset_fps,
+                stride,
+                stride / dataset_fps,
+            )
+        return stride
+
     mem_vit_enabled = bool(getattr(cfg, "mem_vit_enabled", False))
     mem_vit_num_frames = int(getattr(cfg, "mem_vit_num_frames", 1))
-    requested_mem_interval = getattr(cfg, "mem_vit_frame_interval_seconds", None)
-    if requested_mem_interval is not None:
-        mem_vit_frame_stride = max(1, round(float(requested_mem_interval) * dataset_fps))
-        if not bool(getattr(cfg, "io_schema_resolved", False)):
-            cfg.mem_vit_frame_stride = mem_vit_frame_stride
-    else:
-        mem_vit_frame_stride = int(getattr(cfg, "mem_vit_frame_stride", 1))
-    if mem_vit_enabled and mem_vit_num_frames > 1:
+    mem_vit_frame_stride = resolve_history_stride(
+        getattr(cfg, "mem_vit_frame_interval_seconds", None),
+        int(getattr(cfg, "mem_vit_frame_stride", 1)),
+        "MEM image",
+    )
+    continuous_state = getattr(cfg, "state_action_encoding", "text") == "continuous"
+    state_num_frames = int(getattr(cfg, "state_num_frames", 1))
+    state_history_frame_stride = resolve_history_stride(
+        getattr(cfg, "state_history_frame_interval_seconds", None),
+        int(getattr(cfg, "state_history_frame_stride", 1)),
+        "continuous state",
+    )
+    if not bool(getattr(cfg, "io_schema_resolved", False)):
+        cfg.mem_vit_frame_stride = mem_vit_frame_stride
+        cfg.state_history_frame_stride = state_history_frame_stride
+
+    if mem_vit_enabled:
         mem_vit_delta_indices = [-i * mem_vit_frame_stride for i in reversed(range(mem_vit_num_frames))]
         image_features = getattr(cfg, "image_features", {})
     else:
         mem_vit_delta_indices = None
         image_features = {}
+    state_history_delta_indices = (
+        [-i * state_history_frame_stride for i in reversed(range(state_num_frames))]
+        if continuous_state
+        else None
+    )
 
     global_pose_names = ("b2_position_x", "b2_position_y", "b2_yaw")
     state_names = ds_meta.features.get(OBS_STATE, {}).get("names")
@@ -92,7 +123,9 @@ def resolve_delta_timestamps(
         resolved_pose_indices = [state_names.index(name) for name in global_pose_names]
         if not bool(getattr(cfg, "io_schema_resolved", False)):
             cfg.b2_global_pose_state_indices = resolved_pose_indices
-        state_history_indices = mem_vit_delta_indices if mem_vit_delta_indices is not None else [0]
+        state_history_indices = (
+            state_history_delta_indices if state_history_delta_indices is not None else [0]
+        )
         # Layout consumed by the PI0.5 processor: history ending at the current
         # state, then one future state for every action in the chunk.
         state_delta_indices = state_history_indices + list(range(1, int(cfg.chunk_size) + 1))
@@ -101,13 +134,24 @@ def resolve_delta_timestamps(
             getattr(cfg, "io_schema_resolved", False)
         ):
             cfg.b2_global_pose_state_indices = None
-        state_delta_indices = mem_vit_delta_indices
+        state_delta_indices = state_history_delta_indices
 
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
         if key == ACTION and cfg.action_delta_indices is not None:
-            delta_timestamps[key] = model_steps_to_dataset_timestamps(cfg.action_delta_indices)
+            target_timestamps = model_steps_to_dataset_timestamps(cfg.action_delta_indices)
+            extra_target_timestamps = (
+                model_steps_to_dataset_timestamps([int(cfg.chunk_size)])
+                if getattr(cfg, "z1_action_representation", "ee_pose") == "ee_delta"
+                else []
+            )
+            if bool(getattr(cfg, "action_history_enabled", False)):
+                history_indices = state_history_delta_indices[:-1]
+                history_timestamps = [index / dataset_fps for index in history_indices]
+                delta_timestamps[key] = history_timestamps + target_timestamps + extra_target_timestamps
+            else:
+                delta_timestamps[key] = target_timestamps + extra_target_timestamps
         if state_delta_indices is not None and key == OBS_STATE:
             history_length = (
                 len(state_history_indices) if use_global_pose_trajectory else len(state_delta_indices)

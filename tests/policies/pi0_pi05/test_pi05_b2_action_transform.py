@@ -12,8 +12,10 @@ from lerobot.configs import PreTrainedConfig
 from lerobot.policies import factory as policy_factory
 from lerobot.policies.pi05.b2_action_transform import (
     DATASET_ACTION_NAMES,
+    absolute_ee_pose_to_delta,
     action_label_multiplicity,
     decode_b2_action_chunk,
+    ee_pose_delta_to_absolute,
     encode_b2_action_chunk,
     global_pose_to_local_trajectory,
     integrate_body_twist,
@@ -54,7 +56,7 @@ def test_body_twist_round_trip_with_rotating_frame_and_unwrapped_yaw():
     twist = torch.randn(2, 50, 3, dtype=torch.float64)
     twist[..., 2] = 1.2
     trajectory = integrate_body_twist(twist, dt=0.1)
-    assert torch.all(trajectory[..., -1, 2] > math.pi)
+    torch.testing.assert_close(trajectory[..., 2], torch.full((2, 50), 0.12, dtype=torch.float64))
     action = torch.zeros(2, 50, 16, dtype=torch.float64)
     action[..., :3] = trajectory
     decoded = decode_b2_action_chunk(action, dt=0.1)
@@ -68,7 +70,59 @@ def test_global_pose_trajectory_uses_current_body_frame_and_unwraps_yaw():
     trajectory = global_pose_to_local_trajectory(global_pose)
     expected_first_yaw = 2 * math.pi - 6.26
     assert trajectory[0, 0, 2].item() == pytest.approx(expected_first_yaw)
-    assert trajectory[0, 1, 2].item() == pytest.approx(expected_first_yaw + 0.1)
+    assert trajectory[0, 1, 2].item() == pytest.approx(0.1)
+
+
+def test_ee_delta_first_point_is_current_to_next_and_round_trips():
+    identity = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    poses = torch.zeros(1, 3, 9)
+    poses[..., :6] = identity
+    poses[0, :, 6:] = torch.tensor([[1.0, 2.0, 3.0], [1.1, 2.0, 3.0], [1.1, 2.2, 3.0]])
+    deltas = absolute_ee_pose_to_delta(poses[:, 1:], poses[:, 0])
+    torch.testing.assert_close(deltas[0, 0, 6:], torch.tensor([0.1, 0.0, 0.0]))
+    torch.testing.assert_close(deltas[0, 1, 6:], torch.tensor([0.0, 0.2, 0.0]))
+    torch.testing.assert_close(ee_pose_delta_to_absolute(deltas, poses[:, 0]), poses[:, 1:])
+
+
+def test_encode_ee_delta_uses_51_absolute_targets_for_50_deltas():
+    identity = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    action = torch.zeros(1, 51, 16)
+    action[..., 5:11] = identity
+    action[0, :, 11] = torch.arange(51, dtype=torch.float32) * 0.01
+    encoded = encode_b2_action_chunk(action, dt=0.02, representation="velocity", z1_representation="ee_delta")
+    assert encoded.shape == (1, 50, 16)
+    torch.testing.assert_close(encoded[0, :, 11], torch.full((50,), 0.01))
+
+
+def test_velocity_mode_uses_dataset_command_even_when_odom_is_available():
+    action = torch.zeros(1, 2, 16)
+    action[..., :3] = torch.tensor([0.4, -0.2, 0.3])
+    global_pose = torch.tensor([[[0.0, 0.0, 0.0], [9.0, 8.0, 0.7], [7.0, 6.0, 1.2]]])
+    encoded = encode_b2_action_chunk(
+        action,
+        dt=0.02,
+        global_pose=global_pose,
+        representation="velocity",
+    )
+    torch.testing.assert_close(encoded[..., :3], action[..., :3])
+
+
+def test_ee_delta_padding_requires_both_adjacent_targets():
+    identity = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    action = torch.zeros(1, 3, 16)
+    action[..., 5:11] = identity
+    transition = {
+        TransitionKey.ACTION: action,
+        TransitionKey.COMPLEMENTARY_DATA: {f"{ACTION}_is_pad": torch.tensor([[False, False, True]])},
+    }
+    step = Pi05B2LocalTrajectoryProcessorStep(
+        dt=0.02,
+        representation="velocity",
+        z1_representation="ee_delta",
+    )
+    transformed = step(transition)
+    assert transformed[TransitionKey.ACTION].shape[-2] == 2
+    assert transformed[TransitionKey.COMPLEMENTARY_DATA][f"{ACTION}_is_pad"].tolist() == [[False, True]]
 
 
 def test_new_action_schema_retains_explicit_gates_and_completion():
@@ -104,7 +158,7 @@ def test_processor_uses_new_schema_without_mutating_raw_transition():
     step = Pi05B2LocalTrajectoryProcessorStep(dt=0.1, state_indices=(0, 12, 37, 38, 39))
     transformed = step(transition)
     assert transformed[TransitionKey.ACTION].shape == (1, 2, 16)
-    torch.testing.assert_close(transformed[TransitionKey.ACTION][0, :, 0], torch.tensor([0.1, 0.2]))
+    torch.testing.assert_close(transformed[TransitionKey.ACTION][0, :, 0], torch.tensor([0.1, 0.1]))
     torch.testing.assert_close(transformed[TransitionKey.ACTION][..., 3], action[..., 3])
     torch.testing.assert_close(transformed[TransitionKey.ACTION][..., 15], action[..., 15])
     assert transition[TransitionKey.OBSERVATION][OBS_STATE].shape == (1, 49)
@@ -227,7 +281,7 @@ def test_all_boolean_priors_use_capped_starts_and_ignore_post_completion_control
 def test_gate_loss_uses_inactive_reset_and_completion_ground_truth_masks():
     policy = PI05Policy.__new__(PI05Policy)
     torch.nn.Module.__init__(policy)
-    names = ["b2_local_x", "b2_local_y", "b2_local_yaw", *DATASET_ACTION_NAMES[3:]]
+    names = ["b2_delta_x", "b2_delta_y", "b2_delta_yaw", *DATASET_ACTION_NAMES[3:]]
     policy.config = SimpleNamespace(
         action_bool_loss_weight=4.0,
         action_continuous_loss_weight=1.0,
@@ -256,7 +310,7 @@ def test_gate_loss_uses_inactive_reset_and_completion_ground_truth_masks():
 def test_disabling_inactive_prediction_removes_its_output_and_ee_mask():
     policy = PI05Policy.__new__(PI05Policy)
     torch.nn.Module.__init__(policy)
-    names = ["b2_local_x", "b2_local_y", "b2_local_yaw", *DATASET_ACTION_NAMES[4:]]
+    names = ["b2_delta_x", "b2_delta_y", "b2_delta_yaw", *DATASET_ACTION_NAMES[4:]]
     policy.config = SimpleNamespace(
         action_bool_loss_weight=4.0,
         action_continuous_loss_weight=1.0,
@@ -315,7 +369,7 @@ def test_checkpoint_metadata_describes_explicit_completion_protocol(tmp_path):
     config.resolved_state_feature_names = _state_names()[:6]
     config.state_feature_indices = list(range(6))
     config.dataset_action_feature_names = list(DATASET_ACTION_NAMES)
-    config.action_feature_names = ["b2_local_x", "b2_local_y", "b2_local_yaw", *DATASET_ACTION_NAMES[3:]]
+    config.action_feature_names = ["b2_delta_x", "b2_delta_y", "b2_delta_yaw", *DATASET_ACTION_NAMES[3:]]
     config._save_pretrained(tmp_path)
     metadata = json.loads((tmp_path / "pi05_deployment_metadata.json").read_text())
     assert metadata["action"]["predict"]["arm_teleop_inactive"] is True

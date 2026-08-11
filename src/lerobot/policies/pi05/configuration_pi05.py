@@ -82,6 +82,7 @@ class PI05Config(PreTrainedConfig):
     state_use_b2_linear_velocity: bool = False
     state_use_b2_angular_velocity: bool = False
     b2_action_representation: str = "local_trajectory"  # "velocity" or "local_trajectory"
+    z1_action_representation: str = "ee_pose"  # "ee_pose" or "ee_delta"
     action_predict_arm_teleop_inactive: bool = True
     action_predict_arm_reset: bool = True
     action_predict_ee_pose: bool = True
@@ -167,7 +168,7 @@ class PI05Config(PreTrainedConfig):
     # MEM-ViT settings. Passing mem_vit_checkpoint also enables MEM-ViT.
     mem_vit_enabled: bool = False
     mem_vit_checkpoint: str | None = None
-    mem_vit_num_frames: int = 1
+    mem_vit_num_frames: int = 6
     mem_vit_min_num_frames: int | None = None
     mem_vit_max_num_frames: int | None = None
     mem_vit_frame_stride: int = 1
@@ -176,6 +177,11 @@ class PI05Config(PreTrainedConfig):
     mem_vit_frame_interval_seconds: float | None = 0.5
     mem_vit_temporal_every: int = 4
     mem_vit_use_original_for_k1: bool = True
+    state_action_encoding: str = "text"
+    state_num_frames: int = 13
+    state_history_frame_stride: int = 1
+    state_history_frame_interval_seconds: float = 0.04
+    action_history_enabled: bool = False
 
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
@@ -218,6 +224,11 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 "b2_action_representation must be 'velocity' or 'local_trajectory', got "
                 f"{self.b2_action_representation!r}"
+            )
+        if self.z1_action_representation not in ["ee_pose", "ee_delta"]:
+            raise ValueError(
+                "z1_action_representation must be 'ee_pose' or 'ee_delta', got "
+                f"{self.z1_action_representation!r}"
             )
         if not any(self.state_feature_switches().values()):
             raise ValueError("At least one state_use_* switch must be true")
@@ -279,6 +290,25 @@ class PI05Config(PreTrainedConfig):
             )
         if self.mem_vit_temporal_every < 1:
             raise ValueError(f"mem_vit_temporal_every must be >= 1, got {self.mem_vit_temporal_every}")
+        if self.state_action_encoding not in {"text", "continuous"}:
+            raise ValueError(
+                f"state_action_encoding must be 'text' or 'continuous', got {self.state_action_encoding!r}"
+            )
+        if self.state_num_frames < 1:
+            raise ValueError(f"state_num_frames must be >= 1, got {self.state_num_frames}")
+        if self.state_history_frame_stride < 1:
+            raise ValueError(
+                f"state_history_frame_stride must be >= 1, got {self.state_history_frame_stride}"
+            )
+        if self.state_history_frame_interval_seconds <= 0:
+            raise ValueError(
+                "state_history_frame_interval_seconds must be positive, got "
+                f"{self.state_history_frame_interval_seconds}"
+            )
+        if self.action_history_enabled and self.state_action_encoding != "continuous":
+            raise ValueError("action_history_enabled requires state_action_encoding='continuous'")
+        if self.action_history_enabled and self.state_num_frames < 2:
+            raise ValueError("action_history_enabled requires state_num_frames >= 2")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
@@ -333,7 +363,9 @@ class PI05Config(PreTrainedConfig):
         """Return the complete, versioned deployment contract for this checkpoint."""
         control_hz = self.control_frequency_hz
         action_dt = None if control_hz is None else 1.0 / control_hz
-        history_interval = self.mem_vit_frame_interval_seconds if self.mem_vit_enabled else None
+        image_history_interval = self.mem_vit_frame_interval_seconds if self.mem_vit_enabled else None
+        continuous_state = self.state_action_encoding == "continuous"
+        state_history_interval = self.state_history_frame_interval_seconds if continuous_state else None
         min_history_frames = (
             self.mem_vit_min_num_frames
             if self.mem_vit_min_num_frames is not None
@@ -361,7 +393,7 @@ class PI05Config(PreTrainedConfig):
         }
         return {
             "format": "lerobot.pi05.deployment",
-            "version": 1,
+            "version": 4,
             "policy": {
                 "type": self.type,
                 "paligemma_variant": self.paligemma_variant,
@@ -386,20 +418,20 @@ class PI05Config(PreTrainedConfig):
             },
             "observation": {
                 "camera_keys_in_model_order": list(self.image_features),
-                "dataset_camera_keys": self.dataset_camera_keys,
                 "image_features": image_features,
                 "state": {
-                    "dataset_names": self.dataset_state_feature_names,
+                    "source_names": self.dataset_state_feature_names,
                     "switches": self.state_feature_switches(),
                     "selected_names": self.resolved_state_feature_names,
                     "selected_indices": self.state_feature_indices,
-                    "encoding": "continuous_memory_tokens" if self.mem_vit_enabled else "text_tokens",
+                    "encoding": ("continuous_memory_tokens" if continuous_state else "text_tokens"),
                 },
             },
             "action": {
-                "dataset_names": self.dataset_action_feature_names,
+                "source_names": self.dataset_action_feature_names,
                 "model_names": self.action_feature_names,
                 "representation": self.b2_action_representation,
+                "z1_representation": self.z1_action_representation,
                 "trajectory_source": (
                     "global_pose_transform"
                     if self.b2_global_pose_state_indices is not None
@@ -413,8 +445,13 @@ class PI05Config(PreTrainedConfig):
                     else None
                 ),
                 "global_pose_state_indices": self.b2_global_pose_state_indices,
-                "local_trajectory_reference": "current_body_frame",
-                "local_trajectory_samples": "interval_end_t_plus_1_through_t_plus_chunk_size",
+                "local_trajectory_reference": "previous_odom_pose_for_each_step",
+                "local_trajectory_samples": "se2_increment_t_to_t_plus_1_through_t_plus_chunk_size",
+                "ee_delta_reference": (
+                    "previous_operator_ee_target_for_each_step"
+                    if self.z1_action_representation == "ee_delta"
+                    else None
+                ),
                 "predict": {
                     "arm_teleop_inactive": self.action_predict_arm_teleop_inactive,
                     "arm_reset": self.action_predict_arm_reset,
@@ -444,7 +481,7 @@ class PI05Config(PreTrainedConfig):
                     else None
                 ),
                 "local_trajectory_deployment_decode": (
-                    "se2_finite_difference_to_body_twist"
+                    "se2_log_per_increment_to_body_twist"
                     if self.b2_action_representation == "local_trajectory"
                     else None
                 ),
@@ -452,23 +489,61 @@ class PI05Config(PreTrainedConfig):
                 "relative_exclude_joints": self.relative_exclude_joints,
             },
             "memory": {
-                "enabled": self.mem_vit_enabled,
-                "history_length_mode": (
-                    "random_uniform_integer" if self.mem_vit_min_num_frames is not None else "fixed"
-                ),
-                "fixed_num_frames": (
-                    self.mem_vit_num_frames if self.mem_vit_min_num_frames is None else None
-                ),
-                "min_num_frames": min_history_frames,
-                "max_num_frames": max_history_frames,
-                "frame_interval_seconds": history_interval,
+                "enabled": self.mem_vit_enabled or continuous_state or self.action_history_enabled,
+                "state_action_encoding": self.state_action_encoding,
+                "image": {
+                    "enabled": self.mem_vit_enabled,
+                    "sampling_frequency_hz": (
+                        None if image_history_interval is None else 1.0 / image_history_interval
+                    ),
+                    "history_length_mode": (
+                        "random_uniform_integer" if self.mem_vit_min_num_frames is not None else "fixed"
+                    ),
+                    "fixed_num_frames": (
+                        self.mem_vit_num_frames if self.mem_vit_min_num_frames is None else None
+                    ),
+                    "min_num_frames": min_history_frames,
+                    "max_num_frames": max_history_frames,
+                    "frame_interval_seconds": image_history_interval,
+                    "min_history_span_seconds": (
+                        None
+                        if image_history_interval is None
+                        else (min_history_frames - 1) * image_history_interval
+                    ),
+                    "max_history_span_seconds": (
+                        None
+                        if image_history_interval is None
+                        else (max_history_frames - 1) * image_history_interval
+                    ),
+                },
+                "state": {
+                    "enabled": continuous_state,
+                    "sampling_frequency_hz": (
+                        None if state_history_interval is None else 1.0 / state_history_interval
+                    ),
+                    "num_frames": self.state_num_frames if continuous_state else None,
+                    "frame_interval_seconds": state_history_interval,
+                    "history_span_seconds": (
+                        None
+                        if state_history_interval is None
+                        else (self.state_num_frames - 1) * state_history_interval
+                    ),
+                },
+                "action_history": {
+                    "enabled": self.action_history_enabled,
+                    "shares_state_sampling_clock": True,
+                    "num_strictly_past_frames": (
+                        self.state_num_frames - 1 if self.action_history_enabled else 0
+                    ),
+                    "frame_interval_seconds": (
+                        state_history_interval if self.action_history_enabled else None
+                    ),
+                    "source_representation": (
+                        "dataset_executed_command" if self.action_history_enabled else None
+                    ),
+                    "includes_current_supervision": False,
+                },
                 "deployment_sampling_clock": "physical_time_before_current_observation",
-                "min_history_span_seconds": (
-                    None if history_interval is None else (min_history_frames - 1) * history_interval
-                ),
-                "max_history_span_seconds": (
-                    None if history_interval is None else (max_history_frames - 1) * history_interval
-                ),
                 "episode_start_policy": "truncate_to_available_history_with_mask",
                 "temporal_attention_every_layers": self.mem_vit_temporal_every,
                 "use_original_vit_for_k1": self.mem_vit_use_original_for_k1,

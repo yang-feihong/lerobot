@@ -23,6 +23,7 @@ state_use_b2_trunk_pose="true"
 state_use_b2_linear_velocity="false"
 state_use_b2_angular_velocity="false"
 b2_action_representation="local_trajectory" # "velocity" or "local_trajectory"
+z1_action_representation="ee_pose" # "ee_pose" or "ee_delta"
 predict_arm_teleop_inactive="true"
 predict_arm_reset="true"
 predict_ee_pose="true"
@@ -99,9 +100,15 @@ mem_vit_checkpoint="/data/mem_vit_distill_outputs/mem_vit_distill_20260716_14270
 mem_fixed_num_frames="6"
 mem_random_min_num_frames=""
 mem_random_max_num_frames=""
-# Sample one MEM history frame every 0.5 seconds. The loader converts this
-# physical interval to dataset rows (25 rows for a 50 Hz dataset).
+# MEM image sampling interval in seconds.
 mem_frame_interval_seconds="0.5"
+# "text": current state in the prompt; "continuous": linear state-history tokens.
+state_action_encoding="continuous"
+# With 50 Hz data, 13 samples at 0.04 s intervals cover 0.48 s.
+state_num_frames="13"
+state_history_frame_interval_seconds="0.04"
+# Uses the state-history clock and excludes the current action.
+action_history_enabled="true"
 
 # =========================
 # Launch
@@ -152,6 +159,7 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.state_use_b2_linear_velocity="$state_use_b2_linear_velocity"
     --policy.state_use_b2_angular_velocity="$state_use_b2_angular_velocity"
     --policy.b2_action_representation="$b2_action_representation"
+    --policy.z1_action_representation="$z1_action_representation"
     --policy.action_predict_arm_teleop_inactive="$predict_arm_teleop_inactive"
     --policy.action_predict_arm_reset="$predict_arm_reset"
     --policy.action_predict_ee_pose="$predict_ee_pose"
@@ -165,7 +173,7 @@ if [[ -z "$resume_checkpoint" ]]; then
 fi
 
 policy_mem_args=()
-if [[ "$enable_mem" == "true" ]]; then
+if [[ "$enable_mem" == "true" && -z "$resume_checkpoint" ]]; then
   if [[ ! -f "$mem_vit_checkpoint" ]]; then
     echo "MEM ViT checkpoint not found: $mem_vit_checkpoint" >&2
     exit 1
@@ -182,6 +190,16 @@ if [[ "$enable_mem" == "true" ]]; then
   else
     policy_mem_args+=(--policy.mem_vit_num_frames="$mem_fixed_num_frames")
   fi
+fi
+
+policy_history_args=()
+if [[ -z "$resume_checkpoint" ]]; then
+  policy_history_args+=(
+    --policy.state_action_encoding="$state_action_encoding"
+    --policy.state_num_frames="$state_num_frames"
+    --policy.state_history_frame_interval_seconds="$state_history_frame_interval_seconds"
+    --policy.action_history_enabled="$action_history_enabled"
+  )
 fi
 
 peft_args=()
@@ -254,6 +272,7 @@ train_args=(
   --policy.gradient_checkpointing=true \
   --policy.train_expert_only="$train_expert_only" \
   "${policy_mem_args[@]}" \
+  "${policy_history_args[@]}" \
   --policy.push_to_hub=false \
   "${peft_args[@]}" \
   --output_dir="$output_dir" \

@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -21,7 +23,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from lerobot.configs import PipelineFeatureType, PolicyFeature
+from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
@@ -48,12 +50,114 @@ from lerobot.utils.constants import (
 )
 
 from .b2_action_transform import (
+    action_dataset_indices,
     action_schema_kwargs,
     decode_b2_action_chunk,
     encode_b2_action_chunk,
     make_b2_trajectory_stats,
 )
 from .configuration_pi05 import PI05Config
+
+OBS_ACTION_HISTORY = "observation.action_history"
+
+
+def _selected_action_history_stats(
+    dataset_stats: dict[str, dict[str, Any]] | None, indices: tuple[int, ...]
+) -> dict[str, dict[str, Any]] | None:
+    if dataset_stats is None or ACTION not in dataset_stats:
+        return None
+    selected: dict[str, Any] = {}
+    for name, value in dataset_stats[ACTION].items():
+        tensor = torch.as_tensor(value)
+        if tensor.ndim > 0 and tensor.shape[-1] == 16:
+            converted = tensor[..., list(indices)]
+            selected[name] = converted if isinstance(value, torch.Tensor) else converted.cpu().numpy()
+        else:
+            selected[name] = deepcopy(value)
+    return {OBS_ACTION_HISTORY: selected}
+
+
+def _action_history_steps(
+    config: PI05Config, dataset_stats: dict[str, dict[str, Any]] | None
+) -> tuple[Pi05SplitActionHistoryProcessorStep, NormalizerProcessorStep | None] | tuple[()]:
+    needs_reference = config.z1_action_representation == "ee_delta"
+    if not config.action_history_enabled and not needs_reference:
+        return ()
+    indices = action_dataset_indices(
+        **{
+            key: value
+            for key, value in action_schema_kwargs(config).items()
+            if key not in {"representation", "z1_representation"}
+        }
+    )
+    history_length = config.state_num_frames - 1 if config.action_history_enabled else 0
+    split = Pi05SplitActionHistoryProcessorStep(
+        history_length=history_length,
+        target_length=config.chunk_size + int(needs_reference),
+        action_indices=indices,
+    )
+    if not config.action_history_enabled:
+        return split, None
+    action_mode = config.normalization_mapping.get(
+        FeatureType.ACTION, config.normalization_mapping.get("ACTION")
+    )
+    normalizer = NormalizerProcessorStep(
+        features={OBS_ACTION_HISTORY: PolicyFeature(type=FeatureType.STATE, shape=(len(indices),))},
+        norm_map={FeatureType.STATE: action_mode},
+        stats=_selected_action_history_stats(dataset_stats, indices),
+        normalize_observation_keys={OBS_ACTION_HISTORY},
+    )
+    return split, normalizer
+
+
+@ProcessorStepRegistry.register(name="pi05_split_action_history_processor")
+@dataclass
+class Pi05SplitActionHistoryProcessorStep(ProcessorStep):
+    history_length: int
+    target_length: int
+    action_indices: tuple[int, ...]
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        action = transition.get(TransitionKey.ACTION)
+        if action is None:
+            return transition
+        if not isinstance(action, torch.Tensor):
+            raise ValueError(f"Action history expects a tensor action, got {type(action)}")
+        expected = self.history_length + self.target_length
+        if action.ndim < 2 or action.shape[-2] != expected:
+            raise ValueError(
+                f"Expected {expected} action samples ({self.history_length} history + "
+                f"{self.target_length} targets), got {tuple(action.shape)}"
+            )
+
+        new_transition = transition.copy()
+        if self.history_length:
+            observations = dict(new_transition.get(TransitionKey.OBSERVATION, {}) or {})
+            observations[OBS_ACTION_HISTORY] = action[..., : self.history_length, list(self.action_indices)]
+            new_transition[TransitionKey.OBSERVATION] = observations
+        new_transition[TransitionKey.ACTION] = action[..., self.history_length :, :]
+
+        complementary = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {})
+        pad_key = f"{ACTION}_is_pad"
+        if pad_key in complementary:
+            combined_pad = complementary[pad_key]
+            if self.history_length:
+                complementary[f"{OBS_ACTION_HISTORY}_is_pad"] = combined_pad[..., : self.history_length]
+            complementary[pad_key] = combined_pad[..., self.history_length :]
+        new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary
+        return new_transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "history_length": self.history_length,
+            "target_length": self.target_length,
+            "action_indices": list(self.action_indices),
+        }
 
 
 @ProcessorStepRegistry.register(name="pi05_b2_local_trajectory_processor")
@@ -67,6 +171,7 @@ class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
     inverse: bool = False
     include_task_complete: bool = True
     representation: str = "local_trajectory"
+    z1_representation: str = "ee_pose"
     predict_arm_teleop_inactive: bool = True
     predict_arm_reset: bool = True
     predict_ee_pose: bool = True
@@ -87,7 +192,8 @@ class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
             state = observations.get(OBS_STATE)
             if state is not None:
                 if self.global_pose_state_indices and action is not None:
-                    expected_length = self.state_history_length + action.shape[-2]
+                    trajectory_length = action.shape[-2] - int(self.z1_representation == "ee_delta")
+                    expected_length = self.state_history_length + trajectory_length
                     if state.ndim < 3 or state.shape[-2] != expected_length:
                         raise ValueError(
                             "Global-pose trajectory requires state history + future chunk: "
@@ -135,12 +241,17 @@ class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
                 is_pad=is_pad,
                 global_pose=global_pose,
                 representation=self.representation,
+                z1_representation=self.z1_representation,
                 predict_arm_teleop_inactive=self.predict_arm_teleop_inactive,
                 predict_arm_reset=self.predict_arm_reset,
                 predict_ee_pose=self.predict_ee_pose,
                 predict_gripper=self.predict_gripper,
                 include_task_complete=self.include_task_complete,
             )
+            if self.z1_representation == "ee_delta" and is_pad is not None:
+                complementary = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {})
+                complementary[f"{ACTION}_is_pad"] = is_pad[..., :-1] | is_pad[..., 1:]
+                new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary
         new_transition[TransitionKey.ACTION] = transformed
         return new_transition
 
@@ -155,6 +266,7 @@ class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
             "inverse": self.inverse,
             "include_task_complete": self.include_task_complete,
             "representation": self.representation,
+            "z1_representation": self.z1_representation,
             "predict_arm_teleop_inactive": self.predict_arm_teleop_inactive,
             "predict_arm_reset": self.predict_arm_reset,
             "predict_ee_pose": self.predict_ee_pose,
@@ -178,6 +290,7 @@ def reconcile_pi05_b2_trajectory_processors(
     if config.b2_local_trajectory_dt is None:
         raise ValueError("b2_local_trajectory_dt must be resolved from the model control frequency")
 
+    raw_dataset_stats = dataset_stats
     transformed_stats = make_b2_trajectory_stats(
         dataset_stats,
         dt=config.b2_local_trajectory_dt,
@@ -193,9 +306,10 @@ def reconcile_pi05_b2_trajectory_processors(
         dt=config.b2_local_trajectory_dt,
         state_indices=tuple(config.state_feature_indices or ()),
         global_pose_state_indices=tuple(config.b2_global_pose_state_indices or ()),
-        state_history_length=config.mem_vit_num_frames if config.mem_vit_enabled else 1,
-        keep_state_history=config.mem_vit_enabled,
+        state_history_length=(config.state_num_frames if config.state_action_encoding == "continuous" else 1),
+        keep_state_history=config.state_action_encoding == "continuous",
         representation=config.b2_action_representation,
+        z1_representation=config.z1_action_representation,
         predict_arm_teleop_inactive=config.action_predict_arm_teleop_inactive,
         predict_arm_reset=config.action_predict_arm_reset,
         predict_ee_pose=config.action_predict_ee_pose,
@@ -211,12 +325,35 @@ def reconcile_pi05_b2_trajectory_processors(
             i for i, step in enumerate(steps) if isinstance(step, NormalizerProcessorStep)
         )
         steps.insert(normalizer_index, desired_pre_step)
+
+    history_steps = _action_history_steps(config, raw_dataset_stats)
+    steps = [
+        step
+        for step in steps
+        if not isinstance(step, Pi05SplitActionHistoryProcessorStep)
+        and not (
+            isinstance(step, NormalizerProcessorStep)
+            and step.normalize_observation_keys == {OBS_ACTION_HISTORY}
+        )
+    ]
+    if history_steps:
+        split_step, history_normalizer = history_steps
+        relative_index = next(
+            i for i, step in enumerate(steps) if isinstance(step, RelativeActionsProcessorStep)
+        )
+        steps.insert(relative_index, split_step)
+        if history_normalizer is not None:
+            main_normalizer_index = next(
+                i for i, step in enumerate(steps) if isinstance(step, NormalizerProcessorStep)
+            )
+            steps.insert(main_normalizer_index + 1, history_normalizer)
     preprocessor.steps = steps
 
     desired_post_step = Pi05B2LocalTrajectoryProcessorStep(
         dt=config.b2_local_trajectory_dt,
         inverse=True,
         representation=config.b2_action_representation,
+        z1_representation=config.z1_action_representation,
         predict_arm_teleop_inactive=config.action_predict_arm_teleop_inactive,
         include_task_complete=config.action_predict_task_complete,
     )
@@ -321,6 +458,7 @@ def make_pi05_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
+    raw_dataset_stats = dataset_stats
     if config.io_schema_resolved:
         if config.b2_local_trajectory_dt is None:
             raise ValueError("b2_local_trajectory_dt must be resolved from the model control frequency")
@@ -352,7 +490,7 @@ def make_pi05_pre_post_processors(
         ),
         Pi05PrepareStateTokenizerProcessorStep(
             max_state_dim=config.max_state_dim,
-            continuous_state_memory=config.mem_vit_enabled,
+            continuous_state_memory=config.state_action_encoding == "continuous",
         ),
         TokenizerProcessorStep(
             tokenizer_name="google/paligemma-3b-pt-224",
@@ -373,9 +511,12 @@ def make_pi05_pre_post_processors(
                 dt=config.b2_local_trajectory_dt,
                 state_indices=tuple(config.state_feature_indices or ()),
                 global_pose_state_indices=tuple(config.b2_global_pose_state_indices or ()),
-                state_history_length=config.mem_vit_num_frames if config.mem_vit_enabled else 1,
-                keep_state_history=config.mem_vit_enabled,
+                state_history_length=(
+                    config.state_num_frames if config.state_action_encoding == "continuous" else 1
+                ),
+                keep_state_history=config.state_action_encoding == "continuous",
                 representation=config.b2_action_representation,
+                z1_representation=config.z1_action_representation,
                 predict_arm_teleop_inactive=config.action_predict_arm_teleop_inactive,
                 predict_arm_reset=config.action_predict_arm_reset,
                 predict_ee_pose=config.action_predict_ee_pose,
@@ -383,6 +524,22 @@ def make_pi05_pre_post_processors(
                 include_task_complete=config.action_predict_task_complete,
             ),
         )
+
+    history_steps = _action_history_steps(config, raw_dataset_stats)
+    if history_steps:
+        split_step, history_normalizer = history_steps
+        relative_index = next(
+            i for i, step in enumerate(input_steps) if isinstance(step, RelativeActionsProcessorStep)
+        )
+        input_steps.insert(relative_index, split_step)
+        main_normalizer_index = next(
+            i
+            for i, step in enumerate(input_steps)
+            if isinstance(step, NormalizerProcessorStep)
+            and step.normalize_observation_keys != {OBS_ACTION_HISTORY}
+        )
+        if history_normalizer is not None:
+            input_steps.insert(main_normalizer_index + 1, history_normalizer)
 
     output_steps: list[ProcessorStep] = [
         UnnormalizerProcessorStep(
@@ -398,6 +555,7 @@ def make_pi05_pre_post_processors(
                 dt=config.b2_local_trajectory_dt,
                 inverse=True,
                 representation=config.b2_action_representation,
+                z1_representation=config.z1_action_representation,
                 predict_arm_teleop_inactive=config.action_predict_arm_teleop_inactive,
                 include_task_complete=config.action_predict_task_complete,
             ),

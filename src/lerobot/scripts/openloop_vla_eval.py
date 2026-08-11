@@ -31,7 +31,7 @@ from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.pi05.b2_action_transform import (
-    B2_TRAJECTORY_NAMES,
+    B2_GLOBAL_POSE_STATE_NAMES,
     action_dataset_indices,
     action_schema_kwargs,
     b2_execution_action_names,
@@ -45,6 +45,35 @@ from lerobot.scripts.lerobot_train import apply_task_variants_to_batch, load_tas
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.utils import init_logging
+
+_B2_WORLD_TRAJECTORY_NAMES = ["b2_world_x", "b2_world_y", "b2_world_yaw"]
+
+
+def _current_b2_pose_from_raw_state(
+    raw_state: torch.Tensor,
+    pose_indices: list[int],
+    *,
+    history_length: int,
+) -> torch.Tensor:
+    """Read the current world pose before policy state-feature selection.
+
+    A non-MEM batch has shape ``[B, D]``. A MEM/local-trajectory batch can have
+    shape ``[B, T, D]``, with the current state at the end of the history prefix.
+    The pose is an evaluation/visualization input even when the policy itself
+    does not consume it (notably for a velocity checkpoint).
+    """
+    if raw_state.ndim == 2:
+        return raw_state[:, pose_indices]
+    if raw_state.ndim == 3:
+        if history_length < 1 or history_length > raw_state.shape[1]:
+            raise ValueError(
+                f"Invalid history_length={history_length} for observation.state shape "
+                f"{tuple(raw_state.shape)}"
+            )
+        return raw_state[:, history_length - 1, pose_indices]
+    raise ValueError(
+        f"Expected observation.state with shape [B, D] or [B, T, D], got {tuple(raw_state.shape)}"
+    )
 
 
 def _resolve_policy_path(path: str | Path) -> Path:
@@ -218,7 +247,48 @@ def _combined_base_plot_arrays(
 
 
 def _combined_base_plot_names(execution_names: list[str], b2_start: int = 0) -> list[str]:
-    return execution_names[: b2_start + 3] + list(B2_TRAJECTORY_NAMES) + execution_names[b2_start + 3 :]
+    return execution_names[: b2_start + 3] + _B2_WORLD_TRAJECTORY_NAMES + execution_names[b2_start + 3 :]
+
+
+def _local_trajectory_to_world(trajectory: np.ndarray, current_pose: np.ndarray) -> np.ndarray:
+    """Compose per-step body-frame SE(2) increments into an odom/world trajectory."""
+    trajectory = np.asarray(trajectory, dtype=np.float32)
+    current_pose = np.asarray(current_pose, dtype=np.float32)
+    if trajectory.ndim < 2 or trajectory.shape[-1] != 3:
+        raise ValueError(f"Expected local trajectory shape (..., T, 3), got {trajectory.shape}")
+    if current_pose.shape != trajectory.shape[:-2] + (3,):
+        raise ValueError(
+            f"Current pose shape {current_pose.shape} is incompatible with trajectory {trajectory.shape}"
+        )
+
+    pose = current_pose.copy()
+    outputs = []
+    for step in range(trajectory.shape[-2]):
+        delta = trajectory[..., step, :]
+        cos_yaw = np.cos(pose[..., 2])
+        sin_yaw = np.sin(pose[..., 2])
+        pose = np.stack(
+            (
+                pose[..., 0] + cos_yaw * delta[..., 0] - sin_yaw * delta[..., 1],
+                pose[..., 1] + sin_yaw * delta[..., 0] + cos_yaw * delta[..., 1],
+                pose[..., 2] + delta[..., 2],
+            ),
+            axis=-1,
+        )
+        outputs.append(pose.copy())
+    return np.stack(outputs, axis=-2)
+
+
+def _world_trajectory_plot_limits(
+    expert_world_chunks: np.ndarray,
+    pred_world_chunks: np.ndarray,
+) -> list[tuple[float, float]]:
+    """Use one physical scale for world x/y and a separate stable scale for yaw."""
+    xy = np.concatenate((expert_world_chunks[..., :2].reshape(-1), pred_world_chunks[..., :2].reshape(-1)))
+    yaw = np.concatenate((expert_world_chunks[..., 2].reshape(-1), pred_world_chunks[..., 2].reshape(-1)))
+    xy_limits = _padded_limits(float(np.nanmin(xy)), float(np.nanmax(xy)))
+    yaw_limits = _padded_limits(float(np.nanmin(yaw)), float(np.nanmax(yaw)))
+    return [xy_limits, xy_limits, yaw_limits]
 
 
 def _padded_limits(low: float, high: float, *, padding_fraction: float = 0.08) -> tuple[float, float]:
@@ -537,6 +607,12 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--frame-stride",
+        type=int,
+        default=1,
+        help="Run inference once every N source frames, resetting the stride at each episode.",
+    )
     parser.add_argument("--task-variants-path", default=None)
     parser.add_argument("--task-variant", choices=["dataset", "first", "random"], default="first")
     parser.add_argument(
@@ -547,6 +623,15 @@ def main() -> None:
             "Maximum number of per-inference 50-step chunk plots to save per episode. 0 means no "
             "limit. By default, every inference is plotted for explicitly selected --episodes; "
             "split-based evaluation saves at most 20 plots per episode."
+        ),
+    )
+    parser.add_argument(
+        "--chunk-plot-stride",
+        type=int,
+        default=1,
+        help=(
+            "Save one independent action-chunk plot every N evaluated frames. Metrics and the "
+            "episode-level plots still use every evaluated frame."
         ),
     )
     parser.add_argument("--seed", type=int, default=1000)
@@ -561,6 +646,10 @@ def main() -> None:
 
     if args.plot_workers < 1:
         raise ValueError(f"plot_workers must be at least 1, got {args.plot_workers}")
+    if args.frame_stride < 1:
+        raise ValueError(f"frame_stride must be at least 1, got {args.frame_stride}")
+    if args.chunk_plot_stride < 1:
+        raise ValueError(f"chunk_plot_stride must be at least 1, got {args.chunk_plot_stride}")
 
     init_logging()
 
@@ -623,9 +712,11 @@ def main() -> None:
         raise ValueError("No episodes selected for open-loop evaluation.")
     logging.info("Selected %d episode(s): %s", len(episodes), episodes)
     logging.info(
-        "Per-episode limits: frames=%s, chunk_plots=%s",
+        "Per-episode limits: frames=%s, frame_stride=%d, chunk_plots=%s, chunk_plot_stride=%d",
         "all" if args.max_frames_per_episode == 0 else args.max_frames_per_episode,
+        args.frame_stride,
         "all" if args.max_chunk_plots_per_episode == 0 else args.max_chunk_plots_per_episode,
+        args.chunk_plot_stride,
     )
 
     dataset = LeRobotDataset(
@@ -640,6 +731,13 @@ def main() -> None:
 
     dataset_action_dim = int(meta.features[ACTION]["shape"][0])
     dataset_action_names = _default_action_names(meta, dataset_action_dim)
+    dataset_state_names = meta.features.get(OBS_STATE, {}).get("names")
+    dataset_global_pose_indices = (
+        [dataset_state_names.index(name) for name in B2_GLOBAL_POSE_STATE_NAMES]
+        if isinstance(dataset_state_names, list)
+        and all(name in dataset_state_names for name in B2_GLOBAL_POSE_STATE_NAMES)
+        else None
+    )
     execution_action_names = list(dataset_action_names)
     trajectory_action_names = list(dataset_action_names)
     trajectory_stats = None
@@ -696,9 +794,21 @@ def main() -> None:
     else:
         plot_action_names = execution_action_names
         plot_y_limits = _action_plot_y_limits(meta, execution_action_names)
+    sampled_indices = [
+        index
+        for index, frame_index in enumerate(dataset.hf_dataset["frame_index"])
+        if int(frame_index) % args.frame_stride == 0
+    ]
+    logging.info(
+        "Inference sampling: %d/%d source frames (stride=%d)",
+        len(sampled_indices),
+        len(dataset),
+        args.frame_stride,
+    )
     collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
     dataloader = DataLoader(
         dataset,
+        sampler=sampled_indices,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -715,21 +825,12 @@ def main() -> None:
         policy_cfg=policy_cfg,
         pretrained_path=str(policy_path),
         pretrained_revision=getattr(policy_cfg, "pretrained_revision", None),
-        dataset_stats=dataset.meta.stats,
+        # The dataset may have grown after this checkpoint was trained. Keep the
+        # normalization state serialized with the checkpoint instead of silently
+        # replacing it with statistics from the current dataset directory.
+        dataset_stats=None,
         preprocessor_overrides={
             "device_processor": {"device": torch.device(args.device).type},
-            "normalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": {**policy.config.input_features, **policy.config.output_features},
-                "norm_map": policy.config.normalization_mapping,
-            },
-        },
-        postprocessor_overrides={
-            "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": policy.config.output_features,
-                "norm_map": policy.config.normalization_mapping,
-            },
         },
     )
 
@@ -745,6 +846,7 @@ def main() -> None:
             "pred_trajectory": [],
             "expert_trajectory_chunk": [],
             "pred_trajectory_chunk": [],
+            "current_b2_pose": [],
             "task": [],
         }
     )
@@ -756,7 +858,12 @@ def main() -> None:
             if batch is None:
                 continue
 
-            dataset_expert_chunk = _as_action_chunk(batch[ACTION].detach().cpu().to(torch.float32))
+            action_history_length = (
+                policy_cfg.state_num_frames - 1 if policy_cfg.action_history_enabled else 0
+            )
+            dataset_expert_chunk = _as_action_chunk(
+                batch[ACTION][..., action_history_length:, :].detach().cpu().to(torch.float32)
+            )
             episode_indices = batch["episode_index"].detach().cpu().view(-1).tolist()
             keep = []
             for i, ep_idx in enumerate(episode_indices):
@@ -794,20 +901,33 @@ def main() -> None:
             pred_execution_chunk = (
                 postprocessor(policy.predict_action_chunk(processed)).detach().cpu().to(torch.float32)
             )
+            current_b2_pose = None
             if io_schema_enabled:
                 action_is_pad = batch.get(f"{ACTION}_is_pad")
                 if action_is_pad is not None:
-                    action_is_pad = action_is_pad.detach().cpu().to(torch.bool)
+                    action_is_pad = action_is_pad[..., action_history_length:].detach().cpu().to(torch.bool)
                 global_pose = None
+                raw_state = batch[OBS_STATE].detach().cpu().to(torch.float32)
+                history_length = (
+                    policy_cfg.state_num_frames if policy_cfg.state_action_encoding == "continuous" else 1
+                )
+                if dataset_global_pose_indices is not None:
+                    current_b2_pose = _current_b2_pose_from_raw_state(
+                        raw_state,
+                        dataset_global_pose_indices,
+                        history_length=history_length,
+                    )
                 global_pose_indices = getattr(policy_cfg, "b2_global_pose_state_indices", None)
                 if global_pose_indices is not None:
-                    raw_state = batch[OBS_STATE].detach().cpu().to(torch.float32)
-                    history_length = policy_cfg.mem_vit_num_frames if policy_cfg.mem_vit_enabled else 1
                     current_pose = raw_state[
                         ..., history_length - 1 : history_length, list(global_pose_indices)
                     ]
                     future_pose = raw_state[..., history_length:, list(global_pose_indices)]
                     global_pose = torch.cat((current_pose, future_pose), dim=-2)
+                if b2_trajectory_dt is not None and current_b2_pose is None:
+                    raise ValueError(
+                        "World-frame trajectory plots require b2_position_x/y/yaw in observation.state"
+                    )
                 expert_trajectory_chunk = encode_b2_action_chunk(
                     dataset_expert_chunk,
                     dt=float(b2_trajectory_dt),
@@ -850,6 +970,7 @@ def main() -> None:
             pred_np = pred_action.numpy()
             expert_trajectory_np = expert_trajectory_action.numpy()
             pred_trajectory_np = pred_trajectory_action.numpy()
+            current_b2_pose_np = current_b2_pose.numpy() if current_b2_pose is not None else None
             for i, ep_idx in enumerate(ep_np.tolist()):
                 ep_store = per_episode[int(ep_idx)]
                 ep_store["frame_index"].append(int(frame_np[i]))
@@ -862,6 +983,8 @@ def main() -> None:
                 ep_store["pred_trajectory"].append(pred_trajectory_np[i])
                 ep_store["expert_trajectory_chunk"].append(expert_trajectory_chunk[i].numpy())
                 ep_store["pred_trajectory_chunk"].append(pred_trajectory_chunk[i].numpy())
+                if current_b2_pose_np is not None:
+                    ep_store["current_b2_pose"].append(current_b2_pose_np[i])
                 ep_store["task"].append(task_list[i])
 
                 row: dict[str, Any] = {
@@ -909,6 +1032,7 @@ def main() -> None:
             list[tuple[float, float]],
         ]
     ] = []
+    episode_plot_y_limits_by_episode: dict[str, dict[str, list[float]]] = {}
     for ep_idx in sorted(per_episode):
         item = per_episode[ep_idx]
         frame_index = np.asarray(item["frame_index"], dtype=np.int64)
@@ -920,6 +1044,9 @@ def main() -> None:
         pred_trajectory = np.stack(item["pred_trajectory"]).astype(np.float32)
         expert_trajectory_chunks = np.stack(item["expert_trajectory_chunk"]).astype(np.float32)
         pred_trajectory_chunks = np.stack(item["pred_trajectory_chunk"]).astype(np.float32)
+        current_b2_pose = (
+            np.stack(item["current_b2_pose"]).astype(np.float32) if item["current_b2_pose"] else None
+        )
         valid_chunk_lengths = _valid_chunk_lengths(
             meta,
             ep_idx,
@@ -1000,20 +1127,38 @@ def main() -> None:
             normalized_trajectory_metrics_rows.append(normalized_metrics_rows[-1].copy())
             normalized_trajectory_chunk_metrics_rows.append(normalized_chunk_metrics_rows[-1].copy())
 
-        plot_expert = (
-            _combined_base_plot_arrays(expert, expert_trajectory, b2_start) if io_schema_enabled else expert
-        )
-        plot_pred = _combined_base_plot_arrays(pred, pred_trajectory, b2_start) if io_schema_enabled else pred
-        plot_expert_chunks = (
-            _combined_base_plot_arrays(expert_chunks, expert_trajectory_chunks, b2_start)
-            if io_schema_enabled
-            else expert_chunks
-        )
-        plot_pred_chunks = (
-            _combined_base_plot_arrays(pred_chunks, pred_trajectory_chunks, b2_start)
-            if io_schema_enabled
-            else pred_chunks
-        )
+        episode_plot_y_limits = plot_y_limits
+        if io_schema_enabled:
+            if current_b2_pose is None:
+                raise RuntimeError("Missing current B2 pose for world-frame trajectory plots")
+            # Preserve yaw continuity across +/-pi for an episode-level world plot.
+            current_b2_pose[:, 2] = np.unwrap(current_b2_pose[:, 2])
+            expert_world_chunks = _local_trajectory_to_world(
+                expert_trajectory_chunks[..., b2_start : b2_start + 3], current_b2_pose
+            )
+            pred_world_chunks = _local_trajectory_to_world(
+                pred_trajectory_chunks[..., b2_start : b2_start + 3], current_b2_pose
+            )
+            expert_world = expert_world_chunks[:, 0]
+            pred_world = pred_world_chunks[:, 0]
+            plot_expert = _combined_base_plot_arrays(expert, expert_world, b2_start)
+            plot_pred = _combined_base_plot_arrays(pred, pred_world, b2_start)
+            plot_expert_chunks = _combined_base_plot_arrays(expert_chunks, expert_world_chunks, b2_start)
+            plot_pred_chunks = _combined_base_plot_arrays(pred_chunks, pred_world_chunks, b2_start)
+            episode_plot_y_limits = (
+                execution_limits[: b2_start + 3]
+                + _world_trajectory_plot_limits(expert_world_chunks, pred_world_chunks)
+                + execution_limits[b2_start + 3 :]
+            )
+        else:
+            plot_expert = expert
+            plot_pred = pred
+            plot_expert_chunks = expert_chunks
+            plot_pred_chunks = pred_chunks
+        episode_plot_y_limits_by_episode[str(ep_idx)] = {
+            name: [float(low), float(high)]
+            for name, (low, high) in zip(plot_action_names, episode_plot_y_limits, strict=True)
+        }
         _plot_episode(
             plot_dir / f"episode_{ep_idx:06d}.png",
             ep_idx,
@@ -1021,7 +1166,7 @@ def main() -> None:
             plot_expert,
             plot_pred,
             plot_action_names,
-            plot_y_limits,
+            episode_plot_y_limits,
         )
         _plot_episode_rolling_chunks(
             chunk_plot_dir / f"episode_{ep_idx:06d}_rolling_chunks.png",
@@ -1030,15 +1175,15 @@ def main() -> None:
             plot_expert_chunks,
             plot_pred_chunks,
             plot_action_names,
-            plot_y_limits,
+            episode_plot_y_limits,
             valid_chunk_lengths,
         )
         ep_single_dir = single_chunk_plot_dir / f"episode_{ep_idx:06d}"
         ep_single_dir.mkdir(parents=True, exist_ok=True)
-        n_single_plots = len(frame_index)
+        single_plot_indices = np.arange(0, len(frame_index), args.chunk_plot_stride)
         if args.max_chunk_plots_per_episode > 0:
-            n_single_plots = min(n_single_plots, args.max_chunk_plots_per_episode)
-        for i in range(n_single_plots):
+            single_plot_indices = single_plot_indices[: args.max_chunk_plots_per_episode]
+        for i in single_plot_indices:
             single_chunk_plot_jobs.append(
                 (
                     ep_single_dir / f"chunk_start_{int(frame_index[i]):06d}.png",
@@ -1047,7 +1192,7 @@ def main() -> None:
                     plot_expert_chunks[i, : valid_chunk_lengths[i]],
                     plot_pred_chunks[i, : valid_chunk_lengths[i]],
                     plot_action_names,
-                    plot_y_limits,
+                    episode_plot_y_limits,
                 )
             )
         npz_payload[f"episode_{ep_idx:06d}_frame_index"] = frame_index
@@ -1060,6 +1205,8 @@ def main() -> None:
         npz_payload[f"episode_{ep_idx:06d}_expert_trajectory_chunk"] = expert_trajectory_chunks
         npz_payload[f"episode_{ep_idx:06d}_pred_trajectory_chunk"] = pred_trajectory_chunks
         npz_payload[f"episode_{ep_idx:06d}_valid_chunk_length"] = valid_chunk_lengths
+        if current_b2_pose is not None:
+            npz_payload[f"episode_{ep_idx:06d}_current_b2_pose"] = current_b2_pose
 
     logging.info(
         "Generating %d independent action-chunk plot(s) with %d worker(s)",
@@ -1197,10 +1344,7 @@ def main() -> None:
         "execution_action_names": execution_action_names,
         "trajectory_action_names": trajectory_action_names,
         "plot_action_names": plot_action_names,
-        "plot_y_limits": {
-            name: [float(low), float(high)]
-            for name, (low, high) in zip(plot_action_names, plot_y_limits, strict=True)
-        },
+        "plot_y_limits_by_episode": episode_plot_y_limits_by_episode,
         "metrics": metrics_rows[0],
         "normalized_metrics": normalized_metrics_rows[0],
         "chunk_metrics": chunk_metrics_rows[0],
