@@ -29,6 +29,7 @@ predict_arm_reset="true"
 predict_ee_pose="true"
 predict_gripper="true"
 predict_task_complete="true"
+discrete_action_training_mode="structured_temporal" # "continuous_flow" or "structured_temporal"
 task_complete_sample_tail_seconds="2.0"
 
 # GPUs are selected here. Examples:
@@ -140,8 +141,8 @@ if [[ -n "$resume_checkpoint" ]]; then
   log_file="$log_dir/${job_name}_resume_${timestamp}.log"
   pid_file="$log_dir/${job_name}_resume_${timestamp}.pid"
 else
-  output_dir="$output_root/${job_prefix}_${timestamp}"
-  job_name="${job_prefix}_${timestamp}"
+  output_dir="$output_root/${timestamp}_${job_prefix}"
+  job_name="${timestamp}_${job_prefix}"
   log_file="$log_dir/${job_name}.log"
   pid_file="$log_dir/${job_name}.pid"
 fi
@@ -165,6 +166,7 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.action_predict_ee_pose="$predict_ee_pose"
     --policy.action_predict_gripper="$predict_gripper"
     --policy.action_predict_task_complete="$predict_task_complete"
+    --policy.discrete_action_training_mode="$discrete_action_training_mode"
     --policy.task_complete_sample_tail_seconds="$task_complete_sample_tail_seconds"
     --policy.chunk_size="$action_chunk_size"
     --policy.n_action_steps="$action_steps_to_execute"

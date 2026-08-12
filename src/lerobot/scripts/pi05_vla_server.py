@@ -57,8 +57,7 @@ EE_POSE_ACTION_NAMES = (
     "height_invariant_ee_z",
 )
 EE_DELTA_ACTION_NAMES = tuple(
-    name.replace("height_invariant_ee_", "height_invariant_ee_delta_")
-    for name in EE_POSE_ACTION_NAMES
+    name.replace("height_invariant_ee_", "height_invariant_ee_delta_") for name in EE_POSE_ACTION_NAMES
 )
 EXECUTION_ACTION_SUFFIX_NAMES = (
     "gripper_target",
@@ -100,6 +99,53 @@ def _to_execution_actions(
     columns.setdefault("b2_active", torch.ones_like(actions[:, 0]))
     columns.setdefault("task_complete", torch.zeros_like(actions[:, 0]))
     return torch.stack([columns[name] for name in output_names], dim=-1)
+
+
+def _decode_discrete_actions(
+    normalized_actions: torch.Tensor,
+    postprocessed_actions: torch.Tensor,
+    names: tuple[str, ...],
+    *,
+    mode: str,
+    gripper_negative_value: float,
+    gripper_nonnegative_value: float,
+) -> torch.Tensor:
+    """Apply the checkpoint's normalized-domain discrete protocol to physical actions."""
+    if normalized_actions.shape != postprocessed_actions.shape:
+        raise ValueError(
+            "Normalized and postprocessed action shapes differ: "
+            f"{tuple(normalized_actions.shape)} != {tuple(postprocessed_actions.shape)}"
+        )
+    if normalized_actions.ndim != 2 or normalized_actions.shape[-1] != len(names):
+        raise ValueError(
+            f"Invalid named action chunk: shape={tuple(normalized_actions.shape)}, names={names}"
+        )
+    if mode not in {"continuous_flow", "structured_temporal"}:
+        raise ValueError(f"Unsupported discrete action training mode: {mode!r}")
+    decoded = postprocessed_actions.clone()
+    indices = {name: index for index, name in enumerate(names)}
+    for name in ("arm_teleop_inactive", "arm_reset"):
+        if name in indices:
+            index = indices[name]
+            decoded[:, index] = (normalized_actions[:, index] > 0).to(decoded.dtype)
+    if "gripper_target" in indices:
+        index = indices["gripper_target"]
+        negative_class = normalized_actions[:, index] < 0
+        decoded[:, index] = torch.where(
+            negative_class,
+            decoded.new_tensor(gripper_negative_value),
+            decoded.new_tensor(gripper_nonnegative_value),
+        )
+    if "task_complete" in indices:
+        index = indices["task_complete"]
+        complete = torch.cummax(normalized_actions[:, index] > 0, dim=0).values
+        decoded[:, index] = complete.to(decoded.dtype)
+    if mode == "structured_temporal" and {"arm_teleop_inactive", "arm_reset"}.issubset(indices):
+        inactive = decoded[:, indices["arm_teleop_inactive"]] > 0.5
+        reset = decoded[:, indices["arm_reset"]] > 0.5
+        if bool((inactive & reset).any()):
+            raise ValueError("Structured arm mode decoded an impossible inactive+reset state")
+    return decoded
 
 
 def _smooth_b2_execution_velocity(
@@ -158,6 +204,20 @@ def _smooth_b2_execution_velocity(
     return smoothed
 
 
+def _apply_completion_stop(actions: torch.Tensor, names: tuple[str, ...]) -> torch.Tensor:
+    """Make the completion row and its suffix non-actuating while retaining the stop signal."""
+    if "task_complete" not in names:
+        return actions
+    stopped = actions.clone()
+    complete_index = names.index("task_complete")
+    complete = torch.cummax(stopped[:, complete_index] > 0.5, dim=0).values
+    stopped[:, complete_index] = complete.to(stopped.dtype)
+    for name in (*B2_EXECUTION_VELOCITY_NAMES, "b2_active", "arm_active", "arm_reset"):
+        if name in names:
+            stopped[complete, names.index(name)] = 0.0
+    return stopped
+
+
 @dataclass(frozen=True)
 class CheckpointContract:
     """Versioned checkpoint semantics validated before policy construction."""
@@ -172,6 +232,9 @@ class CheckpointContract:
     source_state_names: tuple[str, ...]
     selected_state_names: tuple[str, ...]
     source_action_names: tuple[str, ...]
+    discrete_action_training_mode: str
+    gripper_negative_value: float
+    gripper_nonnegative_value: float
 
 
 @dataclass(frozen=True)
@@ -209,7 +272,7 @@ def _resolve_checkpoint_action_representations(
     raw_config: dict[str, object],
 ) -> tuple[str, str]:
     b2_representation = str(action_metadata["representation"])
-    if metadata_version == 4:
+    if metadata_version >= 4:
         z1_representation = str(action_metadata["z1_representation"])
     else:
         if b2_representation != "velocity":
@@ -219,8 +282,7 @@ def _resolve_checkpoint_action_representations(
             )
         if "z1_representation" in action_metadata or "z1_action_representation" in raw_config:
             raise ValueError(
-                f"Malformed deployment metadata version {metadata_version}: "
-                "Z1 representation must be absent"
+                f"Malformed deployment metadata version {metadata_version}: Z1 representation must be absent"
             )
         z1_representation = "ee_pose"
     if b2_representation not in {"local_trajectory", "velocity"}:
@@ -247,9 +309,9 @@ def _load_checkpoint_contract(
         raise FileNotFoundError(f"Checkpoint is missing deployment metadata: {metadata_path}")
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata_version = saved.get("version")
-    if saved.get("format") != "lerobot.pi05.deployment" or metadata_version not in {2, 3, 4}:
+    if saved.get("format") != "lerobot.pi05.deployment" or metadata_version not in {2, 3, 4, 5}:
         raise ValueError(
-            "Checkpoint deployment metadata must use lerobot.pi05.deployment version 2, 3, or 4"
+            "Checkpoint deployment metadata must use lerobot.pi05.deployment version 2, 3, 4, or 5"
         )
     if not config.io_schema_resolved:
         raise ValueError("Checkpoint contains unresolved PI0.5 I/O metadata")
@@ -260,12 +322,21 @@ def _load_checkpoint_contract(
     b2_action_representation, z1_action_representation = _resolve_checkpoint_action_representations(
         int(metadata_version), action, raw_config
     )
-    if metadata_version == 4:
+    if metadata_version == 5:
         expected = config.deployment_metadata()
         if saved != expected:
             raise ValueError("pi05_deployment_metadata.json disagrees with checkpoint config.json")
     else:
         config.z1_action_representation = z1_action_representation
+    discrete_mode = str(action.get("discrete_training_mode", "continuous_flow"))
+    if discrete_mode not in {"continuous_flow", "structured_temporal"}:
+        raise ValueError(f"Unsupported discrete action training mode: {discrete_mode!r}")
+    config_mode = str(raw_config.get("discrete_action_training_mode", "continuous_flow"))
+    if config_mode != discrete_mode:
+        raise ValueError("Discrete action training mode disagrees between metadata and config.json")
+    decoding = action.get("boolean_decoding", {})
+    output_values = decoding.get("output_values", decoding.get("physical_values", {}))
+    gripper_values = output_values.get("gripper_target", {})
     if raw_config["b2_action_representation"] != b2_action_representation:
         raise ValueError("B2 action representation disagrees between metadata and config.json")
     source_action_names = tuple(str(name) for name in action["source_names"])
@@ -303,6 +374,13 @@ def _load_checkpoint_contract(
         source_state_names=source_state_names,
         selected_state_names=state_names,
         source_action_names=source_action_names,
+        discrete_action_training_mode=discrete_mode,
+        gripper_negative_value=float(
+            gripper_values.get("normalized_negative", gripper_values.get("true", -1.0471976))
+        ),
+        gripper_nonnegative_value=float(
+            gripper_values.get("normalized_nonnegative", gripper_values.get("false", 0.0))
+        ),
     )
 
 
@@ -342,9 +420,7 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
         if len(state_names) != state.size or len(set(state_names)) != len(state_names):
             raise ValueError(f"Invalid named state vector: shape={state.shape}, names={state_names}")
         executed_ee_target = np.asarray(packet["executed_ee_target"], dtype=np.float32).reshape(-1)
-        executed_ee_target_names = tuple(
-            str(name) for name in packet["executed_ee_target_names"].tolist()
-        )
+        executed_ee_target_names = tuple(str(name) for name in packet["executed_ee_target_names"].tolist())
         if (
             executed_ee_target.shape != (len(EE_POSE_ACTION_NAMES),)
             or executed_ee_target_names != EE_POSE_ACTION_NAMES
@@ -584,6 +660,9 @@ class AsyncRTCPolicy:
         if names is None:
             raise ValueError("Checkpoint does not define named actions")
         self.postprocessed_action_names = tuple(str(name) for name in names)
+        self.discrete_action_training_mode = contract.discrete_action_training_mode
+        self.gripper_negative_value = contract.gripper_negative_value
+        self.gripper_nonnegative_value = contract.gripper_nonnegative_value
         self.z1_action_representation = contract.z1_action_representation
         self.action_names = execution_action_names(self.z1_action_representation)
         self.source_state_names = contract.source_state_names
@@ -624,6 +703,7 @@ class AsyncRTCPolicy:
         self._latencies: deque[float] = deque(maxlen=args.rtc_latency_window)
         self._sim_rates: deque[float] = deque(maxlen=args.rtc_latency_window)
         self._previous_observation_clock: tuple[int, int] | None = None
+        self._task_complete_latched = False
         self._stop = Event()
         self._worker = Thread(target=self._run, name="pi05-rtc-worker", daemon=True)
         self._last_error: str | None = None
@@ -640,10 +720,15 @@ class AsyncRTCPolicy:
             z1_model_action_representation=contract.z1_action_representation,
             b2_execution_action_representation="velocity",
             z1_execution_action_representation=contract.z1_action_representation,
-            execution_action_protocol="b2_z1_v2",
+            execution_action_protocol="rtc_action_packet_v3",
             b2_velocity_smoothing="causal_first_order_low_pass",
             b2_velocity_smoothing_time_constant_s=self.b2_velocity_smoothing_time_constant_s,
             arm_gate_conversion="one_minus_arm_teleop_inactive",
+            discrete_action_training_mode=self.discrete_action_training_mode,
+            gripper_output_values={
+                "normalized_negative": self.gripper_negative_value,
+                "normalized_nonnegative": self.gripper_nonnegative_value,
+            },
             checkpoint_control_frequency_hz=contract.control_frequency_hz,
             checkpoint_state_dim=contract.state_dim,
             source_state_names=self.source_state_names,
@@ -676,7 +761,25 @@ class AsyncRTCPolicy:
         self._worker.join(timeout=5.0)
 
     def submit(self, packet: ObservationPacket) -> None:
+        if packet.active_sequence >= 0 and packet.active_index > 0:
+            with self._records_lock:
+                active_record = self._records.get(packet.active_sequence)
+            if active_record is not None and "task_complete" in active_record.action_names:
+                complete_index = active_record.action_names.index("task_complete")
+                executed_count = min(packet.active_index, len(active_record.processed))
+                if bool((active_record.processed[:executed_count, complete_index] > 0.5).any()):
+                    self._task_complete_latched = True
         with self._mailbox_condition:
+            episode_reset = (
+                self._previous_observation_clock is not None
+                and packet.sim_step == 0
+                and self._previous_observation_clock[0] > 0
+            )
+            if episode_reset:
+                self._task_complete_latched = False
+                self._mailbox = None
+                self._observation_history.clear()
+                self._previous_observation_clock = None
             if self._mailbox is not None and packet.sim_step < self._mailbox.sim_step:
                 return
             if self._previous_observation_clock is not None:
@@ -901,11 +1004,22 @@ class AsyncRTCPolicy:
             original = actions.squeeze(0).detach().cpu().clone()
             predicted = time.perf_counter()
             postprocessed = self.postprocessor(actions).squeeze(0).detach().cpu().to(torch.float32)
+            postprocessed = _decode_discrete_actions(
+                original,
+                postprocessed,
+                self.postprocessed_action_names,
+                mode=self.discrete_action_training_mode,
+                gripper_negative_value=self.gripper_negative_value,
+                gripper_nonnegative_value=self.gripper_nonnegative_value,
+            )
             unsmoothed = _to_execution_actions(
                 postprocessed,
                 self.postprocessed_action_names,
                 self.z1_action_representation,
             )
+            if self._task_complete_latched:
+                unsmoothed[:, self.action_names.index("task_complete")] = 1.0
+            unsmoothed = _apply_completion_stop(unsmoothed, self.action_names)
             smoothing_transition_step = int(
                 math.ceil((time.monotonic_ns() - packet.server_received_ns) / 1e9 * sim_rate)
             )

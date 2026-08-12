@@ -76,6 +76,111 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 
+def _wandb_train_metrics(
+    tracker_metrics: dict[str, int | float],
+    policy_metrics: dict[str, Any] | None,
+    action_names: list[str] | None,
+) -> dict[str, int | float]:
+    grouped: dict[str, int | float] = {}
+    tracker_groups = {
+        "loss": "overview/train_loss",
+        "steps": "training_progress/optimizer_steps",
+        "samples": "training_progress/samples",
+        "episodes": "training_progress/episode_equivalents",
+        "epochs": "training_progress/epochs",
+        "lr": "optimization/learning_rate",
+        "grad_norm": "optimization/gradient_norm",
+        "update_s": "performance/update_seconds",
+        "dataloading_s": "performance/dataloading_seconds",
+        "samples_per_s": "performance/samples_per_second",
+        "gpu_mem_gb": "performance/gpu_memory_gb",
+        "task_variant_applied": "data/task_variants_applied",
+    }
+    for source, destination in tracker_groups.items():
+        if source in tracker_metrics:
+            grouped[destination] = tracker_metrics[source]
+    for key, value in tracker_metrics.items():
+        if key not in tracker_groups and isinstance(value, int | float):
+            grouped[f"training_progress/{key}"] = value
+    if not policy_metrics:
+        return grouped
+
+    prefix_groups = {
+        "continuous_mask_frac/": "continuous_action/mask_fraction/",
+        "discrete_loss/": "discrete_action/loss/",
+        "discrete_accuracy/": "discrete_action/accuracy/",
+        "arm_mode_frac/": "discrete_action/target_fraction/arm_mode_",
+        "gate_loss/": "discrete_action/legacy_flow_loss/",
+        "gate_true_frac/": "discrete_action/target_fraction/",
+        "gate_global_true_frac/": "discrete_action/global_target_fraction/",
+        "gate_weight/": "discrete_action/class_weight/",
+        "sample_weight_": "sample_weighting/",
+    }
+    exact_groups = {
+        "continuous_loss": "continuous_action/loss",
+        "gate_aware_action_loss": "discrete_action/legacy_flow_enabled",
+        "structured_temporal_action_loss": "discrete_action/structured_temporal_enabled",
+        "mem_image_num_frames": "memory/image/num_frames",
+        "mem_image_window_num_frames": "memory/image/window_num_frames",
+        "state_num_frames": "memory/state/num_frames",
+        "state_window_num_frames": "memory/state/window_num_frames",
+        "action_history_num_frames": "memory/action/num_frames",
+    }
+    for key, value in policy_metrics.items():
+        if key in {"loss", "loss_per_dim"}:
+            continue
+        if not isinstance(value, int | float):
+            if isinstance(value, (list, tuple)):
+                for index, item in enumerate(value):
+                    if isinstance(item, int | float):
+                        grouped[f"policy_diagnostics/{key}/{index}"] = item
+            continue
+        if key in exact_groups:
+            grouped[exact_groups[key]] = value
+            continue
+        matched = False
+        for prefix, destination in prefix_groups.items():
+            if key.startswith(prefix):
+                grouped[destination + key.removeprefix(prefix)] = value
+                matched = True
+                break
+        if not matched:
+            grouped[f"policy_diagnostics/{key}"] = value
+
+    per_dim = policy_metrics.get("loss_per_dim")
+    if isinstance(per_dim, (list, tuple)) and action_names is not None:
+        if len(per_dim) != len(action_names):
+            raise ValueError(
+                f"loss_per_dim has {len(per_dim)} values but the policy defines {len(action_names)} actions"
+            )
+        for name, value in zip(action_names, per_dim, strict=True):
+            if isinstance(value, int | float):
+                grouped[f"action_dimensions/train/{name}"] = value
+    return grouped
+
+
+def _wandb_eval_metrics(
+    eval_loss: float,
+    eval_batches: int,
+    policy_metric_means: dict[str, float],
+    action_dimension_means: dict[str, float] | None = None,
+) -> dict[str, int | float]:
+    grouped: dict[str, int | float] = {
+        "overview/val_loss": eval_loss,
+        "data/val_batches": eval_batches,
+    }
+    for key, mean in policy_metric_means.items():
+        if key.startswith("discrete_loss/"):
+            grouped[f"discrete_action/val_loss/{key.removeprefix('discrete_loss/')}"] = mean
+        elif key.startswith("discrete_accuracy/"):
+            grouped[f"discrete_action/val_accuracy/{key.removeprefix('discrete_accuracy/')}"] = mean
+        elif key == "continuous_loss":
+            grouped["continuous_action/val_loss"] = mean
+    for name, mean in (action_dimension_means or {}).items():
+        grouped[f"action_dimensions/val/{name}"] = mean
+    return grouped
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -1082,20 +1187,25 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     train_tracker.samples_per_s = effective_batch_size / step_time
                 logging.info(train_tracker)
                 if wandb_logger:
-                    wandb_log_dict = train_tracker.to_dict()
-                    if output_dict:
-                        wandb_log_dict.update(output_dict)
-                    # Log sample weighting statistics if enabled
+                    wandb_log_dict = _wandb_train_metrics(
+                        train_tracker.to_dict(),
+                        output_dict,
+                        getattr(active_cfg, "action_feature_names", None),
+                    )
                     if sample_weighter is not None:
                         weighter_stats = sample_weighter.get_stats()
-                        wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
-                    wandb_logger.log_dict(wandb_log_dict, step)
+                        wandb_log_dict.update(
+                            {f"sample_weighting/{key}": value for key, value in weighter_stats.items()}
+                        )
+                    wandb_logger.log_grouped_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
         if is_eval_step:
             policy.eval()
             eval_loss_sum = 0.0
             n_eval_batches = 0
+            eval_policy_metric_sums: dict[str, float] = {}
+            eval_action_dimension_sums: torch.Tensor | None = None
             with torch.no_grad(), accelerator.autocast():
                 for eval_batch in eval_dataloader:
                     for cam_key in dataset.meta.camera_keys:
@@ -1110,21 +1220,65 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                             randomize=False,
                         )
                     eval_batch = preprocessor(eval_batch)
-                    loss, _ = policy.forward(eval_batch)
+                    loss, eval_output = policy.forward(eval_batch)
                     eval_loss_sum += loss.item()
                     n_eval_batches += 1
+                    for key, value in (eval_output or {}).items():
+                        if (
+                            key == "continuous_loss"
+                            or key.startswith(("discrete_loss/", "discrete_accuracy/"))
+                        ) and isinstance(value, int | float):
+                            eval_policy_metric_sums[key] = eval_policy_metric_sums.get(key, 0.0) + value
+                    per_dim = (eval_output or {}).get("loss_per_dim")
+                    if isinstance(per_dim, (list, tuple)):
+                        numeric_per_dim = torch.tensor(
+                            [float("nan") if value is None else float(value) for value in per_dim],
+                            dtype=torch.float64,
+                        )
+                        if eval_action_dimension_sums is None:
+                            eval_action_dimension_sums = torch.zeros_like(numeric_per_dim)
+                        eval_action_dimension_sums += numeric_per_dim
             eval_loss = eval_loss_sum / max(n_eval_batches, 1)
             eval_loss = torch.tensor(eval_loss, device=device)
             eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
+            eval_metric_means: dict[str, float] = {}
+            if eval_policy_metric_sums:
+                metric_names = sorted(eval_policy_metric_sums)
+                metric_values = torch.tensor(
+                    [eval_policy_metric_sums[name] / max(n_eval_batches, 1) for name in metric_names],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                metric_values = accelerator.reduce(metric_values, reduction="mean")
+                eval_metric_means = dict(zip(metric_names, metric_values.tolist(), strict=True))
+            eval_action_dimension_means: dict[str, float] = {}
+            action_names = getattr(active_cfg, "action_feature_names", None)
+            if eval_action_dimension_sums is not None and action_names is not None:
+                if len(eval_action_dimension_sums) != len(action_names):
+                    raise ValueError(
+                        f"Validation loss_per_dim has {len(eval_action_dimension_sums)} values but "
+                        f"the policy defines {len(action_names)} actions"
+                    )
+                dimension_means = eval_action_dimension_sums / max(n_eval_batches, 1)
+                dimension_means = accelerator.reduce(dimension_means.to(device), reduction="mean").cpu()
+                eval_action_dimension_means = {
+                    name: float(value)
+                    for name, value in zip(action_names, dimension_means.tolist(), strict=True)
+                    if not np.isnan(value)
+                }
             policy.train()
 
             if is_main_process:
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
                 if wandb_logger:
-                    wandb_logger.log_dict(
-                        {"eval_loss": eval_loss, "eval_batches": n_eval_batches},
-                        step=step,
-                        mode="eval",
+                    wandb_logger.log_grouped_dict(
+                        _wandb_eval_metrics(
+                            eval_loss,
+                            n_eval_batches,
+                            eval_metric_means,
+                            eval_action_dimension_means,
+                        ),
+                        step,
                     )
 
         if cfg.save_checkpoint and is_saving_step:

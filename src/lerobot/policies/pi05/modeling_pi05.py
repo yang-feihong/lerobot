@@ -61,6 +61,75 @@ from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 
+
+def linear_chain_crf_nll(
+    emissions: Tensor,
+    targets: Tensor,
+    mask: Tensor,
+    start_scores: Tensor,
+    transitions: Tensor,
+) -> Tensor:
+    """Per-sample linear-chain CRF NLL with arbitrary learned transitions."""
+    mask = mask.to(torch.bool)
+    first_targets = targets[:, 0]
+    log_partition = start_scores[None, :] + emissions[:, 0]
+    target_score = start_scores[first_targets] + emissions[:, 0].gather(1, first_targets[:, None]).squeeze(1)
+    target_score = target_score * mask[:, 0]
+    for step in range(1, emissions.shape[1]):
+        next_partition = torch.logsumexp(
+            log_partition[:, :, None] + transitions[None, :, :] + emissions[:, step, None, :], dim=1
+        )
+        log_partition = torch.where(mask[:, step, None], next_partition, log_partition)
+        transition_score = transitions[targets[:, step - 1], targets[:, step]]
+        emission_score = emissions[:, step].gather(1, targets[:, step, None]).squeeze(1)
+        target_score = target_score + (transition_score + emission_score) * mask[:, step]
+    nll = torch.logsumexp(log_partition, dim=1) - target_score
+    return torch.where(mask.any(dim=1), nll, torch.zeros_like(nll))
+
+
+def linear_chain_viterbi(emissions: Tensor, start_scores: Tensor, transitions: Tensor) -> Tensor:
+    """Decode a batch of fixed-length sequences without restricting state transitions."""
+    scores = start_scores + emissions[:, 0]
+    backpointers = []
+    for step in range(1, emissions.shape[1]):
+        candidates = scores[:, :, None] + transitions[None, :, :]
+        scores, backpointer = candidates.max(dim=1)
+        scores = scores + emissions[:, step]
+        backpointers.append(backpointer)
+    states = [scores.argmax(dim=-1)]
+    for backpointer in reversed(backpointers):
+        states.append(backpointer.gather(1, states[-1][:, None]).squeeze(1))
+    return torch.stack(list(reversed(states)), dim=1)
+
+
+def absorbing_bool_decode(logits: Tensor) -> Tensor:
+    """Threshold a completion-state sequence, then make true an absorbing state."""
+    return torch.cummax(logits > 0, dim=1).values
+
+
+def absorbing_hazard_nll(logits: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
+    """NLL for the first completion onset (or no onset) in each valid chunk."""
+    targets = targets.to(torch.bool) & mask.to(torch.bool)
+    active = torch.cumsum(targets.to(torch.int64), dim=1) == 0
+    before_onset = active & mask
+    first_onset = targets & (torch.cumsum(targets.to(torch.int64), dim=1) == 1)
+    losses = F.softplus(logits) * before_onset + F.softplus(-logits) * first_onset
+    return losses.sum(dim=1) / (before_onset | first_onset).sum(dim=1).clamp_min(1)
+
+
+class LinearChainCRF(nn.Module):
+    def __init__(self, num_states: int):
+        super().__init__()
+        self.start_scores = nn.Parameter(torch.zeros(num_states))
+        self.transitions = nn.Parameter(torch.zeros(num_states, num_states))
+
+    def nll(self, emissions: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
+        return linear_chain_crf_nll(emissions, targets, mask, self.start_scores, self.transitions)
+
+    def decode(self, emissions: Tensor) -> Tensor:
+        return linear_chain_viterbi(emissions, self.start_scores, self.transitions)
+
+
 OBS_ACTION_HISTORY = "observation.action_history"
 
 
@@ -923,6 +992,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
+        if config.discrete_action_training_mode == "structured_temporal":
+            self.arm_mode_head = nn.Linear(action_expert_config.width, 3)
+            self.gripper_state_head = nn.Linear(action_expert_config.width, 2)
+            self.task_complete_head = nn.Linear(action_expert_config.width, 1)
+            self.arm_mode_crf = LinearChainCRF(3)
+            self.gripper_state_crf = LinearChainCRF(2)
 
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -959,6 +1034,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def _zero_structured_discrete_channels(self, actions: Tensor) -> Tensor:
+        if self.config.discrete_action_training_mode != "structured_temporal":
+            return actions
+        names = list(self.config.action_feature_names or [])
+        indices = [
+            names.index(name)
+            for name in ("arm_teleop_inactive", "arm_reset", "gripper_target", "task_complete")
+        ]
+        actions = actions.clone()
+        actions[..., indices] = 0
+        return actions
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
@@ -1211,7 +1298,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         image_memory_masks=None,
         state_memory_mask=None,
         action_history_mask=None,
-    ) -> Tensor:
+        return_action_features: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Do a full training forward pass and compute the loss."""
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
@@ -1268,7 +1356,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        losses = F.mse_loss(u_t, v_t, reduction="none")
+        if return_action_features:
+            return losses, suffix_out
+        return losses
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -1280,7 +1371,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         noise=None,
         num_steps=None,
         **kwargs: Unpack[ActionSelectKwargs],
-    ) -> Tensor:
+    ) -> Tensor | tuple[Tensor, dict[str, Tensor]]:
         """Do a full inference forward and compute the action."""
         if num_steps is None:
             num_steps = self.config.num_inference_steps
@@ -1296,12 +1387,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 self.config.max_action_dim,
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
+        noise = self._zero_structured_discrete_channels(noise)
 
         state = kwargs.get("state")
         action_history = kwargs.get("action_history")
         image_memory_masks = kwargs.get("image_memory_masks")
         state_memory_mask = kwargs.get("state_memory_mask")
         action_history_mask = kwargs.get("action_history_mask")
+        if kwargs.get("prev_chunk_left_over") is not None:
+            kwargs["prev_chunk_left_over"] = self._zero_structured_discrete_channels(
+                kwargs["prev_chunk_left_over"]
+            )
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images,
             img_masks,
@@ -1358,12 +1454,30 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             else:
                 v_t = denoise_step_partial_call(x_t)
 
+            v_t = self._zero_structured_discrete_channels(v_t)
+
             x_t = x_t + dt * v_t
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
-        return x_t
+        if self.config.discrete_action_training_mode != "structured_temporal":
+            return x_t
+        _, suffix_out = self.denoise_step(
+            prefix_pad_masks=prefix_pad_masks,
+            past_key_values=past_key_values,
+            x_t=x_t,
+            timestep=torch.zeros(bsize, dtype=torch.float32, device=device),
+            return_action_features=True,
+        )
+        return x_t, self.structured_action_logits(suffix_out)
+
+    def structured_action_logits(self, action_features: Tensor) -> dict[str, Tensor]:
+        return {
+            "arm_mode": self.arm_mode_head(action_features),
+            "gripper_state": self.gripper_state_head(action_features),
+            "task_complete": self.task_complete_head(action_features).squeeze(-1),
+        }
 
     def denoise_step(
         self,
@@ -1371,6 +1485,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         past_key_values,
         x_t,
         timestep,
+        return_action_features: bool = False,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
@@ -1402,7 +1517,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
-        return self.action_out_proj(suffix_out)
+        velocity = self.action_out_proj(suffix_out)
+        if return_action_features:
+            return velocity, suffix_out
+        return velocity
 
 
 class PI05Policy(PreTrainedPolicy):
@@ -1450,6 +1568,16 @@ class PI05Policy(PreTrainedPolicy):
             full_train_modules.append(self.model.state_memory_proj)
         if self.config.action_history_enabled:
             full_train_modules.append(self.model.action_memory_proj)
+        if self.config.discrete_action_training_mode == "structured_temporal":
+            full_train_modules.extend(
+                [
+                    self.model.arm_mode_head,
+                    self.model.gripper_state_head,
+                    self.model.task_complete_head,
+                    self.model.arm_mode_crf,
+                    self.model.gripper_state_crf,
+                ]
+            )
         for module in full_train_modules:
             module.train()
             for param in module.parameters():
@@ -1570,6 +1698,8 @@ class PI05Policy(PreTrainedPolicy):
                 getattr(model.config, "mem_vit_enabled", False)
                 or getattr(model.config, "state_action_encoding", "text") == "continuous"
                 or getattr(model.config, "action_history_enabled", False)
+                or getattr(model.config, "discrete_action_training_mode", "continuous_flow")
+                == "structured_temporal"
             )
             effective_strict = strict and not has_new_observation_modules
             missing_keys, unexpected_keys = model.load_state_dict(
@@ -2141,6 +2271,139 @@ class PI05Policy(PreTrainedPolicy):
         loss_dict["loss"] = loss.item()
         return loss, loss_dict
 
+    def _structured_temporal_action_loss(
+        self,
+        flow_losses: Tensor,
+        logits: dict[str, Tensor],
+        actions: Tensor,
+        reduction: str,
+        action_is_pad: Tensor | None,
+    ) -> tuple[Tensor, dict]:
+        names = list(self.config.action_feature_names or [])
+        name_to_dim = {name: index for index, name in enumerate(names)}
+        required = {"arm_teleop_inactive", "arm_reset", "gripper_target", "task_complete"}
+        missing = sorted(required - name_to_dim.keys())
+        if missing:
+            raise ValueError(f"structured_temporal requires discrete action fields: {missing}")
+        valid = (
+            torch.ones(actions.shape[:2], dtype=torch.bool, device=actions.device)
+            if action_is_pad is None
+            else ~action_is_pad.to(device=actions.device, dtype=torch.bool)
+        )
+        inactive = self._normalized_bool_mask(actions, name_to_dim["arm_teleop_inactive"])
+        reset = self._normalized_bool_mask(actions, name_to_dim["arm_reset"])
+        if bool((inactive & reset & valid).any()):
+            raise ValueError("arm_teleop_inactive and arm_reset cannot both be true")
+        arm_mode = torch.zeros_like(actions[:, :, 0], dtype=torch.long)
+        arm_mode[inactive] = 1
+        arm_mode[reset] = 2
+        gripper = self._normalized_bool_mask(
+            actions,
+            name_to_dim["gripper_target"],
+            true_side=self.config.action_gripper_target_true_side,
+        ).long()
+        complete = self._normalized_bool_mask(actions, name_to_dim["task_complete"])
+        execution_valid = valid & ~complete
+
+        b2_names = (
+            ["b2_delta_x", "b2_delta_y", "b2_delta_yaw"]
+            if self.config.b2_action_representation == "local_trajectory"
+            else ["b2_vx", "b2_vy", "b2_omega_z"]
+        )
+        b2_dims = [name_to_dim[name] for name in b2_names]
+        ee_dims = [index for index, name in enumerate(names) if name.startswith("height_invariant_ee_")]
+        ee_valid = execution_valid & ~inactive & ~reset
+        continuous_parts = []
+        continuous_weights = []
+        for part, weights in (
+            self._masked_dim_loss(
+                flow_losses, b2_dims, execution_valid, self.config.action_continuous_loss_weight
+            ),
+            self._masked_dim_loss(flow_losses, ee_dims, ee_valid, self.config.action_continuous_loss_weight),
+        ):
+            continuous_parts.append(part.reshape(actions.shape[0], -1))
+            continuous_weights.append(weights.reshape(actions.shape[0], -1))
+        continuous_loss = torch.cat(continuous_parts, dim=1).sum(dim=1) / torch.cat(
+            continuous_weights, dim=1
+        ).sum(dim=1).clamp_min(1e-6)
+
+        def balanced_emission_loss(
+            name: str, emissions: Tensor, target: Tensor, target_valid: Tensor
+        ) -> Tensor:
+            element = F.cross_entropy(emissions.transpose(1, 2), target, reduction="none")
+            if emissions.shape[-1] == 2:
+                weights = self._global_bool_weights(name, target.bool(), target_valid)
+            else:
+                weights = target_valid.float()
+                reset_fraction = self.config.action_bool_true_fractions.get("arm_reset")
+                inactive_fraction = self.config.action_bool_true_fractions.get("arm_teleop_inactive")
+                if reset_fraction is not None and inactive_fraction is not None:
+                    ee_fraction = max(1e-6, 1.0 - reset_fraction - inactive_fraction)
+                    class_weights = emissions.new_tensor(
+                        [1.0 / ee_fraction, 1.0 / inactive_fraction, 1.0 / reset_fraction]
+                    )
+                    class_weights = class_weights / class_weights.mean()
+                    weights = class_weights[target] * target_valid
+            return (element * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1e-6)
+
+        arm_crf = self.model.arm_mode_crf.nll(logits["arm_mode"], arm_mode, execution_valid)
+        arm_crf = arm_crf / execution_valid.sum(1).clamp_min(1)
+        arm_loss = arm_crf + balanced_emission_loss("arm_mode", logits["arm_mode"], arm_mode, execution_valid)
+        gripper_crf = self.model.gripper_state_crf.nll(logits["gripper_state"], gripper, execution_valid)
+        gripper_crf = gripper_crf / execution_valid.sum(1).clamp_min(1)
+        gripper_loss = gripper_crf + balanced_emission_loss(
+            "gripper_target", logits["gripper_state"], gripper, execution_valid
+        )
+        completion_loss = absorbing_hazard_nll(logits["task_complete"], complete, valid)
+        completion_state_element = F.binary_cross_entropy_with_logits(
+            logits["task_complete"], complete.float(), reduction="none"
+        )
+        completion_state_weights = self._global_bool_weights("task_complete", complete, valid)
+        completion_state_loss = (completion_state_element * completion_state_weights).sum(
+            1
+        ) / completion_state_weights.sum(1).clamp_min(1e-6)
+        completion_loss = completion_loss + completion_state_loss
+
+        arm_prediction = self.model.arm_mode_crf.decode(logits["arm_mode"])
+        gripper_prediction = self.model.gripper_state_crf.decode(logits["gripper_state"])
+        complete_prediction = absorbing_bool_decode(logits["task_complete"])
+
+        def masked_accuracy(prediction: Tensor, target: Tensor, target_valid: Tensor) -> float:
+            correct = (prediction == target) & target_valid
+            return float((correct.sum() / target_valid.sum().clamp_min(1)).detach().cpu())
+
+        discrete_weight = float(self.config.action_bool_loss_weight)
+        per_sample = continuous_loss + discrete_weight * (arm_loss + gripper_loss + completion_loss) / 3.0
+        info = {
+            "structured_temporal_action_loss": 1.0,
+            "continuous_loss": float(continuous_loss.mean().detach().cpu()),
+            "discrete_loss/arm_mode": float(arm_loss.mean().detach().cpu()),
+            "discrete_loss/gripper_target": float(gripper_loss.mean().detach().cpu()),
+            "discrete_loss/task_complete": float(completion_loss.mean().detach().cpu()),
+            "discrete_accuracy/arm_mode": masked_accuracy(arm_prediction, arm_mode, execution_valid),
+            "discrete_accuracy/gripper_target": masked_accuracy(gripper_prediction, gripper, execution_valid),
+            "discrete_accuracy/task_complete": masked_accuracy(complete_prediction, complete, valid),
+            "continuous_mask_frac/ee_pose": float(ee_valid.float().mean().detach().cpu()),
+            "arm_mode_frac/ee": float(
+                ((arm_mode == 0) & execution_valid).sum().detach().cpu()
+                / execution_valid.sum().clamp_min(1).cpu()
+            ),
+            "arm_mode_frac/inactive": float(
+                ((arm_mode == 1) & execution_valid).sum().detach().cpu()
+                / execution_valid.sum().clamp_min(1).cpu()
+            ),
+            "arm_mode_frac/reset": float(
+                ((arm_mode == 2) & execution_valid).sum().detach().cpu()
+                / execution_valid.sum().clamp_min(1).cpu()
+            ),
+        }
+        if reduction == "none":
+            info["loss"] = float(per_sample.mean().detach().cpu())
+            return per_sample, info
+        loss = per_sample.mean()
+        info["loss"] = float(loss.detach().cpu())
+        return loss, info
+
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations."""
@@ -2198,11 +2461,29 @@ class PI05Policy(PreTrainedPolicy):
             )
             kwargs["action_history"] = self._prepare_action_history(batch, action_window)
             kwargs["action_history_mask"] = action_mask
-        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        sampled = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        if self.config.discrete_action_training_mode == "structured_temporal":
+            actions, structured_logits = sampled
+        else:
+            actions = sampled
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
         actions = actions[:, :, :original_action_dim]
+
+        if self.config.discrete_action_training_mode == "structured_temporal":
+            names = list(self.config.action_feature_names or [])
+            name_to_dim = {name: index for index, name in enumerate(names)}
+            arm_mode = self.model.arm_mode_crf.decode(structured_logits["arm_mode"])
+            gripper = self.model.gripper_state_crf.decode(structured_logits["gripper_state"])
+            complete = absorbing_bool_decode(structured_logits["task_complete"])
+            actions[:, :, name_to_dim["arm_teleop_inactive"]] = torch.where(arm_mode == 1, 1.0, -1.0)
+            actions[:, :, name_to_dim["arm_reset"]] = torch.where(arm_mode == 2, 1.0, -1.0)
+            gripper_true = torch.where(gripper.bool(), 1.0, -1.0)
+            if self.config.action_gripper_target_true_side == "negative":
+                gripper_true = -gripper_true
+            actions[:, :, name_to_dim["gripper_target"]] = gripper_true
+            actions[:, :, name_to_dim["task_complete"]] = torch.where(complete, 1.0, -1.0)
 
         return actions
 
@@ -2236,6 +2517,7 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
+        flow_actions = self.model._zero_structured_discrete_channels(actions)
         state = self._prepare_state_history(batch, state_window_num_frames)
         action_history = None
         action_history_mask = None
@@ -2250,15 +2532,16 @@ class PI05Policy(PreTrainedPolicy):
             action_history = self._prepare_action_history(batch, action_window)
 
         noise = self.model.sample_noise(actions.shape, actions.device)
+        noise = self.model._zero_structured_discrete_channels(noise)
         time = self.model.sample_time(actions.shape[0], actions.device)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(
+        model_output = self.model.forward(
             images,
             img_masks,
             tokens,
             masks,
-            actions,
+            flow_actions,
             noise,
             time,
             state=state,
@@ -2266,7 +2549,13 @@ class PI05Policy(PreTrainedPolicy):
             image_memory_masks=image_memory_masks,
             state_memory_mask=state_memory_mask,
             action_history_mask=action_history_mask,
+            return_action_features=self.config.discrete_action_training_mode == "structured_temporal",
         )
+        if self.config.discrete_action_training_mode == "structured_temporal":
+            losses, action_features = model_output
+            structured_logits = self.model.structured_action_logits(action_features)
+        else:
+            losses = model_output
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -2283,6 +2572,29 @@ class PI05Policy(PreTrainedPolicy):
             loss_dict["state_window_num_frames"] = float(state_window_num_frames)
         if action_history_lengths is not None:
             loss_dict["action_history_num_frames"] = float(action_history_lengths.float().mean().item())
+
+        if self.config.discrete_action_training_mode == "structured_temporal":
+            discrete_names = {
+                "arm_teleop_inactive",
+                "arm_reset",
+                "gripper_target",
+                "task_complete",
+            }
+            loss_dict["loss_per_dim"] = [
+                None if name in discrete_names else value
+                for name, value in zip(
+                    self.config.action_feature_names or [], loss_dict["loss_per_dim"], strict=True
+                )
+            ]
+            loss, structured_loss_dict = self._structured_temporal_action_loss(
+                losses,
+                structured_logits,
+                actions[:, :, :original_action_dim],
+                reduction,
+                batch.get(f"{ACTION}_is_pad"),
+            )
+            loss_dict.update(structured_loss_dict)
+            return loss, loss_dict
 
         if self._use_b2_z1_gate_action_loss(original_action_dim):
             loss, gate_loss_dict = self._b2_z1_gate_action_loss(
@@ -2325,6 +2637,16 @@ class PI05Policy(PreTrainedPolicy):
             "model.time_mlp_in",
             "model.time_mlp_out",
         ]
+        if self.config.discrete_action_training_mode == "structured_temporal":
+            modules_to_save.extend(
+                [
+                    "model.arm_mode_head",
+                    "model.gripper_state_head",
+                    "model.task_complete_head",
+                    "model.arm_mode_crf",
+                    "model.gripper_state_crf",
+                ]
+            )
         if self.config.state_action_encoding == "continuous":
             modules_to_save.append("model.state_memory_proj")
         if self.config.action_history_enabled:

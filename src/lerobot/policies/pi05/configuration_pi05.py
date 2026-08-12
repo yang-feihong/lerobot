@@ -88,6 +88,7 @@ class PI05Config(PreTrainedConfig):
     action_predict_ee_pose: bool = True
     action_predict_gripper: bool = True
     action_predict_task_complete: bool = True
+    discrete_action_training_mode: str = "continuous_flow"
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
@@ -148,6 +149,8 @@ class PI05Config(PreTrainedConfig):
     # Every enabled bool uses the same fixed prior on every rank/microbatch.
     action_bool_true_fractions: dict[str, float] = field(default_factory=dict)
     action_gripper_target_true_side: str = "negative"  # "negative" or "positive"
+    action_gripper_negative_value: float = -1.0471976
+    action_gripper_nonnegative_value: float = 0.0
     # Keep a bounded number of chunk starts whose current input is already in
     # the explicit completion tail. This teaches stable stopping without letting
     # arbitrarily long post-task bag tails dominate training and validation.
@@ -219,6 +222,23 @@ class PI05Config(PreTrainedConfig):
         if self.action_loss_schema not in ["auto", "always", "off"]:
             raise ValueError(
                 f"Invalid action_loss_schema: {self.action_loss_schema}. Expected 'auto', 'always', or 'off'."
+            )
+        if self.discrete_action_training_mode not in ["continuous_flow", "structured_temporal"]:
+            raise ValueError(
+                "discrete_action_training_mode must be 'continuous_flow' or "
+                f"'structured_temporal', got {self.discrete_action_training_mode!r}"
+            )
+        if self.discrete_action_training_mode == "structured_temporal" and not all(
+            (
+                self.action_predict_arm_teleop_inactive,
+                self.action_predict_arm_reset,
+                self.action_predict_gripper,
+                self.action_predict_task_complete,
+            )
+        ):
+            raise ValueError(
+                "structured_temporal requires arm_teleop_inactive, arm_reset, gripper, and "
+                "task_complete outputs"
             )
         if self.b2_action_representation not in ["velocity", "local_trajectory"]:
             raise ValueError(
@@ -393,7 +413,7 @@ class PI05Config(PreTrainedConfig):
         }
         return {
             "format": "lerobot.pi05.deployment",
-            "version": 4,
+            "version": 5,
             "policy": {
                 "type": self.type,
                 "paligemma_variant": self.paligemma_variant,
@@ -432,6 +452,26 @@ class PI05Config(PreTrainedConfig):
                 "model_names": self.action_feature_names,
                 "representation": self.b2_action_representation,
                 "z1_representation": self.z1_action_representation,
+                "discrete_training_mode": self.discrete_action_training_mode,
+                "discrete_temporal_structure": (
+                    {
+                        "arm_mode": {
+                            "states": ["ee", "inactive", "reset"],
+                            "decoder": "linear_chain_crf",
+                            "allowed_transitions": "all",
+                        },
+                        "gripper_target": {
+                            "states": ["normalized_nonnegative", "normalized_negative"],
+                            "decoder": "linear_chain_crf",
+                        },
+                        "task_complete": {
+                            "decoder": "first_onset_hazard",
+                            "true_is_absorbing": True,
+                        },
+                    }
+                    if self.discrete_action_training_mode == "structured_temporal"
+                    else None
+                ),
                 "trajectory_source": (
                     "global_pose_transform"
                     if self.b2_global_pose_state_indices is not None
@@ -468,6 +508,15 @@ class PI05Config(PreTrainedConfig):
                         "arm_reset": "positive",
                         "gripper_target": self.action_gripper_target_true_side,
                         "task_complete": "positive",
+                    },
+                    "output_values": {
+                        "arm_teleop_inactive": {"false": 0.0, "true": 1.0},
+                        "arm_reset": {"false": 0.0, "true": 1.0},
+                        "gripper_target": {
+                            "normalized_negative": self.action_gripper_negative_value,
+                            "normalized_nonnegative": self.action_gripper_nonnegative_value,
+                        },
+                        "task_complete": {"false": 0.0, "true": 1.0},
                     },
                 },
                 "task_complete_semantics": (

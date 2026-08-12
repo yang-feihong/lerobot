@@ -129,6 +129,23 @@ class WandBLogger:
         self._wandb.define_metric("train/*", step_metric="train/step")
         self._wandb.define_metric("eval/step", hidden=True)
         self._wandb.define_metric("eval/*", step_metric="eval/step")
+        self._wandb.define_metric("optimizer_step", hidden=True)
+        for group in (
+            "overview",
+            "training_progress",
+            "optimization",
+            "performance",
+            "continuous_action",
+            "discrete_action",
+            "action_dimensions",
+            "memory",
+            "data",
+            "sample_weighting",
+            "policy_diagnostics",
+        ):
+            self._wandb.define_metric(f"{group}/*", step_metric="optimizer_step")
+        self._wandb.define_metric("overview/train_loss", step_metric="optimizer_step", summary="min")
+        self._wandb.define_metric("overview/val_loss", step_metric="optimizer_step", summary="min")
 
     def update_config(self, d: dict, *, allow_val_change: bool = True) -> None:
         """Add runtime-derived metadata that is not known when wandb.init receives the CLI config."""
@@ -217,6 +234,13 @@ class WandBLogger:
             else:
                 batch_data[f"{mode}/step"] = step
                 self._wandb.log(data=batch_data, step=step)
+
+    def log_grouped_dict(self, d: dict[str, int | float], step: int) -> None:
+        """Log pre-grouped metric paths on a shared optimizer-step axis."""
+        batch_data = {key: value for key, value in d.items() if isinstance(value, int | float)}
+        if batch_data:
+            batch_data["optimizer_step"] = step
+            self._wandb.log(data=batch_data, step=step)
 
     def log_video(self, video_path: str, step: int, mode: str = "train"):
         if mode not in {"train", "eval"}:
