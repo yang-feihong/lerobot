@@ -103,9 +103,14 @@ def test_historical_saved_config_without_mode_loads_as_continuous_flow(tmp_path)
 
 
 def test_structured_metadata_records_temporal_decoder_contract() -> None:
-    metadata = PI05Config(discrete_action_training_mode="structured_temporal").deployment_metadata()
-    assert metadata["version"] == 5
+    metadata = PI05Config(
+        discrete_action_training_mode="structured_temporal",
+        z1_action_representation="ee_delta",
+        ee_delta_rotation_representation="rotvec",
+    ).deployment_metadata()
+    assert metadata["version"] == 6
     assert metadata["action"]["discrete_training_mode"] == "structured_temporal"
+    assert metadata["action"]["ee_delta_rotation_representation"] == "rotvec"
     assert metadata["action"]["discrete_temporal_structure"]["arm_mode"]["allowed_transitions"] == "all"
     assert metadata["action"]["boolean_decoding"]["output_values"]["gripper_target"] == {
         "normalized_negative": -1.0471976,

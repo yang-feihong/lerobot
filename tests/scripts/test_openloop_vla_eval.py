@@ -3,10 +3,12 @@ import math
 import numpy as np
 import pytest
 import torch
+from datasets import Dataset
 
 from lerobot.scripts.openloop_vla_eval import (
     _current_b2_pose_from_raw_state,
     _local_trajectory_to_world,
+    _manipulation_onset_windows,
     _world_trajectory_plot_limits,
 )
 
@@ -64,3 +66,23 @@ def test_world_xy_plot_limits_share_one_physical_scale():
     assert limits[0][1] > 5.0
     assert limits[2][0] < -0.2
     assert limits[2][1] > 0.3
+
+
+def test_onset_windows_are_kept_even_across_episode_boundaries():
+    actions = np.zeros((8, 16), dtype=np.float32)
+    actions[:, 3] = 1.0
+    actions[2:4, 3] = 0.0
+    actions[6:8, 3] = 0.0
+    dataset = type("DatasetStub", (), {})()
+    dataset.hf_dataset = Dataset.from_dict(
+        {
+            "action": actions.tolist(),
+            "episode_index": [0, 0, 0, 0, 1, 1, 1, 1],
+            "frame_index": [0, 1, 2, 3, 0, 1, 2, 3],
+        }
+    )
+
+    indices, episode_frames = _manipulation_onset_windows(dataset, pre_frames=1, post_frames=1)
+
+    assert indices == {1, 2, 3, 5, 6, 7}
+    assert episode_frames == {(0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (1, 3)}

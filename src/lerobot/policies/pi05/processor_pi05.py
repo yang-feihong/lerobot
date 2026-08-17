@@ -50,9 +50,11 @@ from lerobot.utils.constants import (
 )
 
 from .b2_action_transform import (
+    EE_DELTA_VALID_KEY,
     action_dataset_indices,
     action_schema_kwargs,
     decode_b2_action_chunk,
+    ee_delta_transition_validity,
     encode_b2_action_chunk,
     make_b2_trajectory_stats,
 )
@@ -87,7 +89,12 @@ def _action_history_steps(
         **{
             key: value
             for key, value in action_schema_kwargs(config).items()
-            if key not in {"representation", "z1_representation"}
+            if key
+            not in {
+                "representation",
+                "z1_representation",
+                "ee_delta_rotation_representation",
+            }
         }
     )
     history_length = config.state_num_frames - 1 if config.action_history_enabled else 0
@@ -172,6 +179,7 @@ class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
     include_task_complete: bool = True
     representation: str = "local_trajectory"
     z1_representation: str = "ee_pose"
+    ee_delta_rotation_representation: str = "rot6d"
     predict_arm_teleop_inactive: bool = True
     predict_arm_reset: bool = True
     predict_ee_pose: bool = True
@@ -242,15 +250,18 @@ class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
                 global_pose=global_pose,
                 representation=self.representation,
                 z1_representation=self.z1_representation,
+                ee_delta_rotation_representation=self.ee_delta_rotation_representation,
                 predict_arm_teleop_inactive=self.predict_arm_teleop_inactive,
                 predict_arm_reset=self.predict_arm_reset,
                 predict_ee_pose=self.predict_ee_pose,
                 predict_gripper=self.predict_gripper,
                 include_task_complete=self.include_task_complete,
             )
-            if self.z1_representation == "ee_delta" and is_pad is not None:
+            if self.z1_representation == "ee_delta":
                 complementary = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {})
-                complementary[f"{ACTION}_is_pad"] = is_pad[..., :-1] | is_pad[..., 1:]
+                complementary[EE_DELTA_VALID_KEY] = ee_delta_transition_validity(action, is_pad)
+                if is_pad is not None:
+                    complementary[f"{ACTION}_is_pad"] = is_pad[..., :-1] | is_pad[..., 1:]
                 new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary
         new_transition[TransitionKey.ACTION] = transformed
         return new_transition
@@ -267,6 +278,7 @@ class Pi05B2LocalTrajectoryProcessorStep(ProcessorStep):
             "include_task_complete": self.include_task_complete,
             "representation": self.representation,
             "z1_representation": self.z1_representation,
+            "ee_delta_rotation_representation": self.ee_delta_rotation_representation,
             "predict_arm_teleop_inactive": self.predict_arm_teleop_inactive,
             "predict_arm_reset": self.predict_arm_reset,
             "predict_ee_pose": self.predict_ee_pose,
@@ -283,6 +295,7 @@ def reconcile_pi05_b2_trajectory_processors(
     preprocessor: PolicyProcessorPipeline,
     postprocessor: PolicyProcessorPipeline,
     dataset_stats: dict[str, dict[str, Any]] | None,
+    transformed_action_stats: dict[str, Any] | None = None,
 ) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
     """Insert/refresh B2 trajectory steps when fine-tuning a pretrained PI0.5."""
     if not config.io_schema_resolved:
@@ -293,6 +306,7 @@ def reconcile_pi05_b2_trajectory_processors(
     raw_dataset_stats = dataset_stats
     transformed_stats = make_b2_trajectory_stats(
         dataset_stats,
+        transformed_action_stats=transformed_action_stats,
         dt=config.b2_local_trajectory_dt,
         chunk_size=config.chunk_size,
         state_indices=tuple(config.state_feature_indices or ()),
@@ -310,6 +324,7 @@ def reconcile_pi05_b2_trajectory_processors(
         keep_state_history=config.state_action_encoding == "continuous",
         representation=config.b2_action_representation,
         z1_representation=config.z1_action_representation,
+        ee_delta_rotation_representation=config.ee_delta_rotation_representation,
         predict_arm_teleop_inactive=config.action_predict_arm_teleop_inactive,
         predict_arm_reset=config.action_predict_arm_reset,
         predict_ee_pose=config.action_predict_ee_pose,
@@ -354,6 +369,7 @@ def reconcile_pi05_b2_trajectory_processors(
         inverse=True,
         representation=config.b2_action_representation,
         z1_representation=config.z1_action_representation,
+        ee_delta_rotation_representation=config.ee_delta_rotation_representation,
         predict_arm_teleop_inactive=config.action_predict_arm_teleop_inactive,
         include_task_complete=config.action_predict_task_complete,
     )
@@ -429,6 +445,7 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
 def make_pi05_pre_post_processors(
     config: PI05Config,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+    transformed_action_stats: dict[str, Any] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
@@ -464,6 +481,7 @@ def make_pi05_pre_post_processors(
             raise ValueError("b2_local_trajectory_dt must be resolved from the model control frequency")
         dataset_stats = make_b2_trajectory_stats(
             dataset_stats,
+            transformed_action_stats=transformed_action_stats,
             dt=config.b2_local_trajectory_dt,
             chunk_size=config.chunk_size,
             state_indices=tuple(config.state_feature_indices or ()),
@@ -517,6 +535,7 @@ def make_pi05_pre_post_processors(
                 keep_state_history=config.state_action_encoding == "continuous",
                 representation=config.b2_action_representation,
                 z1_representation=config.z1_action_representation,
+                ee_delta_rotation_representation=config.ee_delta_rotation_representation,
                 predict_arm_teleop_inactive=config.action_predict_arm_teleop_inactive,
                 predict_arm_reset=config.action_predict_arm_reset,
                 predict_ee_pose=config.action_predict_ee_pose,
@@ -556,6 +575,7 @@ def make_pi05_pre_post_processors(
                 inverse=True,
                 representation=config.b2_action_representation,
                 z1_representation=config.z1_action_representation,
+                ee_delta_rotation_representation=config.ee_delta_rotation_representation,
                 predict_arm_teleop_inactive=config.action_predict_arm_teleop_inactive,
                 include_task_complete=config.action_predict_task_complete,
             ),

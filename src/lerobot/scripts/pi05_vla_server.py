@@ -29,14 +29,19 @@ import torch
 
 from lerobot.configs import PreTrainedConfig, RTCAttentionSchedule
 from lerobot.policies import make_policy, make_pre_post_processors
-from lerobot.policies.pi05.b2_action_transform import action_dataset_indices
+from lerobot.policies.pi05.b2_action_transform import (
+    EE_DELTA_ROTVEC_NAMES,
+    _matrix_to_rot6d,
+    _rotvec_to_matrix,
+    action_dataset_indices,
+)
 from lerobot.policies.pi05.processor_pi05 import OBS_ACTION_HISTORY
 from lerobot.policies.rtc import RTCConfig
 from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.utils import init_logging
 
 LOG = logging.getLogger("pi05_vla_server")
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 EXECUTION_ACTION_PREFIX_NAMES = (
     "b2_vx",
     "b2_vy",
@@ -67,6 +72,15 @@ B2_EXECUTION_VELOCITY_NAMES = ("b2_vx", "b2_vy", "b2_omega_z")
 B2_OBSERVED_VELOCITY_NAMES = ("b2_body_vx", "b2_body_vy", "b2_body_wz")
 
 
+def _parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean, got {value!r}")
+
+
 def execution_action_names(z1_action_representation: str) -> tuple[str, ...]:
     if z1_action_representation == "ee_pose":
         ee_names = EE_POSE_ACTION_NAMES
@@ -87,6 +101,11 @@ def _to_execution_actions(
         raise ValueError(f"Invalid named postprocessed actions: shape={tuple(actions.shape)}, names={names}")
     columns = {name: actions[:, index] for index, name in enumerate(names)}
     output_names = execution_action_names(z1_action_representation)
+    if z1_action_representation == "ee_delta" and set(EE_DELTA_ROTVEC_NAMES).issubset(columns):
+        rotvec = torch.stack([columns[name] for name in EE_DELTA_ROTVEC_NAMES], dim=-1)
+        rot6d = _matrix_to_rot6d(_rotvec_to_matrix(rotvec))
+        for index, name in enumerate(EE_DELTA_ACTION_NAMES[:6]):
+            columns[name] = rot6d[:, index]
     required = set(output_names) - {"b2_active", "arm_active", "task_complete"}
     missing = sorted(required - columns.keys())
     if missing:
@@ -204,6 +223,15 @@ def _smooth_b2_execution_velocity(
     return smoothed
 
 
+def _b2_velocity_smoothing_transition_step(
+    inference_delay_steps: int,
+    previous_velocity_prefix: torch.Tensor | None,
+) -> int:
+    if inference_delay_steps < 0:
+        raise ValueError(f"inference_delay_steps must be non-negative, got {inference_delay_steps}")
+    return inference_delay_steps if previous_velocity_prefix is not None else 0
+
+
 def _apply_completion_stop(actions: torch.Tensor, names: tuple[str, ...]) -> torch.Tensor:
     """Make the completion row and its suffix non-actuating while retaining the stop signal."""
     if "task_complete" not in names:
@@ -224,6 +252,7 @@ class CheckpointContract:
 
     model_action_representation: str
     z1_action_representation: str
+    ee_delta_rotation_representation: str
     metadata_version: int
     state_dim: int
     camera_keys: tuple[str, ...]
@@ -239,13 +268,11 @@ class CheckpointContract:
 
 @dataclass(frozen=True)
 class MemoryObservation:
-    """Compact 50 Hz observation record; JPEGs avoid a large decoded-frame ring buffer."""
+    """One exact low-level telemetry sample from the 50 Hz simulator clock."""
 
     sim_step: int
     state: np.ndarray
     state_names: tuple[str, ...]
-    base_jpeg: np.ndarray
-    wrist_jpeg: np.ndarray
     active_sequence: int
     active_index: int
     executed_ee_target: np.ndarray
@@ -309,9 +336,9 @@ def _load_checkpoint_contract(
         raise FileNotFoundError(f"Checkpoint is missing deployment metadata: {metadata_path}")
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata_version = saved.get("version")
-    if saved.get("format") != "lerobot.pi05.deployment" or metadata_version not in {2, 3, 4, 5}:
+    if saved.get("format") != "lerobot.pi05.deployment" or metadata_version not in {2, 3, 4, 5, 6}:
         raise ValueError(
-            "Checkpoint deployment metadata must use lerobot.pi05.deployment version 2, 3, 4, or 5"
+            "Checkpoint deployment metadata must use lerobot.pi05.deployment version 2 through 6"
         )
     if not config.io_schema_resolved:
         raise ValueError("Checkpoint contains unresolved PI0.5 I/O metadata")
@@ -322,8 +349,15 @@ def _load_checkpoint_contract(
     b2_action_representation, z1_action_representation = _resolve_checkpoint_action_representations(
         int(metadata_version), action, raw_config
     )
-    if metadata_version == 5:
+    if metadata_version == 6:
         expected = config.deployment_metadata()
+        if saved != expected:
+            raise ValueError("pi05_deployment_metadata.json disagrees with checkpoint config.json")
+    elif metadata_version == 5:
+        config.ee_delta_rotation_representation = "rot6d"
+        expected = config.deployment_metadata()
+        expected["version"] = 5
+        expected["action"].pop("ee_delta_rotation_representation", None)
         if saved != expected:
             raise ValueError("pi05_deployment_metadata.json disagrees with checkpoint config.json")
     else:
@@ -366,6 +400,7 @@ def _load_checkpoint_contract(
     return CheckpointContract(
         model_action_representation=b2_action_representation,
         z1_action_representation=str(z1_action_representation),
+        ee_delta_rotation_representation=str(action.get("ee_delta_rotation_representation") or "rot6d"),
         metadata_version=int(metadata_version),
         state_dim=state_dim,
         camera_keys=camera_keys,
@@ -430,10 +465,60 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
                 "Invalid executed EE target feedback: "
                 f"shape={executed_ee_target.shape}, names={executed_ee_target_names}"
             )
+        history_sim_steps = np.asarray(packet["history_sim_steps"], dtype=np.int64).reshape(-1)
+        history_states = np.asarray(packet["history_states"], dtype=np.float32)
+        history_active_sequences = np.asarray(packet["history_active_sequences"], dtype=np.int64).reshape(-1)
+        history_active_indices = np.asarray(packet["history_active_indices"], dtype=np.int64).reshape(-1)
+        history_executed_ee_targets = np.asarray(packet["history_executed_ee_targets"], dtype=np.float32)
+        history_count = len(history_sim_steps)
+        expected_shapes = (
+            history_states.shape == (history_count, state.size)
+            and history_active_sequences.shape == (history_count,)
+            and history_active_indices.shape == (history_count,)
+            and history_executed_ee_targets.shape == (history_count, len(EE_POSE_ACTION_NAMES))
+        )
+        if history_count == 0 or not expected_shapes:
+            raise ValueError(
+                "Invalid 50 Hz telemetry history shapes: "
+                f"steps={history_sim_steps.shape}, states={history_states.shape}, "
+                f"sequences={history_active_sequences.shape}, indices={history_active_indices.shape}, "
+                f"ee={history_executed_ee_targets.shape}"
+            )
+        if np.any(np.diff(history_sim_steps) != 1):
+            raise ValueError("50 Hz telemetry history must contain consecutive simulation steps")
+        if (
+            not np.isfinite(history_states).all()
+            or not np.isfinite(history_executed_ee_targets).all()
+            or np.any(history_active_indices < 0)
+        ):
+            raise ValueError("50 Hz telemetry history contains invalid values")
+        sim_step = int(packet["sim_step"].item())
+        active_sequence = int(packet["active_sequence"].item())
+        active_index = int(packet["active_index"].item())
+        if (
+            history_sim_steps[-1] != sim_step
+            or history_active_sequences[-1] != active_sequence
+            or history_active_indices[-1] != active_index
+            or not np.array_equal(history_states[-1], state)
+            or not np.array_equal(history_executed_ee_targets[-1], executed_ee_target)
+        ):
+            raise ValueError("Current observation does not match the final 50 Hz telemetry sample")
+        telemetry_history = tuple(
+            MemoryObservation(
+                sim_step=int(history_sim_steps[index]),
+                state=history_states[index].copy(),
+                state_names=state_names,
+                active_sequence=int(history_active_sequences[index]),
+                active_index=int(history_active_indices[index]),
+                executed_ee_target=history_executed_ee_targets[index].copy(),
+            )
+            for index in range(history_count)
+        )
         return ObservationPacket(
-            sim_step=int(packet["sim_step"].item()),
-            active_sequence=int(packet["active_sequence"].item()),
-            active_index=int(packet["active_index"].item()),
+            control_epoch=int(packet["control_epoch"].item()),
+            sim_step=sim_step,
+            active_sequence=active_sequence,
+            active_index=active_index,
             task=str(packet["task"].item()),
             state=state,
             state_names=state_names,
@@ -450,6 +535,7 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
             encoded_ns=int(packet["encoded_ns"].item()) if "encoded_ns" in packet else -1,
             executed_ee_target=executed_ee_target,
             executed_ee_target_names=executed_ee_target_names,
+            telemetry_history=telemetry_history,
             server_received_ns=time.monotonic_ns(),
         )
 
@@ -471,6 +557,7 @@ def encode_action_packet(record: ActionRecord) -> bytes:
 
 @dataclass(frozen=True)
 class ObservationPacket:
+    control_epoch: int
     sim_step: int
     active_sequence: int
     active_index: int
@@ -486,6 +573,7 @@ class ObservationPacket:
     encoded_ns: int
     executed_ee_target: np.ndarray
     executed_ee_target_names: tuple[str, ...]
+    telemetry_history: tuple[MemoryObservation, ...]
     server_received_ns: int
 
 
@@ -541,6 +629,7 @@ class RolloutRecorder:
             np.savez_compressed(
                 path,
                 protocol_version=np.asarray(PROTOCOL_VERSION),
+                control_epoch=np.asarray(packet.control_epoch),
                 sim_step=np.asarray(packet.sim_step),
                 active_sequence=np.asarray(packet.active_sequence),
                 active_index=np.asarray(packet.active_index),
@@ -554,6 +643,19 @@ class RolloutRecorder:
                 encoded_ns=np.asarray(packet.encoded_ns),
                 executed_ee_target=packet.executed_ee_target,
                 executed_ee_target_names=np.asarray(packet.executed_ee_target_names, dtype=np.str_),
+                history_sim_steps=np.asarray(
+                    [record.sim_step for record in packet.telemetry_history], dtype=np.int64
+                ),
+                history_states=np.stack([record.state for record in packet.telemetry_history]),
+                history_active_sequences=np.asarray(
+                    [record.active_sequence for record in packet.telemetry_history], dtype=np.int64
+                ),
+                history_active_indices=np.asarray(
+                    [record.active_index for record in packet.telemetry_history], dtype=np.int64
+                ),
+                history_executed_ee_targets=np.stack(
+                    [record.executed_ee_target for record in packet.telemetry_history]
+                ),
                 server_received_ns=np.asarray(packet.server_received_ns),
             )
             prompt_path = self.root / "prompt.txt"
@@ -564,6 +666,9 @@ class RolloutRecorder:
             sim_step=packet.sim_step,
             active_sequence=packet.active_sequence,
             active_index=packet.active_index,
+            control_epoch=packet.control_epoch,
+            telemetry_history_first_step=packet.telemetry_history[0].sim_step,
+            telemetry_history_count=len(packet.telemetry_history),
             transport_ms=(packet.server_received_ns - packet.encoded_ns) / 1e6
             if packet.encoded_ns >= 0
             else None,
@@ -641,10 +746,14 @@ class AsyncRTCPolicy:
         self.rtc_config = rtc_config
         self.device = torch.device(args.device)
         self.low_level_hz = float(args.low_level_hz)
+        self.stop_on_model_task_complete = bool(args.stop_on_model_task_complete)
         self.b2_velocity_smoothing_time_constant_s = float(args.b2_velocity_smoothing_time_constant_s)
         self.period_s = 1.0 / float(args.high_level_hz)
         self.camera_keys = contract.camera_keys
         self.base_camera_key, self.wrist_camera_key = _camera_bindings(self.camera_keys)
+        self.camera_shapes = {key: _feature_shape(config.input_features[key]) for key in self.camera_keys}
+        if any(len(shape) != 3 for shape in self.camera_shapes.values()):
+            raise ValueError(f"Checkpoint camera features must be CHW: {self.camera_shapes}")
 
         names = getattr(self.policy.config, "action_feature_names", None)
         if getattr(self.policy.config, "io_schema_resolved", False):
@@ -691,6 +800,7 @@ class AsyncRTCPolicy:
             (self.state_num_frames - 1) * self.state_history_stride,
         )
         self._observation_history: deque[MemoryObservation] = deque(maxlen=max_history_steps + 2)
+        self._image_history: deque[ObservationPacket] = deque(maxlen=256)
 
         self._mailbox_condition = Condition()
         self._mailbox: ObservationPacket | None = None
@@ -703,11 +813,13 @@ class AsyncRTCPolicy:
         self._latencies: deque[float] = deque(maxlen=args.rtc_latency_window)
         self._sim_rates: deque[float] = deque(maxlen=args.rtc_latency_window)
         self._previous_observation_clock: tuple[int, int] | None = None
+        self._control_epoch: int | None = None
         self._task_complete_latched = False
         self._stop = Event()
         self._worker = Thread(target=self._run, name="pi05-rtc-worker", daemon=True)
         self._last_error: str | None = None
         self._inference_count = 0
+        self._warmup_inferences = int(args.warmup_inferences)
         self.recorder.event(
             "vla_loading_finished",
             action_names=self.action_names,
@@ -718,9 +830,11 @@ class AsyncRTCPolicy:
             checkpoint_metadata_version=contract.metadata_version,
             model_action_representation=contract.model_action_representation,
             z1_model_action_representation=contract.z1_action_representation,
+            ee_delta_rotation_representation=contract.ee_delta_rotation_representation,
             b2_execution_action_representation="velocity",
             z1_execution_action_representation=contract.z1_action_representation,
-            execution_action_protocol="rtc_action_packet_v3",
+            execution_action_protocol="rtc_action_packet_v4_50hz_history",
+            stop_on_model_task_complete=self.stop_on_model_task_complete,
             b2_velocity_smoothing="causal_first_order_low_pass",
             b2_velocity_smoothing_time_constant_s=self.b2_velocity_smoothing_time_constant_s,
             arm_gate_conversion="one_minus_arm_teleop_inactive",
@@ -748,11 +862,64 @@ class AsyncRTCPolicy:
             state_history_sampling_hz=(
                 1.0 / config.state_history_frame_interval_seconds if self.continuous_state_enabled else None
             ),
+            state_history_num_frames=self.state_num_frames,
+            state_history_stride_steps=self.state_history_stride,
             action_history_enabled=self.action_history_enabled,
+            action_history_num_frames=(self.state_num_frames - 1 if self.action_history_enabled else 0),
+            warmup_inferences=self._warmup_inferences,
         )
 
     def start(self) -> None:
+        self._warmup()
         self._worker.start()
+
+    def _warmup_batch(self) -> dict[str, object]:
+        batch: dict[str, object] = {
+            OBS_STATE: torch.zeros(
+                1, self.state_num_frames, len(self.source_state_names), dtype=torch.float32
+            ),
+            f"{OBS_STATE}_is_pad": torch.zeros(1, self.state_num_frames, dtype=torch.bool),
+            "task": ["warm up the VLA deployment model"],
+        }
+        for key, (channels, height, width) in self.camera_shapes.items():
+            image = torch.zeros(1, channels, height, width, dtype=torch.float32)
+            if self.mem_enabled:
+                image = image.unsqueeze(1).expand(-1, self.mem_image_num_frames, -1, -1, -1).clone()
+                image_pad = torch.zeros(1, self.mem_image_num_frames, dtype=torch.bool)
+            else:
+                image_pad = torch.zeros(1, dtype=torch.bool)
+            batch[key] = image
+            batch[f"{key}_is_pad"] = image_pad
+        if self.action_history_enabled:
+            action_frames = self.state_num_frames - 1
+            batch[OBS_ACTION_HISTORY] = torch.zeros(
+                1, action_frames, len(self.action_history_indices), dtype=torch.float32
+            )
+            batch[f"{OBS_ACTION_HISTORY}_is_pad"] = torch.ones(1, action_frames, dtype=torch.bool)
+        return batch
+
+    def _warmup(self) -> None:
+        if self._warmup_inferences == 0:
+            return
+        started = time.perf_counter()
+        for _ in range(self._warmup_inferences):
+            batch = self.preprocessor(self._warmup_batch())
+            with torch.inference_mode():
+                actions = self.policy.predict_action_chunk(
+                    batch,
+                    inference_delay=0,
+                    prev_chunk_left_over=None,
+                )
+                self.postprocessor(actions).detach().cpu()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        elapsed = time.perf_counter() - started
+        self.recorder.event(
+            "vla_warmup_finished",
+            inference_count=self._warmup_inferences,
+            elapsed_ms=elapsed * 1000.0,
+        )
+        LOG.info("Completed %d VLA warmup inference(s) in %.3fs", self._warmup_inferences, elapsed)
 
     def stop(self) -> None:
         self._stop.set()
@@ -761,7 +928,7 @@ class AsyncRTCPolicy:
         self._worker.join(timeout=5.0)
 
     def submit(self, packet: ObservationPacket) -> None:
-        if packet.active_sequence >= 0 and packet.active_index > 0:
+        if self.stop_on_model_task_complete and packet.active_sequence >= 0 and packet.active_index > 0:
             with self._records_lock:
                 active_record = self._records.get(packet.active_sequence)
             if active_record is not None and "task_complete" in active_record.action_names:
@@ -770,16 +937,14 @@ class AsyncRTCPolicy:
                 if bool((active_record.processed[:executed_count, complete_index] > 0.5).any()):
                     self._task_complete_latched = True
         with self._mailbox_condition:
-            episode_reset = (
-                self._previous_observation_clock is not None
-                and packet.sim_step == 0
-                and self._previous_observation_clock[0] > 0
-            )
-            if episode_reset:
+            epoch_reset = self._control_epoch is not None and packet.control_epoch != self._control_epoch
+            if epoch_reset:
                 self._task_complete_latched = False
                 self._mailbox = None
                 self._observation_history.clear()
+                self._image_history.clear()
                 self._previous_observation_clock = None
+            self._control_epoch = packet.control_epoch
             if self._mailbox is not None and packet.sim_step < self._mailbox.sim_step:
                 return
             if self._previous_observation_clock is not None:
@@ -789,20 +954,21 @@ class AsyncRTCPolicy:
                 if step_delta > 0 and wall_delta_s > 0:
                     self._sim_rates.append(step_delta / wall_delta_s)
             self._previous_observation_clock = (packet.sim_step, packet.server_received_ns)
-            if self._observation_history and packet.sim_step <= self._observation_history[-1].sim_step:
-                self._observation_history.clear()
-            self._observation_history.append(
-                MemoryObservation(
-                    sim_step=packet.sim_step,
-                    state=packet.state.copy(),
-                    state_names=packet.state_names,
-                    base_jpeg=packet.base_jpeg.copy(),
-                    wrist_jpeg=packet.wrist_jpeg.copy(),
-                    active_sequence=packet.active_sequence,
-                    active_index=packet.active_index,
-                    executed_ee_target=packet.executed_ee_target.copy(),
-                )
+            last_history_step = self._observation_history[-1].sim_step if self._observation_history else -1
+            new_records = tuple(
+                record for record in packet.telemetry_history if record.sim_step > last_history_step
             )
+            if new_records and last_history_step >= 0 and new_records[0].sim_step != last_history_step + 1:
+                raise ValueError(
+                    "Gap in simulator 50 Hz telemetry history: "
+                    f"last={last_history_step}, next={new_records[0].sim_step}"
+                )
+            self._observation_history.extend(new_records)
+            if not self._observation_history or self._observation_history[-1].sim_step != packet.sim_step:
+                raise ValueError(f"Telemetry history did not reach current step {packet.sim_step}")
+            if self._image_history and packet.sim_step <= self._image_history[-1].sim_step:
+                self._image_history.clear()
+            self._image_history.append(packet)
             self._mailbox = packet
             self._mailbox_version += 1
             self._mailbox_condition.notify()
@@ -868,6 +1034,31 @@ class AsyncRTCPolicy:
                 is_pad.append(True)
                 continue
             record = next(
+                (candidate for candidate in reversed(history) if candidate.sim_step == target_step),
+                None,
+            )
+            if record is None:
+                raise ValueError(f"Missing exact 50 Hz telemetry sample for sim_step={target_step}")
+            records.append(record)
+            is_pad.append(False)
+        return records, torch.tensor(is_pad, dtype=torch.bool).unsqueeze(0)
+
+    @staticmethod
+    def _sample_image_records(
+        history: tuple[ObservationPacket, ...], current_step: int, *, count: int, stride: int
+    ) -> tuple[list[ObservationPacket], torch.Tensor]:
+        if not history:
+            raise ValueError("Image observation memory is empty")
+        records: list[ObservationPacket] = []
+        is_pad: list[bool] = []
+        first_step = history[0].sim_step
+        for slot in range(count):
+            target_step = current_step - (count - 1 - slot) * stride
+            if target_step < first_step:
+                records.append(history[0])
+                is_pad.append(True)
+                continue
+            record = next(
                 (candidate for candidate in reversed(history) if candidate.sim_step <= target_step),
                 history[0],
             )
@@ -903,6 +1094,7 @@ class AsyncRTCPolicy:
     def _make_batch(self, packet: ObservationPacket) -> dict[str, object]:
         with self._mailbox_condition:
             history = tuple(self._observation_history)
+            image_history = tuple(self._image_history)
 
         state_records, state_pad = self._sample_memory_records(
             history,
@@ -916,8 +1108,8 @@ class AsyncRTCPolicy:
             f"{OBS_STATE}_is_pad": state_pad,
         }
 
-        image_records, image_pad = self._sample_memory_records(
-            history,
+        image_records, image_pad = self._sample_image_records(
+            image_history,
             packet.sim_step,
             count=self.mem_image_num_frames,
             stride=self.mem_image_stride,
@@ -1017,13 +1209,15 @@ class AsyncRTCPolicy:
                 self.postprocessed_action_names,
                 self.z1_action_representation,
             )
-            if self._task_complete_latched:
-                unsmoothed[:, self.action_names.index("task_complete")] = 1.0
-            unsmoothed = _apply_completion_stop(unsmoothed, self.action_names)
-            smoothing_transition_step = int(
-                math.ceil((time.monotonic_ns() - packet.server_received_ns) / 1e9 * sim_rate)
-            )
+            if self.stop_on_model_task_complete:
+                if self._task_complete_latched:
+                    unsmoothed[:, self.action_names.index("task_complete")] = 1.0
+                unsmoothed = _apply_completion_stop(unsmoothed, self.action_names)
             velocity_anchor, previous_velocity_prefix = self._b2_velocity_filter_context(packet)
+            smoothing_transition_step = _b2_velocity_smoothing_transition_step(
+                inference_delay_steps,
+                previous_velocity_prefix,
+            )
             processed = _smooth_b2_execution_velocity(
                 unsmoothed,
                 self.action_names,
@@ -1194,10 +1388,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-path", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-inference-steps", type=int)
+    parser.add_argument("--warmup-inferences", type=int, default=1)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--high-level-hz", type=float, default=4.0)
     parser.add_argument("--low-level-hz", type=float, default=50.0)
+    parser.add_argument("--stop-on-model-task-complete", type=_parse_bool, required=True)
     parser.add_argument("--b2-velocity-smoothing-time-constant-s", type=float, required=True)
     parser.add_argument("--rtc-execution-horizon", type=int, default=13)
     parser.add_argument("--rtc-max-guidance-weight", type=float, default=10.0)
@@ -1216,6 +1412,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("RTC horizon/window must be positive")
     if args.num_inference_steps is not None and args.num_inference_steps <= 0:
         parser.error("num-inference-steps must be positive")
+    if args.warmup_inferences < 0:
+        parser.error("warmup-inferences must be non-negative")
     return args
 
 
@@ -1233,7 +1431,6 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        server.shutdown()
         server.server_close()
         engine.stop()
 

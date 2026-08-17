@@ -59,9 +59,18 @@ from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
+from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.pi05.transformed_action_stats import (
+    PI05_TRANSFORMED_ACTION_STATS_NAME,
+    assert_transformed_action_stats_equal,
+    compute_transformed_action_stats,
+    load_transformed_action_stats,
+    save_transformed_action_stats,
+    validate_transformed_action_stats,
+)
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
-from lerobot.utils.constants import ACTION
+from lerobot.utils.constants import ACTION, PRETRAINED_MODEL_DIR
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -443,9 +452,12 @@ def resolve_task_complete_sampling(dataset, policy_cfg) -> tuple[list[int], dict
             f"{sorted(seen_incomplete_after_complete)[:10]}"
         )
     missing = sorted(selected_episodes - first_complete.keys())
+    missing_set = set(missing)
     if missing:
-        raise ValueError(
-            f"Every selected episode must contain an explicit task_complete tail; missing {missing[:10]}"
+        logging.warning(
+            "Skipping %d selected episode(s) without an explicit task_complete tail: %s",
+            len(missing),
+            missing[:10],
         )
 
     from_indices = [int(value) for value in dataset.meta.episodes["dataset_from_index"]]
@@ -453,6 +465,10 @@ def resolve_task_complete_sampling(dataset, policy_cfg) -> tuple[list[int], dict
     capped_to = list(original_to)
     start_counts: dict[int, int] = {}
     for episode_index in selected_episodes:
+        if episode_index in missing_set:
+            start_counts[episode_index] = 0
+            capped_to[episode_index] = from_indices[episode_index]
+            continue
         episode_length = original_to[episode_index] - from_indices[episode_index]
         count = (
             episode_length
@@ -762,6 +778,47 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     else "SE(2) integration of commanded body twist",
                 )
 
+    transformed_action_stats_payload = None
+    if (
+        not cfg.is_reward_model_training
+        and isinstance(policy.config, PI05Config)
+        and policy.config.io_schema_resolved
+        and policy.config.z1_action_representation == "ee_delta"
+    ):
+        output_stats_path = cfg.output_dir / PI05_TRANSFORMED_ACTION_STATS_NAME
+        if is_main_process:
+            logging.info("Traversing continuous episodes for exact transformed-action statistics")
+            measured_action_stats_payload = compute_transformed_action_stats(dataset, policy.config)
+            resume_stats_path = (
+                cfg.checkpoint_path / PRETRAINED_MODEL_DIR / PI05_TRANSFORMED_ACTION_STATS_NAME
+                if cfg.resume
+                else None
+            )
+            if resume_stats_path is not None:
+                if not resume_stats_path.is_file():
+                    raise FileNotFoundError(
+                        "Cannot resume EE-delta training without checkpoint-local transformed-action "
+                        f"statistics: {resume_stats_path}"
+                    )
+                transformed_action_stats_payload = load_transformed_action_stats(resume_stats_path)
+                validate_transformed_action_stats(transformed_action_stats_payload, dataset, policy.config)
+                assert_transformed_action_stats_equal(
+                    transformed_action_stats_payload, measured_action_stats_payload
+                )
+            else:
+                transformed_action_stats_payload = measured_action_stats_payload
+            save_transformed_action_stats(transformed_action_stats_payload, output_stats_path)
+            counts = transformed_action_stats_payload["counts"]
+            logging.info(
+                "Measured transformed-action statistics from %d transitions (%d EE-valid at both endpoints)",
+                counts["all_transitions"],
+                counts["ee_active_non_reset_both_endpoints"],
+            )
+        accelerator.wait_for_everyone()
+        if not is_main_process:
+            transformed_action_stats_payload = load_transformed_action_stats(output_stats_path)
+            validate_transformed_action_stats(transformed_action_stats_payload, dataset, policy.config)
+
     if is_main_process and wandb_logger:
         wandb_logger.update_config(
             {
@@ -859,6 +916,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # the generic checkpoint overrides below are built from raw stats.
     if getattr(active_cfg, "io_schema_resolved", False):
         processor_kwargs["dataset_stats"] = dataset.meta.stats
+        if transformed_action_stats_payload is not None:
+            processor_kwargs["transformed_action_stats"] = transformed_action_stats_payload["stats"][ACTION]
 
     if cfg.is_reward_model_training:
         processor_kwargs["dataset_meta"] = dataset.meta
@@ -1307,6 +1366,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     model_state_dict=model_state_dict,
                     optim_state_dict=optim_state_dict,
                 )
+                if transformed_action_stats_payload is not None:
+                    save_transformed_action_stats(
+                        transformed_action_stats_payload,
+                        checkpoint_dir / PRETRAINED_MODEL_DIR / PI05_TRANSFORMED_ACTION_STATS_NAME,
+                    )
                 update_last_checkpoint(checkpoint_dir)
                 if cfg.save_checkpoint_to_hub:
                     push_checkpoint_to_hub(

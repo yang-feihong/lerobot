@@ -28,6 +28,7 @@ def test_gate_loss_uses_inactive_reset_and_completion_ground_truth_masks():
         action_gripper_target_true_side="negative",
         io_schema_resolved=True,
         b2_action_representation="local_trajectory",
+        z1_action_representation="ee_pose",
         action_feature_names=names,
     )
     actions = -torch.ones(1, 5, 16)
@@ -55,6 +56,7 @@ def test_disabling_inactive_prediction_removes_its_output_and_ee_mask():
         action_gripper_target_true_side="negative",
         io_schema_resolved=True,
         b2_action_representation="local_trajectory",
+        z1_action_representation="ee_pose",
         action_feature_names=names,
     )
     actions = -torch.ones(1, 3, 15)
@@ -103,6 +105,7 @@ def test_structured_loss_excludes_discrete_dimensions_from_flow_matching() -> No
         action_continuous_loss_weight=1.0,
         action_masked_continuous_min_weight=0.0,
         b2_action_representation="local_trajectory",
+        z1_action_representation="ee_pose",
     )
     actions = -torch.ones((1, 5, len(names)))
     actions[:, :, names.index("gripper_target")] = torch.tensor([[-1.0, -1.0, 1.0, 1.0, 1.0]])
@@ -121,6 +124,40 @@ def test_structured_loss_excludes_discrete_dimensions_from_flow_matching() -> No
     changed, _ = policy._structured_temporal_action_loss(changed_losses, logits, actions, "mean", None)
 
     torch.testing.assert_close(changed, baseline)
+
+
+def test_structured_ee_delta_loss_uses_both_endpoint_validity_mask() -> None:
+    policy = PI05Policy.__new__(PI05Policy)
+    torch.nn.Module.__init__(policy)
+    policy.model = torch.nn.Module()
+    policy.model.arm_mode_crf = LinearChainCRF(3)
+    policy.model.gripper_state_crf = LinearChainCRF(2)
+    names = ["b2_vx", "b2_vy", "b2_omega_z", *DATASET_ACTION_NAMES[3:]]
+    policy.config = SimpleNamespace(
+        action_feature_names=names,
+        action_gripper_target_true_side="negative",
+        action_bool_true_fractions={
+            "arm_teleop_inactive": 0.25,
+            "arm_reset": 0.1,
+            "gripper_target": 0.5,
+            "task_complete": 0.2,
+        },
+        action_bool_loss_weight=4.0,
+        action_continuous_loss_weight=1.0,
+        action_masked_continuous_min_weight=0.0,
+        b2_action_representation="velocity",
+        z1_action_representation="ee_delta",
+    )
+    actions = -torch.ones((1, 3, len(names)))
+    logits = {
+        "arm_mode": torch.zeros((1, 3, 3)),
+        "gripper_state": torch.zeros((1, 3, 2)),
+        "task_complete": torch.full((1, 3), -10.0),
+    }
+    losses = torch.ones_like(actions)
+    validity = torch.tensor([[True, False, True]])
+    _, info = policy._structured_temporal_action_loss(losses, logits, actions, "mean", None, validity)
+    assert info["continuous_mask_frac/ee_pose"] == pytest.approx(2 / 3)
 
 
 def test_structured_mode_removes_discrete_targets_from_flow_input() -> None:

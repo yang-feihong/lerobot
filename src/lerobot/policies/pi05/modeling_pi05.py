@@ -59,6 +59,7 @@ from lerobot.utils.constants import (
 
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
+from .b2_action_transform import EE_DELTA_VALID_KEY
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 
 
@@ -2128,6 +2129,7 @@ class PI05Policy(PreTrainedPolicy):
         actions: Tensor,
         reduction: str,
         action_is_pad: Tensor | None = None,
+        ee_delta_is_valid: Tensor | None = None,
     ) -> tuple[Tensor, dict]:
         """Reduce PI0.5 action losses with the B2+Z1 gate-aware schema."""
         names = list(self.config.action_feature_names or [])
@@ -2195,6 +2197,16 @@ class PI05Policy(PreTrainedPolicy):
             ee_continuous_mask = ee_continuous_mask & ~arm_teleop_inactive
         if arm_reset is not None:
             ee_continuous_mask = ee_continuous_mask & ~arm_reset
+        if self.config.z1_action_representation == "ee_delta":
+            if ee_delta_is_valid is None:
+                raise ValueError(f"EE-delta training requires {EE_DELTA_VALID_KEY}")
+            ee_delta_is_valid = ee_delta_is_valid.to(device=actions.device, dtype=torch.bool)
+            if ee_delta_is_valid.shape != actions.shape[:2]:
+                raise ValueError(
+                    f"{EE_DELTA_VALID_KEY} shape {tuple(ee_delta_is_valid.shape)} does not match "
+                    f"action chunk shape {tuple(actions.shape[:2])}"
+                )
+            ee_continuous_mask = ee_continuous_mask & ee_delta_is_valid
         b2_names = (
             ["b2_delta_x", "b2_delta_y", "b2_delta_yaw"]
             if self.config.b2_action_representation == "local_trajectory"
@@ -2278,6 +2290,7 @@ class PI05Policy(PreTrainedPolicy):
         actions: Tensor,
         reduction: str,
         action_is_pad: Tensor | None,
+        ee_delta_is_valid: Tensor | None = None,
     ) -> tuple[Tensor, dict]:
         names = list(self.config.action_feature_names or [])
         name_to_dim = {name: index for index, name in enumerate(names)}
@@ -2313,6 +2326,16 @@ class PI05Policy(PreTrainedPolicy):
         b2_dims = [name_to_dim[name] for name in b2_names]
         ee_dims = [index for index, name in enumerate(names) if name.startswith("height_invariant_ee_")]
         ee_valid = execution_valid & ~inactive & ~reset
+        if self.config.z1_action_representation == "ee_delta":
+            if ee_delta_is_valid is None:
+                raise ValueError(f"EE-delta training requires {EE_DELTA_VALID_KEY}")
+            ee_delta_is_valid = ee_delta_is_valid.to(device=actions.device, dtype=torch.bool)
+            if ee_delta_is_valid.shape != actions.shape[:2]:
+                raise ValueError(
+                    f"{EE_DELTA_VALID_KEY} shape {tuple(ee_delta_is_valid.shape)} does not match "
+                    f"action chunk shape {tuple(actions.shape[:2])}"
+                )
+            ee_valid = ee_valid & ee_delta_is_valid
         continuous_parts = []
         continuous_weights = []
         for part, weights in (
@@ -2592,6 +2615,7 @@ class PI05Policy(PreTrainedPolicy):
                 actions[:, :, :original_action_dim],
                 reduction,
                 batch.get(f"{ACTION}_is_pad"),
+                batch.get(EE_DELTA_VALID_KEY),
             )
             loss_dict.update(structured_loss_dict)
             return loss, loss_dict
@@ -2602,6 +2626,7 @@ class PI05Policy(PreTrainedPolicy):
                 actions[:, :, :original_action_dim],
                 reduction,
                 batch.get(f"{ACTION}_is_pad"),
+                batch.get(EE_DELTA_VALID_KEY),
             )
             loss_dict.update(gate_loss_dict)
             return loss, loss_dict

@@ -1,4 +1,5 @@
 import json
+from io import BytesIO
 from threading import Lock
 from types import SimpleNamespace
 
@@ -7,18 +8,26 @@ import pytest
 import torch
 
 from lerobot.configs import FeatureType, PolicyFeature
-from lerobot.policies.pi05.b2_action_transform import differentiate_local_trajectory, integrate_body_twist
+from lerobot.policies.pi05.b2_action_transform import (
+    EE_DELTA_ROTVEC_NAMES,
+    differentiate_local_trajectory,
+    integrate_body_twist,
+)
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.scripts.pi05_vla_server import (
     B2_EXECUTION_VELOCITY_NAMES,
+    EE_POSE_ACTION_NAMES,
+    PROTOCOL_VERSION,
     AsyncRTCPolicy,
     MemoryObservation,
     _apply_completion_stop,
+    _b2_velocity_smoothing_transition_step,
     _decode_discrete_actions,
     _load_checkpoint_contract,
     _resolve_checkpoint_action_representations,
     _smooth_b2_execution_velocity,
     _to_execution_actions,
+    decode_observation_packet,
     execution_action_names,
 )
 
@@ -170,26 +179,36 @@ def test_server_latches_an_executed_completion_until_sim_step_resets() -> None:
     policy._records_lock = Lock()
     policy._mailbox_condition = __import__("threading").Condition()
     policy._observation_history = __import__("collections").deque(maxlen=4)
+    policy._image_history = __import__("collections").deque(maxlen=4)
     policy._records = {}
     policy._mailbox = None
     policy._mailbox_version = 0
     policy._previous_observation_clock = None
+    policy._control_epoch = None
     policy._task_complete_latched = False
+    policy.stop_on_model_task_complete = True
     policy.recorder = SimpleNamespace(observation=lambda _: None)
     actions = torch.zeros((3, len(EXECUTION_ACTION_NAMES)))
     actions[1, EXECUTION_ACTION_NAMES.index("task_complete")] = 1.0
     policy._records[4] = SimpleNamespace(processed=actions, action_names=EXECUTION_ACTION_NAMES)
 
-    def packet(step: int, active_index: int) -> SimpleNamespace:
-        return SimpleNamespace(
+    def packet(step: int, active_index: int, control_epoch: int = 0) -> SimpleNamespace:
+        telemetry = MemoryObservation(
             sim_step=step,
             active_sequence=4,
             active_index=active_index,
             state=np.zeros(1, dtype=np.float32),
             state_names=("state",),
+            executed_ee_target=np.zeros(9, dtype=np.float32),
+        )
+        return SimpleNamespace(
+            control_epoch=control_epoch,
+            sim_step=step,
+            active_sequence=4,
+            active_index=active_index,
+            telemetry_history=(telemetry,),
             base_jpeg=np.zeros(1, dtype=np.uint8),
             wrist_jpeg=np.zeros(1, dtype=np.uint8),
-            executed_ee_target=np.zeros(9, dtype=np.float32),
             server_received_ns=step + 1,
         )
 
@@ -198,10 +217,50 @@ def test_server_latches_an_executed_completion_until_sim_step_resets() -> None:
     policy.submit(packet(9, 0))
     assert policy._task_complete_latched is True
     assert policy._mailbox.sim_step == 10
-    policy.submit(packet(0, 0))
+    policy.submit(packet(11, 0, control_epoch=1))
     assert policy._task_complete_latched is False
-    assert policy._mailbox.sim_step == 0
-    assert [record.sim_step for record in policy._observation_history] == [0]
+    assert policy._mailbox.sim_step == 11
+    assert [record.sim_step for record in policy._observation_history] == [11]
+
+
+def test_server_does_not_latch_completion_when_model_stop_is_disabled() -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy._records_lock = Lock()
+    policy._mailbox_condition = __import__("threading").Condition()
+    policy._observation_history = __import__("collections").deque(maxlen=4)
+    policy._image_history = __import__("collections").deque(maxlen=4)
+    actions = torch.zeros((3, len(EXECUTION_ACTION_NAMES)))
+    actions[1, EXECUTION_ACTION_NAMES.index("task_complete")] = 1.0
+    policy._records = {4: SimpleNamespace(processed=actions, action_names=EXECUTION_ACTION_NAMES)}
+    policy._mailbox = None
+    policy._mailbox_version = 0
+    policy._previous_observation_clock = None
+    policy._control_epoch = None
+    policy._task_complete_latched = False
+    policy.stop_on_model_task_complete = False
+    policy.recorder = SimpleNamespace(observation=lambda _: None)
+    telemetry = MemoryObservation(
+        sim_step=10,
+        active_sequence=4,
+        active_index=2,
+        state=np.zeros(1, dtype=np.float32),
+        state_names=("state",),
+        executed_ee_target=np.zeros(9, dtype=np.float32),
+    )
+    packet = SimpleNamespace(
+        control_epoch=0,
+        sim_step=10,
+        active_sequence=4,
+        active_index=2,
+        telemetry_history=(telemetry,),
+        base_jpeg=np.zeros(1, dtype=np.uint8),
+        wrist_jpeg=np.zeros(1, dtype=np.uint8),
+        server_received_ns=11,
+    )
+
+    policy.submit(packet)
+
+    assert policy._task_complete_latched is False
 
 
 def test_ee_delta_is_forwarded_with_an_explicit_low_level_schema() -> None:
@@ -215,6 +274,33 @@ def test_ee_delta_is_forwarded_with_an_explicit_low_level_schema() -> None:
     assert execution.shape == actions.shape
     assert execution_action_names("ee_delta")[6].startswith("height_invariant_ee_delta_")
     torch.testing.assert_close(execution[:, 6:15], actions[:, 6:15])
+
+
+def test_rotvec_model_delta_is_expanded_to_low_level_rot6d() -> None:
+    names = (
+        "b2_vx",
+        "b2_vy",
+        "b2_omega_z",
+        "arm_teleop_inactive",
+        "arm_reset",
+        *EE_DELTA_ROTVEC_NAMES,
+        "height_invariant_ee_delta_x",
+        "height_invariant_ee_delta_y",
+        "height_invariant_ee_delta_z",
+        "gripper_target",
+        "task_complete",
+    )
+    actions = torch.zeros((1, len(names)))
+    actions[0, names.index("height_invariant_ee_delta_rotvec_z")] = torch.pi / 2
+
+    execution = _to_execution_actions(actions, names, "ee_delta")
+
+    torch.testing.assert_close(
+        execution[0, 6:12],
+        torch.tensor([0.0, 1.0, 0.0, -1.0, 0.0, 0.0]),
+        atol=1e-6,
+        rtol=1e-6,
+    )
 
 
 def test_b2_velocity_smoothing_is_causal_and_leaves_other_actions_unchanged() -> None:
@@ -290,6 +376,11 @@ def test_first_chunk_smoothing_uses_observed_body_velocity() -> None:
 
     torch.testing.assert_close(anchor, torch.tensor([0.1, 0.2, 0.3]))
     assert prefix is None
+
+
+def test_first_chunk_smoothing_does_not_fill_cold_start_delay_with_zeros() -> None:
+    assert _b2_velocity_smoothing_transition_step(71, None) == 0
+    assert _b2_velocity_smoothing_transition_step(12, torch.zeros(5, 3)) == 12
 
 
 def test_action_history_uses_last_executed_row_and_low_level_ee_target_feedback() -> None:
@@ -379,8 +470,6 @@ def test_memory_sampling_is_right_aligned_and_marks_episode_start_padding() -> N
             sim_step=step,
             state=np.asarray([step], dtype=np.float32),
             state_names=("state",),
-            base_jpeg=np.zeros(1, dtype=np.uint8),
-            wrist_jpeg=np.zeros(1, dtype=np.uint8),
             active_sequence=-1,
             active_index=0,
             executed_ee_target=np.zeros(9, dtype=np.float32),
@@ -392,3 +481,55 @@ def test_memory_sampling_is_right_aligned_and_marks_episode_start_padding() -> N
 
     assert [record.sim_step for record in records] == [10, 10, 10, 10, 15, 20]
     assert is_pad.tolist() == [[True, True, True, False, False, False]]
+
+
+def test_memory_sampling_rejects_a_missing_50hz_sample() -> None:
+    history = tuple(
+        MemoryObservation(
+            sim_step=step,
+            state=np.asarray([step], dtype=np.float32),
+            state_names=("state",),
+            active_sequence=-1,
+            active_index=0,
+            executed_ee_target=np.zeros(9, dtype=np.float32),
+        )
+        for step in (10, 11, 12, 14)
+    )
+
+    with pytest.raises(ValueError, match="Missing exact 50 Hz telemetry sample"):
+        AsyncRTCPolicy._sample_memory_records(history, current_step=14, count=2, stride=1)
+
+
+def test_protocol_v4_decodes_consecutive_50hz_telemetry_history() -> None:
+    state_names = ("state_a", "state_b")
+    states = np.asarray([[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]], dtype=np.float32)
+    ee_targets = np.zeros((3, len(EE_POSE_ACTION_NAMES)), dtype=np.float32)
+    ok, jpeg = __import__("cv2").imencode(".jpg", np.zeros((4, 4, 3), dtype=np.uint8))
+    assert ok
+    body = BytesIO()
+    np.savez(
+        body,
+        protocol_version=np.asarray(PROTOCOL_VERSION),
+        control_epoch=np.asarray(7),
+        sim_step=np.asarray(12),
+        active_sequence=np.asarray(3),
+        active_index=np.asarray(2),
+        task=np.asarray("test"),
+        state=states[-1],
+        state_names=np.asarray(state_names),
+        executed_ee_target=ee_targets[-1],
+        executed_ee_target_names=np.asarray(EE_POSE_ACTION_NAMES),
+        history_sim_steps=np.asarray([10, 11, 12]),
+        history_states=states,
+        history_active_sequences=np.asarray([2, 3, 3]),
+        history_active_indices=np.asarray([12, 1, 2]),
+        history_executed_ee_targets=ee_targets,
+        base_jpeg=jpeg,
+        wrist_jpeg=jpeg,
+    )
+
+    packet = decode_observation_packet(body.getvalue())
+
+    assert packet.control_epoch == 7
+    assert [record.sim_step for record in packet.telemetry_history] == [10, 11, 12]
+    np.testing.assert_array_equal(packet.telemetry_history[-1].state, states[-1])

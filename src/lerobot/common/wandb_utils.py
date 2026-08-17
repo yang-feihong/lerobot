@@ -111,6 +111,14 @@ class WandBLogger:
             job_type="train_eval",
             resume="must" if cfg.resume else None,
             mode=self.cfg.mode if self.cfg.mode in ["online", "offline", "disabled"] else "online",
+            settings=wandb.Settings(
+                console="off",
+                disable_code=True,
+                disable_git=True,
+                disable_job_creation=True,
+                save_code=False,
+                x_save_requirements=False,
+            ),
         )
         run_id = wandb.run.id
         # NOTE: We will override the cfg.wandb.run_id with the wandb run id.

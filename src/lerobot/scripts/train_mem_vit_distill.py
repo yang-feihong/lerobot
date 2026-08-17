@@ -666,6 +666,14 @@ def init_wandb(
         save_code=False,
         id=resume_id,
         resume="must" if resume_id is not None and args.wandb_mode == "online" else None,
+        settings=wandb.Settings(
+            console="off",
+            disable_code=True,
+            disable_git=True,
+            disable_job_creation=True,
+            save_code=False,
+            x_save_requirements=False,
+        ),
     )
     run.define_metric("train/global_step")
     run.define_metric("train/*", step_metric="train/global_step")

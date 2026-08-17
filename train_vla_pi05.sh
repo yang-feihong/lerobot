@@ -23,7 +23,8 @@ state_use_b2_trunk_pose="true"
 state_use_b2_linear_velocity="false"
 state_use_b2_angular_velocity="false"
 b2_action_representation="local_trajectory" # "velocity" or "local_trajectory"
-z1_action_representation="ee_pose" # "ee_pose" or "ee_delta"
+z1_action_representation="ee_delta" # "ee_pose" or "ee_delta"
+ee_delta_rotation_representation="rotvec" # "rotvec" for new EE-delta checkpoints
 predict_arm_teleop_inactive="true"
 predict_arm_reset="true"
 predict_ee_pose="true"
@@ -36,6 +37,7 @@ task_complete_sample_tail_seconds="2.0"
 #   gpu_ids="0"      -> single GPU
 #   gpu_ids="0,1,2"  -> 3-GPU DDP via accelerate
 gpu_ids="0,1,2"
+main_process_port="29500"
 
 # Choose exactly one fine-tuning mode:
 #   expert = freeze PaliGemma/VLM and full fine-tune only the action expert/projections.
@@ -161,6 +163,7 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.state_use_b2_angular_velocity="$state_use_b2_angular_velocity"
     --policy.b2_action_representation="$b2_action_representation"
     --policy.z1_action_representation="$z1_action_representation"
+    --policy.ee_delta_rotation_representation="$ee_delta_rotation_representation"
     --policy.action_predict_arm_teleop_inactive="$predict_arm_teleop_inactive"
     --policy.action_predict_arm_reset="$predict_arm_reset"
     --policy.action_predict_ee_pose="$predict_ee_pose"
@@ -239,6 +242,10 @@ for gpu_id in "${gpu_id_array[@]}"; do
     exit 1
   fi
 done
+if [[ ! "$main_process_port" =~ ^[0-9]+$ ]] || (( main_process_port < 1024 || main_process_port > 65535 )); then
+  echo "main_process_port must be an integer in [1024, 65535], got $main_process_port." >&2
+  exit 1
+fi
 
 if [[ ! "$batch_size_per_gpu" =~ ^[1-9][0-9]*$ ]]; then
   echo "batch_size_per_gpu must be a positive integer, got $batch_size_per_gpu." >&2
@@ -295,10 +302,11 @@ train_args=(
 )
 
 if (( num_gpus > 1 )); then
-  setsid env CUDA_VISIBLE_DEVICES="$gpu_ids" uv run accelerate launch \
+  setsid env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES="$gpu_ids" uv run accelerate launch \
     --multi_gpu \
     --num_processes "$num_gpus" \
     --num_machines 1 \
+    --main_process_port "$main_process_port" \
     --gpu_ids "$gpu_ids" \
     --mixed_precision bf16 \
     --dynamo_backend no \
@@ -306,13 +314,18 @@ if (( num_gpus > 1 )); then
     "${train_args[@]}" \
     >"$log_file" 2>&1 </dev/null &
 else
-  setsid env CUDA_VISIBLE_DEVICES="$gpu_ids" uv run python -u -m lerobot.scripts.lerobot_train \
+  setsid env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES="$gpu_ids" uv run python -u -m lerobot.scripts.lerobot_train \
     "${train_args[@]}" \
     >"$log_file" 2>&1 </dev/null &
 fi
 
 pid=$!
 echo "$pid" >"$pid_file"
+sleep 2
+if ! kill -0 "$pid" 2>/dev/null; then
+  echo "Training process exited during startup. See: $log_file" >&2
+  wait "$pid"
+fi
 
 echo "VLA training started"
 echo "PID:              $pid"
@@ -328,6 +341,9 @@ fi
 echo "Finetune mode:    $finetune_mode"
 echo "Train expert only: $train_expert_only"
 echo "GPUs:             $gpu_ids ($num_gpus process(es))"
+if (( num_gpus > 1 )); then
+  echo "DDP port:         $main_process_port"
+fi
 echo "Dataset:          $dataset_root"
 if [[ -z "$resume_checkpoint" ]]; then
   echo "Action timing:    ${control_frequency_hz}Hz, chunk=$action_chunk_size, execute=$action_steps_to_execute (dt derived automatically)"

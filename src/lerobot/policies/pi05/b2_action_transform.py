@@ -42,6 +42,12 @@ B2_TRAJECTORY_NAMES = ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")
 B2_GLOBAL_POSE_STATE_NAMES = ("b2_position_x", "b2_position_y", "b2_yaw")
 ARM_TELEOP_INACTIVE_NAME = "arm_teleop_inactive"
 TASK_COMPLETE_NAME = "task_complete"
+EE_DELTA_VALID_KEY = f"{ACTION}_ee_delta_is_valid"
+EE_DELTA_ROTVEC_NAMES = (
+    "height_invariant_ee_delta_rotvec_x",
+    "height_invariant_ee_delta_rotvec_y",
+    "height_invariant_ee_delta_rotvec_z",
+)
 
 
 def action_dataset_indices(
@@ -71,6 +77,7 @@ def action_schema_kwargs(config: Any) -> dict[str, bool | str]:
     return {
         "representation": config.b2_action_representation,
         "z1_representation": config.z1_action_representation,
+        "ee_delta_rotation_representation": config.ee_delta_rotation_representation,
         "predict_arm_teleop_inactive": config.action_predict_arm_teleop_inactive,
         "predict_arm_reset": config.action_predict_arm_reset,
         "predict_ee_pose": config.action_predict_ee_pose,
@@ -101,6 +108,25 @@ def action_label_multiplicity(
         targets = targets[targets < episode_length]
         multiplicity.scatter_add_(0, targets, torch.ones_like(targets))
     return multiplicity
+
+
+def ee_delta_transition_validity(action: Tensor, is_pad: Tensor | None = None) -> Tensor:
+    """Return whether every t→t+1 EE delta has manipulation semantics at both endpoints."""
+    if action.ndim < 2 or action.shape[-1] != DATASET_ACTION_DIM or action.shape[-2] < 2:
+        raise ValueError(
+            f"Expected raw action shape (..., T+1, {DATASET_ACTION_DIM}), got {tuple(action.shape)}"
+        )
+    source = action[..., :-1, :]
+    target = action[..., 1:, :]
+    source_active = (source[..., 3] < 0.5) & (source[..., 4] < 0.5)
+    target_active = (target[..., 3] < 0.5) & (target[..., 4] < 0.5)
+    valid = source_active & target_active
+    if is_pad is not None:
+        pad = torch.as_tensor(is_pad, dtype=torch.bool, device=action.device)
+        if pad.shape != action.shape[:-1]:
+            raise ValueError(f"is_pad shape {tuple(pad.shape)} != action shape {tuple(action.shape[:-1])}")
+        valid = valid & ~pad[..., :-1] & ~pad[..., 1:]
+    return valid
 
 
 def _sinc_and_cosc(angle: Tensor) -> tuple[Tensor, Tensor]:
@@ -189,7 +215,78 @@ def _matrix_to_rot6d(matrix: Tensor) -> Tensor:
     return torch.cat((matrix[..., :, 0], matrix[..., :, 1]), dim=-1)
 
 
-def absolute_ee_pose_to_delta(targets: Tensor, reference: Tensor) -> Tensor:
+def _skew(vector: Tensor) -> Tensor:
+    x, y, z = vector.unbind(dim=-1)
+    zero = torch.zeros_like(x)
+    return torch.stack((zero, -z, y, z, zero, -x, -y, x, zero), dim=-1).reshape(vector.shape[:-1] + (3, 3))
+
+
+def _rotvec_to_matrix(rotvec: Tensor) -> Tensor:
+    if rotvec.shape[-1] != 3:
+        raise ValueError(f"Rotation vectors must have width 3, got {tuple(rotvec.shape)}")
+    theta2 = rotvec.square().sum(dim=-1, keepdim=True)
+    theta = theta2.sqrt()
+    small = theta2 < 1e-8
+    sinc = torch.where(
+        small,
+        1.0 - theta2 / 6.0 + theta2.square() / 120.0,
+        torch.sin(theta) / theta.clamp_min(1e-12),
+    )
+    cosc = torch.where(
+        small,
+        0.5 - theta2 / 24.0 + theta2.square() / 720.0,
+        (1.0 - torch.cos(theta)) / theta2.clamp_min(1e-12),
+    )
+    skew = _skew(rotvec)
+    identity = torch.eye(3, dtype=rotvec.dtype, device=rotvec.device).expand(rotvec.shape[:-1] + (3, 3))
+    return identity + sinc.unsqueeze(-1) * skew + cosc.unsqueeze(-1) * (skew @ skew)
+
+
+def _matrix_to_rotvec(matrix: Tensor) -> Tensor:
+    if matrix.shape[-2:] != (3, 3):
+        raise ValueError(f"Rotation matrices must end in (3, 3), got {tuple(matrix.shape)}")
+    vee = (
+        torch.stack(
+            (
+                matrix[..., 2, 1] - matrix[..., 1, 2],
+                matrix[..., 0, 2] - matrix[..., 2, 0],
+                matrix[..., 1, 0] - matrix[..., 0, 1],
+            ),
+            dim=-1,
+        )
+        * 0.5
+    )
+    sin_theta = torch.linalg.vector_norm(vee, dim=-1)
+    cos_theta = ((matrix.diagonal(dim1=-2, dim2=-1).sum(dim=-1) - 1.0) * 0.5).clamp(-1.0, 1.0)
+    theta = torch.atan2(sin_theta, cos_theta)
+    scale = torch.where(
+        sin_theta > 1e-6,
+        theta / sin_theta,
+        1.0 + theta.square() / 6.0,
+    )
+    rotvec = vee * scale.unsqueeze(-1)
+
+    # Adjacent 50 Hz targets should never approach pi, but keep the conversion
+    # well-defined for validation and malformed inputs instead of returning zero.
+    near_pi = cos_theta < -0.9999
+    if bool(near_pi.any()):
+        diagonal = matrix.diagonal(dim1=-2, dim2=-1)
+        axis = torch.sqrt(((diagonal + 1.0) * 0.5).clamp_min(0.0))
+        axis = torch.copysign(
+            axis,
+            torch.stack((vee[..., 0], vee[..., 1], vee[..., 2]), dim=-1) + 1e-12,
+        )
+        axis = torch.nn.functional.normalize(axis, dim=-1)
+        rotvec = torch.where(near_pi.unsqueeze(-1), axis * theta.unsqueeze(-1), rotvec)
+    return rotvec
+
+
+def absolute_ee_pose_to_delta(
+    targets: Tensor,
+    reference: Tensor,
+    *,
+    rotation_representation: str = "rot6d",
+) -> Tensor:
     """Encode absolute height-invariant EE targets as parent-frame step deltas."""
     if targets.shape[-1] != 9 or reference.shape[-1] != 9:
         raise ValueError("EE poses must use rot6d(6) + xyz(3)")
@@ -202,19 +299,42 @@ def absolute_ee_pose_to_delta(targets: Tensor, reference: Tensor) -> Tensor:
     previous_rotation = _rot6d_to_matrix(previous[..., :6])
     delta_rotation = target_rotation @ previous_rotation.transpose(-1, -2)
     delta_position = targets[..., 6:9] - previous[..., 6:9]
-    return torch.cat((_matrix_to_rot6d(delta_rotation), delta_position), dim=-1)
+    if rotation_representation == "rotvec":
+        encoded_rotation = _matrix_to_rotvec(delta_rotation)
+    elif rotation_representation == "rot6d":
+        encoded_rotation = _matrix_to_rot6d(delta_rotation)
+    else:
+        raise ValueError(f"Unknown EE delta rotation representation: {rotation_representation!r}")
+    return torch.cat((encoded_rotation, delta_position), dim=-1)
 
 
-def ee_pose_delta_to_absolute(deltas: Tensor, reference: Tensor) -> Tensor:
+def ee_pose_delta_to_absolute(
+    deltas: Tensor,
+    reference: Tensor,
+    *,
+    rotation_representation: str = "rot6d",
+) -> Tensor:
     """Decode parent-frame EE increments into an absolute target sequence."""
-    if deltas.shape[-1] != 9 or reference.shape[-1] != 9:
-        raise ValueError("EE poses must use rot6d(6) + xyz(3)")
+    expected_delta_dim = 6 if rotation_representation == "rotvec" else 9
+    if deltas.shape[-1] != expected_delta_dim or reference.shape[-1] != 9:
+        raise ValueError(
+            f"EE deltas must use {rotation_representation} + xyz ({expected_delta_dim}D) and "
+            "the reference must use rot6d + xyz (9D)"
+        )
     rotation = _rot6d_to_matrix(reference[..., :6])
     position = reference[..., 6:9]
     outputs = []
     for step in range(deltas.shape[-2]):
-        rotation = _rot6d_to_matrix(deltas[..., step, :6]) @ rotation
-        position = position + deltas[..., step, 6:9]
+        if rotation_representation == "rotvec":
+            delta_rotation = _rotvec_to_matrix(deltas[..., step, :3])
+            delta_position = deltas[..., step, 3:6]
+        elif rotation_representation == "rot6d":
+            delta_rotation = _rot6d_to_matrix(deltas[..., step, :6])
+            delta_position = deltas[..., step, 6:9]
+        else:
+            raise ValueError(f"Unknown EE delta rotation representation: {rotation_representation!r}")
+        rotation = delta_rotation @ rotation
+        position = position + delta_position
         outputs.append(torch.cat((_matrix_to_rot6d(rotation), position), dim=-1))
     return torch.stack(outputs, dim=-2)
 
@@ -246,6 +366,7 @@ def encode_b2_action_chunk(
     global_pose: Tensor | None = None,
     representation: str = "local_trajectory",
     z1_representation: str = "ee_pose",
+    ee_delta_rotation_representation: str = "rot6d",
     predict_arm_teleop_inactive: bool = True,
     predict_arm_reset: bool = True,
     predict_ee_pose: bool = True,
@@ -305,8 +426,16 @@ def encode_b2_action_chunk(
         ee_output_indices = [
             index for index, name in enumerate(selected_names) if name.startswith("height_invariant_ee_")
         ]
-        ee_delta = absolute_ee_pose_to_delta(next_action[..., 5:14], source_action[..., 0, 5:14])
-        result[..., ee_output_indices] = ee_delta
+        ee_delta = absolute_ee_pose_to_delta(
+            next_action[..., 5:14],
+            source_action[..., 0, 5:14],
+            rotation_representation=ee_delta_rotation_representation,
+        )
+        if ee_delta_rotation_representation == "rotvec":
+            first, last = ee_output_indices[0], ee_output_indices[-1] + 1
+            result = torch.cat((result[..., :first], ee_delta, result[..., last:]), dim=-1)
+        else:
+            result[..., ee_output_indices] = ee_delta
     return result
 
 
@@ -346,6 +475,7 @@ def b2_execution_action_names(
     *,
     representation: str = "velocity",
     z1_representation: str = "ee_pose",
+    ee_delta_rotation_representation: str = "rot6d",
     predict_arm_teleop_inactive: bool = True,
     predict_arm_reset: bool = True,
     predict_ee_pose: bool = True,
@@ -366,7 +496,25 @@ def b2_execution_action_names(
     )
     names = [dataset_names[i] for i in indices]
     if z1_representation == "ee_delta":
-        names = [name.replace("height_invariant_ee_", "height_invariant_ee_delta_") for name in names]
+        ee_indices = [i for i, name in enumerate(names) if name.startswith("height_invariant_ee_")]
+        if ee_delta_rotation_representation == "rotvec" and ee_indices:
+            first, last = ee_indices[0], ee_indices[-1] + 1
+            names = (
+                names[:first]
+                + list(EE_DELTA_ROTVEC_NAMES)
+                + [
+                    "height_invariant_ee_delta_x",
+                    "height_invariant_ee_delta_y",
+                    "height_invariant_ee_delta_z",
+                ]
+                + names[last:]
+            )
+        elif ee_delta_rotation_representation == "rot6d":
+            names = [name.replace("height_invariant_ee_", "height_invariant_ee_delta_") for name in names]
+        else:
+            raise ValueError(
+                f"Unknown EE delta rotation representation: {ee_delta_rotation_representation!r}"
+            )
     elif z1_representation != "ee_pose":
         raise ValueError(f"Unknown Z1 action representation: {z1_representation!r}")
     return names
@@ -383,10 +531,12 @@ def b2_trajectory_action_names(dataset_names: list[str] | None, **kwargs: Any) -
 def make_b2_trajectory_stats(
     dataset_stats: dict[str, dict[str, Any]] | None,
     *,
+    transformed_action_stats: dict[str, Any] | None = None,
     dt: float,
     chunk_size: int,
     representation: str = "local_trajectory",
     z1_representation: str = "ee_pose",
+    ee_delta_rotation_representation: str = "rot6d",
     predict_arm_teleop_inactive: bool = True,
     predict_arm_reset: bool = True,
     predict_ee_pose: bool = True,
@@ -396,16 +546,67 @@ def make_b2_trajectory_stats(
 ) -> dict[str, dict[str, Any]] | None:
     """Build normalization stats for the compact trajectory representation.
 
-    Dataset statistics remain untouched on disk.  The trajectory bounds use the
-    robust per-step velocity quantiles over the full chunk duration; x/y share
-    one metric scale so rotation never changes their relative units.
+    EE-delta schemas require exact statistics measured after temporal
+    transformation. Absolute-pose marginal statistics cannot recover delta
+    quantiles and are rejected instead of being approximated.
     """
     if dataset_stats is None:
         return None
     stats = deepcopy(dataset_stats)
     if ACTION not in stats:
         raise ValueError("Dataset statistics do not contain action")
-    action_stats = stats[ACTION]
+    if transformed_action_stats is not None:
+        expected_names = b2_trajectory_action_names(
+            list(DATASET_ACTION_NAMES),
+            representation=representation,
+            z1_representation=z1_representation,
+            ee_delta_rotation_representation=ee_delta_rotation_representation,
+            predict_arm_teleop_inactive=predict_arm_teleop_inactive,
+            predict_arm_reset=predict_arm_reset,
+            predict_ee_pose=predict_ee_pose,
+            predict_gripper=predict_gripper,
+            include_task_complete=include_task_complete,
+        )
+        if representation == "velocity":
+            expected_names = b2_execution_action_names(
+                list(DATASET_ACTION_NAMES),
+                representation=representation,
+                z1_representation=z1_representation,
+                ee_delta_rotation_representation=ee_delta_rotation_representation,
+                predict_arm_teleop_inactive=predict_arm_teleop_inactive,
+                predict_arm_reset=predict_arm_reset,
+                predict_ee_pose=predict_ee_pose,
+                predict_gripper=predict_gripper,
+                include_task_complete=include_task_complete,
+            )
+        q01_exact = torch.as_tensor(transformed_action_stats["q01"]).reshape(-1)
+        if expected_names is None or q01_exact.numel() != len(expected_names):
+            raise ValueError(
+                "Exact transformed-action statistics do not match the configured model action schema"
+            )
+        stats[ACTION] = deepcopy(transformed_action_stats)
+        if state_indices is not None and "observation.state" in stats:
+            state_stats = stats["observation.state"]
+
+            def select_exact_state(value: Any) -> Any:
+                tensor = torch.as_tensor(value).reshape(-1)
+                if tensor.numel() == 1:
+                    return deepcopy(value)
+                selected = tensor[list(state_indices)]
+                if isinstance(value, Tensor):
+                    return selected.to(device=value.device, dtype=value.dtype)
+                return selected.numpy()
+
+            stats["observation.state"] = {
+                name: select_exact_state(value) for name, value in state_stats.items()
+            }
+        return stats
+    else:
+        action_stats = stats[ACTION]
+        if z1_representation == "ee_delta":
+            raise ValueError(
+                "EE-delta normalization requires statistics measured after the temporal action transform"
+            )
     if "q01" not in action_stats or "q99" not in action_stats:
         raise ValueError("B2 trajectory normalization requires action q01/q99 statistics")
 
@@ -445,26 +646,6 @@ def make_b2_trajectory_stats(
             tensor[DATASET_B2_TWIST_SLICE] = 0.0
         tensor = tensor[list(action_indices)]
         selected_names = [DATASET_ACTION_NAMES[index] for index in action_indices]
-        if z1_representation == "ee_delta":
-            ee_indices = [
-                i for i, value in enumerate(selected_names) if value.startswith("height_invariant_ee_")
-            ]
-            rotation_indices = ee_indices[:6]
-            position_indices = ee_indices[6:]
-            if name in {"q01", "min", "q10"}:
-                tensor[rotation_indices] = -1.0
-                for output_index, raw_index in zip(position_indices, range(11, 14), strict=True):
-                    tensor[output_index] = -max(float((q99[raw_index] - q01[raw_index]).abs()), 1e-3)
-            elif name in {"q99", "max", "q90"}:
-                tensor[rotation_indices] = 1.0
-                for output_index, raw_index in zip(position_indices, range(11, 14), strict=True):
-                    tensor[output_index] = max(float((q99[raw_index] - q01[raw_index]).abs()), 1e-3)
-            elif name == "std":
-                tensor[rotation_indices] = 0.5
-                for output_index, raw_index in zip(position_indices, range(11, 14), strict=True):
-                    tensor[output_index] = max(float((q99[raw_index] - q01[raw_index]).abs()) / 2, 5e-4)
-            elif name == "mean":
-                tensor[rotation_indices + position_indices] = 0.0
         # Quantile normalization must remain well-defined even when a boolean is
         # extremely imbalanced and both empirical quantiles collapse to one class.
         positive_bool_names = {ARM_TELEOP_INACTIVE_NAME, "arm_reset", TASK_COMPLETE_NAME}

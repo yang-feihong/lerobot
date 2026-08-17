@@ -17,6 +17,7 @@ import logging
 import math
 import multiprocessing
 from collections import defaultdict
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,6 @@ from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.pi05.b2_action_transform import (
     B2_GLOBAL_POSE_STATE_NAMES,
-    action_dataset_indices,
     action_schema_kwargs,
     b2_execution_action_names,
     b2_trajectory_action_names,
@@ -41,7 +41,16 @@ from lerobot.policies.pi05.b2_action_transform import (
     integrate_b2_execution_chunk,
     make_b2_trajectory_stats,
 )
+from lerobot.policies.pi05.manipulation_metrics import (
+    aggregate_manipulation_metrics,
+    compute_manipulation_onset_metrics,
+)
+from lerobot.policies.pi05.transformed_action_stats import (
+    PI05_TRANSFORMED_ACTION_STATS_NAME,
+    load_transformed_action_stats,
+)
 from lerobot.scripts.lerobot_train import apply_task_variants_to_batch, load_task_variants
+from lerobot.scripts.pi05_vla_server import _decode_discrete_actions, _load_checkpoint_contract
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.utils import init_logging
@@ -583,6 +592,42 @@ def _flatten_valid_chunks(chunks: np.ndarray, valid_lengths: np.ndarray) -> np.n
     return np.concatenate(valid_parts, axis=0)
 
 
+def _manipulation_onset_windows(
+    dataset: LeRobotDataset,
+    *,
+    pre_frames: int,
+    post_frames: int,
+) -> tuple[set[int], set[tuple[int, int]]]:
+    table = dataset.hf_dataset.select_columns([ACTION, "episode_index", "frame_index"]).with_format("numpy")
+    required_episode_frames: set[tuple[int, int]] = set()
+    index_by_episode_frame: dict[tuple[int, int], int] = {}
+    offset = 0
+    previous_episode = None
+    previous_active = False
+    for batch in table.iter(batch_size=65_536):
+        actions = np.asarray(batch[ACTION])
+        episode_indices = np.asarray(batch["episode_index"], dtype=np.int64)
+        frame_indices = np.asarray(batch["frame_index"], dtype=np.int64)
+        active = (actions[:, 3] < 0.5) & (actions[:, 4] < 0.5)
+        for local_index, (episode, frame, is_active) in enumerate(
+            zip(episode_indices, frame_indices, active, strict=True)
+        ):
+            episode = int(episode)
+            frame = int(frame)
+            index_by_episode_frame[(episode, frame)] = local_index + offset
+            if episode != previous_episode:
+                previous_active = False
+            if is_active and not previous_active:
+                for required_frame in range(max(0, frame - pre_frames), frame + post_frames + 1):
+                    required_episode_frames.add((episode, required_frame))
+            previous_episode = episode
+            previous_active = bool(is_active)
+        offset += len(actions)
+    required_episode_frames.intersection_update(index_by_episode_frame)
+    required_indices = {index_by_episode_frame[key] for key in required_episode_frames}
+    return required_indices, required_episode_frames
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -590,6 +635,17 @@ def main() -> None:
     )
     parser.add_argument("--dataset-repo-id", default="local/b2_z1_vla")
     parser.add_argument("--dataset-root", default="/data/b2_z1_vla_lerobot")
+    parser.add_argument(
+        "--dataset-group",
+        default=None,
+        help="Metric group such as staff1/staff2. By default it is inferred from --dataset-root.",
+    )
+    parser.add_argument(
+        "--onset-window-seconds",
+        type=float,
+        default=1.0,
+        help="Always evaluate this many seconds before and after every ground-truth manipulation onset.",
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--split", choices=["train", "eval", "all"], default="eval")
     parser.add_argument("--eval-split", type=float, default=0.1)
@@ -615,6 +671,11 @@ def main() -> None:
     )
     parser.add_argument("--task-variants-path", default=None)
     parser.add_argument("--task-variant", choices=["dataset", "first", "random"], default="first")
+    parser.add_argument(
+        "--task-override",
+        default=None,
+        help="Use one exact instruction for every evaluated frame after task-variant selection.",
+    )
     parser.add_argument(
         "--max-chunk-plots-per-episode",
         type=int,
@@ -659,6 +720,10 @@ def main() -> None:
     else:
         output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+    dataset_group = args.dataset_group
+    if dataset_group is None:
+        root_name = Path(args.dataset_root).name.lower()
+        dataset_group = "staff1" if "staff1" in root_name else "staff2" if "staff2" in root_name else "mixed"
     plot_dir = output_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     chunk_plot_dir = output_dir / "rolling_chunk_plots"
@@ -672,15 +737,13 @@ def main() -> None:
     policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
     policy_cfg.pretrained_path = policy_path
     policy_cfg.device = args.device
-    deployment_metadata_path = policy_path / "pi05_deployment_metadata.json"
+    checkpoint_contract = None
     if getattr(policy_cfg, "io_schema_resolved", False):
-        if not deployment_metadata_path.exists():
-            raise FileNotFoundError(
-                f"Checkpoint is missing required deployment metadata: {deployment_metadata_path}"
-            )
-        saved_deployment_metadata = json.loads(deployment_metadata_path.read_text(encoding="utf-8"))
-        if saved_deployment_metadata != policy_cfg.deployment_metadata():
-            raise ValueError("pi05_deployment_metadata.json disagrees with the checkpoint policy config")
+        checkpoint_contract = _load_checkpoint_contract(
+            policy_path,
+            policy_cfg,
+            float(policy_cfg.control_frequency_hz),
+        )
 
     meta = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
     io_schema_enabled = bool(getattr(policy_cfg, "io_schema_resolved", False))
@@ -742,6 +805,7 @@ def main() -> None:
     trajectory_action_names = list(dataset_action_names)
     trajectory_stats = None
     execution_stats = None
+    checkpoint_transformed_action_stats = None
     schema_kwargs = action_schema_kwargs(policy_cfg) if io_schema_enabled else {}
     if io_schema_enabled:
         if dataset_action_dim != 16:
@@ -752,34 +816,57 @@ def main() -> None:
         trajectory_action_names = b2_trajectory_action_names(dataset_action_names, **schema_kwargs)
         assert execution_action_names is not None
         assert trajectory_action_names is not None
+        if policy_cfg.z1_action_representation == "ee_delta":
+            transformed_stats_path = policy_path / PI05_TRANSFORMED_ACTION_STATS_NAME
+            if not transformed_stats_path.is_file():
+                raise FileNotFoundError(
+                    "EE-delta checkpoint is missing exact transformed-action statistics: "
+                    f"{transformed_stats_path}"
+                )
+            checkpoint_transformed_action_stats = load_transformed_action_stats(transformed_stats_path)[
+                "stats"
+            ][ACTION]
         trajectory_schema = {**schema_kwargs, "representation": "local_trajectory"}
         transformed_stats = make_b2_trajectory_stats(
             meta.stats,
+            transformed_action_stats=checkpoint_transformed_action_stats,
             dt=float(b2_trajectory_dt),
             chunk_size=int(policy_cfg.chunk_size),
-            **trajectory_schema,
+            **schema_kwargs,
         )
         assert transformed_stats is not None
-        trajectory_stats = transformed_stats[ACTION]
-        execution_schema = {**schema_kwargs, "representation": "velocity"}
-        execution_transformed_stats = make_b2_trajectory_stats(
-            meta.stats,
-            dt=float(b2_trajectory_dt),
-            chunk_size=int(policy_cfg.chunk_size),
-            **execution_schema,
-        )
-        assert execution_transformed_stats is not None
-        execution_stats = execution_transformed_stats[ACTION]
+        model_stats = transformed_stats[ACTION]
+        trajectory_stats = deepcopy(model_stats)
+        execution_stats = deepcopy(model_stats)
+        if policy_cfg.b2_action_representation == "local_trajectory":
+            for statistic_name, statistic_value in execution_stats.items():
+                if statistic_name == "count":
+                    continue
+                value = np.asarray(statistic_value).copy()
+                raw_value = np.asarray(meta.stats[ACTION][statistic_name])
+                value[:3] = raw_value[:3]
+                execution_stats[statistic_name] = value
+        else:
+            local_b2_stats = make_b2_trajectory_stats(
+                meta.stats,
+                dt=float(b2_trajectory_dt),
+                chunk_size=int(policy_cfg.chunk_size),
+                representation="local_trajectory",
+                z1_representation="ee_pose",
+            )[ACTION]
+            for statistic_name, statistic_value in trajectory_stats.items():
+                if statistic_name == "count":
+                    continue
+                value = np.asarray(statistic_value).copy()
+                value[:3] = np.asarray(local_b2_stats[statistic_name])[:3]
+                trajectory_stats[statistic_name] = value
 
-        raw_limits = _action_plot_y_limits(meta, dataset_action_names)
-        selected_indices = action_dataset_indices(
-            predict_arm_teleop_inactive=policy_cfg.action_predict_arm_teleop_inactive,
-            predict_arm_reset=policy_cfg.action_predict_arm_reset,
-            predict_ee_pose=policy_cfg.action_predict_ee_pose,
-            predict_gripper=policy_cfg.action_predict_gripper,
-            include_task_complete=policy_cfg.action_predict_task_complete,
-        )
-        execution_limits = [raw_limits[i] for i in selected_indices]
+        execution_q01 = np.asarray(execution_stats["q01"], dtype=np.float32)
+        execution_q99 = np.asarray(execution_stats["q99"], dtype=np.float32)
+        execution_limits = [
+            _padded_limits(float(execution_q01[i]), float(execution_q99[i]))
+            for i in range(len(execution_action_names))
+        ]
         trajectory_q01 = np.asarray(trajectory_stats["q01"], dtype=np.float32)
         trajectory_q99 = np.asarray(trajectory_stats["q99"], dtype=np.float32)
         b2_start = 0
@@ -799,6 +886,15 @@ def main() -> None:
         for index, frame_index in enumerate(dataset.hf_dataset["frame_index"])
         if int(frame_index) % args.frame_stride == 0
     ]
+    required_onset_frames: set[tuple[int, int]] = set()
+    if io_schema_enabled and policy_cfg.z1_action_representation == "ee_delta":
+        onset_window_frames = int(round(args.onset_window_seconds * float(meta.fps)))
+        required_onset_indices, required_onset_frames = _manipulation_onset_windows(
+            dataset,
+            pre_frames=onset_window_frames,
+            post_frames=onset_window_frames,
+        )
+        sampled_indices = sorted(set(sampled_indices) | required_onset_indices)
     logging.info(
         "Inference sampling: %d/%d source frames (stride=%d)",
         len(sampled_indices),
@@ -851,6 +947,7 @@ def main() -> None:
         }
     )
     counts: dict[int, int] = defaultdict(int)
+    remaining_required_onset_frames = set(required_onset_frames)
     prediction_rows: list[dict[str, Any]] = []
 
     with torch.inference_mode():
@@ -865,13 +962,22 @@ def main() -> None:
                 batch[ACTION][..., action_history_length:, :].detach().cpu().to(torch.float32)
             )
             episode_indices = batch["episode_index"].detach().cpu().view(-1).tolist()
+            frame_indices_in_batch = batch["frame_index"].detach().cpu().view(-1).tolist()
             keep = []
-            for i, ep_idx in enumerate(episode_indices):
+            for i, (ep_idx, frame_idx) in enumerate(
+                zip(episode_indices, frame_indices_in_batch, strict=True)
+            ):
                 ep_idx = int(ep_idx)
-                if args.max_frames_per_episode > 0 and counts[ep_idx] >= args.max_frames_per_episode:
+                required_onset_frame = (ep_idx, int(frame_idx)) in required_onset_frames
+                if (
+                    args.max_frames_per_episode > 0
+                    and counts[ep_idx] >= args.max_frames_per_episode
+                    and not required_onset_frame
+                ):
                     continue
                 keep.append(i)
                 counts[ep_idx] += 1
+                remaining_required_onset_frames.discard((ep_idx, int(frame_idx)))
             if not keep:
                 continue
             if len(keep) != len(episode_indices):
@@ -895,12 +1001,26 @@ def main() -> None:
                     seed=args.seed,
                     randomize=args.task_variant == "random",
                 )
+            if args.task_override is not None:
+                batch["task"] = [args.task_override] * len(keep)
 
             batch = _batch_to_device_and_float_images(batch, dataset.meta.camera_keys)
             processed = preprocessor(batch)
-            pred_execution_chunk = (
-                postprocessor(policy.predict_action_chunk(processed)).detach().cpu().to(torch.float32)
-            )
+            normalized_pred_chunk = policy.predict_action_chunk(processed)
+            pred_execution_chunk = postprocessor(normalized_pred_chunk).detach().cpu().to(torch.float32)
+            if checkpoint_contract is not None:
+                decoded_batches = [
+                    _decode_discrete_actions(
+                        normalized.detach().cpu().to(torch.float32),
+                        physical,
+                        tuple(execution_action_names),
+                        mode=checkpoint_contract.discrete_action_training_mode,
+                        gripper_negative_value=checkpoint_contract.gripper_negative_value,
+                        gripper_nonnegative_value=checkpoint_contract.gripper_nonnegative_value,
+                    )
+                    for normalized, physical in zip(normalized_pred_chunk, pred_execution_chunk, strict=True)
+                ]
+                pred_execution_chunk = torch.stack(decoded_batches)
             current_b2_pose = None
             if io_schema_enabled:
                 action_is_pad = batch.get(f"{ACTION}_is_pad")
@@ -1000,8 +1120,10 @@ def main() -> None:
                     row[f"error/{name}"] = float(err[j])
                 prediction_rows.append(row)
 
-            if args.max_frames_per_episode > 0 and all(
-                counts[int(ep_idx)] >= args.max_frames_per_episode for ep_idx in episodes
+            if (
+                args.max_frames_per_episode > 0
+                and all(counts[int(ep_idx)] >= args.max_frames_per_episode for ep_idx in episodes)
+                and not remaining_required_onset_frames
             ):
                 break
 
@@ -1016,6 +1138,7 @@ def main() -> None:
     normalized_trajectory_metrics_rows: list[dict[str, Any]] = []
     trajectory_chunk_metrics_rows: list[dict[str, Any]] = []
     normalized_trajectory_chunk_metrics_rows: list[dict[str, Any]] = []
+    manipulation_metric_rows: list[dict[str, Any]] = []
     all_expert, all_pred = [], []
     all_expert_chunks, all_pred_chunks = [], []
     all_expert_trajectories, all_pred_trajectories = [], []
@@ -1044,6 +1167,24 @@ def main() -> None:
         pred_trajectory = np.stack(item["pred_trajectory"]).astype(np.float32)
         expert_trajectory_chunks = np.stack(item["expert_trajectory_chunk"]).astype(np.float32)
         pred_trajectory_chunks = np.stack(item["pred_trajectory_chunk"]).astype(np.float32)
+        if io_schema_enabled and policy_cfg.z1_action_representation == "ee_delta":
+            onset_window_mask = np.asarray(
+                [(int(ep_idx), int(frame)) in required_onset_frames for frame in frame_index],
+                dtype=bool,
+            )
+            if not onset_window_mask.any():
+                raise RuntimeError(f"Episode {ep_idx} has no evaluated manipulation-onset window")
+            onset_metrics = compute_manipulation_onset_metrics(
+                frame_indices=frame_index[onset_window_mask],
+                expert_chunks=expert_chunks[onset_window_mask],
+                predicted_chunks=pred_chunks[onset_window_mask],
+                action_names=execution_action_names,
+                control_frequency_hz=float(policy_cfg.control_frequency_hz),
+                dataset_frequency_hz=float(meta.fps),
+                dataset_group=dataset_group,
+            )
+            onset_metrics["episode_index"] = int(ep_idx)
+            manipulation_metric_rows.append(onset_metrics)
         current_b2_pose = (
             np.stack(item["current_b2_pose"]).astype(np.float32) if item["current_b2_pose"] else None
         )
@@ -1329,6 +1470,17 @@ def main() -> None:
     _write_predictions_csv(output_dir / "predictions.csv", prediction_rows, execution_action_names)
     np.savez_compressed(output_dir / "predictions.npz", **npz_payload)
 
+    manipulation_metrics = None
+    if manipulation_metric_rows:
+        manipulation_metrics = aggregate_manipulation_metrics(manipulation_metric_rows, dataset_group)
+        (output_dir / "manipulation_onset_metrics.json").write_text(
+            json.dumps(
+                {"overall": manipulation_metrics, "episodes": manipulation_metric_rows},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
     summary = {
         "policy_path": str(policy_path),
         "dataset_repo_id": args.dataset_repo_id,
@@ -1353,6 +1505,7 @@ def main() -> None:
         "normalized_trajectory_metrics": normalized_trajectory_metrics_rows[0],
         "trajectory_chunk_metrics": trajectory_chunk_metrics_rows[0],
         "normalized_trajectory_chunk_metrics": normalized_trajectory_chunk_metrics_rows[0],
+        "manipulation_onset_metrics": manipulation_metrics,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 

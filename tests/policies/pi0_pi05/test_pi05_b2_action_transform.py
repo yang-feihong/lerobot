@@ -7,6 +7,7 @@ import torch
 
 from lerobot.policies.pi05.b2_action_transform import (
     DATASET_ACTION_NAMES,
+    EE_DELTA_VALID_KEY,
     absolute_ee_pose_to_delta,
     action_label_multiplicity,
     decode_b2_action_chunk,
@@ -16,7 +17,11 @@ from lerobot.policies.pi05.b2_action_transform import (
     integrate_body_twist,
     make_b2_trajectory_stats,
 )
-from lerobot.policies.pi05.processor_pi05 import Pi05B2LocalTrajectoryProcessorStep
+from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.pi05.processor_pi05 import (
+    Pi05B2LocalTrajectoryProcessorStep,
+    _action_history_steps,
+)
 from lerobot.types import TransitionKey
 from lerobot.utils.constants import ACTION, OBS_STATE
 
@@ -51,6 +56,20 @@ def test_ee_delta_first_point_is_current_to_next_and_round_trips():
     torch.testing.assert_close(deltas[0, 0, 6:], torch.tensor([0.1, 0.0, 0.0]))
     torch.testing.assert_close(deltas[0, 1, 6:], torch.tensor([0.0, 0.2, 0.0]))
     torch.testing.assert_close(ee_pose_delta_to_absolute(deltas, poses[:, 0]), poses[:, 1:])
+
+
+def test_rotvec_ee_delta_is_zero_centered_signed_and_round_trips():
+    angles = torch.tensor([0.0, 0.2, -0.1], dtype=torch.float64)
+    poses = torch.zeros(1, 3, 9, dtype=torch.float64)
+    poses[0, :, 5] = torch.sin(angles)
+    poses[0, :, 4] = torch.cos(angles)
+    poses[0, :, 0] = 1.0
+    deltas = absolute_ee_pose_to_delta(poses[:, 1:], poses[:, 0], rotation_representation="rotvec")
+    assert deltas.shape == (1, 2, 6)
+    torch.testing.assert_close(deltas[0, :, 0], torch.tensor([0.2, -0.3], dtype=torch.float64))
+    torch.testing.assert_close(deltas[0, :, 1:3], torch.zeros(2, 2, dtype=torch.float64))
+    reconstructed = ee_pose_delta_to_absolute(deltas, poses[:, 0], rotation_representation="rotvec")
+    torch.testing.assert_close(reconstructed, poses[:, 1:], rtol=1e-7, atol=1e-7)
 
 
 def test_encode_ee_delta_uses_51_absolute_targets_for_50_deltas():
@@ -92,6 +111,28 @@ def test_ee_delta_padding_requires_both_adjacent_targets():
     transformed = step(transition)
     assert transformed[TransitionKey.ACTION].shape[-2] == 2
     assert transformed[TransitionKey.COMPLEMENTARY_DATA][f"{ACTION}_is_pad"].tolist() == [[False, True]]
+
+
+def test_ee_delta_validity_requires_active_non_reset_at_both_endpoints():
+    identity = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    action = torch.zeros(1, 4, 16)
+    action[..., 5:11] = identity
+    action[0, 2, 3] = 1.0
+    transition = {
+        TransitionKey.ACTION: action,
+        TransitionKey.COMPLEMENTARY_DATA: {f"{ACTION}_is_pad": torch.zeros(1, 4, dtype=torch.bool)},
+    }
+    step = Pi05B2LocalTrajectoryProcessorStep(
+        dt=0.02,
+        representation="velocity",
+        z1_representation="ee_delta",
+        ee_delta_rotation_representation="rotvec",
+    )
+    transformed = step(transition)
+    assert transformed[TransitionKey.ACTION].shape == (1, 3, 13)
+    assert transformed[TransitionKey.COMPLEMENTARY_DATA][EE_DELTA_VALID_KEY].tolist() == [
+        [True, False, False]
+    ]
 
 
 def test_new_action_schema_retains_explicit_gates_and_completion():
@@ -158,3 +199,27 @@ def test_trajectory_stats_keep_rare_positive_boolean_normalizable():
         assert transformed[ACTION]["q99"][dim].item() == 1.0
         assert transformed[ACTION]["mean"][dim].item() == 0.5
         assert transformed[ACTION]["std"][dim].item() == 0.5
+
+
+def test_ee_delta_stats_reject_absolute_workspace_approximation():
+    raw = {ACTION: {name: torch.zeros(16) for name in ("q01", "q99", "min", "max", "mean", "std")}}
+    with pytest.raises(ValueError, match="measured after the temporal action transform"):
+        make_b2_trajectory_stats(
+            raw,
+            dt=0.02,
+            chunk_size=50,
+            z1_representation="ee_delta",
+            ee_delta_rotation_representation="rotvec",
+        )
+
+
+def test_rotvec_ee_delta_builds_absolute_target_reference_step():
+    config = PI05Config(
+        z1_action_representation="ee_delta",
+        ee_delta_rotation_representation="rotvec",
+        action_history_enabled=False,
+    )
+    split, normalizer = _action_history_steps(config, dataset_stats=None)
+    assert split.target_length == config.chunk_size + 1
+    assert len(split.action_indices) == len(DATASET_ACTION_NAMES)
+    assert normalizer is None

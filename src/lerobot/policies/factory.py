@@ -355,6 +355,7 @@ def make_pre_post_processors(
                 preprocessor,
                 postprocessor,
                 kwargs.get("dataset_stats"),
+                kwargs.get("transformed_action_stats"),
             )
         if isinstance(policy_cfg, Evo1Config):
             from .evo1.processor_evo1 import reconcile_evo1_processors
@@ -423,6 +424,7 @@ def make_pre_post_processors(
         processors = make_pi05_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
+            transformed_action_stats=kwargs.get("transformed_action_stats"),
         )
 
     elif isinstance(policy_cfg, GaussianActorConfig):

@@ -65,6 +65,14 @@ def test_completion_tail_sampling_is_monotonic_and_physically_capped():
         )
 
 
+def test_completion_tail_sampling_excludes_episode_without_completion():
+    actions = np.zeros((8, 16), dtype=np.float32)
+    resolved = resolve_task_complete_sampling(
+        _fake_dataset(actions), SimpleNamespace(task_complete_sample_tail_seconds=0.2)
+    )
+    assert resolved == ([0], {0: 0})
+
+
 def test_all_boolean_priors_use_capped_starts_and_ignore_post_completion_controls():
     actions = np.zeros((5, 16), dtype=np.float32)
     actions[:, 3] = [1, 1, 0, 0, 0]

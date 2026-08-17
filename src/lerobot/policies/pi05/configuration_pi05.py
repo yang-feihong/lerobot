@@ -83,6 +83,9 @@ class PI05Config(PreTrainedConfig):
     state_use_b2_angular_velocity: bool = False
     b2_action_representation: str = "local_trajectory"  # "velocity" or "local_trajectory"
     z1_action_representation: str = "ee_pose"  # "ee_pose" or "ee_delta"
+    # Old checkpoints used rot6d. New EE-delta training explicitly selects
+    # rotvec; keeping this default preserves unversioned historical configs.
+    ee_delta_rotation_representation: str = "rot6d"  # "rot6d" or "rotvec"
     action_predict_arm_teleop_inactive: bool = True
     action_predict_arm_reset: bool = True
     action_predict_ee_pose: bool = True
@@ -130,9 +133,10 @@ class PI05Config(PreTrainedConfig):
     #   [0:3]    B2 local x, y, yaw     continuous, always supervised
     #   [3]      arm_teleop_inactive    bool/gate, class-balanced
     #   [4]      arm_reset              bool/gate, class-balanced
-    #   [5:14]   EE rot6d + xyz         continuous, trained only when teleop is active and not reset
-    #   [14]     gripper_target         bool/gate, class-balanced
-    #   [15]     task_complete          explicit bool/gate, class-balanced
+    #   EE        absolute rot6d+xyz, or delta rotvec+xyz for new EE-delta training;
+    #             continuous and supervised only when both transition endpoints are active/non-reset
+    #   gripper   physical two-state target, trained by a class-balanced discrete head
+    #   complete  explicit absorbing completion state
     #            Current B2+Z1 data stores gripper as two raw values (0 and a negative
     #            target position), so its active/event class lives on the negative side
     #            after quantile normalization. Override action_gripper_target_true_side
@@ -249,6 +253,11 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 "z1_action_representation must be 'ee_pose' or 'ee_delta', got "
                 f"{self.z1_action_representation!r}"
+            )
+        if self.ee_delta_rotation_representation not in ["rot6d", "rotvec"]:
+            raise ValueError(
+                "ee_delta_rotation_representation must be 'rot6d' or 'rotvec', got "
+                f"{self.ee_delta_rotation_representation!r}"
             )
         if not any(self.state_feature_switches().values()):
             raise ValueError("At least one state_use_* switch must be true")
@@ -413,7 +422,7 @@ class PI05Config(PreTrainedConfig):
         }
         return {
             "format": "lerobot.pi05.deployment",
-            "version": 5,
+            "version": 6,
             "policy": {
                 "type": self.type,
                 "paligemma_variant": self.paligemma_variant,
@@ -452,6 +461,11 @@ class PI05Config(PreTrainedConfig):
                 "model_names": self.action_feature_names,
                 "representation": self.b2_action_representation,
                 "z1_representation": self.z1_action_representation,
+                "ee_delta_rotation_representation": (
+                    self.ee_delta_rotation_representation
+                    if self.z1_action_representation == "ee_delta"
+                    else None
+                ),
                 "discrete_training_mode": self.discrete_action_training_mode,
                 "discrete_temporal_structure": (
                     {
