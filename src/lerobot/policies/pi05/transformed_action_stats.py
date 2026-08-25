@@ -16,12 +16,26 @@ from .b2_action_transform import (
     TASK_COMPLETE_NAME,
     action_schema_kwargs,
     b2_execution_action_names,
-    b2_trajectory_action_names,
+    b2_pose_delta_action_names,
+    ee_delta_sample_validity,
     ee_delta_transition_validity,
     encode_b2_action_chunk,
+    select_dataset_action_supervision,
 )
 
 PI05_TRANSFORMED_ACTION_STATS_NAME = "pi05_transformed_action_stats.json"
+EE_VALID_TRANSITION_COUNT_KEYS = (
+    "ee_active_non_reset_both_endpoints",
+    "ee_all_transitions",
+)
+
+
+def transformed_action_stats_ee_valid_count(payload: dict[str, Any]) -> int:
+    counts = payload["counts"]
+    present = [key for key in EE_VALID_TRANSITION_COUNT_KEYS if key in counts]
+    if len(present) != 1:
+        raise ValueError(f"Expected exactly one EE-valid transition count, got {present}")
+    return int(counts[present[0]])
 
 
 def _jsonable(value: Any) -> Any:
@@ -69,6 +83,18 @@ def validate_transformed_action_stats(payload: dict[str, Any], dataset, config) 
             )
     saved_schema = payload["schema"]
     for key, expected in action_schema_kwargs(config).items():
+        if saved_schema.get(key) != expected:
+            raise ValueError(
+                f"Transformed-action statistics schema mismatch for {key}: "
+                f"saved={saved_schema.get(key)!r}, current={expected!r}"
+            )
+    for key in (
+        "ee_target_dataset_semantics",
+        "ee_delta_supervision_mode",
+        "gripper_target_representation",
+        "ee_supervision_source",
+    ):
+        expected = getattr(config, key)
         if saved_schema.get(key) != expected:
             raise ValueError(
                 f"Transformed-action statistics schema mismatch for {key}: "
@@ -145,7 +171,7 @@ def compute_transformed_action_stats(dataset, config) -> dict[str, Any]:
     """Traverse continuous episodes and measure statistics after the configured action transform."""
     if not config.io_schema_resolved:
         raise ValueError("Transformed B2+Z1 statistics require a resolved PI0.5 I/O schema")
-    if config.b2_local_trajectory_dt is None or config.control_frequency_hz is None:
+    if config.action_dt_seconds is None or config.control_frequency_hz is None:
         raise ValueError("PI0.5 action timing must be resolved before transformed statistics are computed")
     dataset_fps = float(dataset.meta.fps)
     stride_float = dataset_fps / float(config.control_frequency_hz)
@@ -158,11 +184,11 @@ def compute_transformed_action_stats(dataset, config) -> dict[str, Any]:
 
     schema = action_schema_kwargs(config)
     name_fn = (
-        b2_trajectory_action_names
-        if config.b2_action_representation == "local_trajectory"
+        b2_pose_delta_action_names
+        if config.b2_action_representation == "pose_delta"
         else b2_execution_action_names
     )
-    action_names = name_fn(list(config.dataset_action_feature_names), **schema)
+    action_names = name_fn(list(config.dataset_action_feature_names[:16]), **schema)
     if action_names is None:
         raise ValueError("Resolved PI0.5 schema has no model action names")
     values_by_dimension: list[list[np.ndarray]] = [[] for _ in action_names]
@@ -170,7 +196,17 @@ def compute_transformed_action_stats(dataset, config) -> dict[str, Any]:
     total_transitions = 0
     ee_valid_transitions = 0
     ee_indices = [i for i, name in enumerate(action_names) if name.startswith("height_invariant_ee_")]
-    global_pose_indices = tuple(config.b2_global_pose_state_indices or ())
+    def accumulate(transformed: torch.Tensor, ee_valid: torch.Tensor) -> None:
+        nonlocal total_transitions, ee_valid_transitions
+        transformed_np = transformed.reshape(-1, transformed.shape[-1]).numpy()
+        ee_valid_np = ee_valid.reshape(-1).numpy()
+        total_transitions += len(transformed_np)
+        ee_valid_transitions += int(ee_valid_np.sum())
+        for index in range(len(action_names)):
+            selected = transformed_np[ee_valid_np, index] if index in ee_indices else transformed_np[:, index]
+            if selected.size:
+                values_by_dimension[index].append(selected.astype(np.float32, copy=False))
+                counts_by_dimension[index] += selected.size
 
     for episode_index, frame_indices, actions_np, states_np in _episode_arrays(dataset):
         if len(actions_np) <= stride:
@@ -180,36 +216,63 @@ def compute_transformed_action_stats(dataset, config) -> dict[str, Any]:
                 f"Episode {episode_index} is not a continuous frame sequence: "
                 f"first={frame_indices[0]}, last={frame_indices[-1]}, rows={len(frame_indices)}"
             )
+        needs_full_chunk = (
+            config.b2_action_representation == "pose_delta"
+            or config.z1_action_representation == "ee_state_delta"
+        )
+        if needs_full_chunk:
+            action_count = config.chunk_size + int(config.z1_action_representation == "ee_delta")
+            last_offset = (action_count - 1) * stride
+            num_starts = len(actions_np) - last_offset
+            if num_starts <= 0:
+                continue
+            offsets = np.arange(action_count, dtype=np.int64) * stride
+            for batch_start in range(0, num_starts, 2048):
+                starts = np.arange(batch_start, min(batch_start + 2048, num_starts), dtype=np.int64)
+                raw = torch.from_numpy(actions_np[starts[:, None] + offsets[None, :]])
+                raw = select_dataset_action_supervision(raw, source=config.ee_supervision_source)
+                ee_state_anchor = None
+                if config.z1_action_representation == "ee_state_delta":
+                    if states_np is None or not config.ee_state_anchor_indices:
+                        raise ValueError("ee_state_delta statistics require resolved EE state indices")
+                    ee_state_anchor = torch.from_numpy(
+                        states_np[starts][:, config.ee_state_anchor_indices]
+                    )
+                transformed = encode_b2_action_chunk(
+                    raw,
+                    dt=float(config.action_dt_seconds),
+                    ee_state_anchor=ee_state_anchor,
+                    **schema,
+                )
+                valid = ee_delta_sample_validity(
+                    raw,
+                    None,
+                    representation=config.z1_action_representation,
+                    supervision_mode=config.ee_delta_supervision_mode,
+                )
+                accumulate(transformed, valid)
+            continue
         source = torch.from_numpy(actions_np[:-stride])
         target = torch.from_numpy(actions_np[stride:])
         pairs = torch.stack((source, target), dim=1)
-        global_pose = None
-        if config.b2_action_representation == "local_trajectory" and global_pose_indices:
-            if states_np is None:
-                raise ValueError("Local-trajectory statistics require observation.state")
-            source_pose = torch.from_numpy(states_np[:-stride, list(global_pose_indices)])
-            target_pose = torch.from_numpy(states_np[stride:, list(global_pose_indices)])
-            global_pose = torch.stack((source_pose, target_pose), dim=1)
+        pairs = select_dataset_action_supervision(
+            pairs,
+            source=config.ee_supervision_source,
+        )
         transformed = encode_b2_action_chunk(
             pairs,
-            dt=float(config.b2_local_trajectory_dt),
-            global_pose=global_pose,
+            dt=float(config.action_dt_seconds),
             **schema,
         ).squeeze(1)
         if transformed.shape[-1] != len(action_names):
             raise ValueError(
                 f"Transformed action width {transformed.shape[-1]} does not match names {len(action_names)}"
             )
-        ee_valid = ee_delta_transition_validity(pairs).squeeze(1)
-        transformed_np = transformed.numpy()
-        ee_valid_np = ee_valid.numpy()
-        total_transitions += len(transformed_np)
-        ee_valid_transitions += int(ee_valid_np.sum())
-        for index in range(len(action_names)):
-            selected = transformed_np[ee_valid_np, index] if index in ee_indices else transformed_np[:, index]
-            if selected.size:
-                values_by_dimension[index].append(selected.astype(np.float32, copy=False))
-                counts_by_dimension[index] += selected.size
+        ee_valid = ee_delta_transition_validity(
+            pairs,
+            supervision_mode=config.ee_delta_supervision_mode,
+        ).squeeze(1)
+        accumulate(transformed, ee_valid)
 
     if total_transitions == 0 or any(count == 0 for count in counts_by_dimension):
         raise ValueError(
@@ -237,7 +300,7 @@ def compute_transformed_action_stats(dataset, config) -> dict[str, Any]:
                 stats[key][index] = 1.0
             stats["mean"][index] = 0.5
             stats["std"][index] = 0.5
-        elif name == "gripper_target":
+        elif name == "gripper_target" and config.gripper_target_representation == "binary_position":
             low = float(stats["min"][index])
             high = float(stats["max"][index])
             if not low < high:
@@ -261,13 +324,21 @@ def compute_transformed_action_stats(dataset, config) -> dict[str, Any]:
         },
         "schema": {
             **schema,
+            "ee_target_dataset_semantics": config.ee_target_dataset_semantics,
+            "ee_delta_supervision_mode": config.ee_delta_supervision_mode,
+            "gripper_target_representation": config.gripper_target_representation,
+            "ee_supervision_source": config.ee_supervision_source,
             "control_frequency_hz": float(config.control_frequency_hz),
             "stride_dataset_frames": stride,
             "action_names": action_names,
         },
         "counts": {
             "all_transitions": total_transitions,
-            "ee_active_non_reset_both_endpoints": ee_valid_transitions,
+            (
+                "ee_active_non_reset_both_endpoints"
+                if config.ee_delta_supervision_mode == "active_only"
+                else "ee_all_transitions"
+            ): ee_valid_transitions,
             "per_dimension": counts_by_dimension,
         },
         "stats": {ACTION: stats},

@@ -3,8 +3,8 @@
 
 This evaluates a trained policy on recorded dataset observations without sending
 actions to a robot or simulator. For every sampled frame it predicts an action
-chunk, takes the first action, unnormalizes it with the policy postprocessor, and
-compares it with the dataset action at the same frame.
+chunk and compares it with the physical supervision reconstructed through the
+checkpoint's training preprocessor and postprocessor.
 """
 
 from __future__ import annotations
@@ -32,14 +32,10 @@ from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.pi05.b2_action_transform import (
-    B2_GLOBAL_POSE_STATE_NAMES,
     action_schema_kwargs,
     b2_execution_action_names,
-    b2_trajectory_action_names,
-    decode_b2_action_chunk,
-    encode_b2_action_chunk,
-    integrate_b2_execution_chunk,
-    make_b2_trajectory_stats,
+    b2_pose_delta_action_names,
+    make_pi05_action_stats,
 )
 from lerobot.policies.pi05.manipulation_metrics import (
     aggregate_manipulation_metrics,
@@ -49,13 +45,54 @@ from lerobot.policies.pi05.transformed_action_stats import (
     PI05_TRANSFORMED_ACTION_STATS_NAME,
     load_transformed_action_stats,
 )
+from lerobot.processor.normalize_processor import UnnormalizerProcessorStep
 from lerobot.scripts.lerobot_train import apply_task_variants_to_batch, load_task_variants
-from lerobot.scripts.pi05_vla_server import _decode_discrete_actions, _load_checkpoint_contract
+from lerobot.scripts.pi05_vla_server import _load_checkpoint_contract
 from lerobot.utils.collate import lerobot_collate_fn
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.constants import ACTION
 from lerobot.utils.utils import init_logging
 
 _B2_WORLD_TRAJECTORY_NAMES = ["b2_world_x", "b2_world_y", "b2_world_yaw"]
+
+
+def _unnormalize_model_action(normalized: torch.Tensor, postprocessor) -> torch.Tensor:
+    """Undo checkpoint normalization without applying deployment representation transforms."""
+    if not isinstance(normalized, torch.Tensor):
+        raise ValueError("Expected a tensor in the model action space")
+    transition = postprocessor.to_transition(normalized)
+    found_unnormalizer = False
+    for processor_step in postprocessor.steps:
+        transition = processor_step(transition)
+        if isinstance(processor_step, UnnormalizerProcessorStep):
+            found_unnormalizer = True
+            break
+    if not found_unnormalizer:
+        raise ValueError("Checkpoint postprocessor has no action unnormalizer")
+    model_action = postprocessor.to_output(transition)
+    if not isinstance(model_action, torch.Tensor):
+        raise ValueError("Checkpoint action unnormalizer did not return a tensor")
+    return _as_action_chunk(model_action.detach().cpu().to(torch.float32))
+
+
+def _supervision_contract(policy_cfg: PreTrainedConfig, io_schema_enabled: bool) -> dict[str, Any]:
+    if not io_schema_enabled:
+        return {
+            "construction": "checkpoint_preprocessor_then_action_unnormalizer",
+            "action_source": "dataset_action",
+        }
+    metadata = policy_cfg.deployment_metadata()
+    action = metadata["action"]
+    return {
+        "construction": "checkpoint_preprocessor_then_action_unnormalizer",
+        "b2_source": action["trajectory_source"],
+        "b2_representation": action["representation"],
+        "ee_source": action["ee_supervision_source"],
+        "ee_dataset_semantics": action["ee_target_dataset_semantics"],
+        "ee_representation": action["z1_representation"],
+        "ee_delta_reference": action["ee_delta_reference"],
+        "gripper_source": "dataset_action.gripper_target",
+        "gripper_representation": action["gripper_target_representation"],
+    }
 
 
 def _current_b2_pose_from_raw_state(
@@ -66,7 +103,7 @@ def _current_b2_pose_from_raw_state(
 ) -> torch.Tensor:
     """Read the current world pose before policy state-feature selection.
 
-    A non-MEM batch has shape ``[B, D]``. A MEM/local-trajectory batch can have
+    A non-MEM batch has shape ``[B, D]``. A temporal-state batch can have
     shape ``[B, T, D]``, with the current state at the end of the history prefix.
     The pose is an evaluation/visualization input even when the policy itself
     does not consume it (notably for a velocity checkpoint).
@@ -162,16 +199,58 @@ def _default_action_names(meta: LeRobotDatasetMetadata, action_dim: int) -> list
     return [str(name) for name in names]
 
 
+def _openloop_model_action_names(
+    dataset_names: list[str],
+    *,
+    representation: str,
+    **schema_kwargs: Any,
+) -> list[str]:
+    if representation == "velocity":
+        names = b2_execution_action_names(
+            dataset_names,
+            representation=representation,
+            **schema_kwargs,
+        )
+    elif representation == "pose_delta":
+        names = b2_pose_delta_action_names(
+            dataset_names,
+            representation=representation,
+            **schema_kwargs,
+        )
+    else:
+        raise ValueError(f"Unknown B2 action representation: {representation!r}")
+    assert names is not None
+    return names
+
+
 def _to_numpy_1d(value: Any) -> np.ndarray:
     if isinstance(value, torch.Tensor):
         value = value.detach().cpu().numpy()
     return np.asarray(value, dtype=np.float32).reshape(-1)
 
 
-def _write_metrics_csv(path: Path, rows: list[dict[str, Any]], action_names: list[str]) -> None:
+def _write_metrics_csv(
+    path: Path,
+    rows: list[dict[str, Any]],
+    action_names: list[str],
+    discrete_action_names: frozenset[str] = frozenset(
+        {"arm_teleop_inactive", "arm_reset", "gripper_target", "task_complete"}
+    ),
+) -> None:
     fieldnames = ["scope", "episode_index", "num_frames", "mae_mean", "rmse_mean"]
     for name in action_names:
         fieldnames.extend([f"mae/{name}", f"rmse/{name}"])
+        if name in discrete_action_names:
+            fieldnames.extend(
+                [
+                    f"discrete_accuracy/{name}",
+                    f"discrete_precision/{name}",
+                    f"discrete_recall/{name}",
+                    f"discrete_f1/{name}",
+                    f"discrete_supervision_true_frac/{name}",
+                    f"discrete_pred_true_frac/{name}",
+                ]
+            )
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -182,7 +261,7 @@ def _write_metrics_csv(path: Path, rows: list[dict[str, Any]], action_names: lis
 def _write_predictions_csv(path: Path, rows: list[dict[str, Any]], action_names: list[str]) -> None:
     fieldnames = ["episode_index", "frame_index", "timestamp", "task"]
     for name in action_names:
-        fieldnames.extend([f"expert/{name}", f"pred/{name}", f"error/{name}"])
+        fieldnames.extend([f"supervision/{name}", f"pred/{name}", f"error/{name}"])
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -195,6 +274,9 @@ def _compute_metrics(
     expert: np.ndarray,
     pred: np.ndarray,
     action_names: list[str],
+    discrete_action_names: frozenset[str] = frozenset(
+        {"arm_teleop_inactive", "arm_reset", "gripper_target", "task_complete"}
+    ),
 ) -> dict[str, Any]:
     err = pred - expert
     mae = np.mean(np.abs(err), axis=0)
@@ -209,6 +291,23 @@ def _compute_metrics(
     for i, name in enumerate(action_names):
         row[f"mae/{name}"] = float(mae[i])
         row[f"rmse/{name}"] = float(rmse[i])
+        if name not in discrete_action_names:
+            continue
+        expert_true = expert[:, i] < 0 if name == "gripper_target" else expert[:, i] > 0
+        pred_true = pred[:, i] < 0 if name == "gripper_target" else pred[:, i] > 0
+        true_positive = int(np.count_nonzero(expert_true & pred_true))
+        predicted_positive = int(np.count_nonzero(pred_true))
+        expected_positive = int(np.count_nonzero(expert_true))
+        precision = true_positive / predicted_positive if predicted_positive else 0.0
+        recall = true_positive / expected_positive if expected_positive else 0.0
+        row[f"discrete_accuracy/{name}"] = float(np.mean(expert_true == pred_true))
+        row[f"discrete_precision/{name}"] = precision
+        row[f"discrete_recall/{name}"] = recall
+        row[f"discrete_f1/{name}"] = (
+            2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        )
+        row[f"discrete_supervision_true_frac/{name}"] = float(np.mean(expert_true))
+        row[f"discrete_pred_true_frac/{name}"] = float(np.mean(pred_true))
     return row
 
 
@@ -257,35 +356,6 @@ def _combined_base_plot_arrays(
 
 def _combined_base_plot_names(execution_names: list[str], b2_start: int = 0) -> list[str]:
     return execution_names[: b2_start + 3] + _B2_WORLD_TRAJECTORY_NAMES + execution_names[b2_start + 3 :]
-
-
-def _local_trajectory_to_world(trajectory: np.ndarray, current_pose: np.ndarray) -> np.ndarray:
-    """Compose per-step body-frame SE(2) increments into an odom/world trajectory."""
-    trajectory = np.asarray(trajectory, dtype=np.float32)
-    current_pose = np.asarray(current_pose, dtype=np.float32)
-    if trajectory.ndim < 2 or trajectory.shape[-1] != 3:
-        raise ValueError(f"Expected local trajectory shape (..., T, 3), got {trajectory.shape}")
-    if current_pose.shape != trajectory.shape[:-2] + (3,):
-        raise ValueError(
-            f"Current pose shape {current_pose.shape} is incompatible with trajectory {trajectory.shape}"
-        )
-
-    pose = current_pose.copy()
-    outputs = []
-    for step in range(trajectory.shape[-2]):
-        delta = trajectory[..., step, :]
-        cos_yaw = np.cos(pose[..., 2])
-        sin_yaw = np.sin(pose[..., 2])
-        pose = np.stack(
-            (
-                pose[..., 0] + cos_yaw * delta[..., 0] - sin_yaw * delta[..., 1],
-                pose[..., 1] + sin_yaw * delta[..., 0] + cos_yaw * delta[..., 1],
-                pose[..., 2] + delta[..., 2],
-            ),
-            axis=-1,
-        )
-        outputs.append(pose.copy())
-    return np.stack(outputs, axis=-2)
 
 
 def _world_trajectory_plot_limits(
@@ -390,7 +460,7 @@ def _plot_episode(
         if i >= action_dim:
             ax.axis("off")
             continue
-        ax.plot(x, expert[:, i], label="expert", linewidth=1.3, marker="o", markersize=5.0)
+        ax.plot(x, expert[:, i], label="supervision", linewidth=1.3, marker="o", markersize=5.0)
         ax.plot(x, pred[:, i], label="pred", linewidth=1.1, marker="x", markersize=5.0, alpha=0.85)
         ax.set_ylim(*y_limits[i])
         if len(x) == 1:
@@ -428,7 +498,7 @@ def _plot_episode_rolling_chunks(
       ...
 
     The figure overlays those rolling chunks per action dimension. This makes it
-    clear whether the policy's whole short-horizon plan matches the expert, not
+    clear whether the policy's whole short-horizon plan matches the supervision, not
     just the first action of each chunk.
     """
     import matplotlib
@@ -455,7 +525,7 @@ def _plot_episode_rolling_chunks(
                 color="tab:blue",
                 alpha=0.18,
                 linewidth=0.9,
-                label="expert chunks" if row_idx == 0 else None,
+                label="supervision chunks" if row_idx == 0 else None,
             )
             ax.plot(
                 x,
@@ -507,7 +577,7 @@ def _plot_single_chunk(
         if dim >= action_dim:
             ax.axis("off")
             continue
-        ax.plot(x, expert_chunk[:, dim], label="expert", color="tab:blue", linewidth=1.4)
+        ax.plot(x, expert_chunk[:, dim], label="supervision", color="tab:blue", linewidth=1.4)
         ax.plot(x, pred_chunk[:, dim], label="pred", color="tab:orange", linewidth=1.2)
         ax.set_ylim(*y_limits[dim])
         ax.set_title(action_names[dim], fontsize=9)
@@ -565,7 +635,7 @@ def _first_action(action: torch.Tensor) -> torch.Tensor:
     Some policies request action chunks from LeRobotDataset, yielding
     ``(batch, horizon, action_dim)`` targets. Open-loop comparison uses the same
     convention as deployment: compare the first predicted action with the first
-    expert action in that chunk.
+    supervision action in that chunk.
     """
     return _as_action_chunk(action)[:, 0]
 
@@ -645,6 +715,12 @@ def main() -> None:
         type=float,
         default=1.0,
         help="Always evaluate this many seconds before and after every ground-truth manipulation onset.",
+    )
+    parser.add_argument(
+        "--include-onset-windows",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Augment strided samples with ground-truth manipulation-onset windows.",
     )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--split", choices=["train", "eval", "all"], default="eval")
@@ -744,20 +820,35 @@ def main() -> None:
             policy_cfg,
             float(policy_cfg.control_frequency_hz),
         )
+    discrete_metric_names = {"arm_teleop_inactive", "arm_reset", "task_complete"}
+    if checkpoint_contract is None or checkpoint_contract.gripper_target_representation == "binary_position":
+        discrete_metric_names.add("gripper_target")
+    discrete_metric_names = frozenset(discrete_metric_names)
+
+    def compute_metrics(scope, expert, pred, action_names):
+        return _compute_metrics(
+            scope,
+            expert,
+            pred,
+            action_names,
+            discrete_action_names=discrete_metric_names,
+        )
 
     meta = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
     io_schema_enabled = bool(getattr(policy_cfg, "io_schema_resolved", False))
-    b2_trajectory_dt = getattr(policy_cfg, "b2_local_trajectory_dt", None)
+    supervision_contract = _supervision_contract(policy_cfg, io_schema_enabled)
+    logging.info("Supervision contract: %s", json.dumps(supervision_contract, sort_keys=True))
+    action_dt = getattr(policy_cfg, "action_dt_seconds", None)
     if io_schema_enabled:
         control_frequency_hz = getattr(policy_cfg, "control_frequency_hz", None)
         if control_frequency_hz is None:
             raise ValueError("B2+Z1 checkpoint is missing control_frequency_hz")
         expected_dt = 1.0 / float(control_frequency_hz)
-        if b2_trajectory_dt is None:
-            raise ValueError("B2+Z1 checkpoint is missing b2_local_trajectory_dt")
-        if abs(float(b2_trajectory_dt) - expected_dt) > 1e-9:
+        if action_dt is None:
+            raise ValueError("B2+Z1 checkpoint is missing action_dt_seconds")
+        if abs(float(action_dt) - expected_dt) > 1e-9:
             raise ValueError(
-                f"Trajectory checkpoint dt={b2_trajectory_dt} does not match "
+                f"Action checkpoint dt={action_dt} does not match "
                 f"control_frequency_hz={control_frequency_hz}"
             )
     delta_timestamps = resolve_delta_timestamps(policy_cfg, meta)
@@ -791,16 +882,10 @@ def main() -> None:
         video_backend=args.video_backend,
         return_uint8=True,
     )
+    meta = dataset.meta
 
     dataset_action_dim = int(meta.features[ACTION]["shape"][0])
     dataset_action_names = _default_action_names(meta, dataset_action_dim)
-    dataset_state_names = meta.features.get(OBS_STATE, {}).get("names")
-    dataset_global_pose_indices = (
-        [dataset_state_names.index(name) for name in B2_GLOBAL_POSE_STATE_NAMES]
-        if isinstance(dataset_state_names, list)
-        and all(name in dataset_state_names for name in B2_GLOBAL_POSE_STATE_NAMES)
-        else None
-    )
     execution_action_names = list(dataset_action_names)
     trajectory_action_names = list(dataset_action_names)
     trajectory_stats = None
@@ -808,15 +893,13 @@ def main() -> None:
     checkpoint_transformed_action_stats = None
     schema_kwargs = action_schema_kwargs(policy_cfg) if io_schema_enabled else {}
     if io_schema_enabled:
-        if dataset_action_dim != 16:
-            raise ValueError(
-                f"B2 local trajectory evaluation expects a 16D dataset action, got {dataset_action_dim}"
-            )
-        execution_action_names = b2_execution_action_names(dataset_action_names, **schema_kwargs)
-        trajectory_action_names = b2_trajectory_action_names(dataset_action_names, **schema_kwargs)
-        assert execution_action_names is not None
-        assert trajectory_action_names is not None
-        if policy_cfg.z1_action_representation == "ee_delta":
+        if dataset_action_dim != 25:
+            raise ValueError(f"B2 evaluation expects the 25D control-action schema, got {dataset_action_dim}")
+        canonical_action_names = dataset_action_names[:16]
+        model_action_names = _openloop_model_action_names(canonical_action_names, **schema_kwargs)
+        execution_action_names = list(model_action_names)
+        trajectory_action_names = list(model_action_names)
+        if policy_cfg.z1_action_representation in {"ee_delta", "ee_state_delta"}:
             transformed_stats_path = policy_path / PI05_TRANSFORMED_ACTION_STATS_NAME
             if not transformed_stats_path.is_file():
                 raise FileNotFoundError(
@@ -826,11 +909,10 @@ def main() -> None:
             checkpoint_transformed_action_stats = load_transformed_action_stats(transformed_stats_path)[
                 "stats"
             ][ACTION]
-        trajectory_schema = {**schema_kwargs, "representation": "local_trajectory"}
-        transformed_stats = make_b2_trajectory_stats(
+        transformed_stats = make_pi05_action_stats(
             meta.stats,
             transformed_action_stats=checkpoint_transformed_action_stats,
-            dt=float(b2_trajectory_dt),
+            dt=float(action_dt),
             chunk_size=int(policy_cfg.chunk_size),
             **schema_kwargs,
         )
@@ -838,46 +920,14 @@ def main() -> None:
         model_stats = transformed_stats[ACTION]
         trajectory_stats = deepcopy(model_stats)
         execution_stats = deepcopy(model_stats)
-        if policy_cfg.b2_action_representation == "local_trajectory":
-            for statistic_name, statistic_value in execution_stats.items():
-                if statistic_name == "count":
-                    continue
-                value = np.asarray(statistic_value).copy()
-                raw_value = np.asarray(meta.stats[ACTION][statistic_name])
-                value[:3] = raw_value[:3]
-                execution_stats[statistic_name] = value
-        else:
-            local_b2_stats = make_b2_trajectory_stats(
-                meta.stats,
-                dt=float(b2_trajectory_dt),
-                chunk_size=int(policy_cfg.chunk_size),
-                representation="local_trajectory",
-                z1_representation="ee_pose",
-            )[ACTION]
-            for statistic_name, statistic_value in trajectory_stats.items():
-                if statistic_name == "count":
-                    continue
-                value = np.asarray(statistic_value).copy()
-                value[:3] = np.asarray(local_b2_stats[statistic_name])[:3]
-                trajectory_stats[statistic_name] = value
-
-        execution_q01 = np.asarray(execution_stats["q01"], dtype=np.float32)
-        execution_q99 = np.asarray(execution_stats["q99"], dtype=np.float32)
-        execution_limits = [
-            _padded_limits(float(execution_q01[i]), float(execution_q99[i]))
-            for i in range(len(execution_action_names))
-        ]
         trajectory_q01 = np.asarray(trajectory_stats["q01"], dtype=np.float32)
         trajectory_q99 = np.asarray(trajectory_stats["q99"], dtype=np.float32)
-        b2_start = 0
         trajectory_limits = [
             _padded_limits(float(trajectory_q01[i]), float(trajectory_q99[i]))
-            for i in range(b2_start, b2_start + 3)
+            for i in range(len(trajectory_action_names))
         ]
-        plot_action_names = _combined_base_plot_names(execution_action_names, b2_start)
-        plot_y_limits = (
-            execution_limits[: b2_start + 3] + trajectory_limits + execution_limits[b2_start + 3 :]
-        )
+        plot_action_names = trajectory_action_names
+        plot_y_limits = trajectory_limits
     else:
         plot_action_names = execution_action_names
         plot_y_limits = _action_plot_y_limits(meta, execution_action_names)
@@ -886,8 +936,19 @@ def main() -> None:
         for index, frame_index in enumerate(dataset.hf_dataset["frame_index"])
         if int(frame_index) % args.frame_stride == 0
     ]
+    if args.max_frames_per_episode > 0 and not args.include_onset_windows:
+        limited_indices: list[int] = []
+        limited_counts: dict[int, int] = defaultdict(int)
+        episode_index_column = dataset.hf_dataset["episode_index"]
+        for index in sampled_indices:
+            episode_index = int(episode_index_column[index])
+            if limited_counts[episode_index] >= args.max_frames_per_episode:
+                continue
+            limited_indices.append(index)
+            limited_counts[episode_index] += 1
+        sampled_indices = limited_indices
     required_onset_frames: set[tuple[int, int]] = set()
-    if io_schema_enabled and policy_cfg.z1_action_representation == "ee_delta":
+    if args.include_onset_windows and io_schema_enabled and policy_cfg.z1_action_representation in {"ee_delta", "ee_state_delta"}:
         onset_window_frames = int(round(args.onset_window_seconds * float(meta.fps)))
         required_onset_indices, required_onset_frames = _manipulation_onset_windows(
             dataset,
@@ -955,12 +1016,6 @@ def main() -> None:
             if batch is None:
                 continue
 
-            action_history_length = (
-                policy_cfg.state_num_frames - 1 if policy_cfg.action_history_enabled else 0
-            )
-            dataset_expert_chunk = _as_action_chunk(
-                batch[ACTION][..., action_history_length:, :].detach().cpu().to(torch.float32)
-            )
             episode_indices = batch["episode_index"].detach().cpu().view(-1).tolist()
             frame_indices_in_batch = batch["frame_index"].detach().cpu().view(-1).tolist()
             keep = []
@@ -991,7 +1046,6 @@ def main() -> None:
                     else:
                         filtered[key] = value
                 batch = filtered
-                dataset_expert_chunk = dataset_expert_chunk.index_select(0, keep_t)
 
             if args.task_variant != "dataset":
                 apply_task_variants_to_batch(
@@ -1006,70 +1060,26 @@ def main() -> None:
 
             batch = _batch_to_device_and_float_images(batch, dataset.meta.camera_keys)
             processed = preprocessor(batch)
+            normalized_supervision_chunk = processed.get(ACTION)
+            if not isinstance(normalized_supervision_chunk, torch.Tensor):
+                raise ValueError("Checkpoint preprocessor did not produce tensor action supervision")
+            supervision_model_chunk = _unnormalize_model_action(
+                normalized_supervision_chunk,
+                postprocessor,
+            )
             normalized_pred_chunk = policy.predict_action_chunk(processed)
-            pred_execution_chunk = postprocessor(normalized_pred_chunk).detach().cpu().to(torch.float32)
-            if checkpoint_contract is not None:
-                decoded_batches = [
-                    _decode_discrete_actions(
-                        normalized.detach().cpu().to(torch.float32),
-                        physical,
-                        tuple(execution_action_names),
-                        mode=checkpoint_contract.discrete_action_training_mode,
-                        gripper_negative_value=checkpoint_contract.gripper_negative_value,
-                        gripper_nonnegative_value=checkpoint_contract.gripper_nonnegative_value,
-                    )
-                    for normalized, physical in zip(normalized_pred_chunk, pred_execution_chunk, strict=True)
-                ]
-                pred_execution_chunk = torch.stack(decoded_batches)
+            pred_model_chunk = _unnormalize_model_action(normalized_pred_chunk, postprocessor)
+            if supervision_model_chunk.shape != pred_model_chunk.shape:
+                raise ValueError(
+                    "Training supervision and model prediction have different shapes: "
+                    f"supervision={tuple(supervision_model_chunk.shape)}, "
+                    f"prediction={tuple(pred_model_chunk.shape)}"
+                )
             current_b2_pose = None
-            if io_schema_enabled:
-                action_is_pad = batch.get(f"{ACTION}_is_pad")
-                if action_is_pad is not None:
-                    action_is_pad = action_is_pad[..., action_history_length:].detach().cpu().to(torch.bool)
-                global_pose = None
-                raw_state = batch[OBS_STATE].detach().cpu().to(torch.float32)
-                history_length = (
-                    policy_cfg.state_num_frames if policy_cfg.state_action_encoding == "continuous" else 1
-                )
-                if dataset_global_pose_indices is not None:
-                    current_b2_pose = _current_b2_pose_from_raw_state(
-                        raw_state,
-                        dataset_global_pose_indices,
-                        history_length=history_length,
-                    )
-                global_pose_indices = getattr(policy_cfg, "b2_global_pose_state_indices", None)
-                if global_pose_indices is not None:
-                    current_pose = raw_state[
-                        ..., history_length - 1 : history_length, list(global_pose_indices)
-                    ]
-                    future_pose = raw_state[..., history_length:, list(global_pose_indices)]
-                    global_pose = torch.cat((current_pose, future_pose), dim=-2)
-                if b2_trajectory_dt is not None and current_b2_pose is None:
-                    raise ValueError(
-                        "World-frame trajectory plots require b2_position_x/y/yaw in observation.state"
-                    )
-                expert_trajectory_chunk = encode_b2_action_chunk(
-                    dataset_expert_chunk,
-                    dt=float(b2_trajectory_dt),
-                    is_pad=action_is_pad,
-                    global_pose=global_pose,
-                    **trajectory_schema,
-                )
-                expert_chunk = decode_b2_action_chunk(
-                    expert_trajectory_chunk,
-                    dt=float(b2_trajectory_dt),
-                    representation="local_trajectory",
-                )
-                pred_chunk = pred_execution_chunk
-                pred_trajectory_chunk = integrate_b2_execution_chunk(
-                    pred_execution_chunk,
-                    dt=float(b2_trajectory_dt),
-                )
-            else:
-                expert_chunk = dataset_expert_chunk
-                pred_chunk = pred_execution_chunk
-                expert_trajectory_chunk = expert_chunk
-                pred_trajectory_chunk = pred_chunk
+            expert_chunk = supervision_model_chunk
+            pred_chunk = pred_model_chunk
+            expert_trajectory_chunk = expert_chunk
+            pred_trajectory_chunk = pred_chunk
             expert_action = _first_action(expert_chunk)
             pred_action = _first_action(pred_chunk)
             expert_trajectory_action = _first_action(expert_trajectory_chunk)
@@ -1115,7 +1125,7 @@ def main() -> None:
                 }
                 err = pred_np[i] - expert_np[i]
                 for j, name in enumerate(execution_action_names):
-                    row[f"expert/{name}"] = float(expert_np[i, j])
+                    row[f"supervision/{name}"] = float(expert_np[i, j])
                     row[f"pred/{name}"] = float(pred_np[i, j])
                     row[f"error/{name}"] = float(err[j])
                 prediction_rows.append(row)
@@ -1167,7 +1177,11 @@ def main() -> None:
         pred_trajectory = np.stack(item["pred_trajectory"]).astype(np.float32)
         expert_trajectory_chunks = np.stack(item["expert_trajectory_chunk"]).astype(np.float32)
         pred_trajectory_chunks = np.stack(item["pred_trajectory_chunk"]).astype(np.float32)
-        if io_schema_enabled and policy_cfg.z1_action_representation == "ee_delta":
+        if (
+            args.include_onset_windows
+            and io_schema_enabled
+            and policy_cfg.z1_action_representation in {"ee_delta", "ee_state_delta"}
+        ):
             onset_window_mask = np.asarray(
                 [(int(ep_idx), int(frame)) in required_onset_frames for frame in frame_index],
                 dtype=bool,
@@ -1206,9 +1220,9 @@ def main() -> None:
         all_pred_trajectories.append(pred_trajectory)
         all_expert_trajectory_chunks.append(valid_expert_trajectory_chunks)
         all_pred_trajectory_chunks.append(valid_pred_trajectory_chunks)
-        metrics_rows.append(_compute_metrics(ep_idx, expert, pred, execution_action_names))
+        metrics_rows.append(compute_metrics(ep_idx, expert, pred, execution_action_names))
         normalized_metrics_rows.append(
-            _compute_metrics(
+            compute_metrics(
                 ep_idx,
                 _normalize_execution_action_array(expert, meta, execution_stats),
                 _normalize_execution_action_array(pred, meta, execution_stats),
@@ -1216,7 +1230,7 @@ def main() -> None:
             )
         )
         chunk_metrics_rows.append(
-            _compute_metrics(
+            compute_metrics(
                 ep_idx,
                 valid_expert_chunks,
                 valid_pred_chunks,
@@ -1224,7 +1238,7 @@ def main() -> None:
             )
         )
         normalized_chunk_metrics_rows.append(
-            _compute_metrics(
+            compute_metrics(
                 ep_idx,
                 _normalize_execution_action_array(valid_expert_chunks, meta, execution_stats),
                 _normalize_execution_action_array(valid_pred_chunks, meta, execution_stats),
@@ -1232,7 +1246,7 @@ def main() -> None:
             )
         )
         trajectory_metrics_rows.append(
-            _compute_metrics(
+            compute_metrics(
                 ep_idx,
                 expert_trajectory,
                 pred_trajectory,
@@ -1240,7 +1254,7 @@ def main() -> None:
             )
         )
         trajectory_chunk_metrics_rows.append(
-            _compute_metrics(
+            compute_metrics(
                 ep_idx,
                 valid_expert_trajectory_chunks,
                 valid_pred_trajectory_chunks,
@@ -1249,7 +1263,7 @@ def main() -> None:
         )
         if trajectory_stats is not None:
             normalized_trajectory_metrics_rows.append(
-                _compute_metrics(
+                compute_metrics(
                     ep_idx,
                     _normalize_with_stats(expert_trajectory, trajectory_stats),
                     _normalize_with_stats(pred_trajectory, trajectory_stats),
@@ -1257,7 +1271,7 @@ def main() -> None:
                 )
             )
             normalized_trajectory_chunk_metrics_rows.append(
-                _compute_metrics(
+                compute_metrics(
                     ep_idx,
                     _normalize_with_stats(valid_expert_trajectory_chunks, trajectory_stats),
                     _normalize_with_stats(valid_pred_trajectory_chunks, trajectory_stats),
@@ -1269,33 +1283,10 @@ def main() -> None:
             normalized_trajectory_chunk_metrics_rows.append(normalized_chunk_metrics_rows[-1].copy())
 
         episode_plot_y_limits = plot_y_limits
-        if io_schema_enabled:
-            if current_b2_pose is None:
-                raise RuntimeError("Missing current B2 pose for world-frame trajectory plots")
-            # Preserve yaw continuity across +/-pi for an episode-level world plot.
-            current_b2_pose[:, 2] = np.unwrap(current_b2_pose[:, 2])
-            expert_world_chunks = _local_trajectory_to_world(
-                expert_trajectory_chunks[..., b2_start : b2_start + 3], current_b2_pose
-            )
-            pred_world_chunks = _local_trajectory_to_world(
-                pred_trajectory_chunks[..., b2_start : b2_start + 3], current_b2_pose
-            )
-            expert_world = expert_world_chunks[:, 0]
-            pred_world = pred_world_chunks[:, 0]
-            plot_expert = _combined_base_plot_arrays(expert, expert_world, b2_start)
-            plot_pred = _combined_base_plot_arrays(pred, pred_world, b2_start)
-            plot_expert_chunks = _combined_base_plot_arrays(expert_chunks, expert_world_chunks, b2_start)
-            plot_pred_chunks = _combined_base_plot_arrays(pred_chunks, pred_world_chunks, b2_start)
-            episode_plot_y_limits = (
-                execution_limits[: b2_start + 3]
-                + _world_trajectory_plot_limits(expert_world_chunks, pred_world_chunks)
-                + execution_limits[b2_start + 3 :]
-            )
-        else:
-            plot_expert = expert
-            plot_pred = pred
-            plot_expert_chunks = expert_chunks
-            plot_pred_chunks = pred_chunks
+        plot_expert = expert
+        plot_pred = pred
+        plot_expert_chunks = expert_chunks
+        plot_pred_chunks = pred_chunks
         episode_plot_y_limits_by_episode[str(ep_idx)] = {
             name: [float(low), float(high)]
             for name, (low, high) in zip(plot_action_names, episode_plot_y_limits, strict=True)
@@ -1337,13 +1328,13 @@ def main() -> None:
                 )
             )
         npz_payload[f"episode_{ep_idx:06d}_frame_index"] = frame_index
-        npz_payload[f"episode_{ep_idx:06d}_expert"] = expert
+        npz_payload[f"episode_{ep_idx:06d}_supervision"] = expert
         npz_payload[f"episode_{ep_idx:06d}_pred"] = pred
-        npz_payload[f"episode_{ep_idx:06d}_expert_chunk"] = expert_chunks
+        npz_payload[f"episode_{ep_idx:06d}_supervision_chunk"] = expert_chunks
         npz_payload[f"episode_{ep_idx:06d}_pred_chunk"] = pred_chunks
-        npz_payload[f"episode_{ep_idx:06d}_expert_trajectory"] = expert_trajectory
+        npz_payload[f"episode_{ep_idx:06d}_supervision_trajectory"] = expert_trajectory
         npz_payload[f"episode_{ep_idx:06d}_pred_trajectory"] = pred_trajectory
-        npz_payload[f"episode_{ep_idx:06d}_expert_trajectory_chunk"] = expert_trajectory_chunks
+        npz_payload[f"episode_{ep_idx:06d}_supervision_trajectory_chunk"] = expert_trajectory_chunks
         npz_payload[f"episode_{ep_idx:06d}_pred_trajectory_chunk"] = pred_trajectory_chunks
         npz_payload[f"episode_{ep_idx:06d}_valid_chunk_length"] = valid_chunk_lengths
         if current_b2_pose is not None:
@@ -1376,10 +1367,10 @@ def main() -> None:
     all_pred_trajectory_arr = np.concatenate(all_pred_trajectories, axis=0)
     all_expert_trajectory_chunk_arr = np.concatenate(all_expert_trajectory_chunks, axis=0)
     all_pred_trajectory_chunk_arr = np.concatenate(all_pred_trajectory_chunks, axis=0)
-    metrics_rows.insert(0, _compute_metrics("all", all_expert_arr, all_pred_arr, execution_action_names))
+    metrics_rows.insert(0, compute_metrics("all", all_expert_arr, all_pred_arr, execution_action_names))
     normalized_metrics_rows.insert(
         0,
-        _compute_metrics(
+        compute_metrics(
             "all",
             _normalize_execution_action_array(all_expert_arr, meta, execution_stats),
             _normalize_execution_action_array(all_pred_arr, meta, execution_stats),
@@ -1388,11 +1379,11 @@ def main() -> None:
     )
     chunk_metrics_rows.insert(
         0,
-        _compute_metrics("all", all_expert_chunk_arr, all_pred_chunk_arr, execution_action_names),
+        compute_metrics("all", all_expert_chunk_arr, all_pred_chunk_arr, execution_action_names),
     )
     normalized_chunk_metrics_rows.insert(
         0,
-        _compute_metrics(
+        compute_metrics(
             "all",
             _normalize_execution_action_array(all_expert_chunk_arr, meta, execution_stats),
             _normalize_execution_action_array(all_pred_chunk_arr, meta, execution_stats),
@@ -1402,7 +1393,7 @@ def main() -> None:
 
     trajectory_metrics_rows.insert(
         0,
-        _compute_metrics(
+        compute_metrics(
             "all",
             all_expert_trajectory_arr,
             all_pred_trajectory_arr,
@@ -1411,7 +1402,7 @@ def main() -> None:
     )
     trajectory_chunk_metrics_rows.insert(
         0,
-        _compute_metrics(
+        compute_metrics(
             "all",
             all_expert_trajectory_chunk_arr,
             all_pred_trajectory_chunk_arr,
@@ -1421,7 +1412,7 @@ def main() -> None:
     if trajectory_stats is not None:
         normalized_trajectory_metrics_rows.insert(
             0,
-            _compute_metrics(
+            compute_metrics(
                 "all",
                 _normalize_with_stats(all_expert_trajectory_arr, trajectory_stats),
                 _normalize_with_stats(all_pred_trajectory_arr, trajectory_stats),
@@ -1430,7 +1421,7 @@ def main() -> None:
         )
         normalized_trajectory_chunk_metrics_rows.insert(
             0,
-            _compute_metrics(
+            compute_metrics(
                 "all",
                 _normalize_with_stats(all_expert_trajectory_chunk_arr, trajectory_stats),
                 _normalize_with_stats(all_pred_trajectory_chunk_arr, trajectory_stats),
@@ -1441,31 +1432,47 @@ def main() -> None:
         normalized_trajectory_metrics_rows.insert(0, normalized_metrics_rows[0].copy())
         normalized_trajectory_chunk_metrics_rows.insert(0, normalized_chunk_metrics_rows[0].copy())
 
-    _write_metrics_csv(output_dir / "metrics.csv", metrics_rows, execution_action_names)
-    _write_metrics_csv(output_dir / "normalized_metrics.csv", normalized_metrics_rows, execution_action_names)
-    _write_metrics_csv(output_dir / "chunk_metrics.csv", chunk_metrics_rows, execution_action_names)
+    _write_metrics_csv(
+        output_dir / "metrics.csv", metrics_rows, execution_action_names, discrete_metric_names
+    )
+    _write_metrics_csv(
+        output_dir / "normalized_metrics.csv",
+        normalized_metrics_rows,
+        execution_action_names,
+        discrete_metric_names,
+    )
+    _write_metrics_csv(
+        output_dir / "chunk_metrics.csv", chunk_metrics_rows, execution_action_names, discrete_metric_names
+    )
     _write_metrics_csv(
         output_dir / "normalized_chunk_metrics.csv",
         normalized_chunk_metrics_rows,
         execution_action_names,
+        discrete_metric_names,
     )
     _write_metrics_csv(
-        output_dir / "trajectory_metrics.csv", trajectory_metrics_rows, trajectory_action_names
+        output_dir / "trajectory_metrics.csv",
+        trajectory_metrics_rows,
+        trajectory_action_names,
+        discrete_metric_names,
     )
     _write_metrics_csv(
         output_dir / "normalized_trajectory_metrics.csv",
         normalized_trajectory_metrics_rows,
         trajectory_action_names,
+        discrete_metric_names,
     )
     _write_metrics_csv(
         output_dir / "trajectory_chunk_metrics.csv",
         trajectory_chunk_metrics_rows,
         trajectory_action_names,
+        discrete_metric_names,
     )
     _write_metrics_csv(
         output_dir / "normalized_trajectory_chunk_metrics.csv",
         normalized_trajectory_chunk_metrics_rows,
         trajectory_action_names,
+        discrete_metric_names,
     )
     _write_predictions_csv(output_dir / "predictions.csv", prediction_rows, execution_action_names)
     np.savez_compressed(output_dir / "predictions.npz", **npz_payload)
@@ -1492,7 +1499,8 @@ def main() -> None:
         "episodes": sorted(per_episode),
         "num_frames": int(all_expert_arr.shape[0]),
         "deployment_metadata": policy_cfg.deployment_metadata() if io_schema_enabled else None,
-        "b2_local_trajectory_dt": b2_trajectory_dt,
+        "supervision_contract": supervision_contract,
+        "action_dt_seconds": action_dt,
         "execution_action_names": execution_action_names,
         "trajectory_action_names": trajectory_action_names,
         "plot_action_names": plot_action_names,

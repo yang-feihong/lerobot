@@ -27,7 +27,8 @@ def test_mem_modalities_use_independent_50hz_sampling_clocks():
         state_history_frame_stride=1,
         action_history_enabled=True,
         io_schema_resolved=False,
-        b2_action_representation="local_trajectory",
+        b2_action_representation="pose_delta",
+        z1_action_representation="ee_delta",
         b2_global_pose_state_indices=None,
         chunk_size=50,
         action_delta_indices=list(range(50)),
@@ -47,9 +48,9 @@ def test_mem_modalities_use_independent_50hz_sampling_clocks():
     state_history = [-0.48 + 0.04 * index for index in range(13)]
     assert timestamps[image_key] == pytest.approx(image_history)
     assert timestamps[OBS_STATE][:13] == pytest.approx(state_history)
-    assert timestamps[OBS_STATE][13:] == pytest.approx([index / 50 for index in range(1, 51)])
+    assert timestamps[OBS_STATE] == pytest.approx(state_history)
     assert timestamps[ACTION][:12] == pytest.approx(state_history[:-1])
-    assert timestamps[ACTION][12:] == pytest.approx([index / 50 for index in range(50)])
+    assert timestamps[ACTION][12:] == pytest.approx([index / 50 for index in range(51)])
     assert config.mem_vit_frame_stride == 25
     assert config.state_history_frame_stride == 2
 
@@ -93,6 +94,7 @@ def test_continuous_state_and_action_history_do_not_require_mem_vit():
         action_history_enabled=True,
         io_schema_resolved=False,
         b2_action_representation="velocity",
+        z1_action_representation="ee_delta",
         b2_global_pose_state_indices=None,
         chunk_size=50,
         action_delta_indices=list(range(50)),
@@ -111,7 +113,7 @@ def test_continuous_state_and_action_history_do_not_require_mem_vit():
     assert image_key not in timestamps
     assert timestamps[OBS_STATE] == pytest.approx([-0.48 + 0.04 * index for index in range(13)])
     assert timestamps[ACTION][:12] == pytest.approx(timestamps[OBS_STATE][:-1])
-    assert timestamps[ACTION][12:] == pytest.approx([index / 50 for index in range(50)])
+    assert timestamps[ACTION][12:] == pytest.approx([index / 50 for index in range(51)])
 
 
 def test_ee_delta_loads_current_plus_one_extra_future_target():
@@ -145,3 +147,38 @@ def test_ee_delta_loads_current_plus_one_extra_future_target():
     timestamps = resolve_delta_timestamps(config, metadata)
 
     assert timestamps[ACTION] == pytest.approx([index / 50 for index in range(51)])
+
+
+def test_ee_state_delta_uses_only_the_inference_time_state_anchor():
+    config = SimpleNamespace(
+        control_frequency_hz=50,
+        mem_vit_enabled=False,
+        mem_vit_num_frames=1,
+        mem_vit_frame_interval_seconds=0.5,
+        mem_vit_frame_stride=1,
+        state_action_encoding="text",
+        state_num_frames=1,
+        state_history_frame_interval_seconds=0.04,
+        state_history_frame_stride=1,
+        action_history_enabled=False,
+        io_schema_resolved=False,
+        b2_action_representation="velocity",
+        z1_action_representation="ee_state_delta",
+        ee_supervision_source="control_action",
+        b2_global_pose_state_indices=None,
+        chunk_size=50,
+        action_delta_indices=list(range(50)),
+        reward_delta_indices=None,
+        observation_delta_indices=None,
+        image_features={},
+    )
+    metadata = SimpleNamespace(
+        fps=50,
+        features={ACTION: {}, OBS_STATE: {"names": ["state"]}},
+        camera_keys=[],
+    )
+
+    timestamps = resolve_delta_timestamps(config, metadata)
+
+    assert OBS_STATE not in timestamps
+    assert timestamps[ACTION] == pytest.approx([index / 50 for index in range(50)])

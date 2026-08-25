@@ -38,6 +38,29 @@ from .rewards import RewardModelConfig
 TRAIN_CONFIG_NAME = "train_config.json"
 
 
+@dataclass
+class MotionBalancedSamplingConfig:
+    enabled: bool = False
+    priority_fraction: float = 0.5
+    ee_translation_threshold_m: float = 0.05
+    ee_rotation_threshold_rad: float = 0.17453292519943295
+    gripper_change_threshold: float = 0.5
+
+    def validate(self) -> None:
+        if not 0.0 < self.priority_fraction < 1.0:
+            raise ValueError(
+                "motion_balanced_sampling.priority_fraction must be strictly between 0 and 1, "
+                f"got {self.priority_fraction}"
+            )
+        for name, value in (
+            ("ee_translation_threshold_m", self.ee_translation_threshold_m),
+            ("ee_rotation_threshold_rad", self.ee_rotation_threshold_rad),
+            ("gripper_change_threshold", self.gripper_change_threshold),
+        ):
+            if value <= 0.0:
+                raise ValueError(f"motion_balanced_sampling.{name} must be > 0, got {value}")
+
+
 def _migrate_legacy_rabc_fields(config: dict[str, Any]) -> dict[str, Any] | None:
     """Return migrated payload for legacy RA-BC fields, or None when no migration is needed."""
     legacy_fields = (
@@ -130,6 +153,9 @@ class TrainPipelineConfig(HubMixin):
 
     # Sample weighting configuration (e.g., for RA-BC training)
     sample_weighting: SampleWeightingConfig | None = None
+    motion_balanced_sampling: MotionBalancedSamplingConfig = field(
+        default_factory=MotionBalancedSamplingConfig
+    )
 
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
@@ -276,6 +302,7 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"
             )
+        self.motion_balanced_sampling.validate()
 
         # Remote runs auto-generate the repo_id in submit_to_hf (the policy may only be
         # resolved here, from --policy.path), so don't demand it up front for them.

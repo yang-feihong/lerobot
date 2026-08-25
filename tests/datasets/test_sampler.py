@@ -127,6 +127,36 @@ def test_shuffle_is_reproducible_across_instances():
     assert list(sampler_c) == epoch_0
 
 
+def test_priority_sampling_mixes_exact_fraction_and_resumes_exactly():
+    kwargs = {
+        "dataset_from_indices": [0],
+        "dataset_to_indices": [20],
+        "shuffle": True,
+        "seed": 42,
+        "priority_frame_indices": [1, 3],
+        "priority_fraction": 0.5,
+    }
+    reference = EpisodeAwareSampler(**kwargs)
+    epoch = list(reference)
+    assert len(epoch) == 20
+    assert sum(index in {1, 3} for index in epoch) >= 10
+    assert sum(epoch.count(index) - 1 for index in {1, 3}) >= 8
+
+    reproduced = EpisodeAwareSampler(**kwargs)
+    assert list(reproduced) == epoch
+    resumed = EpisodeAwareSampler(**kwargs)
+    resumed.load_state_dict({"epoch": 0, "start_index": 7})
+    assert list(resumed) == epoch[7:]
+
+
+def test_priority_sampling_disabled_preserves_original_order():
+    original = EpisodeAwareSampler([0], [100], shuffle=True, seed=7)
+    disabled = EpisodeAwareSampler(
+        [0], [100], shuffle=True, seed=7, priority_frame_indices=[1, 2], priority_fraction=0.0
+    )
+    assert list(disabled) == list(original)
+
+
 def test_negative_drop_first_frames_raises():
     with pytest.raises(ValueError, match="drop_n_first_frames must be >= 0"):
         EpisodeAwareSampler([0], [10], drop_n_first_frames=-1)

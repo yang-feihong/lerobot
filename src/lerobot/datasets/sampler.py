@@ -54,6 +54,8 @@ class EpisodeAwareSampler:
         shuffle: bool = False,
         seed: int = 0,
         absolute_to_relative_idx: dict[int, int] | None = None,
+        priority_frame_indices: list[int] | np.ndarray | None = None,
+        priority_fraction: float = 0.0,
     ):
         """
         Args:
@@ -64,11 +66,17 @@ class EpisodeAwareSampler:
             drop_n_last_frames: Frames to drop from the end of each episode.
             shuffle: Whether to shuffle the indices.
             seed: Seed the permutation is derived from (together with the epoch).
+            priority_frame_indices: Absolute dataset frame indices in the priority pool.
+            priority_fraction: Fraction of an epoch drawn from the priority pool.
         """
         if drop_n_first_frames < 0:
             raise ValueError(f"drop_n_first_frames must be >= 0, got {drop_n_first_frames}")
         if drop_n_last_frames < 0:
             raise ValueError(f"drop_n_last_frames must be >= 0, got {drop_n_last_frames}")
+        if not 0.0 <= priority_fraction < 1.0:
+            raise ValueError(f"priority_fraction must be in [0, 1), got {priority_fraction}")
+        if priority_fraction > 0.0 and not shuffle:
+            raise ValueError("priority sampling requires shuffle=True")
 
         from_indices = np.asarray(dataset_from_indices, dtype=np.int64)
         to_indices = np.asarray(dataset_to_indices, dtype=np.int64)
@@ -109,6 +117,29 @@ class EpisodeAwareSampler:
         self._epoch = 0
         self._start_index = 0
         self._absolute_to_relative = absolute_to_relative_idx
+        self.priority_fraction = priority_fraction
+        self._priority_positions = self._resolve_priority_positions(priority_frame_indices)
+        if priority_fraction > 0.0 and len(self._priority_positions) == 0:
+            raise ValueError("priority_fraction is nonzero but no priority frames remain in the sampler")
+
+    def _resolve_priority_positions(
+        self, priority_frame_indices: list[int] | np.ndarray | None
+    ) -> np.ndarray:
+        if priority_frame_indices is None:
+            return np.empty(0, dtype=np.int64)
+        absolute = np.unique(np.asarray(priority_frame_indices, dtype=np.int64))
+        if absolute.ndim != 1:
+            raise ValueError("priority_frame_indices must be one-dimensional")
+        episode_lengths = np.diff(np.concatenate(([0], self._cum_lengths)))
+        episode_ends = self._starts + episode_lengths
+        episode = np.searchsorted(self._starts, absolute, side="right") - 1
+        valid_episode = episode >= 0
+        safe_episode = np.maximum(episode, 0)
+        valid = valid_episode & (absolute < episode_ends[safe_episode])
+        absolute = absolute[valid]
+        episode = episode[valid]
+        preceding = np.where(episode > 0, self._cum_lengths[episode - 1], 0)
+        return (preceding + absolute - self._starts[episode]).astype(np.int64, copy=False)
 
     @property
     def indices(self) -> list[int]:
@@ -148,7 +179,25 @@ class EpisodeAwareSampler:
 
     def _iter_epoch(self, epoch: int, start: int) -> Iterator[int]:
         if self.shuffle:
-            order = torch.randperm(self._num_frames, generator=self._epoch_generator(epoch))
+            generator = self._epoch_generator(epoch)
+            if self.priority_fraction == 0.0:
+                order = torch.randperm(self._num_frames, generator=generator)
+            else:
+                priority_count = round(self._num_frames * self.priority_fraction)
+                uniform_count = self._num_frames - priority_count
+                uniform = torch.randperm(self._num_frames, generator=generator)[:uniform_count]
+                priority_pool = torch.from_numpy(self._priority_positions)
+                priority_parts = []
+                remaining = priority_count
+                while remaining > 0:
+                    take = min(remaining, len(priority_pool))
+                    priority_parts.append(
+                        priority_pool[torch.randperm(len(priority_pool), generator=generator)[:take]]
+                    )
+                    remaining -= take
+                priority = torch.cat(priority_parts)
+                combined = torch.cat((uniform, priority))
+                order = combined[torch.randperm(self._num_frames, generator=generator)]
             for k in range(start, self._num_frames):
                 yield self._frame_index(int(order[k]))
         else:

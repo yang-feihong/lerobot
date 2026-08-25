@@ -33,15 +33,19 @@ from lerobot.policies.pi05.b2_action_transform import (
     EE_DELTA_ROTVEC_NAMES,
     _matrix_to_rot6d,
     _rotvec_to_matrix,
+    absolute_ee_pose_to_reference_delta,
     action_dataset_indices,
+    ee_reference_delta_to_absolute,
 )
 from lerobot.policies.pi05.processor_pi05 import OBS_ACTION_HISTORY
 from lerobot.policies.rtc import RTCConfig
+from lerobot.processor import NormalizerProcessorStep, UnnormalizerProcessorStep
+from lerobot.types import TransitionKey
 from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.utils import init_logging
 
 LOG = logging.getLogger("pi05_vla_server")
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 EXECUTION_ACTION_PREFIX_NAMES = (
     "b2_vx",
     "b2_vy",
@@ -64,12 +68,43 @@ EE_POSE_ACTION_NAMES = (
 EE_DELTA_ACTION_NAMES = tuple(
     name.replace("height_invariant_ee_", "height_invariant_ee_delta_") for name in EE_POSE_ACTION_NAMES
 )
+EE_STATE_NAMES = tuple(name.replace("height_invariant_ee_", "height_invariant_ee_state_") for name in EE_POSE_ACTION_NAMES)
 EXECUTION_ACTION_SUFFIX_NAMES = (
     "gripper_target",
     "task_complete",
 )
 B2_EXECUTION_VELOCITY_NAMES = ("b2_vx", "b2_vy", "b2_omega_z")
 B2_OBSERVED_VELOCITY_NAMES = ("b2_body_vx", "b2_body_vy", "b2_body_wz")
+B2_GLOBAL_POSE_NAMES = ("b2_position_x", "b2_position_y", "b2_yaw")
+
+
+def _reanchor_b2_pose_delta(
+    trajectory: torch.Tensor,
+    old_world_anchor: torch.Tensor,
+    new_world_anchor: torch.Tensor,
+) -> torch.Tensor:
+    """Express old-anchor-relative SE(2) poses in the new inference frame."""
+    if trajectory.ndim != 2 or trajectory.shape[-1] != 3:
+        raise ValueError(f"Expected B2 pose-delta chunk (T, 3), got {tuple(trajectory.shape)}")
+    if old_world_anchor.shape != (3,) or new_world_anchor.shape != (3,):
+        raise ValueError("B2 world anchors must both have shape (3,)")
+    old_yaw = old_world_anchor[2]
+    old_cos, old_sin = torch.cos(old_yaw), torch.sin(old_yaw)
+    world_x = old_world_anchor[0] + old_cos * trajectory[:, 0] - old_sin * trajectory[:, 1]
+    world_y = old_world_anchor[1] + old_sin * trajectory[:, 0] + old_cos * trajectory[:, 1]
+    dx = world_x - new_world_anchor[0]
+    dy = world_y - new_world_anchor[1]
+    new_yaw = new_world_anchor[2]
+    new_cos, new_sin = torch.cos(new_yaw), torch.sin(new_yaw)
+    relative_yaw = old_yaw + trajectory[:, 2] - new_yaw
+    return torch.stack(
+        (
+            new_cos * dx + new_sin * dy,
+            -new_sin * dx + new_cos * dy,
+            torch.atan2(torch.sin(relative_yaw), torch.cos(relative_yaw)),
+        ),
+        dim=-1,
+    )
 
 
 def _parse_bool(value: str) -> bool:
@@ -82,9 +117,7 @@ def _parse_bool(value: str) -> bool:
 
 
 def execution_action_names(z1_action_representation: str) -> tuple[str, ...]:
-    if z1_action_representation == "ee_pose":
-        ee_names = EE_POSE_ACTION_NAMES
-    elif z1_action_representation == "ee_delta":
+    if z1_action_representation in {"ee_delta", "ee_state_delta"}:
         ee_names = EE_DELTA_ACTION_NAMES
     else:
         raise ValueError(f"Unknown Z1 action representation: {z1_action_representation!r}")
@@ -101,21 +134,23 @@ def _to_execution_actions(
         raise ValueError(f"Invalid named postprocessed actions: shape={tuple(actions.shape)}, names={names}")
     columns = {name: actions[:, index] for index, name in enumerate(names)}
     output_names = execution_action_names(z1_action_representation)
-    if z1_action_representation == "ee_delta" and set(EE_DELTA_ROTVEC_NAMES).issubset(columns):
+    if z1_action_representation in {"ee_delta", "ee_state_delta"} and set(EE_DELTA_ROTVEC_NAMES).issubset(columns):
         rotvec = torch.stack([columns[name] for name in EE_DELTA_ROTVEC_NAMES], dim=-1)
         rot6d = _matrix_to_rot6d(_rotvec_to_matrix(rotvec))
         for index, name in enumerate(EE_DELTA_ACTION_NAMES[:6]):
             columns[name] = rot6d[:, index]
-    required = set(output_names) - {"b2_active", "arm_active", "task_complete"}
+    required = set(output_names) - {"b2_active", "arm_active", "arm_reset", "task_complete"}
     missing = sorted(required - columns.keys())
     if missing:
         raise ValueError(f"Checkpoint postprocessor is missing executable actions: {missing}")
-    if "arm_active" in columns or "arm_teleop_inactive" not in columns:
-        raise ValueError(
-            "Schema-v2 checkpoint must output arm_teleop_inactive and must not output legacy arm_active"
-        )
-    columns["arm_active"] = 1.0 - columns["arm_teleop_inactive"]
+    if "arm_active" in columns:
+        raise ValueError("Schema-v2 checkpoint must not output legacy arm_active")
+    if "arm_teleop_inactive" in columns:
+        columns["arm_active"] = 1.0 - columns["arm_teleop_inactive"]
+    else:
+        columns["arm_active"] = torch.ones_like(actions[:, 0])
     columns.setdefault("b2_active", torch.ones_like(actions[:, 0]))
+    columns.setdefault("arm_reset", torch.zeros_like(actions[:, 0]))
     columns.setdefault("task_complete", torch.zeros_like(actions[:, 0]))
     return torch.stack([columns[name] for name in output_names], dim=-1)
 
@@ -126,6 +161,7 @@ def _decode_discrete_actions(
     names: tuple[str, ...],
     *,
     mode: str,
+    gripper_target_representation: str,
     gripper_negative_value: float,
     gripper_nonnegative_value: float,
 ) -> torch.Tensor:
@@ -147,7 +183,9 @@ def _decode_discrete_actions(
         if name in indices:
             index = indices[name]
             decoded[:, index] = (normalized_actions[:, index] > 0).to(decoded.dtype)
-    if "gripper_target" in indices:
+    if gripper_target_representation not in {"binary_position", "continuous_position"}:
+        raise ValueError(f"Unsupported gripper target representation: {gripper_target_representation!r}")
+    if "gripper_target" in indices and gripper_target_representation == "binary_position":
         index = indices["gripper_target"]
         negative_class = normalized_actions[:, index] < 0
         decoded[:, index] = torch.where(
@@ -262,6 +300,9 @@ class CheckpointContract:
     selected_state_names: tuple[str, ...]
     source_action_names: tuple[str, ...]
     discrete_action_training_mode: str
+    ee_target_dataset_semantics: str
+    ee_delta_supervision_mode: str
+    gripper_target_representation: str
     gripper_negative_value: float
     gripper_nonnegative_value: float
 
@@ -299,22 +340,13 @@ def _resolve_checkpoint_action_representations(
     raw_config: dict[str, object],
 ) -> tuple[str, str]:
     b2_representation = str(action_metadata["representation"])
-    if metadata_version >= 4:
-        z1_representation = str(action_metadata["z1_representation"])
-    else:
-        if b2_representation != "velocity":
-            raise ValueError(
-                "Deployment metadata versions 2 and 3 are supported only for B2 velocity; "
-                "their local_trajectory labels use the retired cumulative-pose semantics"
-            )
-        if "z1_representation" in action_metadata or "z1_action_representation" in raw_config:
-            raise ValueError(
-                f"Malformed deployment metadata version {metadata_version}: Z1 representation must be absent"
-            )
-        z1_representation = "ee_pose"
-    if b2_representation not in {"local_trajectory", "velocity"}:
+    del raw_config
+    if metadata_version != 10:
+        raise ValueError(f"Deployment metadata version {metadata_version} uses a retired contract")
+    z1_representation = str(action_metadata["z1_representation"])
+    if b2_representation not in {"pose_delta", "velocity"}:
         raise ValueError(f"Unsupported B2 deployment action representation: {b2_representation!r}")
-    if z1_representation not in {"ee_pose", "ee_delta"}:
+    if z1_representation not in {"ee_delta", "ee_state_delta"}:
         raise ValueError(f"Unsupported Z1 deployment action representation: {z1_representation!r}")
     return b2_representation, z1_representation
 
@@ -324,7 +356,7 @@ def _load_checkpoint_contract(
     config: PreTrainedConfig,
     low_level_hz: float,
 ) -> CheckpointContract:
-    """Validate the checkpoint-local contract and its explicit version migration."""
+    """Validate the current checkpoint-local deployment contract."""
     raw_config = json.loads((policy_path / "config.json").read_text(encoding="utf-8"))
     if not raw_config.get("io_schema_resolved", False):
         raise ValueError(
@@ -336,10 +368,8 @@ def _load_checkpoint_contract(
         raise FileNotFoundError(f"Checkpoint is missing deployment metadata: {metadata_path}")
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata_version = saved.get("version")
-    if saved.get("format") != "lerobot.pi05.deployment" or metadata_version not in {2, 3, 4, 5, 6}:
-        raise ValueError(
-            "Checkpoint deployment metadata must use lerobot.pi05.deployment version 2 through 6"
-        )
+    if saved.get("format") != "lerobot.pi05.deployment" or metadata_version != 10:
+        raise ValueError("Checkpoint deployment metadata must use lerobot.pi05.deployment version 10")
     if not config.io_schema_resolved:
         raise ValueError("Checkpoint contains unresolved PI0.5 I/O metadata")
 
@@ -349,25 +379,18 @@ def _load_checkpoint_contract(
     b2_action_representation, z1_action_representation = _resolve_checkpoint_action_representations(
         int(metadata_version), action, raw_config
     )
-    if metadata_version == 6:
-        expected = config.deployment_metadata()
-        if saved != expected:
-            raise ValueError("pi05_deployment_metadata.json disagrees with checkpoint config.json")
-    elif metadata_version == 5:
-        config.ee_delta_rotation_representation = "rot6d"
-        expected = config.deployment_metadata()
-        expected["version"] = 5
-        expected["action"].pop("ee_delta_rotation_representation", None)
-        if saved != expected:
-            raise ValueError("pi05_deployment_metadata.json disagrees with checkpoint config.json")
-    else:
-        config.z1_action_representation = z1_action_representation
+    expected = config.deployment_metadata()
+    if saved != expected:
+        raise ValueError("pi05_deployment_metadata.json disagrees with checkpoint config.json")
     discrete_mode = str(action.get("discrete_training_mode", "continuous_flow"))
     if discrete_mode not in {"continuous_flow", "structured_temporal"}:
         raise ValueError(f"Unsupported discrete action training mode: {discrete_mode!r}")
     config_mode = str(raw_config.get("discrete_action_training_mode", "continuous_flow"))
     if config_mode != discrete_mode:
         raise ValueError("Discrete action training mode disagrees between metadata and config.json")
+    gripper_target_representation = str(action.get("gripper_target_representation", "binary_position"))
+    if gripper_target_representation != config.gripper_target_representation:
+        raise ValueError("Gripper target representation disagrees between metadata and config.json")
     decoding = action.get("boolean_decoding", {})
     output_values = decoding.get("output_values", decoding.get("physical_values", {}))
     gripper_values = output_values.get("gripper_target", {})
@@ -384,6 +407,13 @@ def _load_checkpoint_contract(
         raise ValueError(f"Checkpoint has invalid source state names: {source_state_names}")
     if not set(state_names).issubset(source_state_names):
         raise ValueError("Checkpoint selected state fields are not a subset of its source state fields")
+    if z1_action_representation == "ee_state_delta":
+        missing_anchor_state = tuple(name for name in EE_STATE_NAMES if name not in source_state_names)
+        if missing_anchor_state:
+            raise ValueError(
+                "ee_state_delta checkpoint is missing source EE anchor fields: "
+                f"{missing_anchor_state}"
+            )
     state_dim = _feature_shape(raw_config["input_features"][OBS_STATE])[-1]
     if state_dim != len(state_names):
         raise ValueError(
@@ -410,6 +440,9 @@ def _load_checkpoint_contract(
         selected_state_names=state_names,
         source_action_names=source_action_names,
         discrete_action_training_mode=discrete_mode,
+        ee_target_dataset_semantics=str(action.get("ee_target_dataset_semantics", "legacy_raw")),
+        ee_delta_supervision_mode=str(action.get("ee_delta_supervision_mode", "active_only")),
+        gripper_target_representation=gripper_target_representation,
         gripper_negative_value=float(
             gripper_values.get("normalized_negative", gripper_values.get("true", -1.0471976))
         ),
@@ -465,6 +498,14 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
                 "Invalid executed EE target feedback: "
                 f"shape={executed_ee_target.shape}, names={executed_ee_target_names}"
             )
+        actual_ee_state = np.asarray(packet["actual_ee_state"], dtype=np.float32).reshape(-1)
+        if actual_ee_state.shape != (len(EE_POSE_ACTION_NAMES),) or not np.isfinite(actual_ee_state).all():
+            raise ValueError(f"Invalid actual EE state anchor: shape={actual_ee_state.shape}")
+        state_index = {name: index for index, name in enumerate(state_names)}
+        if all(name in state_index for name in EE_STATE_NAMES):
+            state_anchor = state[[state_index[name] for name in EE_STATE_NAMES]]
+            if not np.array_equal(actual_ee_state, state_anchor):
+                raise ValueError("Actual EE anchor disagrees with the named observation.state channels")
         history_sim_steps = np.asarray(packet["history_sim_steps"], dtype=np.int64).reshape(-1)
         history_states = np.asarray(packet["history_states"], dtype=np.float32)
         history_active_sequences = np.asarray(packet["history_active_sequences"], dtype=np.int64).reshape(-1)
@@ -535,6 +576,7 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
             encoded_ns=int(packet["encoded_ns"].item()) if "encoded_ns" in packet else -1,
             executed_ee_target=executed_ee_target,
             executed_ee_target_names=executed_ee_target_names,
+            actual_ee_state=actual_ee_state,
             telemetry_history=telemetry_history,
             server_received_ns=time.monotonic_ns(),
         )
@@ -550,6 +592,8 @@ def encode_action_packet(record: ActionRecord) -> bytes:
         inference_seconds=np.asarray(record.inference_seconds, dtype=np.float64),
         action_names=np.asarray(record.action_names, dtype=np.str_),
         z1_action_representation=np.asarray(record.z1_action_representation, dtype=np.str_),
+        ee_anchor_kind=np.asarray(record.ee_anchor_kind, dtype=np.str_),
+        ee_anchor=record.ee_anchor,
         processed_actions=record.processed.numpy().astype(np.float32, copy=False),
     )
     return output.getvalue()
@@ -573,6 +617,7 @@ class ObservationPacket:
     encoded_ns: int
     executed_ee_target: np.ndarray
     executed_ee_target_names: tuple[str, ...]
+    actual_ee_state: np.ndarray
     telemetry_history: tuple[MemoryObservation, ...]
     server_received_ns: int
 
@@ -583,7 +628,12 @@ class ActionRecord:
     source_step: int
     inference_seconds: float
     action_names: tuple[str, ...]
+    model_action_names: tuple[str, ...]
     z1_action_representation: str
+    b2_anchor_kind: str
+    b2_anchor: np.ndarray
+    ee_anchor_kind: str
+    ee_anchor: np.ndarray
     original: torch.Tensor
     unsmoothed: torch.Tensor
     processed: torch.Tensor
@@ -643,6 +693,7 @@ class RolloutRecorder:
                 encoded_ns=np.asarray(packet.encoded_ns),
                 executed_ee_target=packet.executed_ee_target,
                 executed_ee_target_names=np.asarray(packet.executed_ee_target_names, dtype=np.str_),
+                actual_ee_state=packet.actual_ee_state,
                 history_sim_steps=np.asarray(
                     [record.sim_step for record in packet.telemetry_history], dtype=np.int64
                 ),
@@ -686,7 +737,12 @@ class RolloutRecorder:
                 sequence=np.asarray(record.sequence),
                 source_step=np.asarray(record.source_step),
                 action_names=np.asarray(record.action_names),
+                model_action_names=np.asarray(record.model_action_names),
                 z1_action_representation=np.asarray(record.z1_action_representation),
+                b2_anchor_kind=np.asarray(record.b2_anchor_kind),
+                b2_anchor=record.b2_anchor,
+                ee_anchor_kind=np.asarray(record.ee_anchor_kind),
+                ee_anchor=record.ee_anchor,
                 original_actions=record.original.numpy(),
                 unsmoothed_execution_actions=record.unsmoothed.numpy(),
                 processed_actions=record.processed.numpy(),
@@ -707,6 +763,10 @@ class RolloutRecorder:
             postprocess_ms=record.postprocess_seconds * 1000.0,
             inference_ms=record.inference_seconds * 1000.0,
             inference_delay_steps=record.inference_delay_steps,
+            b2_anchor_kind=record.b2_anchor_kind,
+            b2_anchor=record.b2_anchor.tolist(),
+            ee_anchor_kind=record.ee_anchor_kind,
+            ee_anchor=record.ee_anchor.tolist(),
             velocity_smoothing_transition_step=record.velocity_smoothing_transition_step,
             sim_steps_per_wall_second=record.sim_steps_per_wall_second,
         )
@@ -722,6 +782,7 @@ class AsyncRTCPolicy:
         config = PreTrainedConfig.from_pretrained(policy_path)
         config.pretrained_path = policy_path
         config.device = args.device
+        self.device = torch.device(args.device)
         contract = _load_checkpoint_contract(policy_path, config, float(args.low_level_hz))
         if args.num_inference_steps is not None:
             config.num_inference_steps = args.num_inference_steps
@@ -734,6 +795,18 @@ class AsyncRTCPolicy:
             pretrained_path=str(policy_path),
             pretrained_revision=getattr(config, "pretrained_revision", None),
         )
+        action_unnormalizers = [
+            step for step in self.postprocessor.steps if isinstance(step, UnnormalizerProcessorStep)
+        ]
+        if len(action_unnormalizers) != 1:
+            raise ValueError(f"Expected one action unnormalizer, got {len(action_unnormalizers)}")
+        self._action_unnormalizer = action_unnormalizers[0]
+        self._action_normalizer = NormalizerProcessorStep(
+            features=self._action_unnormalizer.features,
+            norm_map=self._action_unnormalizer.norm_map,
+            stats=self._action_unnormalizer.stats,
+            device=self.device,
+        )
 
         rtc_config = RTCConfig(
             enabled=True,
@@ -744,7 +817,6 @@ class AsyncRTCPolicy:
         self.policy.config.rtc_config = rtc_config
         self.policy.init_rtc_processor()
         self.rtc_config = rtc_config
-        self.device = torch.device(args.device)
         self.low_level_hz = float(args.low_level_hz)
         self.stop_on_model_task_complete = bool(args.stop_on_model_task_complete)
         self.b2_velocity_smoothing_time_constant_s = float(args.b2_velocity_smoothing_time_constant_s)
@@ -769,10 +841,16 @@ class AsyncRTCPolicy:
         if names is None:
             raise ValueError("Checkpoint does not define named actions")
         self.postprocessed_action_names = tuple(str(name) for name in names)
+        self.model_action_names = tuple(
+            str(name)
+            for name in (self.policy.config.action_feature_names or self.postprocessed_action_names)
+        )
         self.discrete_action_training_mode = contract.discrete_action_training_mode
+        self.gripper_target_representation = contract.gripper_target_representation
         self.gripper_negative_value = contract.gripper_negative_value
         self.gripper_nonnegative_value = contract.gripper_nonnegative_value
         self.z1_action_representation = contract.z1_action_representation
+        self.b2_action_representation = contract.model_action_representation
         self.action_names = execution_action_names(self.z1_action_representation)
         self.source_state_names = contract.source_state_names
         self.selected_state_names = contract.selected_state_names
@@ -792,7 +870,12 @@ class AsyncRTCPolicy:
             **{
                 key: value
                 for key, value in action_schema_kwargs(config).items()
-                if key not in {"representation", "z1_representation"}
+                if key
+                not in {
+                    "representation",
+                    "z1_representation",
+                    "ee_delta_rotation_representation",
+                }
             }
         )
         max_history_steps = max(
@@ -823,6 +906,7 @@ class AsyncRTCPolicy:
         self.recorder.event(
             "vla_loading_finished",
             action_names=self.action_names,
+            model_action_names=self.model_action_names,
             postprocessed_action_names=self.postprocessed_action_names,
             camera_keys=self.camera_keys,
             base_camera_key=self.base_camera_key,
@@ -833,12 +917,24 @@ class AsyncRTCPolicy:
             ee_delta_rotation_representation=contract.ee_delta_rotation_representation,
             b2_execution_action_representation="velocity",
             z1_execution_action_representation=contract.z1_action_representation,
-            execution_action_protocol="rtc_action_packet_v4_50hz_history",
+            execution_action_protocol="rtc_action_packet_v5_50hz_history_with_anchor",
             stop_on_model_task_complete=self.stop_on_model_task_complete,
             b2_velocity_smoothing="causal_first_order_low_pass",
             b2_velocity_smoothing_time_constant_s=self.b2_velocity_smoothing_time_constant_s,
-            arm_gate_conversion="one_minus_arm_teleop_inactive",
+            arm_gate_conversion=(
+                "one_minus_arm_teleop_inactive"
+                if "arm_teleop_inactive" in self.postprocessed_action_names
+                else "not_present_low_level_always_ee"
+            ),
             discrete_action_training_mode=self.discrete_action_training_mode,
+            ee_target_dataset_semantics=contract.ee_target_dataset_semantics,
+            ee_delta_supervision_mode=contract.ee_delta_supervision_mode,
+            gripper_target_representation=self.gripper_target_representation,
+            structured_action_crf_initial_stay_bias=(
+                self.policy.config.structured_action_crf_initial_stay_bias
+                if self.discrete_action_training_mode == "structured_temporal"
+                else None
+            ),
             gripper_output_values={
                 "normalized_negative": self.gripper_negative_value,
                 "normalized_nonnegative": self.gripper_nonnegative_value,
@@ -992,6 +1088,66 @@ class AsyncRTCPolicy:
             "last_error": self._last_error,
         }
 
+    @staticmethod
+    def _b2_global_pose(packet: ObservationPacket) -> np.ndarray:
+        indices = {name: index for index, name in enumerate(packet.state_names)}
+        missing = tuple(name for name in B2_GLOBAL_POSE_NAMES if name not in indices)
+        if missing:
+            raise ValueError(f"Simulator observation is missing B2 global-pose fields: {missing}")
+        return packet.state[[indices[name] for name in B2_GLOBAL_POSE_NAMES]].astype(
+            np.float32, copy=True
+        )
+
+    @staticmethod
+    def _apply_action_processor(step, action: torch.Tensor) -> torch.Tensor:
+        transition = step({TransitionKey.ACTION: action})
+        result = transition[TransitionKey.ACTION]
+        if not isinstance(result, torch.Tensor):
+            raise TypeError(f"Action processor returned {type(result)}")
+        return result
+
+    def _reanchor_rtc_prefix(
+        self,
+        normalized_prefix: torch.Tensor,
+        record: ActionRecord,
+        packet: ObservationPacket,
+    ) -> torch.Tensor:
+        physical = self._apply_action_processor(self._action_unnormalizer, normalized_prefix)
+        if self.b2_action_representation == "pose_delta":
+            indices = [self.model_action_names.index(name) for name in ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")]
+            old_anchor = torch.as_tensor(record.b2_anchor, dtype=physical.dtype, device=physical.device)
+            new_anchor = torch.as_tensor(
+                self._b2_global_pose(packet), dtype=physical.dtype, device=physical.device
+            )
+            physical[:, indices] = _reanchor_b2_pose_delta(physical[:, indices], old_anchor, new_anchor)
+
+        if self.z1_action_representation == "ee_state_delta":
+            if set(EE_DELTA_ROTVEC_NAMES).issubset(self.model_action_names):
+                rotation_representation = "rotvec"
+                ee_names = (*EE_DELTA_ROTVEC_NAMES, *EE_DELTA_ACTION_NAMES[6:9])
+            elif set(EE_DELTA_ACTION_NAMES).issubset(self.model_action_names):
+                rotation_representation = "rot6d"
+                ee_names = EE_DELTA_ACTION_NAMES
+            else:
+                raise ValueError("Model action names do not contain a complete EE-delta representation")
+            indices = [self.model_action_names.index(name) for name in ee_names]
+            old_anchor = torch.as_tensor(record.ee_anchor, dtype=physical.dtype, device=physical.device)
+            new_anchor = torch.as_tensor(
+                packet.actual_ee_state, dtype=physical.dtype, device=physical.device
+            )
+            absolute_targets = ee_reference_delta_to_absolute(
+                physical[:, indices].unsqueeze(0),
+                old_anchor.unsqueeze(0),
+                rotation_representation=rotation_representation,
+            )
+            physical[:, indices] = absolute_ee_pose_to_reference_delta(
+                absolute_targets,
+                new_anchor.unsqueeze(0),
+                rotation_representation=rotation_representation,
+            ).squeeze(0)
+
+        return self._apply_action_processor(self._action_normalizer, physical)
+
     def _previous_prefix(self, packet: ObservationPacket) -> torch.Tensor | None:
         if packet.active_sequence < 0:
             return None
@@ -1004,6 +1160,20 @@ class AsyncRTCPolicy:
         prefix = record.original[index:].clone().to(self.device)
         if prefix.numel() == 0:
             return None
+        if self.b2_action_representation == "pose_delta" or self.z1_action_representation == "ee_state_delta":
+            prefix = self._reanchor_rtc_prefix(prefix, record, packet)
+            self.recorder.event(
+                "rtc_prefix_reanchored",
+                active_sequence=record.sequence,
+                active_index=index,
+                source_step=packet.sim_step,
+                b2_reanchored=self.b2_action_representation == "pose_delta",
+                b2_old_anchor=record.b2_anchor.tolist(),
+                b2_new_anchor=self._b2_global_pose(packet).tolist(),
+                ee_reanchored=self.z1_action_representation == "ee_state_delta",
+                ee_old_anchor=record.ee_anchor.tolist(),
+                ee_new_anchor=packet.actual_ee_state.tolist(),
+            )
         horizon = self.rtc_config.execution_horizon
         if len(prefix) >= horizon:
             return prefix[:horizon]
@@ -1068,10 +1238,16 @@ class AsyncRTCPolicy:
 
     def _source_state(self, record: MemoryObservation) -> torch.Tensor:
         indices = {name: index for index, name in enumerate(record.state_names)}
-        missing = tuple(name for name in self.source_state_names if name not in indices)
+        missing = tuple(name for name in self.selected_state_names if name not in indices)
         if missing:
-            raise ValueError(f"Simulator observation is missing checkpoint state fields: {missing}")
-        return torch.from_numpy(record.state[[indices[name] for name in self.source_state_names]])
+            raise ValueError(f"Simulator observation is missing model state fields: {missing}")
+        source = torch.zeros(len(self.source_state_names), dtype=torch.float32)
+        source_indices = {name: index for index, name in enumerate(self.source_state_names)}
+        for name, record_index in indices.items():
+            source_index = source_indices.get(name)
+            if source_index is not None:
+                source[source_index] = float(record.state[record_index])
+        return source
 
     def _executed_source_action(self, record: MemoryObservation) -> torch.Tensor | None:
         if record.active_sequence < 0:
@@ -1201,6 +1377,7 @@ class AsyncRTCPolicy:
                 postprocessed,
                 self.postprocessed_action_names,
                 mode=self.discrete_action_training_mode,
+                gripper_target_representation=self.gripper_target_representation,
                 gripper_negative_value=self.gripper_negative_value,
                 gripper_nonnegative_value=self.gripper_nonnegative_value,
             )
@@ -1240,7 +1417,20 @@ class AsyncRTCPolicy:
             source_step=packet.sim_step,
             inference_seconds=elapsed,
             action_names=self.action_names,
+            model_action_names=self.model_action_names,
             z1_action_representation=self.z1_action_representation,
+            b2_anchor_kind="actual_world_pose",
+            b2_anchor=self._b2_global_pose(packet),
+            ee_anchor_kind=(
+                "actual_ee_state"
+                if self.z1_action_representation == "ee_state_delta"
+                else "executed_ee_target"
+            ),
+            ee_anchor=(
+                packet.actual_ee_state.copy()
+                if self.z1_action_representation == "ee_state_delta"
+                else packet.executed_ee_target.copy()
+            ),
             original=original,
             unsmoothed=unsmoothed,
             processed=processed,

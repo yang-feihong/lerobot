@@ -81,10 +81,8 @@ class PI05Config(PreTrainedConfig):
     state_use_b2_trunk_pose: bool = True
     state_use_b2_linear_velocity: bool = False
     state_use_b2_angular_velocity: bool = False
-    b2_action_representation: str = "local_trajectory"  # "velocity" or "local_trajectory"
-    z1_action_representation: str = "ee_pose"  # "ee_pose" or "ee_delta"
-    # Old checkpoints used rot6d. New EE-delta training explicitly selects
-    # rotvec; keeping this default preserves unversioned historical configs.
+    b2_action_representation: str = "velocity"  # "velocity" or "pose_delta"
+    z1_action_representation: str = "ee_delta"  # "ee_delta" or "ee_state_delta"
     ee_delta_rotation_representation: str = "rot6d"  # "rot6d" or "rotvec"
     action_predict_arm_teleop_inactive: bool = True
     action_predict_arm_reset: bool = True
@@ -92,6 +90,11 @@ class PI05Config(PreTrainedConfig):
     action_predict_gripper: bool = True
     action_predict_task_complete: bool = True
     discrete_action_training_mode: str = "continuous_flow"
+    ee_target_dataset_semantics: str = "joint_control_inactive_interpolated"
+    ee_supervision_source: str = "control_action"
+    ee_state_anchor_indices: list[int] | None = None
+    ee_delta_supervision_mode: str = "all"
+    gripper_target_representation: str = "continuous_position"
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
@@ -123,6 +126,10 @@ class PI05Config(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
+    # State/action memory projections and structured action heads do not exist in the
+    # base PI0.5 checkpoint. Train these randomly initialized modules faster than the
+    # pretrained backbone and action expert.
+    new_module_optimizer_lr_multiplier: float = 40.0
 
     # B2+Z1 VLA gate-aware action loss.
     #
@@ -144,11 +151,12 @@ class PI05Config(PreTrainedConfig):
     #
     # "auto" applies this to a resolved B2+Z1 schema; "always"
     # forces it; "off" restores the original unweighted mean.
-    action_loss_schema: str = "auto"  # "auto", "always", or "off"
+    action_loss_schema: str = "auto"  # "auto", "always", "off", or "uniform_valid"
     action_bool_loss_weight: float = 4.0
     action_continuous_loss_weight: float = 1.0
     action_masked_continuous_min_weight: float = 0.0
     action_bool_balance_eps: float = 1e-3
+    structured_action_crf_initial_stay_bias: float = 4.0
     # Resolved once from the complete train split before policy construction.
     # Every enabled bool uses the same fixed prior on every rank/microbatch.
     action_bool_true_fractions: dict[str, float] = field(default_factory=dict)
@@ -160,16 +168,9 @@ class PI05Config(PreTrainedConfig):
     # arbitrarily long post-task bag tails dominate training and validation.
     task_complete_sample_tail_seconds: float | None = 2.0
 
-    # B2 high-level action representation. The dataset remains 16D and stores
-    # [vx, vy, omega_z]. At load time the configured groups are selected, B2
-    # motion can stay as velocity or become a chunk-local SE(2) trajectory, and
-    # task_complete remains the dataset's explicit completion label. The postprocessor
-    # converts local trajectories back into executable body twist when needed.
-    # Resolved automatically as 1 / model control frequency by make_policy. It is persisted
-    # in checkpoints so inference uses exactly the training discretization.
-    b2_local_trajectory_dt: float | None = None
-    # Resolved from named dataset state fields. When present, measured global
-    # poses replace command integration for local-trajectory supervision.
+    # Persisted as 1 / model control frequency for SE(2) encode/decode.
+    action_dt_seconds: float | None = None
+    # Retained only so retired checkpoints fail with an explicit diagnostic.
     b2_global_pose_state_indices: list[int] | None = None
 
     # MEM-ViT settings. Passing mem_vit_checkpoint also enables MEM-ViT.
@@ -223,9 +224,10 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
-        if self.action_loss_schema not in ["auto", "always", "off"]:
+        if self.action_loss_schema not in ["auto", "always", "off", "uniform_valid"]:
             raise ValueError(
-                f"Invalid action_loss_schema: {self.action_loss_schema}. Expected 'auto', 'always', or 'off'."
+                "Invalid action_loss_schema: "
+                f"{self.action_loss_schema}. Expected 'auto', 'always', 'off', or 'uniform_valid'."
             )
         if self.discrete_action_training_mode not in ["continuous_flow", "structured_temporal"]:
             raise ValueError(
@@ -244,14 +246,14 @@ class PI05Config(PreTrainedConfig):
                 "structured_temporal requires arm_teleop_inactive, arm_reset, gripper, and "
                 "task_complete outputs"
             )
-        if self.b2_action_representation not in ["velocity", "local_trajectory"]:
+        if self.b2_action_representation not in ["velocity", "pose_delta"]:
             raise ValueError(
-                "b2_action_representation must be 'velocity' or 'local_trajectory', got "
+                "b2_action_representation must be 'velocity' or 'pose_delta', got "
                 f"{self.b2_action_representation!r}"
             )
-        if self.z1_action_representation not in ["ee_pose", "ee_delta"]:
+        if self.z1_action_representation not in ["ee_delta", "ee_state_delta"]:
             raise ValueError(
-                "z1_action_representation must be 'ee_pose' or 'ee_delta', got "
+                "z1_action_representation must be 'ee_delta' or 'ee_state_delta', got "
                 f"{self.z1_action_representation!r}"
             )
         if self.ee_delta_rotation_representation not in ["rot6d", "rotvec"]:
@@ -259,10 +261,47 @@ class PI05Config(PreTrainedConfig):
                 "ee_delta_rotation_representation must be 'rot6d' or 'rotvec', got "
                 f"{self.ee_delta_rotation_representation!r}"
             )
+        if self.ee_target_dataset_semantics != "joint_control_inactive_interpolated":
+            raise ValueError(
+                "ee_target_dataset_semantics must be 'joint_control_inactive_interpolated', got "
+                f"{self.ee_target_dataset_semantics!r}"
+            )
+        if self.ee_supervision_source != "control_action":
+            raise ValueError(
+                "Unsupported ee_supervision_source: "
+                f"{self.ee_supervision_source!r}"
+            )
+        if self.ee_delta_supervision_mode not in {"active_only", "all"}:
+            raise ValueError(
+                "ee_delta_supervision_mode must be 'active_only' or 'all', got "
+                f"{self.ee_delta_supervision_mode!r}"
+            )
+        if self.gripper_target_representation not in {"binary_position", "continuous_position"}:
+            raise ValueError(
+                "gripper_target_representation must be 'binary_position' or 'continuous_position', got "
+                f"{self.gripper_target_representation!r}"
+            )
+        if (
+            self.discrete_action_training_mode == "structured_temporal"
+            and self.gripper_target_representation != "binary_position"
+        ):
+            raise ValueError("structured_temporal requires gripper_target_representation='binary_position'")
+        if self.action_loss_schema == "uniform_valid" and self.discrete_action_training_mode != "continuous_flow":
+            raise ValueError("uniform_valid action loss requires discrete_action_training_mode='continuous_flow'")
         if not any(self.state_feature_switches().values()):
             raise ValueError("At least one state_use_* switch must be true")
         if self.action_bool_loss_weight <= 0:
             raise ValueError(f"action_bool_loss_weight must be > 0, got {self.action_bool_loss_weight}")
+        if self.new_module_optimizer_lr_multiplier <= 0:
+            raise ValueError(
+                "new_module_optimizer_lr_multiplier must be > 0, got "
+                f"{self.new_module_optimizer_lr_multiplier}"
+            )
+        if self.structured_action_crf_initial_stay_bias < 0:
+            raise ValueError(
+                "structured_action_crf_initial_stay_bias must be >= 0, got "
+                f"{self.structured_action_crf_initial_stay_bias}"
+            )
         if self.task_complete_sample_tail_seconds is not None and self.task_complete_sample_tail_seconds < 0:
             raise ValueError("task_complete_sample_tail_seconds must be >= 0 or None")
         invalid_bool_fractions = {
@@ -288,8 +327,8 @@ class PI05Config(PreTrainedConfig):
                 "Invalid action_gripper_target_true_side: "
                 f"{self.action_gripper_target_true_side}. Expected 'negative' or 'positive'."
             )
-        if self.b2_local_trajectory_dt is not None and self.b2_local_trajectory_dt <= 0:
-            raise ValueError(f"b2_local_trajectory_dt must be positive, got {self.b2_local_trajectory_dt}")
+        if self.action_dt_seconds is not None and self.action_dt_seconds <= 0:
+            raise ValueError(f"action_dt_seconds must be positive, got {self.action_dt_seconds}")
         if self.control_frequency_hz is not None and self.control_frequency_hz <= 0:
             raise ValueError(f"control_frequency_hz must be positive, got {self.control_frequency_hz}")
         if self.dataset_frequency_hz is not None and self.dataset_frequency_hz <= 0:
@@ -422,7 +461,7 @@ class PI05Config(PreTrainedConfig):
         }
         return {
             "format": "lerobot.pi05.deployment",
-            "version": 6,
+            "version": 10,
             "policy": {
                 "type": self.type,
                 "paligemma_variant": self.paligemma_variant,
@@ -463,10 +502,15 @@ class PI05Config(PreTrainedConfig):
                 "z1_representation": self.z1_action_representation,
                 "ee_delta_rotation_representation": (
                     self.ee_delta_rotation_representation
-                    if self.z1_action_representation == "ee_delta"
+                    if self.z1_action_representation in {"ee_delta", "ee_state_delta"}
                     else None
                 ),
                 "discrete_training_mode": self.discrete_action_training_mode,
+                "ee_target_dataset_semantics": self.ee_target_dataset_semantics,
+                "ee_supervision_source": self.ee_supervision_source,
+                "ee_delta_supervision_mode": self.ee_delta_supervision_mode,
+                "flow_loss_schema": self.action_loss_schema,
+                "gripper_target_representation": self.gripper_target_representation,
                 "discrete_temporal_structure": (
                     {
                         "arm_mode": {
@@ -487,23 +531,45 @@ class PI05Config(PreTrainedConfig):
                     else None
                 ),
                 "trajectory_source": (
-                    "global_pose_transform"
-                    if self.b2_global_pose_state_indices is not None
-                    else "twist_integration"
-                )
-                if self.b2_action_representation == "local_trajectory"
-                else "body_twist",
-                "global_pose_state_names": (
-                    ["b2_position_x", "b2_position_y", "b2_yaw"]
-                    if self.b2_global_pose_state_indices is not None
+                    "body_twist_se2_integration_from_inference_time"
+                    if self.b2_action_representation == "pose_delta"
+                    else "body_twist"
+                ),
+                "global_pose_state_names": None,
+                "global_pose_state_indices": None,
+                "b2_pose_delta_reference": (
+                    "inference_time_identity_pose"
+                    if self.b2_action_representation == "pose_delta"
                     else None
                 ),
-                "global_pose_state_indices": self.b2_global_pose_state_indices,
-                "local_trajectory_reference": "previous_odom_pose_for_each_step",
-                "local_trajectory_samples": "se2_increment_t_to_t_plus_1_through_t_plus_chunk_size",
+                "b2_deployment_anchor": (
+                    "actual_world_pose_at_source_step"
+                    if self.b2_action_representation == "pose_delta"
+                    else None
+                ),
+                "b2_rtc_prefix_reanchor": (
+                    "old_anchor_targets_to_current_actual_world_pose"
+                    if self.b2_action_representation == "pose_delta"
+                    else None
+                ),
+                "b2_supervision_samples": (
+                    "se2_pose_delta_t_to_t_plus_1_through_t_plus_chunk_size"
+                    if self.b2_action_representation == "pose_delta"
+                    else "body_twist_command_at_each_future_step"
+                ),
                 "ee_delta_reference": (
-                    "previous_operator_ee_target_for_each_step"
-                    if self.z1_action_representation == "ee_delta"
+                    "inference_time_measured_height_invariant_ee_state"
+                    if self.z1_action_representation == "ee_state_delta"
+                    else "previous_joint_control_height_invariant_ee_target_for_each_step"
+                ),
+                "ee_deployment_anchor": (
+                    "actual_ee_state_at_source_step"
+                    if self.z1_action_representation == "ee_state_delta"
+                    else "executed_ee_target_at_source_step"
+                ),
+                "ee_rtc_prefix_reanchor": (
+                    "old_anchor_targets_to_current_actual_ee_state"
+                    if self.z1_action_representation == "ee_state_delta"
                     else None
                 ),
                 "predict": {
@@ -543,9 +609,9 @@ class PI05Config(PreTrainedConfig):
                     if self.action_predict_task_complete
                     else None
                 ),
-                "local_trajectory_deployment_decode": (
-                    "se2_log_per_increment_to_body_twist"
-                    if self.b2_action_representation == "local_trajectory"
+                "b2_pose_delta_deployment_decode": (
+                    "differentiate_inference_time_relative_se2_poses_to_body_twist"
+                    if self.b2_action_representation == "pose_delta"
                     else None
                 ),
                 "relative_actions": self.use_relative_actions,
@@ -650,9 +716,16 @@ class PI05Config(PreTrainedConfig):
 
         grouped_names: dict[str, list[str]] = {group: [] for group in self.state_feature_switches()}
         auxiliary_names = {"b2_position_x", "b2_position_y", "b2_yaw"}
+        def is_auxiliary(name: str) -> bool:
+            return (
+                name in auxiliary_names
+                or name.startswith("height_invariant_ee_state_")
+                or name.startswith("continuous_height_invariant_ee_state_")
+            )
+
         unknown_names = []
         for name in dataset_names:
-            if name in auxiliary_names:
+            if is_auxiliary(name):
                 continue
             group = group_for(name)
             if group is None:
@@ -670,7 +743,7 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(f"Enabled state groups are absent from the dataset: {missing_groups}")
         selected_names = []
         for name in dataset_names:
-            if name in auxiliary_names:
+            if is_auxiliary(name):
                 continue
             group = group_for(name)
             assert group is not None

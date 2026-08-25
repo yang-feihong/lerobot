@@ -30,6 +30,8 @@ from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
 from .streaming_dataset import StreamingLeRobotDataset
 
+HEIGHT_INVARIANT_EE_STATE_KEY = "observation.height_invariant_ee_state"
+
 
 def resolve_delta_timestamps(
     cfg: PreTrainedConfig | RewardModelConfig, ds_meta: LeRobotDatasetMetadata
@@ -112,29 +114,7 @@ def resolve_delta_timestamps(
         else None
     )
 
-    global_pose_names = ("b2_position_x", "b2_position_y", "b2_yaw")
-    state_names = ds_meta.features.get(OBS_STATE, {}).get("names")
-    use_global_pose_trajectory = (
-        getattr(cfg, "b2_action_representation", None) == "local_trajectory"
-        and isinstance(state_names, list)
-        and all(name in state_names for name in global_pose_names)
-    )
-    if use_global_pose_trajectory:
-        resolved_pose_indices = [state_names.index(name) for name in global_pose_names]
-        if not bool(getattr(cfg, "io_schema_resolved", False)):
-            cfg.b2_global_pose_state_indices = resolved_pose_indices
-        state_history_indices = (
-            state_history_delta_indices if state_history_delta_indices is not None else [0]
-        )
-        # Layout consumed by the PI0.5 processor: history ending at the current
-        # state, then one future state for every action in the chunk.
-        state_delta_indices = state_history_indices + list(range(1, int(cfg.chunk_size) + 1))
-    else:
-        if hasattr(cfg, "b2_global_pose_state_indices") and not bool(
-            getattr(cfg, "io_schema_resolved", False)
-        ):
-            cfg.b2_global_pose_state_indices = None
-        state_delta_indices = state_history_delta_indices
+    state_delta_indices = state_history_delta_indices
 
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
@@ -143,7 +123,7 @@ def resolve_delta_timestamps(
             target_timestamps = model_steps_to_dataset_timestamps(cfg.action_delta_indices)
             extra_target_timestamps = (
                 model_steps_to_dataset_timestamps([int(cfg.chunk_size)])
-                if getattr(cfg, "z1_action_representation", "ee_pose") == "ee_delta"
+                if getattr(cfg, "z1_action_representation", "ee_delta") == "ee_delta"
                 else []
             )
             if bool(getattr(cfg, "action_history_enabled", False)):
@@ -152,15 +132,10 @@ def resolve_delta_timestamps(
                 delta_timestamps[key] = history_timestamps + target_timestamps + extra_target_timestamps
             else:
                 delta_timestamps[key] = target_timestamps + extra_target_timestamps
+        if key == HEIGHT_INVARIANT_EE_STATE_KEY:
+            continue
         if state_delta_indices is not None and key == OBS_STATE:
-            history_length = (
-                len(state_history_indices) if use_global_pose_trajectory else len(state_delta_indices)
-            )
-            history_indices = state_delta_indices[:history_length]
-            future_indices = state_delta_indices[history_length:]
-            history_timestamps = [index / dataset_fps for index in history_indices]
-            future_timestamps = model_steps_to_dataset_timestamps(future_indices)
-            delta_timestamps[key] = history_timestamps + future_timestamps
+            delta_timestamps[key] = [index / dataset_fps for index in state_delta_indices]
             continue
         if (
             mem_vit_delta_indices is not None

@@ -119,10 +119,10 @@ def absorbing_hazard_nll(logits: Tensor, targets: Tensor, mask: Tensor) -> Tenso
 
 
 class LinearChainCRF(nn.Module):
-    def __init__(self, num_states: int):
+    def __init__(self, num_states: int, initial_stay_bias: float = 0.0):
         super().__init__()
         self.start_scores = nn.Parameter(torch.zeros(num_states))
-        self.transitions = nn.Parameter(torch.zeros(num_states, num_states))
+        self.transitions = nn.Parameter(torch.eye(num_states) * float(initial_stay_bias))
 
     def nll(self, emissions: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
         return linear_chain_crf_nll(emissions, targets, mask, self.start_scores, self.transitions)
@@ -997,8 +997,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.arm_mode_head = nn.Linear(action_expert_config.width, 3)
             self.gripper_state_head = nn.Linear(action_expert_config.width, 2)
             self.task_complete_head = nn.Linear(action_expert_config.width, 1)
-            self.arm_mode_crf = LinearChainCRF(3)
-            self.gripper_state_crf = LinearChainCRF(2)
+            self.arm_mode_crf = LinearChainCRF(
+                3, initial_stay_bias=config.structured_action_crf_initial_stay_bias
+            )
+            self.gripper_state_crf = LinearChainCRF(
+                2, initial_stay_bias=config.structured_action_crf_initial_stay_bias
+            )
 
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -1803,8 +1807,36 @@ class PI05Policy(PreTrainedPolicy):
 
         return fixed_state_dict
 
-    def get_optim_params(self) -> dict:
-        return self.parameters()
+    def get_optim_params(self) -> list[dict]:
+        new_module_names = [
+            "state_memory_proj",
+            "action_memory_proj",
+            "arm_mode_head",
+            "gripper_state_head",
+            "task_complete_head",
+            "arm_mode_crf",
+            "gripper_state_crf",
+        ]
+        base_parameters = []
+        new_module_parameters = []
+        for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if any(module_name in name for module_name in new_module_names):
+                new_module_parameters.append(parameter)
+            else:
+                base_parameters.append(parameter)
+
+        groups = [{"params": base_parameters, "name": "pretrained_and_action_expert"}]
+        if new_module_parameters:
+            groups.append(
+                {
+                    "params": new_module_parameters,
+                    "lr": self.config.optimizer_lr * self.config.new_module_optimizer_lr_multiplier,
+                    "name": "new_modules",
+                }
+            )
+        return groups
 
     def reset(self):
         """Reset internal state - called when environment resets."""
@@ -2042,18 +2074,47 @@ class PI05Policy(PreTrainedPolicy):
         return actions
 
     def _use_b2_z1_gate_action_loss(self, action_dim: int) -> bool:
-        schema = getattr(self.config, "action_loss_schema", "auto")
-        if schema == "off":
+        schema = self.config.action_loss_schema
+        if schema in {"off", "uniform_valid"}:
             return False
         if schema == "always":
             return True
         if schema != "auto":
             raise ValueError(
-                f"Unsupported action_loss_schema={schema!r}. Expected one of: 'auto', 'always', 'off'."
+                "Unsupported action_loss_schema="
+                f"{schema!r}. Expected one of: 'auto', 'always', 'off', 'uniform_valid'."
             )
-        return bool(getattr(self.config, "io_schema_resolved", False)) and action_dim == len(
+        return self.config.io_schema_resolved and action_dim == len(
             self.config.action_feature_names or []
         )
+
+    @staticmethod
+    def _uniform_valid_action_loss(
+        losses: Tensor,
+        reduction: str,
+        action_is_pad: Tensor | None,
+    ) -> Tensor:
+        """Uniformly reduce continuous action loss over non-padding elements."""
+        if action_is_pad is None:
+            valid = torch.ones(losses.shape[:2], dtype=torch.bool, device=losses.device)
+        else:
+            valid = ~action_is_pad.to(device=losses.device, dtype=torch.bool)
+            if valid.shape != losses.shape[:2]:
+                raise ValueError(
+                    f"action_is_pad shape {tuple(valid.shape)} does not match loss shape {tuple(losses.shape[:2])}"
+                )
+        weights = valid.to(losses.dtype).unsqueeze(-1)
+        per_sample_denominator = weights.sum(dim=(1, 2)) * losses.shape[-1]
+        valid_batch = per_sample_denominator > 0
+        if not bool(valid_batch.any()):
+            raise ValueError("uniform_valid action loss received a batch containing only padding")
+        per_sample = losses.new_zeros(losses.shape[0])
+        per_sample[valid_batch] = (losses * weights).sum(dim=(1, 2))[valid_batch] / per_sample_denominator[
+            valid_batch
+        ]
+        if reduction == "none":
+            return per_sample
+        return (losses * weights).sum() / (weights.sum() * losses.shape[-1])
 
     @staticmethod
     def _normalized_bool_mask(actions: Tensor, dim: int, true_side: str = "positive") -> Tensor:
@@ -2083,7 +2144,7 @@ class PI05Policy(PreTrainedPolicy):
             balance_target = target_true[valid_mask]
             if balance_target.numel() == 0:
                 return torch.zeros_like(target_true, dtype=torch.float32)
-        eps = getattr(self.config, "action_bool_balance_eps", 1e-3)
+        eps = self.config.action_bool_balance_eps
         true_frac = balance_target.float().mean().clamp(min=eps, max=1.0 - eps)
         false_frac = 1.0 - true_frac
         true_weight = 0.5 / true_frac
@@ -2095,7 +2156,7 @@ class PI05Policy(PreTrainedPolicy):
 
     def _global_bool_weights(self, name: str, target_true: Tensor, valid_mask: Tensor) -> Tensor:
         """Use a fixed train-split class prior for an enabled boolean action."""
-        true_fraction = getattr(self.config, "action_bool_true_fractions", {}).get(name)
+        true_fraction = self.config.action_bool_true_fractions.get(name)
         if true_fraction is None:
             return self._balanced_bool_weights(target_true, valid_mask)
         true_weight = 0.5 / true_fraction
@@ -2117,7 +2178,7 @@ class PI05Policy(PreTrainedPolicy):
             return empty, empty
         dim_losses = losses[:, :, dim_indices]
         weights = active_mask.to(dtype=dim_losses.dtype).unsqueeze(-1).expand_as(dim_losses)
-        min_weight = getattr(self.config, "action_masked_continuous_min_weight", 0.0)
+        min_weight = self.config.action_masked_continuous_min_weight
         if min_weight > 0:
             weights = torch.clamp(weights, min=min_weight)
         weights = weights * base_weight
@@ -2138,8 +2199,8 @@ class PI05Policy(PreTrainedPolicy):
                 f"B2+Z1 action names ({len(names)}) do not match model action width {actions.shape[-1]}"
             )
         name_to_dim = {name: i for i, name in enumerate(names)}
-        bool_weight = float(getattr(self.config, "action_bool_loss_weight", 4.0))
-        continuous_weight = float(getattr(self.config, "action_continuous_loss_weight", 1.0))
+        bool_weight = float(self.config.action_bool_loss_weight)
+        continuous_weight = float(self.config.action_continuous_loss_weight)
 
         if action_is_pad is None:
             valid_mask = torch.ones(actions.shape[:2], dtype=torch.bool, device=actions.device)
@@ -2164,7 +2225,7 @@ class PI05Policy(PreTrainedPolicy):
             if name not in name_to_dim:
                 continue
             true_side = (
-                getattr(self.config, "action_gripper_target_true_side", "negative")
+                self.config.action_gripper_target_true_side
                 if name == "gripper_target"
                 else "positive"
             )
@@ -2181,7 +2242,7 @@ class PI05Policy(PreTrainedPolicy):
             bool_dim_stats[f"gate_loss/{name}"] = float(
                 ((dim_losses * weights).sum() / weights.sum().clamp_min(1e-6)).detach().cpu().item()
             )
-            global_true_fraction = getattr(self.config, "action_bool_true_fractions", {}).get(name)
+            global_true_fraction = self.config.action_bool_true_fractions.get(name)
             if global_true_fraction is not None:
                 bool_dim_stats[f"gate_global_true_frac/{name}"] = float(global_true_fraction)
                 bool_dim_stats[f"gate_weight/{name}_true"] = float(bool_weight * 0.5 / global_true_fraction)
@@ -2197,7 +2258,7 @@ class PI05Policy(PreTrainedPolicy):
             ee_continuous_mask = ee_continuous_mask & ~arm_teleop_inactive
         if arm_reset is not None:
             ee_continuous_mask = ee_continuous_mask & ~arm_reset
-        if self.config.z1_action_representation == "ee_delta":
+        if self.config.z1_action_representation in {"ee_delta", "ee_state_delta"}:
             if ee_delta_is_valid is None:
                 raise ValueError(f"EE-delta training requires {EE_DELTA_VALID_KEY}")
             ee_delta_is_valid = ee_delta_is_valid.to(device=actions.device, dtype=torch.bool)
@@ -2209,7 +2270,7 @@ class PI05Policy(PreTrainedPolicy):
             ee_continuous_mask = ee_continuous_mask & ee_delta_is_valid
         b2_names = (
             ["b2_delta_x", "b2_delta_y", "b2_delta_yaw"]
-            if self.config.b2_action_representation == "local_trajectory"
+            if self.config.b2_action_representation == "pose_delta"
             else ["b2_vx", "b2_vy", "b2_omega_z"]
         )
         b2_dims = [name_to_dim[name] for name in b2_names]
@@ -2244,7 +2305,7 @@ class PI05Policy(PreTrainedPolicy):
                 .cpu()
                 .item()
             )
-            global_true_fraction = getattr(self.config, "action_bool_true_fractions", {}).get("task_complete")
+            global_true_fraction = self.config.action_bool_true_fractions.get("task_complete")
             if global_true_fraction is not None:
                 bool_dim_stats["gate_global_true_frac/task_complete"] = float(global_true_fraction)
                 bool_dim_stats["gate_weight/task_complete_true"] = float(
@@ -2320,13 +2381,13 @@ class PI05Policy(PreTrainedPolicy):
 
         b2_names = (
             ["b2_delta_x", "b2_delta_y", "b2_delta_yaw"]
-            if self.config.b2_action_representation == "local_trajectory"
+            if self.config.b2_action_representation == "pose_delta"
             else ["b2_vx", "b2_vy", "b2_omega_z"]
         )
         b2_dims = [name_to_dim[name] for name in b2_names]
         ee_dims = [index for index, name in enumerate(names) if name.startswith("height_invariant_ee_")]
         ee_valid = execution_valid & ~inactive & ~reset
-        if self.config.z1_action_representation == "ee_delta":
+        if self.config.z1_action_representation in {"ee_delta", "ee_state_delta"}:
             if ee_delta_is_valid is None:
                 raise ValueError(f"EE-delta training requires {EE_DELTA_VALID_KEY}")
             ee_delta_is_valid = ee_delta_is_valid.to(device=actions.device, dtype=torch.bool)
@@ -2395,6 +2456,29 @@ class PI05Policy(PreTrainedPolicy):
             correct = (prediction == target) & target_valid
             return float((correct.sum() / target_valid.sum().clamp_min(1)).detach().cpu())
 
+        def class_metrics(
+            prefix: str,
+            prediction: Tensor,
+            target: Tensor,
+            target_valid: Tensor,
+            classes: tuple[tuple[str, int], ...],
+        ) -> dict[str, float]:
+            metrics: dict[str, float] = {}
+            for label, value in classes:
+                predicted = (prediction == value) & target_valid
+                expected = (target == value) & target_valid
+                true_positive = (predicted & expected).sum()
+                metrics[f"{prefix}_pred_frac/{label}"] = float(
+                    (predicted.sum() / target_valid.sum().clamp_min(1)).detach().cpu()
+                )
+                metrics[f"{prefix}_precision/{label}"] = float(
+                    (true_positive / predicted.sum().clamp_min(1)).detach().cpu()
+                )
+                metrics[f"{prefix}_recall/{label}"] = float(
+                    (true_positive / expected.sum().clamp_min(1)).detach().cpu()
+                )
+            return metrics
+
         discrete_weight = float(self.config.action_bool_loss_weight)
         per_sample = continuous_loss + discrete_weight * (arm_loss + gripper_loss + completion_loss) / 3.0
         info = {
@@ -2420,6 +2504,33 @@ class PI05Policy(PreTrainedPolicy):
                 / execution_valid.sum().clamp_min(1).cpu()
             ),
         }
+        info.update(
+            class_metrics(
+                "arm_mode",
+                arm_prediction,
+                arm_mode,
+                execution_valid,
+                (("ee", 0), ("inactive", 1), ("reset", 2)),
+            )
+        )
+        info.update(
+            class_metrics(
+                "gripper_target",
+                gripper_prediction,
+                gripper,
+                execution_valid,
+                (("open", 0), ("closed", 1)),
+            )
+        )
+        info.update(
+            class_metrics(
+                "task_complete",
+                complete_prediction.long(),
+                complete.long(),
+                valid,
+                (("false", 0), ("true", 1)),
+            )
+        )
         if reduction == "none":
             info["loss"] = float(per_sample.mean().detach().cpu())
             return per_sample, info
@@ -2618,6 +2729,16 @@ class PI05Policy(PreTrainedPolicy):
                 batch.get(EE_DELTA_VALID_KEY),
             )
             loss_dict.update(structured_loss_dict)
+            return loss, loss_dict
+
+        if self.config.action_loss_schema == "uniform_valid":
+            loss = self._uniform_valid_action_loss(
+                losses,
+                reduction,
+                batch.get(f"{ACTION}_is_pad"),
+            )
+            scalar_loss = loss.mean() if loss.ndim else loss
+            loss_dict["loss"] = scalar_loss.item()
             return loss, loss_dict
 
         if self._use_b2_z1_gate_action_loss(original_action_dim):

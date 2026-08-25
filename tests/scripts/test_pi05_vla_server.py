@@ -1,4 +1,3 @@
-import json
 from io import BytesIO
 from threading import Lock
 from types import SimpleNamespace
@@ -9,13 +8,20 @@ import torch
 
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.policies.pi05.b2_action_transform import (
+    CONTROL_EXTENDED_DATASET_ACTION_NAMES,
     EE_DELTA_ROTVEC_NAMES,
-    differentiate_local_trajectory,
+    HEIGHT_INVARIANT_EE_STATE_NAMES,
+    action_schema_kwargs,
+    b2_execution_action_names,
+    b2_pose_delta_action_names,
     integrate_body_twist,
+    se2_increment_to_body_twist,
 )
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.scripts.pi05_vla_server import (
     B2_EXECUTION_VELOCITY_NAMES,
+    B2_GLOBAL_POSE_NAMES,
+    EE_DELTA_ACTION_NAMES,
     EE_POSE_ACTION_NAMES,
     PROTOCOL_VERSION,
     AsyncRTCPolicy,
@@ -24,6 +30,7 @@ from lerobot.scripts.pi05_vla_server import (
     _b2_velocity_smoothing_transition_step,
     _decode_discrete_actions,
     _load_checkpoint_contract,
+    _reanchor_b2_pose_delta,
     _resolve_checkpoint_action_representations,
     _smooth_b2_execution_velocity,
     _to_execution_actions,
@@ -31,19 +38,55 @@ from lerobot.scripts.pi05_vla_server import (
     execution_action_names,
 )
 
-EXECUTION_ACTION_NAMES = execution_action_names("ee_pose")
+EXECUTION_ACTION_NAMES = execution_action_names("ee_delta")
 
 
-def test_metadata_v2_velocity_explicitly_migrates_to_ee_pose() -> None:
-    assert _resolve_checkpoint_action_representations(
-        2,
-        {"representation": "velocity"},
-        {"b2_action_representation": "velocity"},
-    ) == ("velocity", "ee_pose")
+def test_b2_rtc_pose_delta_prefix_is_reexpressed_in_new_inference_frame() -> None:
+    old_anchor = torch.tensor([10.0, 20.0, np.pi / 2])
+    new_anchor = torch.tensor([10.0, 21.0, np.pi / 2])
+    old_relative_targets = torch.tensor([[1.0, 0.0, 0.1], [2.0, 0.0, 0.2]])
+
+    rebased = _reanchor_b2_pose_delta(old_relative_targets, old_anchor, new_anchor)
+
+    torch.testing.assert_close(rebased[:, :2], torch.tensor([[0.0, 0.0], [1.0, 0.0]]), atol=1e-6, rtol=0)
+    torch.testing.assert_close(rebased[:, 2], torch.tensor([0.1, 0.2]), atol=1e-6, rtol=0)
+
+
+def test_z1_state_delta_rtc_prefix_is_reexpressed_from_current_actual_state() -> None:
+    model_names = (*B2_EXECUTION_VELOCITY_NAMES, *EE_DELTA_ROTVEC_NAMES, *EE_DELTA_ACTION_NAMES[6:9])
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy._action_unnormalizer = lambda transition: transition
+    policy._action_normalizer = lambda transition: transition
+    policy.b2_action_representation = "velocity"
+    policy.z1_action_representation = "ee_state_delta"
+    policy.model_action_names = model_names
+    prefix = torch.zeros(2, len(model_names))
+    prefix[:, model_names.index("height_invariant_ee_delta_x")] = torch.tensor([1.0, 2.0])
+    identity = np.asarray([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    old_anchor = np.concatenate((identity, np.zeros(3, dtype=np.float32)))
+    new_anchor = np.concatenate((identity, np.asarray([0.5, 0.0, 0.0], dtype=np.float32)))
+
+    rebased = policy._reanchor_rtc_prefix(
+        prefix,
+        SimpleNamespace(ee_anchor=old_anchor),
+        SimpleNamespace(actual_ee_state=new_anchor),
+    )
+
+    x_index = model_names.index("height_invariant_ee_delta_x")
+    torch.testing.assert_close(rebased[:, x_index], torch.tensor([0.5, 1.5]))
+
+
+def test_metadata_v2_is_rejected() -> None:
+    with pytest.raises(ValueError, match="retired contract"):
+        _resolve_checkpoint_action_representations(
+            2,
+            {"representation": "velocity"},
+            {"b2_action_representation": "velocity"},
+        )
 
 
 def test_metadata_v2_rejects_retired_cumulative_local_trajectory() -> None:
-    with pytest.raises(ValueError, match="retired cumulative-pose semantics"):
+    with pytest.raises(ValueError, match="retired contract"):
         _resolve_checkpoint_action_representations(
             2,
             {"representation": "local_trajectory"},
@@ -51,64 +94,54 @@ def test_metadata_v2_rejects_retired_cumulative_local_trajectory() -> None:
         )
 
 
-def test_metadata_v4_uses_both_explicit_representations() -> None:
-    assert _resolve_checkpoint_action_representations(
-        4,
-        {"representation": "local_trajectory", "z1_representation": "ee_delta"},
-        {
-            "b2_action_representation": "local_trajectory",
-            "z1_action_representation": "ee_delta",
-        },
-    ) == ("local_trajectory", "ee_delta")
+def test_metadata_v4_is_rejected_even_when_representations_are_named() -> None:
+    with pytest.raises(ValueError, match="retired contract"):
+        _resolve_checkpoint_action_representations(
+            4,
+            {"representation": "pose_delta", "z1_representation": "ee_delta"},
+            {"b2_action_representation": "pose_delta"},
+        )
 
 
-def test_server_loads_missing_discrete_mode_in_historical_metadata_as_continuous_flow(tmp_path) -> None:
-    state_names = ["arm_q_1"]
-    action_names = [
-        "b2_vx",
-        "b2_vy",
-        "b2_omega_z",
-        "arm_teleop_inactive",
-        "arm_reset",
-        *[f"height_invariant_ee_{index}" for index in range(9)],
-        "gripper_target",
-        "task_complete",
-    ]
+@pytest.mark.parametrize("b2_representation", ["velocity", "pose_delta"])
+@pytest.mark.parametrize("z1_representation", ["ee_delta", "ee_state_delta"])
+def test_server_loads_current_contract_for_all_representation_pairs(
+    tmp_path, b2_representation: str, z1_representation: str
+) -> None:
+    state_names = ["arm_q_1", *HEIGHT_INVARIANT_EE_STATE_NAMES]
     config = PI05Config(
-        b2_action_representation="velocity",
+        b2_action_representation=b2_representation,
+        z1_action_representation=z1_representation,
+        ee_delta_rotation_representation="rotvec",
         control_frequency_hz=50.0,
+        action_dt_seconds=0.02,
         input_features={
-            "observation.state": PolicyFeature(FeatureType.STATE, (1,)),
+            "observation.state": PolicyFeature(FeatureType.STATE, (len(state_names),)),
             "observation.images.base": PolicyFeature(FeatureType.VISUAL, (3, 224, 224)),
             "observation.images.wrist": PolicyFeature(FeatureType.VISUAL, (3, 224, 224)),
         },
-        output_features={"action": PolicyFeature(FeatureType.ACTION, (16,))},
     )
+    name_fn = b2_pose_delta_action_names if b2_representation == "pose_delta" else b2_execution_action_names
+    config.action_feature_names = name_fn(
+        list(CONTROL_EXTENDED_DATASET_ACTION_NAMES), **action_schema_kwargs(config)
+    )
+    config.output_features = {
+        "action": PolicyFeature(FeatureType.ACTION, (len(config.action_feature_names),))
+    }
     config.io_schema_resolved = True
     config.dataset_state_feature_names = state_names
     config.resolved_state_feature_names = state_names
-    config.state_feature_indices = [0]
-    config.dataset_action_feature_names = action_names
-    config.action_feature_names = action_names
+    config.state_feature_indices = list(range(len(state_names)))
+    config.ee_state_anchor_indices = list(range(1, 10))
+    config.dataset_action_feature_names = list(CONTROL_EXTENDED_DATASET_ACTION_NAMES)
     config.dataset_camera_keys = ["observation.images.base", "observation.images.wrist"]
     config._save_pretrained(tmp_path)
-    config_path = tmp_path / "config.json"
-    raw_config = json.loads(config_path.read_text())
-    raw_config.pop("discrete_action_training_mode")
-    config_path.write_text(json.dumps(raw_config))
-    metadata_path = tmp_path / "pi05_deployment_metadata.json"
-    metadata = json.loads(metadata_path.read_text())
-    metadata["version"] = 4
-    metadata["action"].pop("discrete_training_mode")
-    metadata["action"].pop("discrete_temporal_structure")
-    metadata["action"]["boolean_decoding"].pop("output_values")
-    metadata_path.write_text(json.dumps(metadata))
 
     contract = _load_checkpoint_contract(tmp_path, config, 50.0)
 
-    assert contract.discrete_action_training_mode == "continuous_flow"
-    assert contract.gripper_negative_value == pytest.approx(-1.0471976)
-    assert contract.gripper_nonnegative_value == 0.0
+    assert contract.metadata_version == 10
+    assert contract.model_action_representation == b2_representation
+    assert contract.z1_action_representation == z1_representation
 
 
 def _schema_v2_names() -> tuple[str, ...]:
@@ -123,7 +156,7 @@ def test_schema_v2_arm_gate_is_converted_before_low_level() -> None:
     gate_index = names.index("arm_teleop_inactive")
     actions[:, gate_index] = torch.tensor([0.0, 1.0])
 
-    execution = _to_execution_actions(actions, names, "ee_pose")
+    execution = _to_execution_actions(actions, names, "ee_delta")
 
     assert execution[:, EXECUTION_ACTION_NAMES.index("arm_active")].tolist() == [1.0, 0.0]
 
@@ -143,6 +176,7 @@ def test_server_decodes_normalized_discrete_outputs_to_physical_commands(mode: s
         postprocessed,
         names,
         mode=mode,
+        gripper_target_representation="binary_position",
         gripper_negative_value=-1.0471976,
         gripper_nonnegative_value=0.0,
     )
@@ -156,11 +190,104 @@ def test_server_decodes_normalized_discrete_outputs_to_physical_commands(mode: s
     assert decoded[:, names.index("task_complete")].tolist() == [0.0, 1.0, 1.0, 1.0]
 
 
+def test_continuous_gripper_is_not_thresholded() -> None:
+    names = ("gripper_target",)
+    normalized = torch.tensor([[-0.2], [0.3]])
+    physical = torch.tensor([[-0.27], [-0.81]])
+
+    decoded = _decode_discrete_actions(
+        normalized,
+        physical,
+        names,
+        mode="continuous_flow",
+        gripper_target_representation="continuous_position",
+        gripper_negative_value=-1.0471976,
+        gripper_nonnegative_value=0.0,
+    )
+
+    torch.testing.assert_close(decoded, physical)
+
+
+def test_continuous_ee_schema_defaults_missing_arm_modes_to_active() -> None:
+    names = tuple(
+        ["b2_vx", "b2_vy", "b2_omega_z"]
+        + list(EE_DELTA_ACTION_NAMES)
+        + ["gripper_target"]
+    )
+    actions = torch.zeros((2, len(names)))
+
+    execution = _to_execution_actions(actions, names, "ee_delta")
+
+    assert execution[:, EXECUTION_ACTION_NAMES.index("arm_active")].tolist() == [1.0, 1.0]
+    assert execution[:, EXECUTION_ACTION_NAMES.index("arm_reset")].tolist() == [0.0, 0.0]
+    assert execution[:, EXECUTION_ACTION_NAMES.index("task_complete")].tolist() == [0.0, 0.0]
+
+
+@pytest.mark.parametrize(
+    ("z1_representation", "expected_anchor_kind", "expected_anchor"),
+    [
+        ("ee_delta", "executed_ee_target", np.zeros(9, dtype=np.float32)),
+        ("ee_state_delta", "actual_ee_state", np.ones(9, dtype=np.float32)),
+    ],
+)
+def test_infer_records_model_action_names_and_source_step_anchor(
+    z1_representation: str,
+    expected_anchor_kind: str,
+    expected_anchor: np.ndarray,
+) -> None:
+    model_names = (*B2_EXECUTION_VELOCITY_NAMES, *EE_DELTA_ACTION_NAMES, "gripper_target")
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.preprocessor = lambda batch: batch
+    policy.postprocessor = lambda actions: actions
+    policy.policy = SimpleNamespace(
+        predict_action_chunk=lambda *_args, **_kwargs: torch.zeros((1, 2, len(model_names)))
+    )
+    policy._make_batch = lambda _packet: {}
+    policy._previous_prefix = lambda _packet: None
+    policy._estimated_delay = lambda: (0, 50.0)
+    policy._b2_velocity_filter_context = lambda _packet: (torch.zeros(3), None)
+    policy.postprocessed_action_names = model_names
+    policy.model_action_names = model_names
+    policy.discrete_action_training_mode = "continuous_flow"
+    policy.gripper_target_representation = "continuous_position"
+    policy.gripper_negative_value = -1.0471976
+    policy.gripper_nonnegative_value = 0.0
+    policy.z1_action_representation = z1_representation
+    policy.b2_action_representation = "velocity"
+    policy.action_names = EXECUTION_ACTION_NAMES
+    policy.stop_on_model_task_complete = False
+    policy._task_complete_latched = False
+    policy.b2_velocity_smoothing_time_constant_s = 0.0
+    policy.low_level_hz = 50.0
+    policy._latencies = []
+    policy._next_sequence = 1
+
+    record = policy._infer(
+        SimpleNamespace(
+            sim_step=25,
+            server_received_ns=0,
+            executed_ee_target=np.zeros(9, dtype=np.float32),
+            actual_ee_state=np.ones(9, dtype=np.float32),
+            state_names=B2_GLOBAL_POSE_NAMES,
+            state=np.asarray([1.0, 2.0, 0.3], dtype=np.float32),
+        )
+    )
+
+    assert record.model_action_names == model_names
+    assert record.original.shape == (2, len(model_names))
+    assert record.processed.shape == (2, len(EXECUTION_ACTION_NAMES))
+    assert record.source_step == 25
+    assert record.ee_anchor_kind == expected_anchor_kind
+    np.testing.assert_array_equal(record.ee_anchor, expected_anchor)
+    assert record.b2_anchor_kind == "actual_world_pose"
+    np.testing.assert_allclose(record.b2_anchor, [1.0, 2.0, 0.3])
+
+
 def test_formal_server_rejects_legacy_arm_active_semantics() -> None:
     actions = torch.zeros((2, len(EXECUTION_ACTION_NAMES)))
 
     with pytest.raises(ValueError, match="must not output legacy arm_active"):
-        _to_execution_actions(actions, EXECUTION_ACTION_NAMES, "ee_pose")
+        _to_execution_actions(actions, EXECUTION_ACTION_NAMES, "ee_delta")
 
 
 def test_completion_stops_motion_at_the_first_true_row() -> None:
@@ -378,6 +505,33 @@ def test_first_chunk_smoothing_uses_observed_body_velocity() -> None:
     assert prefix is None
 
 
+def test_source_state_requires_model_fields_but_not_unused_dataset_storage_fields() -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.source_state_names = ("arm_q_1", "unused_ee_label", "b2_body_height")
+    policy.selected_state_names = ("arm_q_1", "b2_body_height")
+    record = SimpleNamespace(
+        state_names=("b2_body_height", "arm_q_1"),
+        state=np.asarray([0.48, 0.25], dtype=np.float32),
+    )
+
+    source = policy._source_state(record)
+
+    torch.testing.assert_close(source, torch.tensor([0.25, 0.0, 0.48]))
+
+
+def test_source_state_rejects_missing_model_field() -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.source_state_names = ("arm_q_1", "unused_ee_label", "b2_body_height")
+    policy.selected_state_names = ("arm_q_1", "b2_body_height")
+    record = SimpleNamespace(
+        state_names=("arm_q_1",),
+        state=np.asarray([0.25], dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="missing model state fields.*b2_body_height"):
+        policy._source_state(record)
+
+
 def test_first_chunk_smoothing_does_not_fill_cold_start_delay_with_zeros() -> None:
     assert _b2_velocity_smoothing_transition_step(71, None) == 0
     assert _b2_velocity_smoothing_transition_step(12, torch.zeros(5, 3)) == 12
@@ -436,10 +590,10 @@ def test_rtc_skipped_prefix_keeps_previous_plan_and_delays_new_transition() -> N
     )
 
 
-def test_local_trajectory_and_velocity_modes_share_identical_execution_smoothing() -> None:
+def test_se2_increment_decode_and_velocity_modes_share_identical_execution_smoothing() -> None:
     velocity = torch.tensor([[0.2, -0.1, 0.3], [0.4, 0.0, -0.2], [-0.1, 0.2, 0.1]], dtype=torch.float32)
-    local_trajectory = integrate_body_twist(velocity, dt=0.02)
-    differentiated_velocity = differentiate_local_trajectory(local_trajectory, dt=0.02)
+    increments = integrate_body_twist(velocity, dt=0.02)
+    differentiated_velocity = se2_increment_to_body_twist(increments, dt=0.02)
     velocity_actions = torch.zeros((len(velocity), len(EXECUTION_ACTION_NAMES)))
     trajectory_actions = velocity_actions.clone()
     velocity_indices = [EXECUTION_ACTION_NAMES.index(name) for name in B2_EXECUTION_VELOCITY_NAMES]
@@ -500,7 +654,7 @@ def test_memory_sampling_rejects_a_missing_50hz_sample() -> None:
         AsyncRTCPolicy._sample_memory_records(history, current_step=14, count=2, stride=1)
 
 
-def test_protocol_v4_decodes_consecutive_50hz_telemetry_history() -> None:
+def test_protocol_v5_decodes_consecutive_50hz_telemetry_history() -> None:
     state_names = ("state_a", "state_b")
     states = np.asarray([[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]], dtype=np.float32)
     ee_targets = np.zeros((3, len(EE_POSE_ACTION_NAMES)), dtype=np.float32)
@@ -519,6 +673,7 @@ def test_protocol_v4_decodes_consecutive_50hz_telemetry_history() -> None:
         state_names=np.asarray(state_names),
         executed_ee_target=ee_targets[-1],
         executed_ee_target_names=np.asarray(EE_POSE_ACTION_NAMES),
+        actual_ee_state=ee_targets[-1],
         history_sim_steps=np.asarray([10, 11, 12]),
         history_states=states,
         history_active_sequences=np.asarray([2, 3, 3]),

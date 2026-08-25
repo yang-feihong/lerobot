@@ -1,12 +1,6 @@
 #!/usr/bin/env python
 
-"""B2 action representation helpers for PI0.5.
-
-The dataset stores body-frame planar twist commands.  PI0.5 instead learns a
-50-step trajectory in the frame attached to the robot at the start of each
-inference.  The conversion uses the exact SE(2) exponential/log maps for a
-piecewise-constant body twist, so translation is rotated as yaw accumulates.
-"""
+"""PI0.5 transforms for B2 velocity/SE(2) pose delta and Z1 EE delta targets."""
 
 from __future__ import annotations
 
@@ -37,9 +31,16 @@ DATASET_ACTION_NAMES = (
     "task_complete",
 )
 DATASET_ACTION_DIM = len(DATASET_ACTION_NAMES)
+CONTROL_EE_ACTION_NAMES = tuple(f"control_{name}" for name in DATASET_ACTION_NAMES[5:14])
+CONTROL_EXTENDED_DATASET_ACTION_NAMES = (*DATASET_ACTION_NAMES, *CONTROL_EE_ACTION_NAMES)
+CONTROL_EXTENDED_DATASET_ACTION_DIM = len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)
+HEIGHT_INVARIANT_EE_STATE_NAMES = tuple(
+    name.replace("height_invariant_ee_", "height_invariant_ee_state_")
+    for name in DATASET_ACTION_NAMES[5:14]
+)
+RAW_EE_STATE_SLICE = slice(49, 58)
 DATASET_B2_TWIST_SLICE = slice(0, 3)
-B2_TRAJECTORY_NAMES = ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")
-B2_GLOBAL_POSE_STATE_NAMES = ("b2_position_x", "b2_position_y", "b2_yaw")
+B2_POSE_DELTA_NAMES = ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")
 ARM_TELEOP_INACTIVE_NAME = "arm_teleop_inactive"
 TASK_COMPLETE_NAME = "task_complete"
 EE_DELTA_VALID_KEY = f"{ACTION}_ee_delta_is_valid"
@@ -86,6 +87,24 @@ def action_schema_kwargs(config: Any) -> dict[str, bool | str]:
     }
 
 
+def select_dataset_action_supervision(
+    action: Tensor,
+    *,
+    source: str,
+) -> Tensor:
+    """Select B2 velocity and Z1 control-target channels from the stored action."""
+    if action.ndim < 2 or action.shape[-1] != CONTROL_EXTENDED_DATASET_ACTION_DIM:
+        raise ValueError(
+            f"Control-action supervision requires {CONTROL_EXTENDED_DATASET_ACTION_DIM}D action, "
+            f"got {tuple(action.shape)}"
+        )
+    if source != "control_action":
+        raise ValueError(f"Unsupported supervision source {source!r}; expected 'control_action'")
+    result = action[..., :DATASET_ACTION_DIM].clone()
+    result[..., 5:14] = action[..., 16:25]
+    return result
+
+
 def action_sample_offsets(chunk_size: int, dataset_fps: float, control_frequency_hz: float) -> list[int]:
     """Map model action slots to nearest native dataset-frame offsets."""
     if chunk_size < 1 or dataset_fps <= 0 or control_frequency_hz <= 0:
@@ -110,22 +129,64 @@ def action_label_multiplicity(
     return multiplicity
 
 
-def ee_delta_transition_validity(action: Tensor, is_pad: Tensor | None = None) -> Tensor:
-    """Return whether every t→t+1 EE delta has manipulation semantics at both endpoints."""
+def ee_delta_transition_validity(
+    action: Tensor,
+    is_pad: Tensor | None = None,
+    *,
+    supervision_mode: str = "active_only",
+) -> Tensor:
+    """Return the valid t→t+1 EE-delta transitions for one supervision policy.
+
+    ``active_only`` is the historical gate-aware definition. ``all`` is used
+    only with a dataset whose inactive EE targets have already been rewritten
+    into a meaningful continuous trajectory.
+    """
     if action.ndim < 2 or action.shape[-1] != DATASET_ACTION_DIM or action.shape[-2] < 2:
         raise ValueError(
             f"Expected raw action shape (..., T+1, {DATASET_ACTION_DIM}), got {tuple(action.shape)}"
         )
-    source = action[..., :-1, :]
-    target = action[..., 1:, :]
-    source_active = (source[..., 3] < 0.5) & (source[..., 4] < 0.5)
-    target_active = (target[..., 3] < 0.5) & (target[..., 4] < 0.5)
-    valid = source_active & target_active
+    if supervision_mode == "active_only":
+        source = action[..., :-1, :]
+        target = action[..., 1:, :]
+        source_active = (source[..., 3] < 0.5) & (source[..., 4] < 0.5)
+        target_active = (target[..., 3] < 0.5) & (target[..., 4] < 0.5)
+        valid = source_active & target_active
+    elif supervision_mode == "all":
+        valid = torch.ones(action.shape[:-2] + (action.shape[-2] - 1,), dtype=torch.bool, device=action.device)
+    else:
+        raise ValueError(
+            f"Unknown EE-delta supervision mode {supervision_mode!r}; expected 'active_only' or 'all'"
+        )
     if is_pad is not None:
         pad = torch.as_tensor(is_pad, dtype=torch.bool, device=action.device)
         if pad.shape != action.shape[:-1]:
             raise ValueError(f"is_pad shape {tuple(pad.shape)} != action shape {tuple(action.shape[:-1])}")
         valid = valid & ~pad[..., :-1] & ~pad[..., 1:]
+    return valid
+
+
+def ee_delta_sample_validity(
+    action: Tensor,
+    is_pad: Tensor | None,
+    *,
+    representation: str,
+    supervision_mode: str,
+) -> Tensor:
+    if representation == "ee_delta":
+        return ee_delta_transition_validity(action, is_pad, supervision_mode=supervision_mode)
+    if representation != "ee_state_delta":
+        raise ValueError(f"Unknown EE delta representation: {representation!r}")
+    if supervision_mode == "active_only":
+        valid = (action[..., 3] < 0.5) & (action[..., 4] < 0.5)
+    elif supervision_mode == "all":
+        valid = torch.ones(action.shape[:-1], dtype=torch.bool, device=action.device)
+    else:
+        raise ValueError(f"Unknown EE-delta supervision mode {supervision_mode!r}")
+    if is_pad is not None:
+        pad = torch.as_tensor(is_pad, dtype=torch.bool, device=action.device)
+        if pad.shape != action.shape[:-1]:
+            raise ValueError(f"is_pad shape {tuple(pad.shape)} != action shape {tuple(action.shape[:-1])}")
+        valid = valid & ~pad
     return valid
 
 
@@ -163,42 +224,24 @@ def integrate_body_twist(twist: Tensor, dt: float, is_pad: Tensor | None = None)
     return torch.stack((delta_body_x, delta_body_y, delta_yaw), dim=-1)
 
 
-def global_pose_to_local_trajectory(global_pose: Tensor, is_pad: Tensor | None = None) -> Tensor:
-    """Express every future SE(2) pose relative to its immediately preceding pose.
-
-    ``global_pose`` is ``(..., T + 1, 3)``: the current pose followed by
-    future pose targets. Incremental yaw differences are wrapped before they
-    are accumulated, so crossing +/-pi does not create a discontinuity.
-    """
-    if global_pose.ndim < 2 or global_pose.shape[-1] != 3 or global_pose.shape[-2] < 2:
-        raise ValueError(f"Expected global pose shape (..., T+1, 3), got {tuple(global_pose.shape)}")
-
-    current = global_pose[..., :-1, :]
-    future = global_pose[..., 1:, :]
-    delta_world = future[..., :2] - current[..., :2]
-    yaw0 = current[..., 2]
-    cos_yaw = torch.cos(yaw0)
-    sin_yaw = torch.sin(yaw0)
-    local_x = cos_yaw * delta_world[..., 0] + sin_yaw * delta_world[..., 1]
-    local_y = -sin_yaw * delta_world[..., 0] + cos_yaw * delta_world[..., 1]
-
-    yaw_steps = global_pose[..., 1:, 2] - global_pose[..., :-1, 2]
-    yaw_steps = torch.atan2(torch.sin(yaw_steps), torch.cos(yaw_steps))
-    local_yaw = yaw_steps
-    trajectory = torch.stack((local_x, local_y, local_yaw), dim=-1)
-
-    if is_pad is not None:
-        pad = torch.as_tensor(is_pad, dtype=torch.bool, device=trajectory.device)
-        if pad.shape != trajectory.shape[:-1]:
-            raise ValueError(
-                f"is_pad shape {tuple(pad.shape)} != trajectory shape {tuple(trajectory.shape[:-1])}"
-            )
-        valid = ~pad
-        time_indices = torch.arange(trajectory.shape[-2], device=trajectory.device)
-        time_indices = time_indices.view(*([1] * (valid.ndim - 1)), -1).expand_as(valid)
-        last_valid = torch.where(valid, time_indices, -1).cummax(dim=-1).values.clamp_min(0)
-        trajectory = trajectory.gather(-2, last_valid.unsqueeze(-1).expand(*last_valid.shape, 3))
-    return trajectory
+def integrate_body_twist_to_pose_delta(
+    twist: Tensor, dt: float, is_pad: Tensor | None = None
+) -> Tensor:
+    """Integrate body-frame velocity commands into poses relative to the chunk start."""
+    increments = integrate_body_twist(twist, dt, is_pad)
+    position = torch.zeros(increments.shape[:-2] + (2,), dtype=twist.dtype, device=twist.device)
+    yaw = torch.zeros(increments.shape[:-2], dtype=twist.dtype, device=twist.device)
+    outputs = []
+    for step in range(increments.shape[-2]):
+        dx, dy, dyaw = increments[..., step, :].unbind(dim=-1)
+        cos_yaw = torch.cos(yaw)
+        sin_yaw = torch.sin(yaw)
+        position = position + torch.stack(
+            (cos_yaw * dx - sin_yaw * dy, sin_yaw * dx + cos_yaw * dy), dim=-1
+        )
+        yaw = yaw + dyaw
+        outputs.append(torch.cat((position, yaw.unsqueeze(-1)), dim=-1))
+    return torch.stack(outputs, dim=-2)
 
 
 def _rot6d_to_matrix(rot6d: Tensor) -> Tensor:
@@ -308,6 +351,30 @@ def absolute_ee_pose_to_delta(
     return torch.cat((encoded_rotation, delta_position), dim=-1)
 
 
+def absolute_ee_pose_to_reference_delta(
+    targets: Tensor,
+    reference: Tensor,
+    *,
+    rotation_representation: str = "rot6d",
+) -> Tensor:
+    """Encode every future EE target relative to one inference-time EE state."""
+    if targets.shape[-1] != 9 or reference.shape != targets.shape[:-2] + (9,):
+        raise ValueError(
+            f"EE reference shape {tuple(reference.shape)} is incompatible with {tuple(targets.shape)}"
+        )
+    target_rotation = _rot6d_to_matrix(targets[..., :6])
+    reference_rotation = _rot6d_to_matrix(reference[..., :6]).unsqueeze(-3)
+    delta_rotation = target_rotation @ reference_rotation.transpose(-1, -2)
+    delta_position = targets[..., 6:9] - reference[..., 6:9].unsqueeze(-2)
+    if rotation_representation == "rotvec":
+        encoded_rotation = _matrix_to_rotvec(delta_rotation)
+    elif rotation_representation == "rot6d":
+        encoded_rotation = _matrix_to_rot6d(delta_rotation)
+    else:
+        raise ValueError(f"Unknown EE delta rotation representation: {rotation_representation!r}")
+    return torch.cat((encoded_rotation, delta_position), dim=-1)
+
+
 def ee_pose_delta_to_absolute(
     deltas: Tensor,
     reference: Tensor,
@@ -339,7 +406,34 @@ def ee_pose_delta_to_absolute(
     return torch.stack(outputs, dim=-2)
 
 
-def differentiate_local_trajectory(trajectory: Tensor, dt: float) -> Tensor:
+def ee_reference_delta_to_absolute(
+    deltas: Tensor,
+    reference: Tensor,
+    *,
+    rotation_representation: str = "rot6d",
+) -> Tensor:
+    """Decode independently anchored EE deltas using one fixed reference pose."""
+    expected_delta_dim = 6 if rotation_representation == "rotvec" else 9
+    if deltas.shape[-1] != expected_delta_dim or reference.shape != deltas.shape[:-2] + (9,):
+        raise ValueError(
+            f"EE deltas must be {expected_delta_dim}D and reference shape must match the batch, "
+            f"got deltas={tuple(deltas.shape)}, reference={tuple(reference.shape)}"
+        )
+    if rotation_representation == "rotvec":
+        delta_rotation = _rotvec_to_matrix(deltas[..., :3])
+        delta_position = deltas[..., 3:6]
+    elif rotation_representation == "rot6d":
+        delta_rotation = _rot6d_to_matrix(deltas[..., :6])
+        delta_position = deltas[..., 6:9]
+    else:
+        raise ValueError(f"Unknown EE delta rotation representation: {rotation_representation!r}")
+    reference_rotation = _rot6d_to_matrix(reference[..., :6]).unsqueeze(-3)
+    rotation = delta_rotation @ reference_rotation
+    position = reference[..., 6:9].unsqueeze(-2) + delta_position
+    return torch.cat((_matrix_to_rot6d(rotation), position), dim=-1)
+
+
+def se2_increment_to_body_twist(trajectory: Tensor, dt: float) -> Tensor:
     """Convert per-step local SE(2) increments to body twist."""
     if trajectory.ndim < 2 or trajectory.shape[-1] != 3:
         raise ValueError(f"Expected trajectory shape (..., T, 3), got {tuple(trajectory.shape)}")
@@ -358,14 +452,32 @@ def differentiate_local_trajectory(trajectory: Tensor, dt: float) -> Tensor:
     return torch.stack((vx, vy, omega), dim=-1)
 
 
+def differentiate_pose_delta_trajectory(trajectory: Tensor, dt: float) -> Tensor:
+    """Differentiate chunk-start-relative SE(2) poses into body-frame velocity commands."""
+    if trajectory.ndim < 2 or trajectory.shape[-1] != 3:
+        raise ValueError(f"Expected trajectory shape (..., T, 3), got {tuple(trajectory.shape)}")
+    origin = torch.zeros_like(trajectory[..., :1, :])
+    previous = torch.cat((origin, trajectory[..., :-1, :]), dim=-2)
+    delta_xy = trajectory[..., :2] - previous[..., :2]
+    previous_yaw = previous[..., 2]
+    cos_yaw = torch.cos(previous_yaw)
+    sin_yaw = torch.sin(previous_yaw)
+    local_x = cos_yaw * delta_xy[..., 0] + sin_yaw * delta_xy[..., 1]
+    local_y = -sin_yaw * delta_xy[..., 0] + cos_yaw * delta_xy[..., 1]
+    local_yaw = trajectory[..., 2] - previous_yaw
+    local_yaw = torch.atan2(torch.sin(local_yaw), torch.cos(local_yaw))
+    increments = torch.stack((local_x, local_y, local_yaw), dim=-1)
+    return se2_increment_to_body_twist(increments, dt)
+
+
 def encode_b2_action_chunk(
     action: Tensor,
     *,
     dt: float,
     is_pad: Tensor | None = None,
-    global_pose: Tensor | None = None,
-    representation: str = "local_trajectory",
-    z1_representation: str = "ee_pose",
+    ee_state_anchor: Tensor | None = None,
+    representation: str = "velocity",
+    z1_representation: str = "ee_delta",
     ee_delta_rotation_representation: str = "rot6d",
     predict_arm_teleop_inactive: bool = True,
     predict_arm_reset: bool = True,
@@ -373,12 +485,7 @@ def encode_b2_action_chunk(
     predict_gripper: bool = True,
     include_task_complete: bool = True,
 ) -> Tensor:
-    """Convert the raw 16D action into the model action.
-
-    The three B2 twist dimensions are replaced by a local trajectory. The
-    explicit ``arm_teleop_inactive`` and ``task_complete`` dataset labels are
-    retained; completion is never inferred from episode padding.
-    """
+    """Convert raw velocity/EE-target controls into the configured model action."""
     if action.ndim < 2 or action.shape[-1] != DATASET_ACTION_DIM:
         raise ValueError(
             f"Expected raw dataset action shape (..., T, {DATASET_ACTION_DIM}), got {tuple(action.shape)}"
@@ -399,7 +506,7 @@ def encode_b2_action_chunk(
         next_action = action[..., 1:, :]
         if pad is not None:
             pad = pad[..., :-1] | pad[..., 1:]
-    elif z1_representation == "ee_pose":
+    elif z1_representation == "ee_state_delta":
         next_action = None
         source_action = action
     else:
@@ -413,24 +520,31 @@ def encode_b2_action_chunk(
         include_task_complete=include_task_complete,
     )
     result = source_action[..., indices].clone()
-    if representation == "local_trajectory":
-        result[..., :3] = (
-            global_pose_to_local_trajectory(global_pose, pad)
-            if global_pose is not None
-            else integrate_body_twist(source_action[..., DATASET_B2_TWIST_SLICE], dt, pad)
+    if representation == "pose_delta":
+        result[..., :3] = integrate_body_twist_to_pose_delta(
+            source_action[..., DATASET_B2_TWIST_SLICE], dt, pad
         )
     elif representation != "velocity":
         raise ValueError(f"Unknown B2 action representation: {representation!r}")
-    if z1_representation == "ee_delta" and predict_ee_pose:
+    if z1_representation in {"ee_delta", "ee_state_delta"} and predict_ee_pose:
         selected_names = [DATASET_ACTION_NAMES[index] for index in indices]
         ee_output_indices = [
             index for index, name in enumerate(selected_names) if name.startswith("height_invariant_ee_")
         ]
-        ee_delta = absolute_ee_pose_to_delta(
-            next_action[..., 5:14],
-            source_action[..., 0, 5:14],
-            rotation_representation=ee_delta_rotation_representation,
-        )
+        if z1_representation == "ee_delta":
+            ee_delta = absolute_ee_pose_to_delta(
+                next_action[..., 5:14],
+                source_action[..., 0, 5:14],
+                rotation_representation=ee_delta_rotation_representation,
+            )
+        else:
+            if ee_state_anchor is None:
+                raise ValueError("ee_state_delta requires the inference-time height-invariant EE state")
+            ee_delta = absolute_ee_pose_to_reference_delta(
+                source_action[..., 5:14],
+                ee_state_anchor,
+                rotation_representation=ee_delta_rotation_representation,
+            )
         if ee_delta_rotation_representation == "rotvec":
             first, last = ee_output_indices[0], ee_output_indices[-1] + 1
             result = torch.cat((result[..., :first], ee_delta, result[..., last:]), dim=-1)
@@ -443,30 +557,16 @@ def decode_b2_action_chunk(
     action: Tensor,
     *,
     dt: float,
-    representation: str = "local_trajectory",
+    representation: str = "velocity",
 ) -> Tensor:
     """Replace the compact predicted trajectory with executable body twist."""
     if action.ndim < 2:
         raise ValueError(f"Expected an action chunk, got {tuple(action.shape)}")
     result = action.clone()
-    if representation == "local_trajectory":
-        result[..., :3] = differentiate_local_trajectory(action[..., :3], dt)
+    if representation == "pose_delta":
+        result[..., :3] = differentiate_pose_delta_trajectory(action[..., :3], dt)
     elif representation != "velocity":
         raise ValueError(f"Unknown B2 action representation: {representation!r}")
-    return result
-
-
-def integrate_b2_execution_chunk(
-    action: Tensor,
-    *,
-    dt: float,
-    is_pad: Tensor | None = None,
-) -> Tensor:
-    """Convert a compact executable B2 twist chunk back to trajectory space."""
-    if action.ndim < 2:
-        raise ValueError(f"Expected a compact executable action chunk, got {tuple(action.shape)}")
-    result = action.clone()
-    result[..., :3] = integrate_body_twist(action[..., :3], dt, is_pad)
     return result
 
 
@@ -474,7 +574,7 @@ def b2_execution_action_names(
     dataset_names: list[str] | None,
     *,
     representation: str = "velocity",
-    z1_representation: str = "ee_pose",
+    z1_representation: str = "ee_delta",
     ee_delta_rotation_representation: str = "rot6d",
     predict_arm_teleop_inactive: bool = True,
     predict_arm_reset: bool = True,
@@ -485,8 +585,19 @@ def b2_execution_action_names(
     del representation
     if dataset_names is None:
         return None
-    if len(dataset_names) != DATASET_ACTION_DIM:
-        raise ValueError(f"B2 compact action expects the 16D B2+Z1 schema, got {len(dataset_names)} names")
+    if len(dataset_names) == CONTROL_EXTENDED_DATASET_ACTION_DIM:
+        extended_names = tuple(dataset_names)
+        if extended_names != CONTROL_EXTENDED_DATASET_ACTION_NAMES:
+            raise ValueError(
+                "B2 compact action received an unknown 25D extended dataset schema; "
+                "expected the control-EE storage layout"
+            )
+        dataset_names = dataset_names[:DATASET_ACTION_DIM]
+    elif len(dataset_names) != DATASET_ACTION_DIM:
+        raise ValueError(
+            "B2 compact action expects the 16D B2+Z1 schema or a known 25D extended "
+            f"storage schema, got {len(dataset_names)} names"
+        )
     indices = action_dataset_indices(
         predict_arm_teleop_inactive=predict_arm_teleop_inactive,
         predict_arm_reset=predict_arm_reset,
@@ -495,7 +606,7 @@ def b2_execution_action_names(
         include_task_complete=include_task_complete,
     )
     names = [dataset_names[i] for i in indices]
-    if z1_representation == "ee_delta":
+    if z1_representation in {"ee_delta", "ee_state_delta"}:
         ee_indices = [i for i, name in enumerate(names) if name.startswith("height_invariant_ee_")]
         if ee_delta_rotation_representation == "rotvec" and ee_indices:
             first, last = ee_indices[0], ee_indices[-1] + 1
@@ -515,27 +626,27 @@ def b2_execution_action_names(
             raise ValueError(
                 f"Unknown EE delta rotation representation: {ee_delta_rotation_representation!r}"
             )
-    elif z1_representation != "ee_pose":
+    else:
         raise ValueError(f"Unknown Z1 action representation: {z1_representation!r}")
     return names
 
 
-def b2_trajectory_action_names(dataset_names: list[str] | None, **kwargs: Any) -> list[str] | None:
+def b2_pose_delta_action_names(dataset_names: list[str] | None, **kwargs: Any) -> list[str] | None:
     names = b2_execution_action_names(dataset_names, **kwargs)
     if names is None:
         return None
-    names[:3] = list(B2_TRAJECTORY_NAMES)
+    names[:3] = list(B2_POSE_DELTA_NAMES)
     return names
 
 
-def make_b2_trajectory_stats(
+def make_pi05_action_stats(
     dataset_stats: dict[str, dict[str, Any]] | None,
     *,
     transformed_action_stats: dict[str, Any] | None = None,
     dt: float,
     chunk_size: int,
-    representation: str = "local_trajectory",
-    z1_representation: str = "ee_pose",
+    representation: str = "velocity",
+    z1_representation: str = "ee_delta",
     ee_delta_rotation_representation: str = "rot6d",
     predict_arm_teleop_inactive: bool = True,
     predict_arm_reset: bool = True,
@@ -544,19 +655,34 @@ def make_b2_trajectory_stats(
     include_task_complete: bool = True,
     state_indices: tuple[int, ...] | None = None,
 ) -> dict[str, dict[str, Any]] | None:
-    """Build normalization stats for the compact trajectory representation.
-
-    EE-delta schemas require exact statistics measured after temporal
-    transformation. Absolute-pose marginal statistics cannot recover delta
-    quantiles and are rejected instead of being approximated.
-    """
+    """Install exact statistics measured after the configured temporal transform."""
+    del dt, chunk_size
     if dataset_stats is None:
         return None
+    if representation not in {"velocity", "pose_delta"}:
+        raise ValueError(f"Unknown B2 action representation: {representation!r}")
+    if z1_representation not in {"ee_delta", "ee_state_delta"}:
+        raise ValueError(f"Unknown Z1 action representation: {z1_representation!r}")
+    if transformed_action_stats is None:
+        raise ValueError(
+            "Configured action normalization requires statistics measured after the temporal transform"
+        )
     stats = deepcopy(dataset_stats)
     if ACTION not in stats:
         raise ValueError("Dataset statistics do not contain action")
-    if transformed_action_stats is not None:
-        expected_names = b2_trajectory_action_names(
+    expected_names = b2_pose_delta_action_names(
+        list(DATASET_ACTION_NAMES),
+        representation=representation,
+        z1_representation=z1_representation,
+        ee_delta_rotation_representation=ee_delta_rotation_representation,
+        predict_arm_teleop_inactive=predict_arm_teleop_inactive,
+        predict_arm_reset=predict_arm_reset,
+        predict_ee_pose=predict_ee_pose,
+        predict_gripper=predict_gripper,
+        include_task_complete=include_task_complete,
+    )
+    if representation == "velocity":
+        expected_names = b2_execution_action_names(
             list(DATASET_ACTION_NAMES),
             representation=representation,
             z1_representation=z1_representation,
@@ -567,112 +693,10 @@ def make_b2_trajectory_stats(
             predict_gripper=predict_gripper,
             include_task_complete=include_task_complete,
         )
-        if representation == "velocity":
-            expected_names = b2_execution_action_names(
-                list(DATASET_ACTION_NAMES),
-                representation=representation,
-                z1_representation=z1_representation,
-                ee_delta_rotation_representation=ee_delta_rotation_representation,
-                predict_arm_teleop_inactive=predict_arm_teleop_inactive,
-                predict_arm_reset=predict_arm_reset,
-                predict_ee_pose=predict_ee_pose,
-                predict_gripper=predict_gripper,
-                include_task_complete=include_task_complete,
-            )
-        q01_exact = torch.as_tensor(transformed_action_stats["q01"]).reshape(-1)
-        if expected_names is None or q01_exact.numel() != len(expected_names):
-            raise ValueError(
-                "Exact transformed-action statistics do not match the configured model action schema"
-            )
-        stats[ACTION] = deepcopy(transformed_action_stats)
-        if state_indices is not None and "observation.state" in stats:
-            state_stats = stats["observation.state"]
-
-            def select_exact_state(value: Any) -> Any:
-                tensor = torch.as_tensor(value).reshape(-1)
-                if tensor.numel() == 1:
-                    return deepcopy(value)
-                selected = tensor[list(state_indices)]
-                if isinstance(value, Tensor):
-                    return selected.to(device=value.device, dtype=value.dtype)
-                return selected.numpy()
-
-            stats["observation.state"] = {
-                name: select_exact_state(value) for name, value in state_stats.items()
-            }
-        return stats
-    else:
-        action_stats = stats[ACTION]
-        if z1_representation == "ee_delta":
-            raise ValueError(
-                "EE-delta normalization requires statistics measured after the temporal action transform"
-            )
-    if "q01" not in action_stats or "q99" not in action_stats:
-        raise ValueError("B2 trajectory normalization requires action q01/q99 statistics")
-
-    q01 = torch.as_tensor(action_stats["q01"], dtype=torch.float32).reshape(-1)
-    q99 = torch.as_tensor(action_stats["q99"], dtype=torch.float32).reshape(-1)
-    if q01.numel() != 16 or q99.numel() != 16:
-        raise ValueError(f"B2 local trajectory expects 16D dataset action stats, got {q01.numel()}")
-    velocity_extent = torch.maximum(q01[DATASET_B2_TWIST_SLICE].abs(), q99[DATASET_B2_TWIST_SLICE].abs())
-    duration = dt
-    xy_scale = max(float(torch.linalg.vector_norm(velocity_extent[:2]).item() * duration), 1e-3)
-    yaw_scale = max(float(velocity_extent[2].item() * duration), 1e-3)
-    action_indices = action_dataset_indices(
-        predict_arm_teleop_inactive=predict_arm_teleop_inactive,
-        predict_arm_reset=predict_arm_reset,
-        predict_ee_pose=predict_ee_pose,
-        predict_gripper=predict_gripper,
-        include_task_complete=include_task_complete,
-    )
-    gripper_min = float(torch.as_tensor(action_stats.get("min", q01)).reshape(-1)[14])
-    gripper_max = float(torch.as_tensor(action_stats.get("max", q99)).reshape(-1)[14])
-    if gripper_max <= gripper_min:
-        raise ValueError("gripper_target must contain two distinct classes in dataset statistics")
-
-    def converted(name: str, value: Any) -> Any:
-        tensor = torch.as_tensor(value, dtype=torch.float32).reshape(-1).clone()
-        if name == "count":
-            return value.clone() if isinstance(value, Tensor) else deepcopy(value)
-        if tensor.numel() != 16:
-            raise ValueError(f"Action stat {name!r} has {tensor.numel()} dims, expected 16")
-        if representation == "local_trajectory" and name in {"q01", "min", "q10"}:
-            tensor[DATASET_B2_TWIST_SLICE] = torch.tensor([-xy_scale, -xy_scale, -yaw_scale])
-        elif representation == "local_trajectory" and name in {"q99", "max", "q90"}:
-            tensor[DATASET_B2_TWIST_SLICE] = torch.tensor([xy_scale, xy_scale, yaw_scale])
-        elif representation == "local_trajectory" and name == "std":
-            tensor[DATASET_B2_TWIST_SLICE] = torch.tensor([xy_scale / 2, xy_scale / 2, yaw_scale / 2])
-        elif representation == "local_trajectory":
-            tensor[DATASET_B2_TWIST_SLICE] = 0.0
-        tensor = tensor[list(action_indices)]
-        selected_names = [DATASET_ACTION_NAMES[index] for index in action_indices]
-        # Quantile normalization must remain well-defined even when a boolean is
-        # extremely imbalanced and both empirical quantiles collapse to one class.
-        positive_bool_names = {ARM_TELEOP_INACTIVE_NAME, "arm_reset", TASK_COMPLETE_NAME}
-        for index, selected_name in enumerate(selected_names):
-            if selected_name not in positive_bool_names:
-                continue
-            if name in {"q01", "min", "q10"}:
-                tensor[index] = 0.0
-            elif name in {"q99", "max", "q90"}:
-                tensor[index] = 1.0
-            elif name in {"mean", "std"}:
-                tensor[index] = 0.5
-        if "gripper_target" in selected_names:
-            index = selected_names.index("gripper_target")
-            if name in {"q01", "min", "q10"}:
-                tensor[index] = gripper_min
-            elif name in {"q99", "max", "q90"}:
-                tensor[index] = gripper_max
-            elif name == "mean":
-                tensor[index] = (gripper_min + gripper_max) / 2
-            elif name == "std":
-                tensor[index] = (gripper_max - gripper_min) / 2
-        if isinstance(value, Tensor):
-            return tensor.to(device=value.device, dtype=value.dtype)
-        return tensor.numpy()
-
-    stats[ACTION] = {name: converted(name, value) for name, value in action_stats.items()}
+    q01_exact = torch.as_tensor(transformed_action_stats["q01"]).reshape(-1)
+    if expected_names is None or q01_exact.numel() != len(expected_names):
+        raise ValueError("Exact transformed-action statistics do not match the configured model action schema")
+    stats[ACTION] = deepcopy(transformed_action_stats)
     if state_indices is not None and "observation.state" in stats:
         state_stats = stats["observation.state"]
 

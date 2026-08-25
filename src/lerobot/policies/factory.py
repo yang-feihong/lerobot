@@ -348,9 +348,9 @@ def make_pre_post_processors(
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
         if isinstance(policy_cfg, PI05Config):
-            from .pi05.processor_pi05 import reconcile_pi05_b2_trajectory_processors
+            from .pi05.processor_pi05 import reconcile_pi05_action_representation_processors
 
-            preprocessor, postprocessor = reconcile_pi05_b2_trajectory_processors(
+            preprocessor, postprocessor = reconcile_pi05_action_representation_processors(
                 policy_cfg,
                 preprocessor,
                 postprocessor,
@@ -614,11 +614,11 @@ def make_policy(
             cfg.action_feature_names = list(action_names)
     if isinstance(cfg, PI05Config) and ds_meta is not None:
         from .pi05.b2_action_transform import (
-            B2_GLOBAL_POSE_STATE_NAMES,
-            DATASET_ACTION_NAMES,
+            CONTROL_EXTENDED_DATASET_ACTION_NAMES,
+            HEIGHT_INVARIANT_EE_STATE_NAMES,
             action_schema_kwargs,
             b2_execution_action_names,
-            b2_trajectory_action_names,
+            b2_pose_delta_action_names,
         )
 
         resolved_dataset_frequency = float(ds_meta.fps)
@@ -653,30 +653,59 @@ def make_policy(
         dataset_state_names = ds_meta.features.get(OBS_STATE, {}).get("names")
         is_b2_schema = (
             dataset_action is not None
-            and dataset_action.shape == (16,)
+            and dataset_action.shape == (25,)
             and dataset_action_names is not None
-            and tuple(dataset_action_names) == DATASET_ACTION_NAMES
+            and tuple(dataset_action_names) == CONTROL_EXTENDED_DATASET_ACTION_NAMES
         )
         if not is_b2_schema:
             cfg.io_schema_resolved = False
         elif dataset_state_names is None:
             raise ValueError("PI0.5 configurable B2+Z1 I/O requires named observation.state dimensions")
         else:
+            if cfg.ee_supervision_source != "control_action":
+                raise ValueError("PI0.5 B2+Z1 supervision must use the stored control-action channels")
+            cfg.ee_state_anchor_indices = None
+            if cfg.z1_action_representation == "ee_state_delta":
+                missing = [name for name in HEIGHT_INVARIANT_EE_STATE_NAMES if name not in dataset_state_names]
+                if missing:
+                    raise ValueError(
+                        "ee_state_delta requires inference-time height-invariant EE state channels; "
+                        f"missing={missing}"
+                    )
+                cfg.ee_state_anchor_indices = [
+                    dataset_state_names.index(name) for name in HEIGHT_INVARIANT_EE_STATE_NAMES
+                ]
+            dataset_ee_semantics = "joint_control_inactive_interpolated"
+            if cfg.ee_target_dataset_semantics != dataset_ee_semantics:
+                raise ValueError(
+                    "PI0.5 EE-target dataset semantics mismatch: "
+                    f"policy={cfg.ee_target_dataset_semantics!r}, dataset={dataset_ee_semantics!r}, "
+                    f"root={ds_meta.root}"
+                )
             checkpoint_schema_resolved = cfg.io_schema_resolved
-            if cfg.io_schema_resolved and cfg.dataset_action_feature_names not in (
-                None,
-                list(dataset_action_names),
-            ):
+            checkpoint_action_names = cfg.dataset_action_feature_names
+            action_names_compatible = (
+                checkpoint_action_names is None
+                or checkpoint_action_names == list(dataset_action_names)
+            )
+            if cfg.io_schema_resolved and not action_names_compatible:
                 raise ValueError(
                     "Checkpoint action semantics do not match this dataset: "
                     f"checkpoint={cfg.dataset_action_feature_names}, dataset={list(dataset_action_names)}"
                 )
-            if cfg.io_schema_resolved and cfg.dataset_state_feature_names not in (
-                None,
-                list(dataset_state_names),
-            ):
+            checkpoint_state_names = cfg.dataset_state_feature_names
+            state_names_compatible = (
+                checkpoint_state_names is None
+                or checkpoint_state_names == list(dataset_state_names)
+                or list(dataset_state_names[: len(checkpoint_state_names)]) == checkpoint_state_names
+            )
+            if cfg.io_schema_resolved and not state_names_compatible:
                 raise ValueError("Checkpoint state semantics do not match this dataset")
             resolved_state_names = cfg.resolve_state_feature_names(list(dataset_state_names))
+            if cfg.z1_action_representation == "ee_state_delta":
+                resolved_state_names.extend(
+                    name for name in HEIGHT_INVARIANT_EE_STATE_NAMES if name not in resolved_state_names
+                )
             if cfg.io_schema_resolved and cfg.resolved_state_feature_names not in (
                 None,
                 resolved_state_names,
@@ -691,28 +720,19 @@ def make_policy(
             cfg.dataset_state_feature_names = list(dataset_state_names)
             cfg.resolved_state_feature_names = resolved_state_names
             cfg.state_feature_indices = [dataset_state_names.index(name) for name in resolved_state_names]
-            resolved_global_pose_indices = (
-                [dataset_state_names.index(name) for name in B2_GLOBAL_POSE_STATE_NAMES]
-                if cfg.b2_action_representation == "local_trajectory"
-                and all(name in dataset_state_names for name in B2_GLOBAL_POSE_STATE_NAMES)
-                else None
-            )
-            if (
-                checkpoint_schema_resolved
-                and cfg.b2_global_pose_state_indices != resolved_global_pose_indices
-            ):
-                raise ValueError("Checkpoint B2 global-pose trajectory semantics do not match this dataset")
-            cfg.b2_global_pose_state_indices = resolved_global_pose_indices
+            if checkpoint_schema_resolved and cfg.b2_global_pose_state_indices is not None:
+                raise ValueError("State-derived B2 pose-delta checkpoints are no longer supported")
+            cfg.b2_global_pose_state_indices = None
             cfg.input_features[OBS_STATE] = PolicyFeature(
                 type=FeatureType.STATE, shape=(len(resolved_state_names),)
             )
             schema_kwargs = action_schema_kwargs(cfg)
             name_fn = (
-                b2_trajectory_action_names
-                if cfg.b2_action_representation == "local_trajectory"
+                b2_pose_delta_action_names
+                if cfg.b2_action_representation == "pose_delta"
                 else b2_execution_action_names
             )
-            cfg.action_feature_names = name_fn(list(dataset_action_names), **schema_kwargs)
+            cfg.action_feature_names = name_fn(list(dataset_action_names[:16]), **schema_kwargs)
             assert cfg.action_feature_names is not None
             if len(cfg.action_feature_names) > cfg.max_action_dim:
                 raise ValueError(
@@ -722,12 +742,12 @@ def make_policy(
                 type=FeatureType.ACTION, shape=(len(cfg.action_feature_names),)
             )
             resolved_dt = 1.0 / resolved_control_frequency
-            if cfg.b2_local_trajectory_dt is None:
-                cfg.b2_local_trajectory_dt = resolved_dt
-            elif abs(cfg.b2_local_trajectory_dt - resolved_dt) > 1e-9:
+            if cfg.action_dt_seconds is None:
+                cfg.action_dt_seconds = resolved_dt
+            elif abs(cfg.action_dt_seconds - resolved_dt) > 1e-9:
                 raise ValueError(
                     "Checkpoint B2 action dt does not match model control frequency: "
-                    f"dt={cfg.b2_local_trajectory_dt}, control_frequency_hz={resolved_control_frequency}"
+                    f"dt={cfg.action_dt_seconds}, control_frequency_hz={resolved_control_frequency}"
                 )
     if ds_meta is not None:
         set_dataset_feature_metadata = getattr(cfg, "set_dataset_feature_metadata", None)
@@ -780,6 +800,10 @@ def make_policy(
         policy = PeftModel.from_pretrained(
             policy, peft_pretrained_path, config=peft_config, is_trainable=True
         )
+        if isinstance(cfg, PI05Config):
+            policy._enable_lora_full_finetuning_modules()  # type: ignore[attr-defined]
+            if cfg.mem_vit_enabled and not cfg.freeze_vision_encoder:
+                policy._enable_mem_vit_full_finetuning()  # type: ignore[attr-defined]
 
     else:
         # Make a fresh policy.

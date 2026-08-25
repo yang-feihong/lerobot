@@ -274,3 +274,316 @@ open-loop 评估必须强制包含每个 manipulation onset 前后窗口，不�
 验收时 A 已在验证后继续到至少 step 510，B 已继续到至少 step 505；两组均无 OOM、NaN、数据读取或 processor 错误。两组 `checkpoints/last` 均已指向完整写入的 `000500`，远程保留器持续执行 latest-2 规则。
 
 checkpoint 检查确认 A 的 adapter 保存 action expert/projection、结构化离散 head 和 CRF；B 在此基础上额外完整保存 `model.state_memory_proj`。两组 checkpoint 均包含 `pi05_transformed_action_stats.json` 和 `pi05_deployment_metadata.json`，W&B 的 model artifact 上传保持关闭。
+
+## 2026-08-17：下一轮训练的执行优先级
+
+### 核心判断
+
+当前最先要回答的不是“MEM 或 continuous history 是否更强”，而是修正后的基础模型能否学会一条完整、可观察的操作因果链：识别操作时机 → 解除机械臂保持 → 将 EE 平移到门把手 → 给出正确腕部旋转方向 → 闭合夹爪。门把手对准本质上是视觉条件下的连续位置预测；数据中已经存在厘米级、方向明确的 EE 位移监督，因此不能把未学会对准简单归因于任务过难或数据没有动作。
+
+下一轮采用逐项增加变量的顺序实验。每组先训练到 5,000 step，根据固定 open-loop 指标决定是否继续到 20,000 step；不能只比较总体 validation loss，也不能在基础动作尚未学会时直接叠加 MEM。
+
+### 固定配置与实验变量
+
+以下配置在所有正式实验中固定，不再重复比较：
+
+| 类别 | 固定取值 | 原因 |
+| --- | --- | --- |
+| Z1 动作 | `ee_delta` + `rotvec` | 使用已经修正的 EE 增量、旋转和归一化语义 |
+| 离散动作 | `structured_temporal` | 四个控制状态不再作为连续 flow 数值回归 |
+| B2 动作 | 第一阶段固定 `local_trajectory` | 先隔离机械臂学习问题，B2 表示留到后续单变量对照 |
+| 微调方式 | `lora`，rank 16，alpha 32 | action expert/projection 全量训练，同时允许视觉与语言主干适配 |
+| 动作时域 | 50 Hz、chunk 50、部署执行 25 | 训练监督完整 1 秒；`action_steps_to_execute` 不参与训练 loss |
+| batch / seed | global batch 48、seed 1000 | 保证各组可直接比较 |
+| 语言 | 启用 `task_variants.json` | 使用 annotation 产生的 episode 级语言改写，不能退化成唯一固定任务文本 |
+| 训练起点 | 基础 PI0.5 checkpoint | 旧 EE-delta 和缺失 memory projection 的 checkpoint 不用于 resume |
+
+本轮真正改变的变量只有三个：state 是否使用连续历史、是否输入严格过去的已执行 action、是否使用图像历史 MEM。它们必须按下表顺序加入。
+
+### 推荐实验表
+
+| 顺序 | 编号 | 数据 | state 输入 | 历史 action | MEM | 主要回答的问题 | 进入下一步的条件 |
+| ---: | --- | --- | --- | ---: | ---: | --- | --- |
+| 1 | T0 | staff1 + staff2，固定 train/val 划分 | `text`，当前帧 | 关闭 | 关闭 | 修正后的最小模型能否学会操作门控、朝门把手平移和两套腕部方向 | staff1/staff2 均能检出 manipulation onset，EE endpoint 明显优于零动作基线，腕部方向不是单边塌缩 |
+| 2 | T1 | 与 T0 完全相同 | `continuous`，13 帧，间隔 0.04 秒 | 关闭 | 关闭 | 单独加入约 0.48 秒本体状态历史是否改善阶段判断与 EE 预测 | 相对 T0 至少改善 onset、EE endpoint 或旋转方向之一，且另一项没有明显退化 |
+| 3 | T2 | 与 T0 完全相同 | 与 T1 相同 | 开启，12 帧严格过去的已执行 action | 关闭 | 历史 action 是否帮助模型理解 RTC 已执行部分、执行滞后和目标连续性 | 部署加载确认 `action_memory_proj` 完整，且相对 T1 的时序指标有稳定收益 |
+| 4 | T3 | 与胜出的 T0/T1/T2 相同 | 继承胜出方案 | 继承胜出方案 | 关闭 | 将 B2 从 `local_trajectory` 改为 `velocity` 后，导航输出是否更稳定 | 只允许改变 B2 action representation；机械臂和门控指标不得明显退化 |
+| 5 | T4 | 与 T3 后的胜出方案相同 | 继承胜出方案 | 继承胜出方案 | 开启，6 帧、间隔 0.5 秒 | 历史图像是否真正帮助门状态、遮挡和操作进度判断 | 非 MEM 基线已能基本对准门把手；否则不启动 T4 |
+| 6 | T5 | 与 T4 前的胜出方案相同 | 继承胜出方案 | 继承胜出方案 | 先保持关闭 | 轻量成像增强能否缩小实采图像与仿真渲染的域差异 | 只有“真实图像正常、仿真图像显著退化”被替换图像实验确认后才启动 |
+
+T0 必须同时包含 staff1 和 staff2，且评估结果分开报告。只在 staff1 上训练或只看混合平均值，都不能回答两套数据中的 wrist-twist 方向是否学对。T0/T1/T2 是严格递进关系：T1 相对 T0 只增加连续 state，T2 相对 T1 只增加历史 action。不要再用“text + 无 action history”直接对比“continuous + action history”，因为那会把两个变量混在一起。
+
+### 每个 checkpoint 的统一评估
+
+每组至少评估 step 500、2,000、5,000；候选模型再延长到 20,000。固定抽取 staff1 和 staff2 的 manipulation onset 前后窗口，并分别输出以下指标：
+
+| 优先级 | 指标 | 要验证的能力 |
+| ---: | --- | --- |
+| 1 | active 条件下前 1 秒 EE 平移 endpoint error | 是否真正朝门把手移动，而不是只学到门控或小幅抖动 |
+| 2 | manipulation onset precision / recall | 是否在正确时刻解除“保持不动”并启动机械臂 |
+| 3 | staff1/staff2 腕部旋转符号准确率 | 是否根据输入区分两套方向，而不是输出数据集多数方向 |
+| 4 | 前 1 秒累计 SO(3) 旋转误差 | 旋转幅度和时序是否正确 |
+| 5 | gripper、reset、task-complete 的状态和转移指标 | 四个离散控制语义是否完整、是否提前触发 |
+| 6 | 总体 validation loss | 只用于观察训练稳定性，不单独决定模型优劣 |
+
+还必须增加两个对照：一是把真实 open-loop 样本的相机图替换为闭环仿真的第一帧，只替换图像、不改 state 和语言，用来隔离视觉域差异；二是零 EE 动作/保持不动基线，用来判断 endpoint error 的改善是否确实来自模型学会位置移动。
+
+### 停止规则与 checkpoint 验收
+
+出现以下任一情况时，不应机械地训练到 20,000 step：
+
+1. 到 5,000 step 仍没有 manipulation onset，或 EE endpoint 与零动作基线无显著差别；
+2. staff1 和 staff2 始终输出同一腕部旋转方向；
+3. 真实图像输入本身就频繁误触发 task complete；
+4. continuous/action-history 模型加载时缺少对应 memory projection 参数。
+
+每个候选 checkpoint 必须同时具备可恢复的 adapter、`pi05_transformed_action_stats.json`、`pi05_deployment_metadata.json` 和明确的 action representation。启用了 continuous state 或历史 action 时，`state_memory_proj` / `action_memory_proj` 的 weight 与 bias 必须完整保存，并通过部署使用的同一加载入口验证。只有通过上述 open-loop 验收的模型才进入闭环；首轮闭环关闭 task-complete 提前终止，避免把门控错误误判为任务成功。
+
+## 2026-08-17：staff1 修复后 A/B/C 严格对照
+
+### 为什么必须重新训练
+
+`build_staff_subsets.sh` 早期通过 hardlink 克隆数据集，随后原地写入各子集的
+`meta/stats.json`。因此 source、staff1 和 staff2 的统计文件曾共享同一 inode，最后计算的
+staff2 统计覆盖了 staff1。2026-08-16 的 staff1 A/B 虽然数据帧来自 staff1，归一化却读取了
+staff2 统计，不能作为有效模型结果，也不能 resume。
+
+修复后构建流程会在计算统计前解除 `stats.json` hardlink，并在结束时验证 source、staff1、
+staff2 的统计文件 inode 不同。当前 staff1 固定为 1,229 episodes、2,902,892 frames、50 Hz；
+q6 的 `q01/q50/q90/q99` 分别为
+`-0.0906635772 / 0.0241424019 / 1.8090149010 / 2.1707248565`。
+实验启动器对 `stats.json`、`info.json` 和 `task_variants.json` 做 SHA-256 强校验，任何旧统计
+或错误数据目录都会在申请 GPU 前失败。
+
+### 已停止的 fixedstats 基线
+
+以下三个任务只使用修复后的 staff1，不混入 staff2，且数据/action schema 本身正确；但随机
+初始化的新模块错误地与预训练主体共用 `2.5e-5` 学习率。因此它们只作为旧优化器基线，
+不能作为本轮最终模型：
+
+| 编号 | 机器 / GPU | state | 历史 action | run | 状态 |
+| --- | --- | --- | --- | --- | --- |
+| A | 本地 0,1,2 | `text` 当前帧 | 关闭 | `20260817_215222_pi05_b2_z1_vla_staff1_A_fixedstats` | 3,420 step 后停止 |
+| B | 远程 0,1,2,3 | `continuous` 13 帧、0.04 秒 | 关闭 | `20260817_140244_pi05_b2_z1_vla_staff1_B_fixedstats` | 4,677 step 后停止 |
+| C | 远程 4,5,6,7 | 与 B 相同 | 开启，12 帧严格过去 action | `20260817_140246_pi05_b2_z1_vla_staff1_C_fixedstats` | 4,730 step 后停止 |
+
+旧 B/C 于北京时间 2026-08-17 22:02 启动，分别于 2026-08-18 06:07 和 06:09 停止。
+接近 4,700 step 的这两个 checkpoint 没有直接执行闭环；停止依据是更早 B 模型的闭环暴露
+离散门控毛刺/常量输出后，确认它们使用同一错误优化器配置，并在 checkpoint 中观察到 CRF
+transition 仍接近零。这里必须区分直接行为验证与基于同构配置、参数状态的判定。
+
+### 当前正式 newmodulelr 训练
+
+修复后的三个任务均从基础 PI0.5 重新训练，仍只使用 staff1。统一配置为
+B2=`local_trajectory`、Z1=`ee_delta + rotvec`、离散输出=`structured_temporal`、LoRA
+r16/alpha32、global batch=48、seed=1000、5,000 step。预训练主体与 action expert 使用
+`2.5e-5`，随机初始化的 memory projection、离散 head 和 CRF 使用独立参数组 `1e-3`；CRF
+transition 对角线以 4.0 初始化。
+
+| 编号 | 机器 / GPU | 单卡 batch / grad accumulation | state | 历史 action | 正式 run |
+| --- | --- | --- | --- | --- | --- |
+| A | 本地 0,1,2 | 2 / 8 | `text` 当前帧 | 关闭 | `20260818_060822_pi05_b2_z1_vla_staff1_A_newmodulelr` |
+| B | 远程 0,1,2,3 | 2 / 6 | `continuous` 13 帧、0.04 秒 | 关闭 | `20260817_221004_pi05_b2_z1_vla_staff1_B_newmodulelr` |
+| C | 远程 4,5,6,7 | 2 / 6 | 与 B 相同 | 开启，12 帧严格过去 action | `20260817_221006_pi05_b2_z1_vla_staff1_C_newmodulelr` |
+
+远程容器使用 UTC 生成 run 名；因此 B/C 名称中的 `20260817_2210` 对应宿主机北京时间
+2026-08-18 06:10。A 在 1,000 step 做中间闭环后从 numeric checkpoint 恢复；恢复加载必须
+重新启用 LoRA 外的 full-finetuning modules，并验证 optimizer 参数张量数与保存状态一致。
+
+统一入口为 `train_vla_pi05_abc.sh local-a` 和 `train_vla_pi05_abc.sh remote-bc`。远程
+checkpoint 回传使用 `sync_remote_play_checkpoint.sh` 的 play 文件白名单，只同步 adapter、
+模型/部署配置和 pre/postprocessor；明确排除 `train_config.json`、optimizer、scheduler、
+RNG 和其他训练状态。
+
+远程 B/C 由 `retain_staff1_abc_latest2.sh` 只保留各 run 最近两个完整 numeric checkpoint。
+脚本只在 `checkpoints/last` 已指向带 `training_step.json` 的完整目录后清理旧版本，并在两组
+`005000` 都出现后退出，避免十个保存节点占满远程数据盘。
+
+三个 step 5,000 模型就绪后，`run_staff1_abc_5000.sh` 依次执行完全相同的本地闭环：出生位置
+`(3.5, 19.5, 0.5)`、yaw `180°`、理想运动学低层、10 步去噪、30 仿真秒，并关闭
+task-complete 提前终止。闭环结束后必须检查模型输出与实际执行的 EE、底盘、arm mode、
+gripper 和 task-complete，而不能只看最终视频是否移动。
+
+### 结构化输出优化器问题
+
+首个 B 闭环暴露出 arm mode 短毛刺，而 gripper 与 task complete 始终不切换。检查 checkpoint
+发现 CRF transition 在 5,000 step 后仍约为 `±0.06`。此前所有随机初始化的新模块——
+`state_memory_proj`、`action_memory_proj`、三个离散 head 和两个 CRF——与预训练主体共用
+`2.5e-5` 学习率；这不足以在短程微调中建立状态表示和长保持/少切换的离散时序。
+
+修复后的训练将预训练主体及 action expert 保持原学习率，新模块使用独立参数组，学习率为
+主体的 40 倍（当前为 `1e-3`）。CRF transition 的对角线以 4.0 初始化，并作为普通可训练参数
+同时用于训练 NLL 和 Viterbi 解码；不再仅在部署解码时额外加入不可训练的 stay bias。训练日志
+与 open-loop 指标同时记录各离散类别的预测比例、precision 和 recall，用来区分“任务没有进入
+该阶段”和“head 塌缩成常量”。在此优化器修复前启动的 checkpoint 只能作为旧优化器基线，
+不能被部署侧的平滑补丁视作修复后的训练结果。
+
+## 2026-08-18：全连续 EE v1
+
+本轮先停止离散门控路线。现有 LeRobot staff1 数据已经包含阶段标志、六个机械臂关节状态和
+逐帧 height-invariant EE target，不需要回读 rosbag。reset 与遥操 target 原样保留；对名义
+inactive 段，先根据关节状态校正 reset 结束和 inactive 开始，只对关节稳定的后缀做 SE(3)
+首尾插值。正式数据集保留原 `action` 并新增 `action.continuous_ee`，训练时通过
+`dataset.action_key` 选择；不再为这一语义维护独立派生数据集。新字段语义标识为
+`inactive_endpoint_interpolated`。从源消息进一步重构
+command-only target 只保留为未来可选消融，不在本轮数据或训练关键路径上。
+
+正式训练配置固定为：staff1、B2 local trajectory、Z1 EE delta rotvec、连续夹爪位置、无
+inactive/reset/task-complete、`continuous_flow + uniform_valid loss`、text state、无 action
+history、无 MEM、LoRA r16/alpha32、global batch 48、seed 1000。入口为
+`train_vla_pi05_continuous_ee.sh`；本地短训与 open-loop 探针通过后，远程 8 卡训练至 10,000
+step，并在 5,000 step 安全备份、拉回本地闭环后继续训练。
+
+远程正式 run 为
+`20260818_155704_pi05_b2_z1_vla_continuous_ee_v1_existingdata`：8 卡、10,000 step、每 500
+step 验证和保存。完整数据首次运行暴露了 episode 最后一帧无法形成 EE delta、整个 action
+chunk 均为 padding 的边界样本；修复后的 `uniform_valid` loss 在 batch 级只平均真实
+transition，不伪造零 delta，也不让空尾帧稀释 loss。相关回归测试 77 项通过。
+
+当前派生器把 inactive 段首到下一条命令之间的每个 transition（包括跨出 inactive 段的最后
+一步）等距分配。早期本地 v1 产物在段尾仍残留跳变，不作为本轮训练输入；sidecar v2 通过
+`interpolation` 字段明确记录这一端点约定，避免与旧产物混淆。
+
+截至 step 5,000，正式 run 的 validation loss 依次为
+`0.1266 / 0.0970 / 0.0888 / 0.0941 / 0.0934 / 0.0903 / 0.0910 / 0.0772 / 0.0813 / 0.0717`
+（step 500 到 5,000，每 500 step 一次）；step 5,000 为当前最低值，训练 loss、梯度和 8 卡
+显存均稳定。当前正式回归为
+82 项 PI0.5 训练/开环/服务端 CPU 测试、2 项数据派生测试和 4 项低层 EE 语义测试；核心
+Python 文件同时通过 Ruff、mypy、compileall 和 `git diff --check`。早期本地 3-step GPU
+探针使用的是 command-only 小子集，只证明代码路径可运行，不能代替本轮
+`inactive_endpoint_interpolated` 全量数据的能力评估。
+
+部署协议保持 EE delta 到低层：服务器发送显式 `z1_action_representation=ee_delta`，低层以
+当前已执行 target 为起点逐步积分，并把该 target 随 50 Hz telemetry 回传。服务器不自行
+积分绝对 EE 序列。完整 `_infer()` 探针曾发现并修复 `ActionRecord.model_action_names` 构造
+漏参；该问题会在首次在线推理后报错，但不影响正在运行的训练进程。
+
+远程只保留两个完整 checkpoint。保留器最初把 `training_state/training_step.json` 错按深度
+2 搜索，实际深度为 3；修复后已在 step 2,000 的真实轮转中自动删除 step 1,000，并只保留
+step 1,500/2,000。step 5,000 由独立 watcher 在 `checkpoints/last=005000` 且训练状态完整后
+创建 hardlink 备份；本地先拉模型权重并执行固定 30 秒闭环，再拉完整训练状态、逐文件
+SHA-256 对比，验证通过后才删除远程备份。
+
+step 5,000 的上述流程已实际完成：本地 checkpoint 位于
+`/data01/yangfeihong/MEM_videos/b2_z1_vla_pi05_outputs/20260818_155704_pi05_b2_z1_vla_continuous_ee_v1_existingdata/checkpoints/005000`，
+远程 hardlink 备份在逐文件 SHA-256 一致后删除，远程训练未暂停并继续向 step 10,000
+推进。本地固定条件闭环为
+`20260819_041217_continuous_ee_v1_005000_r01`，完整运行 1,500 个 50 Hz step、120 次 VLA
+推理和 30 秒仿真；两路相机的 120 个发送 JPEG 与服务端接收哈希逐帧一致。RTC 每个 chunk
+实际执行 6--20 帧，中位 12.5 帧；暖机后推理平均 437 ms，平均跳过 6.7 帧。
+
+这次闭环排除了跨层 EE delta 积分错误：1,499 个实际执行 delta 的逐轴累加与低层 target
+首尾差在约 `1e-7 m` 内一致。模型已表现出底盘朝门靠近和 q6 正向旋转趋势：底盘位移
+0.93 m，q6 从约 0 度到 +48.6 度；但仍未完成任务。EE target 累计变化约
+`[+0.170, +0.006, -0.352] m`，存在少量厘米级/多度单步毛刺，joint4 长期贴下限、joint2
+后段贴上限，最终 EE target/actual 误差约 17.6 cm；夹爪全程保持打开。结论是部署协议正确，
+step 5,000 已学到部分方向性，但 EE 对准、可达性和抓门把手能力尚未收敛。
+
+闭环分析器同时修复了连续夹爪的显示阈值：旧逻辑以 0 为阈值，会把接近 0 的负噪声误画成
+闭合脉冲；现按 checkpoint metadata 中开/闭端点的中点判定，本次实际执行值
+`[-0.018, 0.045] rad` 因而正确显示为全程打开。历史记录缺少端点字段时使用旧协议明确端点
+`[-pi/3, 0]`，不改变旧 checkpoint 的控制链路。
+
+step 6,000 后还发现 milestone 保护与 latest2 轮转之间的生命周期边界：备份目录按要求在
+本地 SHA-256 验证后删除，旧保留器会因看不到目录内 marker 而再次永久保护远程 5,000。
+修复后备份创建时额外原子写入备份根目录下的持久 `005000.BACKUP_CREATED` 墓碑；删除实际
+备份目录不删除该墓碑。保留器只有在备份目录 marker 和持久墓碑均不存在时才保护源
+checkpoint。未备份保护、已备份释放和 hardlink/marker 创建均通过临时目录测试；真实 run
+随后正确删除远程 5,000，只保留 5,500/6,000，本地 5,000 保持完整。
+
+训练继续到 step 7,000，step 5,500/6,000/6,500/7,000 的 validation loss 分别为
+`0.0834 / 0.0822 / 0.0659 / 0.0703`。其中 step 6,500 暂为全程最低。step 7,000 的
+adapter（1,733,889,184 bytes）、optimizer state（2,406,797,464 bytes）、RNG state 和
+`training_step.json` 均已完整落盘，`checkpoints/last` 正确指向 `007000`。
+
+step 7,000 检查时发现保留器本身已退出，因而短暂留下 6,000/6,500/7,000 三份完整
+checkpoint；训练进程不受影响。已用独立 pidfile 和日志重新以 `FINAL_STEP=10000` 启动
+保留器，并跨轮询验证进程存活。它随即按 latest-2 规则删除 6,000，目前保留
+6,500/7,000。该维护动作没有停止、重启或修改 8 卡训练。
+
+训练最终于 step 10,000 正常结束。step 7,500 到 10,000 的 validation loss 依次为
+`0.0806 / 0.0885 / 0.0826 / 0.0809 / 0.0780 / 0.0650`；step 10,000 的 `0.0650` 为本轮
+最低值。最终 checkpoint 的 adapter、optimizer、scheduler、RNG、metadata 和 action stats
+均已落盘，`training_step.json` 为 10,000，训练日志包含 `End of training`，训练进程已退出。
+`checkpoints/last` 指向 `010000`，latest-2 保留器正常结束并只留下 `009500/010000`。
+
+本轮数据处理始终只读取现有 LeRobot parquet，没有读取 rosbag。command、reset、inactive 的
+边界直接取 LeRobot 中已有的逐帧阶段标志，并用其中的机械臂关节状态把 reset 后仍在运动的
+部分归入 reset 延续；关节稳定后的后缀才视为真正 inactive。现有数据已经包含完成该判定和
+生成连续 EE 监督所需的全部信息，因此重新从 rosbag 生成数据既无必要，也未进入正式训练链路。
+
+### step 5,000 与 10,000 闭环对照
+
+step 10,000 完整 checkpoint 已拉到本地并与远程逐文件 SHA-256 一致。本地使用与 step 5,000
+完全相同的条件复测：`(3.5, 19.5, 0.5)`、yaw 180 度、理想运动学、30 秒、10 步去噪、关闭
+task-complete 提前终止、指令 `Open the door.`。输出为
+`20260819_093047_continuous_ee_v1_010000_r01`；1,500 个低层 step、120 个 VLA chunk、两路
+120 帧相机输入及 RTC 记录均完整，所有闭环链路检查通过。
+
+| 指标 | step 5,000 | step 10,000 |
+|---|---:|---:|
+| 底盘位移 | 0.934 m | 3.753 m |
+| q6 最终变化 | +48.56 度 | -16.65 度 |
+| q6 最大正向变化 | +48.56 度 | +5.85 度 |
+| 夹爪闭合帧 | 0 | 0 |
+| EE target 位移 | 0.391 m | 0.165 m |
+| EE target/actual 中位误差 | 10.88 cm | 0.304 cm |
+| 暖机后推理中位耗时 | 422.8 ms | 429.1 ms |
+| RTC 跳帧中位数 | 7 | 7 |
+
+两者都没有完成开门。step 5,000 在门前基本停止，q6 有正确的正向趋势但只到约 49 度，夹爪
+不闭合；step 10,000 则一直向前，直接越过门进入房间，q6 后续转为错误的负方向，夹爪仍不
+闭合。step 10,000 的 EE 跟踪误差更小，只说明它给出的目标更温和、可达，不能说明任务能力
+更好。两次 EE 平移 delta 的实际执行累加与低层 target 变化分别在 `2.9e-7 m` 和 `3.9e-7 m`
+以内一致；RTC 延迟也相同，因此失败不是跨层协议、delta 积分或实时覆盖造成的。
+
+训练数据本身不支持“方向标签混乱”的解释：1,229/1,229 个 episode 的 q6 都曾正向变化超过
+60 度，负向超过 30 度的只有 1 个；每个 episode 都包含夹爪闭合，但闭合帧只占全数据的
+9.05%。精确提示词 `Open the door.` 出现在 777 个 episode 的 task variants 中。该提示词
+仍标注整段“接近门、操作门把手、进入房间”的示范，而不是只标注机械臂操作阶段。
+
+为区分训练能力与仿真域问题，使用同一提示词在两个 held-out LeRobot episode（1106、1200）
+的 602 个真实图像采样点上做了 open-loop 对照。step 10,000 的原始 MAE 从 0.01090 降到
+0.01057；首动作夹爪闭合 recall 从 82.95% 提升到 92.05%，完整 chunk recall 从 83.81%
+提升到 88.03%。对于真实监督中累计旋转超过 0.2 rad 的 chunk，预测/监督末端旋转轴的余弦
+中位数从 0.915 提升到 0.948，反向比例从 20.3% 降到 12.1%。这说明 10,000 step 在真实
+训练分布上确实比 5,000 更接近正确操作语义，但该能力没有迁移到当前仿真闭环。
+
+当前失败的首要原因是评估闭环本身：理想运动学模式每个 physics step 直接写入机器狗 root
+pose，不受门和墙的碰撞约束。模型在门前持续给出前进轨迹时，机器人会穿过尚未操作的门，
+随后相机直接看到房间内部，因而跳过“贴近把手、旋转、闭合、推门”的因果状态序列。其次是
+明显的 sim-to-real 图像与构型分布差异；本轮训练配置中 `image_transforms.enable=false`，
+而真实走廊、门/把手材质、照明和相机内物体尺度与 OfficeBuilding 渲染并不一致。模型又只有
+单帧视觉和当前关节状态，没有视觉、状态或动作历史，穿门后的闭环分布一旦偏离示范便没有
+稳定的阶段记忆可用于恢复。
+
+因此本轮结论不是“连续 EE 方案无效”，而是：连续 EE 的训练与部署协议已正确，10,000 step
+在真实图像 open-loop 上有改进，但尚未实现仿真闭环开门。下一步必须先让能力评估保留任务的
+物理前提——至少让理想底盘受门碰撞/门前门控约束，或改用真实 whole-body 物理控制——并做
+匹配视角的 real/sim 图像探针；在此之后才应判断是否需要增加 manipulation 采样权重、视觉域
+随机化或时序历史。仅继续降低全帧平均 validation loss 不能证明开门能力收敛。
+
+### Motion-balanced sampling
+
+后续 state-EE 训练默认启用 50/50 混合采样：一半保持全体 chunk 起点的均匀分布，一半从
+“未来 1 秒内 EE 平移超过 5 cm、旋转超过 10 度或夹爪状态发生变化”的起点池采样。数据集、
+动作标签、归一化和 loss 均不修改；每个 epoch 的样本总数及断点恢复语义保持不变。
+
+staff1 全量探针中，运动池占 1,060,651 / 2,902,892（36.54%），其中平移、旋转、夹爪条件
+分别命中 700,404、572,273、241,526 个起点（条件可重叠）。50/50 混采使运动池样本的期望
+占比从 36.54% 提升到 68.27%，同时保留原始分布用于学习接近门和稳定保持阶段。该功能仅在
+`train_vla_pi05_state_ee.sh` 默认开启；通用训练入口和历史 checkpoint 默认关闭。
+
+### 2026-08-21：EE 字段并入主 state/action
+
+最终数据接口不再增加独立 feature key。三个现有数据集均已原地迁移为 67 维
+`observation.state` 和 25 维 `action`；业务 key 只有 state、两路图像和 action。总集仍为
+5,797,265 帧/2,487 episodes，严格等于 staff1 的 2,902,892/1,229 与 staff2 的
+2,894,373/1,258 之和。全量 schema、有限值、rot6d 正交性和 metadata 已通过审计。
+
+当前训练 profile 为 `state_ee_continuous_v1`：从 state 最后 9 维 continuous 实测 EE 形成
+delta 标签，模型仍只接收原先选定的 10 维机器人状态并输出 10 维动作。GPU 2 的两步真实训练
+探针成功遍历 dataloader、精确 transformed-action stats、motion-balanced sampling、前反向、
+eval 和 checkpoint 保存；2,081 个 transition 均进入 EE loss，未出现维度或 metadata 错配。
+历史 raw-state 与 continuous-action checkpoint 在新主向量布局上由 metadata 自动映射回等价
+通道，不需要恢复旧的独立 key。

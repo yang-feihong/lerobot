@@ -22,16 +22,24 @@ state_use_b2_joint_velocities="false"
 state_use_b2_trunk_pose="true"
 state_use_b2_linear_velocity="false"
 state_use_b2_angular_velocity="false"
-b2_action_representation="local_trajectory" # "velocity" or "local_trajectory"
-z1_action_representation="ee_delta" # "ee_pose" or "ee_delta"
+b2_action_representation="velocity" # "velocity" or "pose_delta"
+z1_action_representation="ee_delta" # "ee_delta" (adjacent target) or "ee_state_delta" (inference-time state anchor)
 ee_delta_rotation_representation="rotvec" # "rotvec" for new EE-delta checkpoints
-predict_arm_teleop_inactive="true"
-predict_arm_reset="true"
+action_semantics_profile="joint_control_ee_v1"
+predict_arm_teleop_inactive="false"
+predict_arm_reset="false"
 predict_ee_pose="true"
 predict_gripper="true"
-predict_task_complete="true"
-discrete_action_training_mode="structured_temporal" # "continuous_flow" or "structured_temporal"
+predict_task_complete="false"
+discrete_action_training_mode="continuous_flow" # "continuous_flow" or "structured_temporal"
+ee_target_dataset_semantics="joint_control_inactive_interpolated"
+ee_supervision_source="control_action"
+ee_delta_supervision_mode="all" # "active_only" or "all"
+gripper_target_representation="continuous_position"
+action_loss_schema="uniform_valid"
 task_complete_sample_tail_seconds="2.0"
+new_module_optimizer_lr_multiplier="40.0"
+structured_action_crf_initial_stay_bias="4.0"
 
 # GPUs are selected here. Examples:
 #   gpu_ids="0"      -> single GPU
@@ -59,6 +67,7 @@ base_policy="/data/checkpoints/lerobot_pi05_base_local_tokenizer"
 max_state_dim="32"
 
 steps="20000"
+seed="1000"
 # Temporal semantics for the planned 50 Hz dataset. A chunk covers one second,
 # while deployment requests a fresh observation/chunk after executing 0.5 s.
 # A dataset at another FPS is timestamp-resampled to this model frequency;
@@ -73,6 +82,11 @@ control_frequency_hz="50"
 batch_size_per_gpu="2"
 global_batch_size="48"
 num_workers="4"
+motion_balanced_sampling="true"
+motion_priority_fraction="0.5"
+motion_ee_translation_threshold_m="0.05"
+motion_ee_rotation_threshold_rad="0.17453292519943295"
+motion_gripper_change_threshold="0.5"
 
 # Fraction of episodes held out for periodic validation.
 eval_split="0.1"
@@ -82,6 +96,7 @@ max_eval_samples="512"
 log_freq="10"
 save_freq="500"
 wandb_project="b2-z1-vla"
+wandb_enable="true"
 
 output_root="/data/b2_z1_vla_pi05_outputs"
 
@@ -106,12 +121,129 @@ mem_random_max_num_frames=""
 # MEM image sampling interval in seconds.
 mem_frame_interval_seconds="0.5"
 # "text": current state in the prompt; "continuous": linear state-history tokens.
-state_action_encoding="continuous"
+state_action_encoding="text"
 # With 50 Hz data, 13 samples at 0.04 s intervals cover 0.48 s.
 state_num_frames="13"
 state_history_frame_interval_seconds="0.04"
 # Uses the state-history clock and excludes the current action.
-action_history_enabled="true"
+action_history_enabled="false"
+
+# Optional named overrides used by checked-in experiment launchers. Ordinary
+# single-run training can keep editing the user configuration above.
+job_suffix=""
+output_root_override=""
+wandb_project_override=""
+dry_run="false"
+dataset_episodes=""
+for argument in "$@"; do
+  if [[ "$argument" == --action-semantics-profile=* ]]; then
+    action_semantics_profile="${argument#*=}"
+  fi
+done
+case "$action_semantics_profile" in
+  joint_control_ee_v1)
+    predict_arm_teleop_inactive="false"
+    predict_arm_reset="false"
+    predict_task_complete="false"
+    discrete_action_training_mode="continuous_flow"
+    ee_target_dataset_semantics="joint_control_inactive_interpolated"
+    ee_supervision_source="control_action"
+    ee_delta_supervision_mode="all"
+    gripper_target_representation="continuous_position"
+    action_loss_schema="uniform_valid"
+    ;;
+  custom) ;;
+  *)
+    echo "Unknown action_semantics_profile=$action_semantics_profile" >&2
+    exit 2
+    ;;
+esac
+while (( $# > 0 )); do
+  case "$1" in
+    --gpu-id=*) gpu_ids="${1#*=}" ;;
+    --main-process-port=*) main_process_port="${1#*=}" ;;
+    --enable-mem=*) enable_mem="${1#*=}" ;;
+    --state-action-encoding=*) state_action_encoding="${1#*=}" ;;
+    --action-history-enabled=*) action_history_enabled="${1#*=}" ;;
+    --b2-action-representation=*) b2_action_representation="${1#*=}" ;;
+    --z1-action-representation=*) z1_action_representation="${1#*=}" ;;
+    --action-semantics-profile=*) action_semantics_profile="${1#*=}" ;;
+    --discrete-action-training-mode=*) discrete_action_training_mode="${1#*=}" ;;
+    --ee-delta-supervision-mode=*) ee_delta_supervision_mode="${1#*=}" ;;
+    --gripper-target-representation=*) gripper_target_representation="${1#*=}" ;;
+    --action-loss-schema=*) action_loss_schema="${1#*=}" ;;
+    --predict-arm-teleop-inactive=*) predict_arm_teleop_inactive="${1#*=}" ;;
+    --predict-arm-reset=*) predict_arm_reset="${1#*=}" ;;
+    --predict-task-complete=*) predict_task_complete="${1#*=}" ;;
+    --new-module-optimizer-lr-multiplier=*) new_module_optimizer_lr_multiplier="${1#*=}" ;;
+    --structured-action-crf-initial-stay-bias=*) structured_action_crf_initial_stay_bias="${1#*=}" ;;
+    --batch-size-per-gpu=*) batch_size_per_gpu="${1#*=}" ;;
+    --global-batch-size=*) global_batch_size="${1#*=}" ;;
+    --num-workers=*) num_workers="${1#*=}" ;;
+    --motion-balanced-sampling=*) motion_balanced_sampling="${1#*=}" ;;
+    --motion-priority-fraction=*) motion_priority_fraction="${1#*=}" ;;
+    --motion-ee-translation-threshold-m=*) motion_ee_translation_threshold_m="${1#*=}" ;;
+    --motion-ee-rotation-threshold-rad=*) motion_ee_rotation_threshold_rad="${1#*=}" ;;
+    --motion-gripper-change-threshold=*) motion_gripper_change_threshold="${1#*=}" ;;
+    --finetune-mode=*) finetune_mode="${1#*=}" ;;
+    --dataset-repo-id=*) dataset_repo_id="${1#*=}" ;;
+    --dataset-root=*) dataset_root="${1#*=}" ;;
+    --dataset-episodes=*) dataset_episodes="${1#*=}" ;;
+    --gpu-ids=*) gpu_ids="${1#*=}" ;;
+    --steps=*) steps="${1#*=}" ;;
+    --log-freq=*) log_freq="${1#*=}" ;;
+    --eval-steps=*) eval_steps="${1#*=}" ;;
+    --max-eval-samples=*) max_eval_samples="${1#*=}" ;;
+    --save-freq=*) save_freq="${1#*=}" ;;
+    --seed=*) seed="${1#*=}" ;;
+    --job-suffix=*) job_suffix="${1#*=}" ;;
+    --output-root=*) output_root_override="${1#*=}" ;;
+    --wandb-project=*) wandb_project_override="${1#*=}" ;;
+    --wandb-enable=*) wandb_enable="${1#*=}" ;;
+    --resume-checkpoint=*) resume_checkpoint="${1#*=}" ;;
+    --dry-run=*) dry_run="${1#*=}" ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+if [[ "$b2_action_representation" != "velocity" && "$b2_action_representation" != "pose_delta" ]]; then
+  echo "B2 representation must be velocity or pose_delta." >&2
+  exit 2
+fi
+if [[ "$z1_action_representation" != "ee_delta" && "$z1_action_representation" != "ee_state_delta" ]]; then
+  echo "Z1 representation must be ee_delta or ee_state_delta." >&2
+  exit 2
+fi
+
+case "$action_semantics_profile" in
+  joint_control_ee_v1)
+    expected_semantics=(false false false continuous_flow joint_control_inactive_interpolated control_action all continuous_position uniform_valid)
+    ;;
+  custom)
+    expected_semantics=()
+    ;;
+  *)
+    echo "Unknown action_semantics_profile=$action_semantics_profile" >&2
+    exit 2
+    ;;
+esac
+if (( ${#expected_semantics[@]} )); then
+  actual_semantics=(
+    "$predict_arm_teleop_inactive" "$predict_arm_reset" "$predict_task_complete"
+    "$discrete_action_training_mode" "$ee_target_dataset_semantics" "$ee_supervision_source"
+    "$ee_delta_supervision_mode"
+    "$gripper_target_representation" "$action_loss_schema"
+  )
+  if [[ "${actual_semantics[*]}" != "${expected_semantics[*]}" ]]; then
+    echo "Profile $action_semantics_profile was mixed with incompatible overrides." >&2
+    echo "Use --action-semantics-profile=custom for an ablation." >&2
+    exit 2
+  fi
+fi
 
 # =========================
 # Launch
@@ -124,7 +256,19 @@ job_prefix="pi05_b2_z1_vla"
 if [[ "$enable_mem" == "true" ]]; then
   job_prefix="mem_pi05_b2_z1_vla"
   output_root="/data/b2_z1_vla_mem_outputs"
-  wandb_project="b2-z1-mem-vla"
+fi
+if [[ -n "$job_suffix" ]]; then
+  if [[ ! "$job_suffix" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "Invalid job suffix: $job_suffix" >&2
+    exit 2
+  fi
+  job_prefix="${job_prefix}_${job_suffix}"
+fi
+if [[ -n "$output_root_override" ]]; then
+  output_root="$output_root_override"
+fi
+if [[ -n "$wandb_project_override" ]]; then
+  wandb_project="$wandb_project_override"
 fi
 
 resume_args=()
@@ -152,6 +296,8 @@ fi
 policy_io_args=()
 if [[ -z "$resume_checkpoint" ]]; then
   policy_io_args+=(
+    --policy.input_features=null
+    --policy.output_features=null
     --policy.max_state_dim="$max_state_dim"
     --policy.state_use_arm_joint_positions="$state_use_arm_joint_positions"
     --policy.state_use_arm_joint_velocities="$state_use_arm_joint_velocities"
@@ -170,7 +316,14 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.action_predict_gripper="$predict_gripper"
     --policy.action_predict_task_complete="$predict_task_complete"
     --policy.discrete_action_training_mode="$discrete_action_training_mode"
+    --policy.ee_target_dataset_semantics="$ee_target_dataset_semantics"
+    --policy.ee_supervision_source="$ee_supervision_source"
+    --policy.ee_delta_supervision_mode="$ee_delta_supervision_mode"
+    --policy.gripper_target_representation="$gripper_target_representation"
+    --policy.action_loss_schema="$action_loss_schema"
     --policy.task_complete_sample_tail_seconds="$task_complete_sample_tail_seconds"
+    --policy.new_module_optimizer_lr_multiplier="$new_module_optimizer_lr_multiplier"
+    --policy.structured_action_crf_initial_stay_bias="$structured_action_crf_initial_stay_bias"
     --policy.chunk_size="$action_chunk_size"
     --policy.n_action_steps="$action_steps_to_execute"
     --policy.control_frequency_hz="$control_frequency_hz"
@@ -208,24 +361,34 @@ if [[ -z "$resume_checkpoint" ]]; then
 fi
 
 peft_args=()
-case "$finetune_mode" in
-  lora)
-    train_expert_only="false"
-    peft_args+=(--peft.method_type=LORA)
-    peft_args+=(--peft.r="$lora_rank")
-    peft_args+=(--peft.lora_alpha="$lora_alpha")
-    ;;
-  expert)
-    train_expert_only="true"
-    ;;
-  full)
-    train_expert_only="false"
-    ;;
-  *)
-    echo "Unknown finetune_mode=$finetune_mode. Expected one of: lora, expert, full." >&2
-    exit 1
-    ;;
-esac
+policy_runtime_args=()
+train_expert_only="restored"
+if [[ -z "$resume_checkpoint" ]]; then
+  case "$finetune_mode" in
+    lora)
+      train_expert_only="false"
+      peft_args+=(--peft.method_type=LORA)
+      peft_args+=(--peft.r="$lora_rank")
+      peft_args+=(--peft.lora_alpha="$lora_alpha")
+      ;;
+    expert)
+      train_expert_only="true"
+      ;;
+    full)
+      train_expert_only="false"
+      ;;
+    *)
+      echo "Unknown finetune_mode=$finetune_mode. Expected one of: lora, expert, full." >&2
+      exit 1
+      ;;
+  esac
+  policy_runtime_args+=(
+    --policy.device=cuda
+    --policy.dtype=bfloat16
+    --policy.gradient_checkpointing=true
+    --policy.train_expert_only="$train_expert_only"
+  )
+fi
 
 mkdir -p "$log_dir" "$output_root"
 
@@ -267,19 +430,20 @@ if (( global_batch_size % batch_per_micro_step != 0 )); then
 fi
 gradient_accumulation_steps=$((global_batch_size / batch_per_micro_step))
 
+runtime_bin="${LEROBOT_RUNTIME_BIN:-}"
+if [[ -n "$runtime_bin" ]]; then
+  [[ -x "$runtime_bin/accelerate" ]] || { echo "Missing $runtime_bin/accelerate" >&2; exit 1; }
+  [[ -x "$runtime_bin/python" ]] || { echo "Missing $runtime_bin/python" >&2; exit 1; }
+fi
+
 train_args=(
   "${resume_args[@]}" \
   --dataset.repo_id="$dataset_repo_id" \
   --dataset.root="$dataset_root" \
   --dataset.eval_split="$eval_split" \
   "${policy_source_args[@]}" \
-  --policy.input_features=null \
-  --policy.output_features=null \
   "${policy_io_args[@]}" \
-  --policy.device=cuda \
-  --policy.dtype=bfloat16 \
-  --policy.gradient_checkpointing=true \
-  --policy.train_expert_only="$train_expert_only" \
+  "${policy_runtime_args[@]}" \
   "${policy_mem_args[@]}" \
   "${policy_history_args[@]}" \
   --policy.push_to_hub=false \
@@ -287,22 +451,47 @@ train_args=(
   --output_dir="$output_dir" \
   --job_name="$job_name" \
   --steps="$steps" \
+  --seed="$seed" \
   --batch_size="$batch_size_per_gpu" \
   --gradient_accumulation_steps="$gradient_accumulation_steps" \
   --num_workers="$num_workers" \
+  --motion_balanced_sampling.enabled="$motion_balanced_sampling" \
+  --motion_balanced_sampling.priority_fraction="$motion_priority_fraction" \
+  --motion_balanced_sampling.ee_translation_threshold_m="$motion_ee_translation_threshold_m" \
+  --motion_balanced_sampling.ee_rotation_threshold_rad="$motion_ee_rotation_threshold_rad" \
+  --motion_balanced_sampling.gripper_change_threshold="$motion_gripper_change_threshold" \
   --log_freq="$log_freq" \
   --eval_steps="$eval_steps" \
   --max_eval_samples="$max_eval_samples" \
   --env_eval_freq=0 \
   --save_checkpoint=true \
   --save_freq="$save_freq" \
-  --wandb.enable=true \
+  --wandb.enable="$wandb_enable" \
   --wandb.project="$wandb_project" \
   --wandb.disable_artifact=true
 )
 
+if [[ -n "$dataset_episodes" ]]; then
+  train_args+=(--dataset.episodes="$dataset_episodes")
+fi
+
+if [[ "$dry_run" == "true" ]]; then
+  printf 'CUDA_VISIBLE_DEVICES=%q lerobot_train' "$gpu_ids"
+  printf ' %q' "${train_args[@]}"
+  printf '\n'
+  exit 0
+elif [[ "$dry_run" != "false" ]]; then
+  echo "--dry-run must be true or false, got $dry_run" >&2
+  exit 2
+fi
+
 if (( num_gpus > 1 )); then
-  setsid env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES="$gpu_ids" uv run accelerate launch \
+  if [[ -n "$runtime_bin" ]]; then
+    launch_command=("$runtime_bin/accelerate")
+  else
+    launch_command=(uv run --no-sync accelerate)
+  fi
+  setsid env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES="$gpu_ids" "${launch_command[@]}" launch \
     --multi_gpu \
     --num_processes "$num_gpus" \
     --num_machines 1 \
@@ -314,7 +503,12 @@ if (( num_gpus > 1 )); then
     "${train_args[@]}" \
     >"$log_file" 2>&1 </dev/null &
 else
-  setsid env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES="$gpu_ids" uv run python -u -m lerobot.scripts.lerobot_train \
+  if [[ -n "$runtime_bin" ]]; then
+    launch_command=("$runtime_bin/python")
+  else
+    launch_command=(uv run --no-sync python)
+  fi
+  setsid env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES="$gpu_ids" "${launch_command[@]}" -u -m lerobot.scripts.lerobot_train \
     "${train_args[@]}" \
     >"$log_file" 2>&1 </dev/null &
 fi
@@ -345,6 +539,7 @@ if (( num_gpus > 1 )); then
   echo "DDP port:         $main_process_port"
 fi
 echo "Dataset:          $dataset_root"
+echo "Motion sampling:  enabled=$motion_balanced_sampling, priority=$motion_priority_fraction, translation=${motion_ee_translation_threshold_m}m, rotation=${motion_ee_rotation_threshold_rad}rad, gripper=$motion_gripper_change_threshold"
 if [[ -z "$resume_checkpoint" ]]; then
   echo "Action timing:    ${control_frequency_hz}Hz, chunk=$action_chunk_size, execute=$action_steps_to_execute (dt derived automatically)"
 else
@@ -352,6 +547,8 @@ else
 fi
 echo "Train/eval split: eval_split=$eval_split"
 echo "Steps:            $steps optimizer updates"
+echo "Action semantics: $action_semantics_profile ($ee_target_dataset_semantics, EE source=$ee_supervision_source, mask=$ee_delta_supervision_mode, gripper=$gripper_target_representation, loss=$action_loss_schema)"
+echo "Seed:             $seed"
 echo "Batch per GPU:    $batch_size_per_gpu"
 echo "Gradient accum:   $gradient_accumulation_steps (computed)"
 echo "Global batch:     $batch_size_per_gpu x $num_gpus GPU(s) x $gradient_accumulation_steps = $global_batch_size"

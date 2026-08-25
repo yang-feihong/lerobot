@@ -55,6 +55,7 @@ from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
 from lerobot.datasets.factory import make_train_eval_datasets
+from lerobot.datasets.motion_balanced_sampling import build_motion_priority_pool
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -66,6 +67,7 @@ from lerobot.policies.pi05.transformed_action_stats import (
     compute_transformed_action_stats,
     load_transformed_action_stats,
     save_transformed_action_stats,
+    transformed_action_stats_ee_valid_count,
     validate_transformed_action_stats,
 )
 from lerobot.rewards import make_reward_pre_post_processors
@@ -168,6 +170,14 @@ def _wandb_train_metrics(
     return grouped
 
 
+def _is_eval_policy_metric(key: str, value: object) -> bool:
+    return isinstance(value, int | float) and (
+        key == "continuous_loss"
+        or key.startswith(("discrete_loss/", "discrete_accuracy/"))
+        or any(token in key for token in ("_pred_frac/", "_precision/", "_recall/"))
+    )
+
+
 def _wandb_eval_metrics(
     eval_loss: float,
     eval_batches: int,
@@ -183,6 +193,8 @@ def _wandb_eval_metrics(
             grouped[f"discrete_action/val_loss/{key.removeprefix('discrete_loss/')}"] = mean
         elif key.startswith("discrete_accuracy/"):
             grouped[f"discrete_action/val_accuracy/{key.removeprefix('discrete_accuracy/')}"] = mean
+        elif any(token in key for token in ("_pred_frac/", "_precision/", "_recall/")):
+            grouped[f"discrete_action/val_class_metrics/{key}"] = mean
         elif key == "continuous_loss":
             grouped["continuous_action/val_loss"] = mean
     for name, mean in (action_dimension_means or {}).items():
@@ -421,10 +433,12 @@ def resolve_task_complete_sampling(dataset, policy_cfg) -> tuple[list[int], dict
     """Cap post-completion chunk starts while retaining the full episode as label context."""
     from lerobot.policies.pi05.b2_action_transform import DATASET_ACTION_NAMES, TASK_COMPLETE_NAME
 
+    if policy_cfg.type != "pi05" or not policy_cfg.action_predict_task_complete:
+        return None
     action_names = dataset.meta.features.get(ACTION, {}).get("names") or []
     if tuple(action_names) != DATASET_ACTION_NAMES:
         return None
-    tail_seconds = getattr(policy_cfg, "task_complete_sample_tail_seconds", 2.0)
+    tail_seconds = policy_cfg.task_complete_sample_tail_seconds
     tail_frames = None if tail_seconds is None else int(np.ceil(float(tail_seconds) * dataset.meta.fps))
     selected_episodes = set(dataset.episodes or range(dataset.num_episodes))
     first_complete: dict[int, int] = {}
@@ -485,6 +499,8 @@ def configure_action_bool_balance(
 ) -> dict[str, dict[str, int | float]] | None:
     """Resolve fixed class priors for every enabled boolean action from the train split."""
     policy_cfg = cfg.trainable_config
+    if policy_cfg.type != "pi05":
+        return None
     action_names = dataset.meta.features.get(ACTION, {}).get("names") or []
     from lerobot.policies.pi05.b2_action_transform import DATASET_ACTION_NAMES
 
@@ -492,10 +508,11 @@ def configure_action_bool_balance(
         return None
 
     enabled = {
-        "arm_teleop_inactive": bool(getattr(policy_cfg, "action_predict_arm_teleop_inactive", False)),
-        "arm_reset": bool(getattr(policy_cfg, "action_predict_arm_reset", False)),
-        "gripper_target": bool(getattr(policy_cfg, "action_predict_gripper", False)),
-        "task_complete": bool(getattr(policy_cfg, "action_predict_task_complete", False)),
+        "arm_teleop_inactive": policy_cfg.action_predict_arm_teleop_inactive,
+        "arm_reset": policy_cfg.action_predict_arm_reset,
+        "gripper_target": policy_cfg.action_predict_gripper
+        and policy_cfg.gripper_target_representation == "binary_position",
+        "task_complete": policy_cfg.action_predict_task_complete,
     }
     enabled_names = [name for name, is_enabled in enabled.items() if is_enabled]
     if not enabled_names:
@@ -514,7 +531,7 @@ def configure_action_bool_balance(
         - int(episodes_meta[episode_index]["dataset_from_index"])
         for episode_index in episode_indices
     ]
-    control_frequency_hz = float(getattr(policy_cfg, "control_frequency_hz", None) or dataset.meta.fps)
+    control_frequency_hz = float(policy_cfg.control_frequency_hz or dataset.meta.fps)
     offsets = action_sample_offsets(
         policy_cfg.chunk_size,
         float(dataset.meta.fps),
@@ -770,12 +787,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 action_steps_to_execute,
                 action_steps_to_execute * action_dt,
             )
-            if getattr(policy.config, "b2_action_representation", None) == "local_trajectory":
+            if getattr(policy.config, "b2_action_representation", None) == "pose_delta":
                 logging.info(
-                    "B2 local-trajectory source: %s",
-                    "global observation.state pose transform"
-                    if getattr(policy.config, "b2_global_pose_state_indices", None) is not None
-                    else "SE(2) integration of commanded body twist",
+                    "B2 pose-delta source: SE(2) integration of commanded body twist",
                 )
 
     transformed_action_stats_payload = None
@@ -783,7 +797,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         not cfg.is_reward_model_training
         and isinstance(policy.config, PI05Config)
         and policy.config.io_schema_resolved
-        and policy.config.z1_action_representation == "ee_delta"
+        and policy.config.z1_action_representation in {"ee_delta", "ee_state_delta"}
     ):
         output_stats_path = cfg.output_dir / PI05_TRANSFORMED_ACTION_STATS_NAME
         if is_main_process:
@@ -812,7 +826,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             logging.info(
                 "Measured transformed-action statistics from %d transitions (%d EE-valid at both endpoints)",
                 counts["all_transitions"],
-                counts["ee_active_non_reset_both_endpoints"],
+                transformed_action_stats_ee_valid_count(transformed_action_stats_payload),
             )
         accelerator.wait_for_everyone()
         if not is_main_process:
@@ -877,14 +891,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     if not cfg.is_reward_model_training
                     else None
                 ),
-                "runtime/b2_trajectory_source": (
-                    (
-                        "global_pose_transform"
-                        if getattr(policy.config, "b2_global_pose_state_indices", None) is not None
-                        else "twist_integration"
-                    )
+                "runtime/b2_pose_delta_source": (
+                    "commanded_body_twist_se2_integration"
                     if not cfg.is_reward_model_training
-                    and getattr(policy.config, "b2_action_representation", None) == "local_trajectory"
+                    and getattr(policy.config, "b2_action_representation", None) == "pose_delta"
                     else None
                 ),
             }
@@ -1017,6 +1027,51 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     # create dataloader for offline training
     if not cfg.dataset.streaming:
+        priority_frame_indices = None
+        priority_fraction = 0.0
+        if cfg.motion_balanced_sampling.enabled:
+            if not isinstance(active_cfg, PI05Config):
+                raise ValueError("Motion-balanced sampling currently requires a PI0.5 policy")
+            if active_cfg.ee_supervision_source != "control_action":
+                raise ValueError(
+                    "Motion-balanced sampling requires a continuous height-invariant EE supervision trajectory"
+                )
+            from lerobot.policies.pi05.b2_action_transform import action_sample_offsets
+
+            offsets = action_sample_offsets(
+                active_cfg.chunk_size,
+                float(dataset.meta.fps),
+                float(active_cfg.control_frequency_hz or dataset.meta.fps),
+            )
+            motion_cfg = cfg.motion_balanced_sampling
+            pool = None
+            if is_main_process:
+                pool = build_motion_priority_pool(
+                    dataset,
+                    horizon_frames=int(offsets[-1]),
+                    translation_threshold_m=motion_cfg.ee_translation_threshold_m,
+                    rotation_threshold_rad=motion_cfg.ee_rotation_threshold_rad,
+                    gripper_change_threshold=motion_cfg.gripper_change_threshold,
+                )
+            from accelerate.utils import broadcast_object_list
+
+            pool = broadcast_object_list([pool])[0]
+            if pool is None:
+                raise RuntimeError("Failed to broadcast the motion-priority pool")
+            priority_frame_indices = pool.frame_indices
+            priority_fraction = motion_cfg.priority_fraction
+            if is_main_process:
+                logging.info(
+                    "Motion priority pool: %d/%d starts (%.2f%%); translation=%d, rotation=%d, "
+                    "gripper=%d; epoch mixture=%.1f%% priority",
+                    len(pool.frame_indices),
+                    pool.total_frames,
+                    100.0 * len(pool.frame_indices) / pool.total_frames,
+                    pool.translation_frames,
+                    pool.rotation_frames,
+                    pool.gripper_frames,
+                    100.0 * priority_fraction,
+                )
         # All non-streaming (map-style) datasets use EpisodeAwareSampler.
         # The order is a pure function of (seed, epoch), so every rank independently produces the
         # same permutation. accelerate then shards it disjointly across ranks via BatchSamplerShard
@@ -1030,6 +1085,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             shuffle=True,
             seed=cfg.seed if cfg.seed is not None else 0,
             absolute_to_relative_idx=dataset.absolute_to_relative_idx,
+            priority_frame_indices=priority_frame_indices,
+            priority_fraction=priority_fraction,
         )
         if cfg.resume and step > 0:
             # The resume offset depends on the (num_processes, batch_size) that produced `step`, so
@@ -1283,10 +1340,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     eval_loss_sum += loss.item()
                     n_eval_batches += 1
                     for key, value in (eval_output or {}).items():
-                        if (
-                            key == "continuous_loss"
-                            or key.startswith(("discrete_loss/", "discrete_accuracy/"))
-                        ) and isinstance(value, int | float):
+                        if _is_eval_policy_metric(key, value):
                             eval_policy_metric_sums[key] = eval_policy_metric_sums.get(key, 0.0) + value
                     per_dim = (eval_output or {}).get("loss_per_dim")
                     if isinstance(per_dim, (list, tuple)):

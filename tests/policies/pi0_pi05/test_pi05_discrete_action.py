@@ -27,17 +27,19 @@ def test_gate_loss_uses_inactive_reset_and_completion_ground_truth_masks():
         ),
         action_gripper_target_true_side="negative",
         io_schema_resolved=True,
-        b2_action_representation="local_trajectory",
-        z1_action_representation="ee_pose",
+        b2_action_representation="pose_delta",
+        z1_action_representation="ee_delta",
         action_feature_names=names,
     )
     actions = -torch.ones(1, 5, 16)
     actions[0, :, 3] = torch.tensor([-1.0, 1.0, -1.0, -1.0, -1.0])
     actions[0, :, 4] = torch.tensor([-1.0, -1.0, 1.0, -1.0, -1.0])
     actions[0, :, 15] = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0])
-    loss, info = policy._b2_z1_gate_action_loss(torch.ones_like(actions), actions, "mean")
+    loss, info = policy._b2_z1_gate_action_loss(
+        torch.ones_like(actions), actions, "mean", ee_delta_is_valid=torch.ones(1, 5, dtype=torch.bool)
+    )
     assert torch.isfinite(loss)
-    assert info["continuous_mask_frac/b2_local_trajectory"] == pytest.approx(0.6)
+    assert info["continuous_mask_frac/b2_pose_delta"] == pytest.approx(0.6)
     assert info["continuous_mask_frac/ee_pose"] == pytest.approx(0.2)
     assert info["gate_true_frac/task_complete"] == pytest.approx(0.4)
     assert "gate_loss/arm_teleop_inactive" in info
@@ -55,15 +57,52 @@ def test_disabling_inactive_prediction_removes_its_output_and_ee_mask():
         action_bool_true_fractions=dict.fromkeys(("arm_reset", "gripper_target", "task_complete"), 0.5),
         action_gripper_target_true_side="negative",
         io_schema_resolved=True,
-        b2_action_representation="local_trajectory",
-        z1_action_representation="ee_pose",
+        b2_action_representation="pose_delta",
+        z1_action_representation="ee_delta",
         action_feature_names=names,
     )
     actions = -torch.ones(1, 3, 15)
-    loss, info = policy._b2_z1_gate_action_loss(torch.ones_like(actions), actions, "mean")
+    loss, info = policy._b2_z1_gate_action_loss(
+        torch.ones_like(actions), actions, "mean", ee_delta_is_valid=torch.ones(1, 3, dtype=torch.bool)
+    )
     assert torch.isfinite(loss)
     assert info["continuous_mask_frac/ee_pose"] == pytest.approx(1.0)
     assert "gate_loss/arm_teleop_inactive" not in info
+
+
+def test_uniform_valid_loss_uses_every_non_padding_continuous_element() -> None:
+    losses = torch.tensor([[[1.0, 3.0], [100.0, 100.0], [5.0, 7.0]]])
+    is_pad = torch.tensor([[False, True, False]])
+
+    mean_loss = PI05Policy._uniform_valid_action_loss(losses, "mean", is_pad)
+    per_sample = PI05Policy._uniform_valid_action_loss(losses, "none", is_pad)
+
+    assert mean_loss.item() == pytest.approx(4.0)
+    assert per_sample.tolist() == pytest.approx([4.0])
+
+
+def test_uniform_valid_loss_ignores_empty_episode_tail_samples() -> None:
+    losses = torch.tensor(
+        [
+            [[1.0, 3.0], [5.0, 7.0]],
+            [[100.0, 100.0], [100.0, 100.0]],
+        ]
+    )
+    is_pad = torch.tensor([[False, False], [True, True]])
+
+    mean_loss = PI05Policy._uniform_valid_action_loss(losses, "mean", is_pad)
+    per_sample = PI05Policy._uniform_valid_action_loss(losses, "none", is_pad)
+
+    assert mean_loss.item() == pytest.approx(4.0)
+    assert per_sample.tolist() == pytest.approx([4.0, 0.0])
+
+
+def test_uniform_valid_loss_rejects_an_entirely_empty_batch() -> None:
+    losses = torch.ones(2, 3, 4)
+    is_pad = torch.ones(2, 3, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="batch containing only padding"):
+        PI05Policy._uniform_valid_action_loss(losses, "mean", is_pad)
 
 
 def test_arm_mode_crf_allows_reset_to_reappear() -> None:
@@ -76,6 +115,30 @@ def test_arm_mode_crf_allows_reset_to_reappear() -> None:
     assert torch.isfinite(crf.nll(emissions, targets, torch.ones_like(targets, dtype=torch.bool))).all()
 
 
+def test_crf_initial_persistence_prior_removes_isolated_weak_spike() -> None:
+    emissions = torch.zeros((1, 5, 2))
+    emissions[:, :, 0] = 2.0
+    emissions[0, 2, 1] = 3.0
+
+    without_persistence = LinearChainCRF(2).decode(emissions)
+    with_persistence = LinearChainCRF(2, initial_stay_bias=4.0).decode(emissions)
+
+    assert without_persistence.tolist() == [[0, 0, 1, 0, 0]]
+    assert with_persistence.tolist() == [[0, 0, 0, 0, 0]]
+
+
+def test_crf_initial_persistence_prior_keeps_sustained_state_change() -> None:
+    emissions = torch.zeros((1, 8, 2))
+    emissions[:, :, 0] = 2.0
+    emissions[0, 3:, 1] = 3.0
+
+    crf = LinearChainCRF(2, initial_stay_bias=4.0)
+    decoded = crf.decode(emissions)
+
+    assert decoded.tolist() == [[0, 0, 0, 1, 1, 1, 1, 1]]
+    torch.testing.assert_close(crf.transitions.detach(), torch.eye(2) * 4.0)
+
+
 def test_task_complete_hazard_is_monotonic_without_masking_its_tail() -> None:
     logits = torch.tensor([[-3.0, -2.0, 4.0, -5.0]])
     target = torch.tensor([[False, False, True, True]])
@@ -83,6 +146,30 @@ def test_task_complete_hazard_is_monotonic_without_masking_its_tail() -> None:
     decoded = absorbing_bool_decode(logits)
     assert decoded.tolist() == [[False, False, True, True]]
     assert torch.isfinite(absorbing_hazard_nll(logits, target, mask)).all()
+
+
+def test_newly_initialized_modules_use_a_separate_optimizer_group() -> None:
+    policy = PI05Policy.__new__(PI05Policy)
+    torch.nn.Module.__init__(policy)
+    policy.model = torch.nn.Module()
+    policy.model.action_out_proj = torch.nn.Linear(2, 2)
+    policy.model.state_memory_proj = torch.nn.Linear(2, 2)
+    policy.model.arm_mode_head = torch.nn.Linear(2, 3)
+    policy.config = SimpleNamespace(
+        optimizer_lr=2.5e-5,
+        new_module_optimizer_lr_multiplier=40.0,
+    )
+
+    groups = policy.get_optim_params()
+
+    assert [group["name"] for group in groups] == ["pretrained_and_action_expert", "new_modules"]
+    assert "lr" not in groups[0]
+    assert groups[1]["lr"] == pytest.approx(1e-3)
+    assert set(groups[0]["params"]) == set(policy.model.action_out_proj.parameters())
+    assert set(groups[1]["params"]) == {
+        *policy.model.state_memory_proj.parameters(),
+        *policy.model.arm_mode_head.parameters(),
+    }
 
 
 def test_structured_loss_excludes_discrete_dimensions_from_flow_matching() -> None:
@@ -104,8 +191,8 @@ def test_structured_loss_excludes_discrete_dimensions_from_flow_matching() -> No
         action_bool_loss_weight=4.0,
         action_continuous_loss_weight=1.0,
         action_masked_continuous_min_weight=0.0,
-        b2_action_representation="local_trajectory",
-        z1_action_representation="ee_pose",
+        b2_action_representation="pose_delta",
+        z1_action_representation="ee_delta",
     )
     actions = -torch.ones((1, 5, len(names)))
     actions[:, :, names.index("gripper_target")] = torch.tensor([[-1.0, -1.0, 1.0, 1.0, 1.0]])
@@ -120,8 +207,13 @@ def test_structured_loss_excludes_discrete_dimensions_from_flow_matching() -> No
     for name in ("arm_teleop_inactive", "arm_reset", "gripper_target", "task_complete"):
         changed_losses[:, :, names.index(name)] = 1_000_000.0
 
-    baseline, _ = policy._structured_temporal_action_loss(baseline_losses, logits, actions, "mean", None)
-    changed, _ = policy._structured_temporal_action_loss(changed_losses, logits, actions, "mean", None)
+    ee_valid = torch.ones(1, 5, dtype=torch.bool)
+    baseline, _ = policy._structured_temporal_action_loss(
+        baseline_losses, logits, actions, "mean", None, ee_valid
+    )
+    changed, _ = policy._structured_temporal_action_loss(
+        changed_losses, logits, actions, "mean", None, ee_valid
+    )
 
     torch.testing.assert_close(changed, baseline)
 

@@ -46,8 +46,28 @@ gpu_id="0"
 batch_size="2"
 num_workers="2"
 plot_workers="8"
+include_onset_windows="true"
 
 output_root="/data/b2_z1_vla_openloop_eval/pi05_b2_z1_vla_20260806_131138_004500"
+
+while (( $# > 0 )); do
+  case "$1" in
+    --policy-path=*) policy_path="${1#*=}" ;;
+    --dataset-repo-id=*) dataset_repo_id="${1#*=}" ;;
+    --dataset-root=*) dataset_root="${1#*=}" ;;
+    --output-root=*) output_root="${1#*=}" ;;
+    --gpu-id=*) gpu_id="${1#*=}" ;;
+    --device=*) device="${1#*=}" ;;
+    --train-episodes=*) train_episodes="${1#*=}" ;;
+    --eval-episodes=*) eval_episodes="${1#*=}" ;;
+    --max-episodes=*) max_episodes="${1#*=}" ;;
+    --max-frames-per-episode=*) max_frames_per_episode="${1#*=}" ;;
+    --frame-stride=*) frame_stride="${1#*=}" ;;
+    --include-onset-windows=*) include_onset_windows="${1#*=}" ;;
+    *) echo "Unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
 
 # =========================
 # Launch
@@ -82,6 +102,12 @@ run_openloop() {
     --task-variant first
     --plot-workers "$plot_workers"
   )
+  if [[ "$include_onset_windows" == "false" ]]; then
+    cmd+=(--no-include-onset-windows)
+  elif [[ "$include_onset_windows" != "true" ]]; then
+    echo "--include-onset-windows must be true or false" >&2
+    exit 2
+  fi
 
   if [[ "$device" == cuda* ]]; then
     CUDA_VISIBLE_DEVICES="$gpu_id" "${cmd[@]}"
