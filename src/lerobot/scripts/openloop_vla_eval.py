@@ -32,9 +32,12 @@ from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.pi05.b2_action_transform import (
+    absolute_ee_pose_to_reference_delta,
     action_schema_kwargs,
     b2_execution_action_names,
     b2_pose_delta_action_names,
+    ee_reference_delta_to_absolute,
+    integrate_body_twist_to_pose_delta,
     make_pi05_action_stats,
 )
 from lerobot.policies.pi05.manipulation_metrics import (
@@ -49,7 +52,7 @@ from lerobot.processor.normalize_processor import UnnormalizerProcessorStep
 from lerobot.scripts.lerobot_train import apply_task_variants_to_batch, load_task_variants
 from lerobot.scripts.pi05_vla_server import _load_checkpoint_contract
 from lerobot.utils.collate import lerobot_collate_fn
-from lerobot.utils.constants import ACTION
+from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.utils import init_logging
 
 _B2_WORLD_TRAJECTORY_NAMES = ["b2_world_x", "b2_world_y", "b2_world_yaw"]
@@ -95,13 +98,13 @@ def _supervision_contract(policy_cfg: PreTrainedConfig, io_schema_enabled: bool)
     }
 
 
-def _current_b2_pose_from_raw_state(
+def _current_state_slice(
     raw_state: torch.Tensor,
     pose_indices: list[int],
     *,
     history_length: int,
 ) -> torch.Tensor:
-    """Read the current world pose before policy state-feature selection.
+    """Read current physical state fields before policy state-feature selection.
 
     A non-MEM batch has shape ``[B, D]``. A temporal-state batch can have
     shape ``[B, T, D]``, with the current state at the end of the history prefix.
@@ -120,6 +123,149 @@ def _current_b2_pose_from_raw_state(
     raise ValueError(
         f"Expected observation.state with shape [B, D] or [B, T, D], got {tuple(raw_state.shape)}"
     )
+
+
+def _episode_b2_command_anchors(
+    dataset: LeRobotDataset,
+    episode_index: int,
+    frame_index: np.ndarray,
+    *,
+    dataset_dt_seconds: float,
+) -> np.ndarray:
+    """Return each plotted frame's command-integrated pose from the episode start."""
+    episode = dataset.meta.episodes[episode_index]
+    absolute_indices = list(range(int(episode["dataset_from_index"]), int(episode["dataset_to_index"])))
+    relative_index = dataset.absolute_to_relative_idx
+    rows = (
+        [relative_index[index] for index in absolute_indices]
+        if relative_index is not None
+        else absolute_indices
+    )
+    raw_action = dataset.hf_dataset[rows][ACTION]
+    if isinstance(raw_action, list):
+        raw_action = torch.stack([torch.as_tensor(value) for value in raw_action])
+    else:
+        raw_action = torch.as_tensor(raw_action)
+    if raw_action.ndim != 2 or raw_action.shape[1] < 3:
+        raise ValueError(
+            f"Expected episode action matrix with at least 3 columns, got {tuple(raw_action.shape)}"
+        )
+
+    pose_after_interval = integrate_body_twist_to_pose_delta(
+        raw_action[:, :3].to(dtype=torch.float32).unsqueeze(0),
+        dataset_dt_seconds,
+    )[0]
+    anchors = torch.cat((torch.zeros_like(pose_after_interval[:1]), pose_after_interval[:-1]), dim=0)
+    selected = torch.as_tensor(frame_index, dtype=torch.long)
+    if selected.numel() and (selected.min() < 0 or selected.max() >= len(anchors)):
+        raise IndexError(
+            f"Episode {episode_index} plot frame indices are outside [0, {len(anchors)}): "
+            f"min={int(selected.min())}, max={int(selected.max())}"
+        )
+    return anchors[selected].numpy()
+
+
+def _reanchor_episode_plot_actions(
+    actions: np.ndarray,
+    action_names: list[str],
+    *,
+    b2_representation: str,
+    z1_representation: str,
+    ee_rotation_representation: str,
+    b2_episode_anchors: np.ndarray | None,
+    current_ee_anchor: np.ndarray | None,
+) -> np.ndarray:
+    """Express anchored model actions relative to the episode's first inference anchor."""
+    original = np.asarray(actions)
+    if original.ndim not in (2, 3):
+        raise ValueError(f"Expected [N, A] or [N, H, A] plot actions, got {original.shape}")
+    values = torch.from_numpy(original.astype(np.float32, copy=False))
+    squeeze_horizon = values.ndim == 2
+    if squeeze_horizon:
+        values = values.unsqueeze(1)
+    result = values.clone()
+    inference_count = result.shape[0]
+
+    if b2_representation == "pose_delta":
+        if b2_episode_anchors is None or np.asarray(b2_episode_anchors).shape != (inference_count, 3):
+            raise ValueError(
+                "B2 pose-delta episode plots require one command-integrated anchor per inference"
+            )
+        anchors = torch.as_tensor(b2_episode_anchors, dtype=result.dtype)
+        local = result[..., :3]
+        anchor_yaw = anchors[:, None, 2]
+        cos_yaw = torch.cos(anchor_yaw)
+        sin_yaw = torch.sin(anchor_yaw)
+        target_x = anchors[:, None, 0] + cos_yaw * local[..., 0] - sin_yaw * local[..., 1]
+        target_y = anchors[:, None, 1] + sin_yaw * local[..., 0] + cos_yaw * local[..., 1]
+        target_yaw = anchors[:, None, 2] + local[..., 2]
+
+        first_anchor = anchors[0]
+        world_x = target_x - first_anchor[0]
+        world_y = target_y - first_anchor[1]
+        first_cos = torch.cos(first_anchor[2])
+        first_sin = torch.sin(first_anchor[2])
+        result[..., 0] = first_cos * world_x + first_sin * world_y
+        result[..., 1] = -first_sin * world_x + first_cos * world_y
+        yaw_delta = target_yaw - first_anchor[2]
+        result[..., 2] = torch.atan2(torch.sin(yaw_delta), torch.cos(yaw_delta))
+    elif b2_representation != "velocity":
+        raise ValueError(f"Unknown B2 representation: {b2_representation!r}")
+
+    if z1_representation == "ee_state_delta":
+        expected_ee_dim = 6 if ee_rotation_representation == "rotvec" else 9
+        ee_indices = [
+            index for index, name in enumerate(action_names) if name.startswith("height_invariant_ee_")
+        ]
+        if not ee_indices:
+            output = result[:, 0] if squeeze_horizon else result
+            return output.numpy().astype(original.dtype, copy=False)
+        if len(ee_indices) != expected_ee_dim or ee_indices != list(
+            range(ee_indices[0], ee_indices[0] + expected_ee_dim)
+        ):
+            raise ValueError(
+                "Cannot identify one contiguous EE-delta block in model actions: "
+                f"indices={ee_indices}, expected_dim={expected_ee_dim}"
+            )
+        if current_ee_anchor is None or np.asarray(current_ee_anchor).shape != (inference_count, 9):
+            raise ValueError("EE state-delta episode plots require one measured EE anchor per inference")
+        anchors = torch.as_tensor(current_ee_anchor, dtype=result.dtype)
+        ee_slice = slice(ee_indices[0], ee_indices[-1] + 1)
+        absolute_targets = ee_reference_delta_to_absolute(
+            result[..., ee_slice],
+            anchors,
+            rotation_representation=ee_rotation_representation,
+        )
+        first_anchor = anchors[0].expand(inference_count, -1)
+        result[..., ee_slice] = absolute_ee_pose_to_reference_delta(
+            absolute_targets,
+            first_anchor,
+            rotation_representation=ee_rotation_representation,
+        )
+    elif z1_representation != "ee_delta":
+        raise ValueError(f"Unknown Z1 representation: {z1_representation!r}")
+
+    output = result[:, 0] if squeeze_horizon else result
+    return output.numpy().astype(original.dtype, copy=False)
+
+
+def _episode_anchor_plot_names(
+    action_names: list[str],
+    *,
+    b2_representation: str,
+    z1_representation: str,
+) -> list[str]:
+    names = list(action_names)
+    if b2_representation == "pose_delta":
+        names[:3] = ["b2_episode_anchor_x", "b2_episode_anchor_y", "b2_episode_anchor_yaw"]
+    if z1_representation == "ee_state_delta":
+        names = [
+            name.replace("height_invariant_ee_", "episode_anchor_ee_")
+            if name.startswith("height_invariant_ee_")
+            else name
+            for name in names
+        ]
+    return names
 
 
 def _resolve_policy_path(path: str | Path) -> Path:
@@ -161,6 +307,62 @@ def _parse_episodes(value: str | None) -> list[int] | None:
         else:
             episodes.append(int(part))
     return sorted(set(episodes))
+
+
+def _resolve_image_source(
+    *,
+    policy_path: Path,
+    dataset_root: Path,
+    requested_source: str,
+    sim_image_manifest: str | None,
+    sim_image_root: str | None,
+    mixed_sim_probability: float | None,
+    image_source_seed: int | None,
+) -> dict[str, Any]:
+    """Resolve the same paired-image source used to train the checkpoint."""
+    if requested_source == "checkpoint":
+        train_config_path = policy_path / "train_config.json"
+        if not train_config_path.is_file():
+            return {"image_source": "real"}
+        train_config = json.loads(train_config_path.read_text(encoding="utf-8"))
+        dataset_config = train_config.get("dataset", {})
+        source = str(dataset_config.get("image_source", "real"))
+        manifest_value = dataset_config.get("sim_image_manifest")
+        root_value = dataset_config.get("sim_image_root")
+        probability = float(dataset_config.get("mixed_sim_probability", 0.5))
+        seed = int(dataset_config.get("image_source_seed", 0))
+    else:
+        source = requested_source
+        manifest_value = sim_image_manifest
+        root_value = sim_image_root
+        probability = 0.5 if mixed_sim_probability is None else mixed_sim_probability
+        seed = 0 if image_source_seed is None else image_source_seed
+
+    if source == "real":
+        return {"image_source": "real"}
+    if source not in {"sim", "mixed"}:
+        raise ValueError(f"Unsupported open-loop image source: {source!r}")
+    if manifest_value is None or root_value is None:
+        raise ValueError(f"image_source={source!r} requires simulator manifest and root")
+
+    manifest = Path(manifest_value).expanduser()
+    root = Path(root_value).expanduser()
+    if requested_source == "checkpoint" and not manifest.is_file():
+        # Training paths are container-local. Rebase the paired dataset beside
+        # the explicitly supplied evaluation dataset without changing its name.
+        manifest = dataset_root.parent / manifest.parent.name / manifest.name
+        root = dataset_root.parent
+    if not manifest.is_file():
+        raise FileNotFoundError(f"Paired simulator image manifest does not exist: {manifest}")
+    if not root.is_dir():
+        raise FileNotFoundError(f"Paired simulator image root does not exist: {root}")
+    return {
+        "image_source": source,
+        "sim_image_manifest": manifest,
+        "sim_image_root": root,
+        "mixed_sim_probability": probability,
+        "image_source_seed": seed,
+    }
 
 
 def _split_episodes(meta: LeRobotDatasetMetadata, split: str, eval_split: float) -> list[int]:
@@ -662,6 +864,28 @@ def _flatten_valid_chunks(chunks: np.ndarray, valid_lengths: np.ndarray) -> np.n
     return np.concatenate(valid_parts, axis=0)
 
 
+def _plot_limits_covering_arrays(
+    base_limits: list[tuple[float, float]],
+    *arrays: np.ndarray,
+) -> list[tuple[float, float]]:
+    """Expand configured limits when a display-only representation has a wider range."""
+    if not arrays:
+        return list(base_limits)
+    flattened = [np.asarray(array).reshape(-1, np.asarray(array).shape[-1]) for array in arrays]
+    values = np.concatenate(flattened, axis=0)
+    if values.shape[1] != len(base_limits):
+        raise ValueError(f"Plot values have {values.shape[1]} dims but limits have {len(base_limits)}")
+    limits = []
+    for index, (base_low, base_high) in enumerate(base_limits):
+        finite = values[:, index][np.isfinite(values[:, index])]
+        if not len(finite):
+            limits.append((base_low, base_high))
+            continue
+        data_low, data_high = _padded_limits(float(np.min(finite)), float(np.max(finite)))
+        limits.append((min(base_low, data_low), max(base_high, data_high)))
+    return limits
+
+
 def _manipulation_onset_windows(
     dataset: LeRobotDataset,
     *,
@@ -705,6 +929,16 @@ def main() -> None:
     )
     parser.add_argument("--dataset-repo-id", default="local/b2_z1_vla")
     parser.add_argument("--dataset-root", default="/data/b2_z1_vla_lerobot")
+    parser.add_argument(
+        "--image-source",
+        choices=["checkpoint", "real", "sim", "mixed"],
+        default="checkpoint",
+        help="Image channel used for evaluation. 'checkpoint' reproduces the training config.",
+    )
+    parser.add_argument("--sim-image-manifest", default=None)
+    parser.add_argument("--sim-image-root", default=None)
+    parser.add_argument("--mixed-sim-probability", type=float, default=None)
+    parser.add_argument("--image-source-seed", type=int, default=None)
     parser.add_argument(
         "--dataset-group",
         default=None,
@@ -848,8 +1082,7 @@ def main() -> None:
             raise ValueError("B2+Z1 checkpoint is missing action_dt_seconds")
         if abs(float(action_dt) - expected_dt) > 1e-9:
             raise ValueError(
-                f"Action checkpoint dt={action_dt} does not match "
-                f"control_frequency_hz={control_frequency_hz}"
+                f"Action checkpoint dt={action_dt} does not match control_frequency_hz={control_frequency_hz}"
             )
     delta_timestamps = resolve_delta_timestamps(policy_cfg, meta)
 
@@ -873,6 +1106,19 @@ def main() -> None:
         args.chunk_plot_stride,
     )
 
+    image_source_kwargs = _resolve_image_source(
+        policy_path=policy_path,
+        dataset_root=Path(args.dataset_root).expanduser(),
+        requested_source=args.image_source,
+        sim_image_manifest=args.sim_image_manifest,
+        sim_image_root=args.sim_image_root,
+        mixed_sim_probability=args.mixed_sim_probability,
+        image_source_seed=args.image_source_seed,
+    )
+    logging.info(
+        "Evaluation image source: %s",
+        {key: str(value) if isinstance(value, Path) else value for key, value in image_source_kwargs.items()},
+    )
     dataset = LeRobotDataset(
         args.dataset_repo_id,
         root=args.dataset_root,
@@ -881,6 +1127,7 @@ def main() -> None:
         image_transforms=None,
         video_backend=args.video_backend,
         return_uint8=True,
+        **image_source_kwargs,
     )
     meta = dataset.meta
 
@@ -948,7 +1195,11 @@ def main() -> None:
             limited_counts[episode_index] += 1
         sampled_indices = limited_indices
     required_onset_frames: set[tuple[int, int]] = set()
-    if args.include_onset_windows and io_schema_enabled and policy_cfg.z1_action_representation in {"ee_delta", "ee_state_delta"}:
+    if (
+        args.include_onset_windows
+        and io_schema_enabled
+        and policy_cfg.z1_action_representation in {"ee_delta", "ee_state_delta"}
+    ):
         onset_window_frames = int(round(args.onset_window_seconds * float(meta.fps)))
         required_onset_indices, required_onset_frames = _manipulation_onset_windows(
             dataset,
@@ -977,6 +1228,22 @@ def main() -> None:
     task_variants = load_task_variants(dataset.root, args.task_variants_path)
     policy = make_policy(policy_cfg, ds_meta=dataset.meta)
     policy.eval()
+    episode_plot_action_names = _episode_anchor_plot_names(
+        plot_action_names,
+        b2_representation=policy_cfg.b2_action_representation,
+        z1_representation=policy_cfg.z1_action_representation,
+    )
+    state_history_length = (
+        policy_cfg.state_num_frames if policy_cfg.state_action_encoding == "continuous" else 1
+    )
+    dataset_state_names = meta.features[OBS_STATE].get("names")
+    if dataset_state_names is None:
+        raise ValueError("Open-loop anchor visualization requires named observation.state dimensions")
+    ee_plot_anchor_indices = None
+    if policy_cfg.z1_action_representation == "ee_state_delta":
+        if policy_cfg.ee_state_anchor_indices is None:
+            raise ValueError("EE state-delta checkpoint did not resolve its measured-state anchor indices")
+        ee_plot_anchor_indices = list(policy_cfg.ee_state_anchor_indices)
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy_cfg,
@@ -1003,7 +1270,7 @@ def main() -> None:
             "pred_trajectory": [],
             "expert_trajectory_chunk": [],
             "pred_trajectory_chunk": [],
-            "current_b2_pose": [],
+            "current_ee_anchor": [],
             "task": [],
         }
     )
@@ -1059,6 +1326,18 @@ def main() -> None:
                 batch["task"] = [args.task_override] * len(keep)
 
             batch = _batch_to_device_and_float_images(batch, dataset.meta.camera_keys)
+            raw_state = batch.get(OBS_STATE)
+            if not isinstance(raw_state, torch.Tensor):
+                raise ValueError("Open-loop evaluation batch has no tensor observation.state")
+            current_ee_anchor = (
+                _current_state_slice(
+                    raw_state,
+                    ee_plot_anchor_indices,
+                    history_length=state_history_length,
+                )
+                if ee_plot_anchor_indices is not None
+                else None
+            )
             processed = preprocessor(batch)
             normalized_supervision_chunk = processed.get(ACTION)
             if not isinstance(normalized_supervision_chunk, torch.Tensor):
@@ -1075,7 +1354,6 @@ def main() -> None:
                     f"supervision={tuple(supervision_model_chunk.shape)}, "
                     f"prediction={tuple(pred_model_chunk.shape)}"
                 )
-            current_b2_pose = None
             expert_chunk = supervision_model_chunk
             pred_chunk = pred_model_chunk
             expert_trajectory_chunk = expert_chunk
@@ -1100,7 +1378,7 @@ def main() -> None:
             pred_np = pred_action.numpy()
             expert_trajectory_np = expert_trajectory_action.numpy()
             pred_trajectory_np = pred_trajectory_action.numpy()
-            current_b2_pose_np = current_b2_pose.numpy() if current_b2_pose is not None else None
+            current_ee_anchor_np = current_ee_anchor.numpy() if current_ee_anchor is not None else None
             for i, ep_idx in enumerate(ep_np.tolist()):
                 ep_store = per_episode[int(ep_idx)]
                 ep_store["frame_index"].append(int(frame_np[i]))
@@ -1113,8 +1391,8 @@ def main() -> None:
                 ep_store["pred_trajectory"].append(pred_trajectory_np[i])
                 ep_store["expert_trajectory_chunk"].append(expert_trajectory_chunk[i].numpy())
                 ep_store["pred_trajectory_chunk"].append(pred_trajectory_chunk[i].numpy())
-                if current_b2_pose_np is not None:
-                    ep_store["current_b2_pose"].append(current_b2_pose_np[i])
+                if current_ee_anchor_np is not None:
+                    ep_store["current_ee_anchor"].append(current_ee_anchor_np[i])
                 ep_store["task"].append(task_list[i])
 
                 row: dict[str, Any] = {
@@ -1199,8 +1477,18 @@ def main() -> None:
             )
             onset_metrics["episode_index"] = int(ep_idx)
             manipulation_metric_rows.append(onset_metrics)
-        current_b2_pose = (
-            np.stack(item["current_b2_pose"]).astype(np.float32) if item["current_b2_pose"] else None
+        b2_episode_anchors = (
+            _episode_b2_command_anchors(
+                dataset,
+                ep_idx,
+                frame_index,
+                dataset_dt_seconds=1.0 / float(meta.fps),
+            )
+            if policy_cfg.b2_action_representation == "pose_delta"
+            else None
+        )
+        current_ee_anchor = (
+            np.stack(item["current_ee_anchor"]).astype(np.float32) if item["current_ee_anchor"] else None
         )
         valid_chunk_lengths = _valid_chunk_lengths(
             meta,
@@ -1282,14 +1570,47 @@ def main() -> None:
             normalized_trajectory_metrics_rows.append(normalized_metrics_rows[-1].copy())
             normalized_trajectory_chunk_metrics_rows.append(normalized_chunk_metrics_rows[-1].copy())
 
-        episode_plot_y_limits = plot_y_limits
-        plot_expert = expert
-        plot_pred = pred
-        plot_expert_chunks = expert_chunks
-        plot_pred_chunks = pred_chunks
+        reanchor_kwargs = {
+            "b2_representation": policy_cfg.b2_action_representation,
+            "z1_representation": policy_cfg.z1_action_representation,
+            "ee_rotation_representation": policy_cfg.ee_delta_rotation_representation,
+            "b2_episode_anchors": b2_episode_anchors,
+            "current_ee_anchor": current_ee_anchor,
+        }
+        plot_expert = _reanchor_episode_plot_actions(
+            expert,
+            plot_action_names,
+            **reanchor_kwargs,
+        )
+        plot_pred = _reanchor_episode_plot_actions(
+            pred,
+            plot_action_names,
+            **reanchor_kwargs,
+        )
+        plot_expert_chunks = _reanchor_episode_plot_actions(
+            expert_chunks,
+            plot_action_names,
+            **reanchor_kwargs,
+        )
+        plot_pred_chunks = _reanchor_episode_plot_actions(
+            pred_chunks,
+            plot_action_names,
+            **reanchor_kwargs,
+        )
+        episode_plot_y_limits = _plot_limits_covering_arrays(
+            plot_y_limits,
+            plot_expert,
+            plot_pred,
+            _flatten_valid_chunks(plot_expert_chunks, valid_chunk_lengths),
+            _flatten_valid_chunks(plot_pred_chunks, valid_chunk_lengths),
+        )
         episode_plot_y_limits_by_episode[str(ep_idx)] = {
             name: [float(low), float(high)]
-            for name, (low, high) in zip(plot_action_names, episode_plot_y_limits, strict=True)
+            for name, (low, high) in zip(
+                episode_plot_action_names,
+                episode_plot_y_limits,
+                strict=True,
+            )
         }
         _plot_episode(
             plot_dir / f"episode_{ep_idx:06d}.png",
@@ -1297,7 +1618,7 @@ def main() -> None:
             frame_index,
             plot_expert,
             plot_pred,
-            plot_action_names,
+            episode_plot_action_names,
             episode_plot_y_limits,
         )
         _plot_episode_rolling_chunks(
@@ -1306,7 +1627,7 @@ def main() -> None:
             frame_index,
             plot_expert_chunks,
             plot_pred_chunks,
-            plot_action_names,
+            episode_plot_action_names,
             episode_plot_y_limits,
             valid_chunk_lengths,
         )
@@ -1321,10 +1642,10 @@ def main() -> None:
                     ep_single_dir / f"chunk_start_{int(frame_index[i]):06d}.png",
                     ep_idx,
                     int(frame_index[i]),
-                    plot_expert_chunks[i, : valid_chunk_lengths[i]],
-                    plot_pred_chunks[i, : valid_chunk_lengths[i]],
+                    expert_chunks[i, : valid_chunk_lengths[i]],
+                    pred_chunks[i, : valid_chunk_lengths[i]],
                     plot_action_names,
-                    episode_plot_y_limits,
+                    plot_y_limits,
                 )
             )
         npz_payload[f"episode_{ep_idx:06d}_frame_index"] = frame_index
@@ -1337,8 +1658,14 @@ def main() -> None:
         npz_payload[f"episode_{ep_idx:06d}_supervision_trajectory_chunk"] = expert_trajectory_chunks
         npz_payload[f"episode_{ep_idx:06d}_pred_trajectory_chunk"] = pred_trajectory_chunks
         npz_payload[f"episode_{ep_idx:06d}_valid_chunk_length"] = valid_chunk_lengths
-        if current_b2_pose is not None:
-            npz_payload[f"episode_{ep_idx:06d}_current_b2_pose"] = current_b2_pose
+        npz_payload[f"episode_{ep_idx:06d}_episode_anchor_plot_supervision"] = plot_expert
+        npz_payload[f"episode_{ep_idx:06d}_episode_anchor_plot_pred"] = plot_pred
+        npz_payload[f"episode_{ep_idx:06d}_episode_anchor_plot_supervision_chunk"] = plot_expert_chunks
+        npz_payload[f"episode_{ep_idx:06d}_episode_anchor_plot_pred_chunk"] = plot_pred_chunks
+        if b2_episode_anchors is not None:
+            npz_payload[f"episode_{ep_idx:06d}_b2_episode_command_anchor"] = b2_episode_anchors
+        if current_ee_anchor is not None:
+            npz_payload[f"episode_{ep_idx:06d}_current_ee_anchor"] = current_ee_anchor
 
     logging.info(
         "Generating %d independent action-chunk plot(s) with %d worker(s)",
@@ -1503,7 +1830,16 @@ def main() -> None:
         "action_dt_seconds": action_dt,
         "execution_action_names": execution_action_names,
         "trajectory_action_names": trajectory_action_names,
-        "plot_action_names": plot_action_names,
+        "plot_action_names": episode_plot_action_names,
+        "single_chunk_plot_action_names": plot_action_names,
+        "plot_anchor_semantics": {
+            "episode_and_rolling_chunk_plots": {
+                "b2_pose_delta": "episode_first_frame_command_integrated_se2_anchor",
+                "z1_ee_state_delta": "episode_first_frame_measured_ee_anchor",
+            },
+            "single_chunk_plots": "each_inference_own_training_anchor",
+            "metrics_and_csv": "checkpoint_training_representation",
+        },
         "plot_y_limits_by_episode": episode_plot_y_limits_by_episode,
         "metrics": metrics_rows[0],
         "normalized_metrics": normalized_metrics_rows[0],

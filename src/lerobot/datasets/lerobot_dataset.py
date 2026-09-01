@@ -65,6 +65,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_threads: int | None = None,
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
+        image_source: str = "real",
+        sim_image_manifest: str | Path | None = None,
+        sim_image_root: str | Path | None = None,
+        mixed_sim_probability: float = 0.5,
+        image_source_seed: int = 0,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -214,6 +219,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._depth_output_unit = depth_output_unit
         self._batch_encoding_size = batch_encoding_size
         self._encoder_threads = encoder_threads
+        self._image_source = image_source
+        self._sim_image_manifest = sim_image_manifest
+        self._sim_image_root = sim_image_root
+        self._mixed_sim_probability = mixed_sim_probability
+        self._image_source_seed = image_source_seed
 
         if self._requested_root is not None:
             self._requested_root.mkdir(exist_ok=True, parents=True)
@@ -254,6 +264,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
             image_transforms=image_transforms,
             return_uint8=self._return_uint8,
             depth_output_unit=self._depth_output_unit,
+            image_source=self._image_source,
+            sim_image_manifest=self._sim_image_manifest,
+            sim_image_root=self._sim_image_root,
+            mixed_sim_probability=self._mixed_sim_probability,
+            image_source_seed=self._image_source_seed,
         )
         self.image_transforms = image_transforms
 
@@ -325,6 +340,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 image_transforms=self.image_transforms,
                 return_uint8=self._return_uint8,
                 depth_output_unit=self._depth_output_unit,
+                image_source=self._image_source,
+                sim_image_manifest=self._sim_image_manifest,
+                sim_image_root=self._sim_image_root,
+                mixed_sim_probability=self._mixed_sim_probability,
+                image_source_seed=self._image_source_seed,
             )
         return self.reader
 

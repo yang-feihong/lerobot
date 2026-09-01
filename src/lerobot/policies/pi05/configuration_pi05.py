@@ -20,7 +20,11 @@ from enum import Enum
 from pathlib import Path
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
-from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
+from lerobot.optim import (
+    AdamWConfig,
+    ConstantWithWarmupSchedulerConfig,
+    CosineDecayWithWarmupSchedulerConfig,
+)
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 from ..rtc.configuration_rtc import RTCConfig
@@ -192,15 +196,13 @@ class PI05Config(PreTrainedConfig):
     action_history_enabled: bool = False
 
     # Optimizer settings: see openpi `AdamW`
-    optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
+    optimizer_lr: float = 2.5e-5
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01
     optimizer_grad_clip_norm: float = 1.0
 
-    # Scheduler settings: see openpi `CosineDecaySchedule`
-    # Note: These will auto-scale if --steps < scheduler_decay_steps
-    # For example, --steps=3000 will scale warmup to 100 and decay to 3000
+    lr_scheduler_type: str = "constant_with_warmup"
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
@@ -224,6 +226,11 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+        if self.lr_scheduler_type not in ["constant_with_warmup", "cosine_decay_with_warmup"]:
+            raise ValueError(
+                "lr_scheduler_type must be constant_with_warmup or cosine_decay_with_warmup, "
+                f"got {self.lr_scheduler_type}"
+            )
         if self.action_loss_schema not in ["auto", "always", "off", "uniform_valid"]:
             raise ValueError(
                 "Invalid action_loss_schema: "
@@ -267,10 +274,7 @@ class PI05Config(PreTrainedConfig):
                 f"{self.ee_target_dataset_semantics!r}"
             )
         if self.ee_supervision_source != "control_action":
-            raise ValueError(
-                "Unsupported ee_supervision_source: "
-                f"{self.ee_supervision_source!r}"
-            )
+            raise ValueError(f"Unsupported ee_supervision_source: {self.ee_supervision_source!r}")
         if self.ee_delta_supervision_mode not in {"active_only", "all"}:
             raise ValueError(
                 "ee_delta_supervision_mode must be 'active_only' or 'all', got "
@@ -286,8 +290,13 @@ class PI05Config(PreTrainedConfig):
             and self.gripper_target_representation != "binary_position"
         ):
             raise ValueError("structured_temporal requires gripper_target_representation='binary_position'")
-        if self.action_loss_schema == "uniform_valid" and self.discrete_action_training_mode != "continuous_flow":
-            raise ValueError("uniform_valid action loss requires discrete_action_training_mode='continuous_flow'")
+        if (
+            self.action_loss_schema == "uniform_valid"
+            and self.discrete_action_training_mode != "continuous_flow"
+        ):
+            raise ValueError(
+                "uniform_valid action loss requires discrete_action_training_mode='continuous_flow'"
+            )
         if not any(self.state_feature_switches().values()):
             raise ValueError("At least one state_use_* switch must be true")
         if self.action_bool_loss_weight <= 0:
@@ -412,6 +421,8 @@ class PI05Config(PreTrainedConfig):
         )
 
     def get_scheduler_preset(self):
+        if self.lr_scheduler_type == "constant_with_warmup":
+            return ConstantWithWarmupSchedulerConfig(num_warmup_steps=self.scheduler_warmup_steps)
         return CosineDecayWithWarmupSchedulerConfig(
             peak_lr=self.optimizer_lr,
             decay_lr=self.scheduler_decay_lr,
@@ -538,9 +549,7 @@ class PI05Config(PreTrainedConfig):
                 "global_pose_state_names": None,
                 "global_pose_state_indices": None,
                 "b2_pose_delta_reference": (
-                    "inference_time_identity_pose"
-                    if self.b2_action_representation == "pose_delta"
-                    else None
+                    "inference_time_identity_pose" if self.b2_action_representation == "pose_delta" else None
                 ),
                 "b2_deployment_anchor": (
                     "actual_world_pose_at_source_step"
@@ -716,6 +725,7 @@ class PI05Config(PreTrainedConfig):
 
         grouped_names: dict[str, list[str]] = {group: [] for group in self.state_feature_switches()}
         auxiliary_names = {"b2_position_x", "b2_position_y", "b2_yaw"}
+
         def is_auxiliary(name: str) -> bool:
             return (
                 name in auxiliary_names

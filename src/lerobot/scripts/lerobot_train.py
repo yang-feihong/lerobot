@@ -46,6 +46,7 @@ from lerobot.common.train_utils import (
     load_training_batch_size,
     load_training_num_processes,
     load_training_state,
+    prune_checkpoints,
     push_checkpoint_to_hub,
     save_checkpoint,
     update_last_checkpoint,
@@ -684,6 +685,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     # Use accelerator's device
     device = accelerator.device
+    if device.type == "cuda":
+        device = torch.device("cuda", accelerator.local_process_index)
+        torch.cuda.set_device(device)
+    cfg.trainable_config.device = str(device)
     if cfg.cudnn_deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
@@ -1434,6 +1439,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     )
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
+                removed_checkpoints = prune_checkpoints(
+                    checkpoint_dir.parent,
+                    keep_last=cfg.keep_last_checkpoints,
+                    keep_every_n_steps=cfg.keep_checkpoint_every_n_steps,
+                )
+                if removed_checkpoints:
+                    logging.info(
+                        "Removed old checkpoints: %s",
+                        ", ".join(path.name for path in removed_checkpoints),
+                    )
 
             accelerator.wait_for_everyone()
 

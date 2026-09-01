@@ -137,6 +137,10 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
+    # Zero keeps every numbered checkpoint. Otherwise retain this many newest checkpoints and all
+    # milestones divisible by `keep_checkpoint_every_n_steps`.
+    keep_last_checkpoints: int = 0
+    keep_checkpoint_every_n_steps: int = 0
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
@@ -301,6 +305,13 @@ class TrainPipelineConfig(HubMixin):
         if self.gradient_accumulation_steps < 1:
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"
+            )
+        if self.keep_last_checkpoints < 0:
+            raise ValueError(f"keep_last_checkpoints must be non-negative, got {self.keep_last_checkpoints}")
+        if self.keep_checkpoint_every_n_steps < 0:
+            raise ValueError(
+                "keep_checkpoint_every_n_steps must be non-negative, "
+                f"got {self.keep_checkpoint_every_n_steps}"
             )
         self.motion_balanced_sampling.validate()
 

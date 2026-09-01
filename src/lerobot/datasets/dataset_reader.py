@@ -39,6 +39,7 @@ from .io_utils import (
     hf_transform_to_torch,
     load_nested_dataset,
 )
+from .paired_image_source import PairedImageSource
 from .video_utils import decode_video_frames
 
 
@@ -59,6 +60,11 @@ class DatasetReader:
         image_transforms: Callable | None,
         return_uint8: bool = False,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
+        image_source: str = "real",
+        sim_image_manifest: str | Path | None = None,
+        sim_image_root: str | Path | None = None,
+        mixed_sim_probability: float = 0.5,
+        image_source_seed: int = 0,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -91,6 +97,19 @@ class DatasetReader:
         self._image_transforms = image_transforms
         self._return_uint8 = return_uint8
         self._depth_output_unit = depth_output_unit
+        self._paired_image_source = None
+        if image_source != "real":
+            if sim_image_manifest is None or sim_image_root is None:
+                raise ValueError("Simulator image manifest and root are required")
+            selected_episodes = episodes or list(range(meta.total_episodes))
+            self._paired_image_source = PairedImageSource(
+                mode=image_source,
+                manifest=sim_image_manifest,
+                root=sim_image_root,
+                mixed_sim_probability=mixed_sim_probability,
+                seed=image_source_seed,
+                episodes=selected_episodes,
+            )
 
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
@@ -274,10 +293,18 @@ class DatasetReader:
         """
         ep = self._meta.episodes[ep_idx]
 
+        representative_timestamps = next(iter(query_timestamps.values()))
+        use_sim = self._paired_image_source is not None and self._paired_image_source.use_sim(
+            ep_idx, representative_timestamps
+        )
+
         def _decode_single(vid_key: str, query_ts: list[float]) -> tuple[str, torch.Tensor]:
-            from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
-            shifted_query_ts = [from_timestamp + ts for ts in query_ts]
-            video_path = self.root / self._meta.get_video_file_path(ep_idx, vid_key)
+            if use_sim:
+                video_path, shifted_query_ts = self._paired_image_source.resolve(ep_idx, vid_key, query_ts)
+            else:
+                from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
+                shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+                video_path = self.root / self._meta.get_video_file_path(ep_idx, vid_key)
             frames = decode_video_frames(
                 video_path,
                 shifted_query_ts,

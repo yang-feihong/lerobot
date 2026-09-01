@@ -63,11 +63,22 @@ finetune_mode="lora"
 
 dataset_repo_id="local/b2_z1_vla"
 dataset_root="/data/b2_z1_vla_lerobot"
+# CLI: --image-source=real|sim|mixed. Simulated images require the physically
+# paired manifest and rollout root for the selected dataset.
+image_source="real" # "real", "sim", or "mixed"
+sim_image_manifest=""
+sim_image_root=""
+mixed_sim_probability="0.5"
 base_policy="/data/checkpoints/lerobot_pi05_base_local_tokenizer"
 max_state_dim="32"
 
 steps="20000"
 seed="1000"
+optimizer_lr="2.5e-5"
+lr_scheduler_type="constant_with_warmup" # warmup, then hold optimizer_lr
+scheduler_warmup_steps="1000"
+scheduler_decay_steps="30000" # used only by cosine_decay_with_warmup
+scheduler_decay_lr="2.5e-6" # used only by cosine_decay_with_warmup
 # Temporal semantics for the planned 50 Hz dataset. A chunk covers one second,
 # while deployment requests a fresh observation/chunk after executing 0.5 s.
 # A dataset at another FPS is timestamp-resampled to this model frequency;
@@ -95,6 +106,8 @@ max_eval_samples="512"
 
 log_freq="10"
 save_freq="500"
+keep_last_checkpoints="2"
+keep_checkpoint_every_n_steps="10000"
 wandb_project="b2-z1-vla"
 wandb_enable="true"
 
@@ -135,6 +148,18 @@ output_root_override=""
 wandb_project_override=""
 dry_run="false"
 dataset_episodes=""
+dataset_repo_id_explicit="false"
+dataset_root_explicit="false"
+dataset_episodes_explicit="false"
+image_source_explicit="false"
+sim_image_manifest_explicit="false"
+sim_image_root_explicit="false"
+mixed_sim_probability_explicit="false"
+motion_balanced_sampling_explicit="false"
+motion_priority_fraction_explicit="false"
+motion_ee_translation_threshold_m_explicit="false"
+motion_ee_rotation_threshold_rad_explicit="false"
+motion_gripper_change_threshold_explicit="false"
 for argument in "$@"; do
   if [[ "$argument" == --action-semantics-profile=* ]]; then
     action_semantics_profile="${argument#*=}"
@@ -144,6 +169,8 @@ case "$action_semantics_profile" in
   joint_control_ee_v1)
     predict_arm_teleop_inactive="false"
     predict_arm_reset="false"
+    predict_ee_pose="true"
+    predict_gripper="true"
     predict_task_complete="false"
     discrete_action_training_mode="continuous_flow"
     ee_target_dataset_semantics="joint_control_inactive_interpolated"
@@ -174,27 +201,40 @@ while (( $# > 0 )); do
     --action-loss-schema=*) action_loss_schema="${1#*=}" ;;
     --predict-arm-teleop-inactive=*) predict_arm_teleop_inactive="${1#*=}" ;;
     --predict-arm-reset=*) predict_arm_reset="${1#*=}" ;;
+    --predict-ee-pose=*) predict_ee_pose="${1#*=}" ;;
+    --predict-gripper=*) predict_gripper="${1#*=}" ;;
     --predict-task-complete=*) predict_task_complete="${1#*=}" ;;
     --new-module-optimizer-lr-multiplier=*) new_module_optimizer_lr_multiplier="${1#*=}" ;;
     --structured-action-crf-initial-stay-bias=*) structured_action_crf_initial_stay_bias="${1#*=}" ;;
     --batch-size-per-gpu=*) batch_size_per_gpu="${1#*=}" ;;
     --global-batch-size=*) global_batch_size="${1#*=}" ;;
     --num-workers=*) num_workers="${1#*=}" ;;
-    --motion-balanced-sampling=*) motion_balanced_sampling="${1#*=}" ;;
-    --motion-priority-fraction=*) motion_priority_fraction="${1#*=}" ;;
-    --motion-ee-translation-threshold-m=*) motion_ee_translation_threshold_m="${1#*=}" ;;
-    --motion-ee-rotation-threshold-rad=*) motion_ee_rotation_threshold_rad="${1#*=}" ;;
-    --motion-gripper-change-threshold=*) motion_gripper_change_threshold="${1#*=}" ;;
+    --motion-balanced-sampling=*) motion_balanced_sampling="${1#*=}"; motion_balanced_sampling_explicit="true" ;;
+    --motion-priority-fraction=*) motion_priority_fraction="${1#*=}"; motion_priority_fraction_explicit="true" ;;
+    --motion-ee-translation-threshold-m=*) motion_ee_translation_threshold_m="${1#*=}"; motion_ee_translation_threshold_m_explicit="true" ;;
+    --motion-ee-rotation-threshold-rad=*) motion_ee_rotation_threshold_rad="${1#*=}"; motion_ee_rotation_threshold_rad_explicit="true" ;;
+    --motion-gripper-change-threshold=*) motion_gripper_change_threshold="${1#*=}"; motion_gripper_change_threshold_explicit="true" ;;
     --finetune-mode=*) finetune_mode="${1#*=}" ;;
-    --dataset-repo-id=*) dataset_repo_id="${1#*=}" ;;
-    --dataset-root=*) dataset_root="${1#*=}" ;;
-    --dataset-episodes=*) dataset_episodes="${1#*=}" ;;
+    --dataset-repo-id=*) dataset_repo_id="${1#*=}"; dataset_repo_id_explicit="true" ;;
+    --dataset-root=*) dataset_root="${1#*=}"; dataset_root_explicit="true" ;;
+    --dataset-episodes=*) dataset_episodes="${1#*=}"; dataset_episodes_explicit="true" ;;
+    --image-source=*) image_source="${1#*=}"; image_source_explicit="true" ;;
+    --sim-image-manifest=*) sim_image_manifest="${1#*=}"; sim_image_manifest_explicit="true" ;;
+    --sim-image-root=*) sim_image_root="${1#*=}"; sim_image_root_explicit="true" ;;
+    --mixed-sim-probability=*) mixed_sim_probability="${1#*=}"; mixed_sim_probability_explicit="true" ;;
     --gpu-ids=*) gpu_ids="${1#*=}" ;;
     --steps=*) steps="${1#*=}" ;;
+    --optimizer-lr=*) optimizer_lr="${1#*=}" ;;
+    --lr-scheduler-type=*) lr_scheduler_type="${1#*=}" ;;
+    --scheduler-warmup-steps=*) scheduler_warmup_steps="${1#*=}" ;;
+    --scheduler-decay-steps=*) scheduler_decay_steps="${1#*=}" ;;
+    --scheduler-decay-lr=*) scheduler_decay_lr="${1#*=}" ;;
     --log-freq=*) log_freq="${1#*=}" ;;
     --eval-steps=*) eval_steps="${1#*=}" ;;
     --max-eval-samples=*) max_eval_samples="${1#*=}" ;;
     --save-freq=*) save_freq="${1#*=}" ;;
+    --keep-last-checkpoints=*) keep_last_checkpoints="${1#*=}" ;;
+    --keep-checkpoint-every-n-steps=*) keep_checkpoint_every_n_steps="${1#*=}" ;;
     --seed=*) seed="${1#*=}" ;;
     --job-suffix=*) job_suffix="${1#*=}" ;;
     --output-root=*) output_root_override="${1#*=}" ;;
@@ -218,10 +258,18 @@ if [[ "$z1_action_representation" != "ee_delta" && "$z1_action_representation" !
   echo "Z1 representation must be ee_delta or ee_state_delta." >&2
   exit 2
 fi
+if [[ "$image_source" != "real" && "$image_source" != "sim" && "$image_source" != "mixed" ]]; then
+  echo "Image source must be real, sim or mixed." >&2
+  exit 2
+fi
+if [[ "$image_source" != "real" && ( -z "$sim_image_manifest" || -z "$sim_image_root" ) ]]; then
+  echo "Sim and mixed image sources require --sim-image-manifest and --sim-image-root." >&2
+  exit 2
+fi
 
 case "$action_semantics_profile" in
   joint_control_ee_v1)
-    expected_semantics=(false false false continuous_flow joint_control_inactive_interpolated control_action all continuous_position uniform_valid)
+    expected_semantics=(false false true true false continuous_flow joint_control_inactive_interpolated control_action all continuous_position uniform_valid)
     ;;
   custom)
     expected_semantics=()
@@ -233,7 +281,8 @@ case "$action_semantics_profile" in
 esac
 if (( ${#expected_semantics[@]} )); then
   actual_semantics=(
-    "$predict_arm_teleop_inactive" "$predict_arm_reset" "$predict_task_complete"
+    "$predict_arm_teleop_inactive" "$predict_arm_reset" "$predict_ee_pose" "$predict_gripper"
+    "$predict_task_complete"
     "$discrete_action_training_mode" "$ee_target_dataset_semantics" "$ee_supervision_source"
     "$ee_delta_supervision_mode"
     "$gripper_target_representation" "$action_loss_schema"
@@ -256,6 +305,9 @@ job_prefix="pi05_b2_z1_vla"
 if [[ "$enable_mem" == "true" ]]; then
   job_prefix="mem_pi05_b2_z1_vla"
   output_root="/data/b2_z1_vla_mem_outputs"
+fi
+if [[ "$image_source" != "real" ]]; then
+  job_prefix="${job_prefix}_${image_source}_images"
 fi
 if [[ -n "$job_suffix" ]]; then
   if [[ ! "$job_suffix" =~ ^[a-zA-Z0-9_-]+$ ]]; then
@@ -360,6 +412,51 @@ if [[ -z "$resume_checkpoint" ]]; then
   )
 fi
 
+dataset_args=()
+if [[ -z "$resume_checkpoint" ]]; then
+  dataset_args+=(
+    --dataset.repo_id="$dataset_repo_id"
+    --dataset.root="$dataset_root"
+    --dataset.eval_split="$eval_split"
+    --dataset.image_source="$image_source"
+    --dataset.mixed_sim_probability="$mixed_sim_probability"
+    --dataset.image_source_seed="$seed"
+  )
+  if [[ "$image_source" != "real" ]]; then
+    dataset_args+=(
+      --dataset.sim_image_manifest="$sim_image_manifest"
+      --dataset.sim_image_root="$sim_image_root"
+    )
+  fi
+else
+  [[ "$dataset_repo_id_explicit" == "false" ]] || dataset_args+=(--dataset.repo_id="$dataset_repo_id")
+  [[ "$dataset_root_explicit" == "false" ]] || dataset_args+=(--dataset.root="$dataset_root")
+  [[ "$image_source_explicit" == "false" ]] || dataset_args+=(--dataset.image_source="$image_source")
+  [[ "$sim_image_manifest_explicit" == "false" ]] || dataset_args+=(--dataset.sim_image_manifest="$sim_image_manifest")
+  [[ "$sim_image_root_explicit" == "false" ]] || dataset_args+=(--dataset.sim_image_root="$sim_image_root")
+  [[ "$mixed_sim_probability_explicit" == "false" ]] || dataset_args+=(--dataset.mixed_sim_probability="$mixed_sim_probability")
+fi
+
+sampling_args=()
+if [[ -z "$resume_checkpoint" ]]; then
+  sampling_args+=(
+    --motion_balanced_sampling.enabled="$motion_balanced_sampling"
+    --motion_balanced_sampling.priority_fraction="$motion_priority_fraction"
+    --motion_balanced_sampling.ee_translation_threshold_m="$motion_ee_translation_threshold_m"
+    --motion_balanced_sampling.ee_rotation_threshold_rad="$motion_ee_rotation_threshold_rad"
+    --motion_balanced_sampling.gripper_change_threshold="$motion_gripper_change_threshold"
+  )
+else
+  [[ "$motion_balanced_sampling_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.enabled="$motion_balanced_sampling")
+  [[ "$motion_priority_fraction_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.priority_fraction="$motion_priority_fraction")
+  [[ "$motion_ee_translation_threshold_m_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.ee_translation_threshold_m="$motion_ee_translation_threshold_m")
+  [[ "$motion_ee_rotation_threshold_rad_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.ee_rotation_threshold_rad="$motion_ee_rotation_threshold_rad")
+  [[ "$motion_gripper_change_threshold_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.gripper_change_threshold="$motion_gripper_change_threshold")
+fi
+if [[ "$dataset_episodes_explicit" == "true" ]]; then
+  dataset_args+=(--dataset.episodes="$dataset_episodes")
+fi
+
 peft_args=()
 policy_runtime_args=()
 train_expert_only="restored"
@@ -387,6 +484,11 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.dtype=bfloat16
     --policy.gradient_checkpointing=true
     --policy.train_expert_only="$train_expert_only"
+    --policy.optimizer_lr="$optimizer_lr"
+    --policy.lr_scheduler_type="$lr_scheduler_type"
+    --policy.scheduler_warmup_steps="$scheduler_warmup_steps"
+    --policy.scheduler_decay_steps="$scheduler_decay_steps"
+    --policy.scheduler_decay_lr="$scheduler_decay_lr"
   )
 fi
 
@@ -438,9 +540,7 @@ fi
 
 train_args=(
   "${resume_args[@]}" \
-  --dataset.repo_id="$dataset_repo_id" \
-  --dataset.root="$dataset_root" \
-  --dataset.eval_split="$eval_split" \
+  "${dataset_args[@]}" \
   "${policy_source_args[@]}" \
   "${policy_io_args[@]}" \
   "${policy_runtime_args[@]}" \
@@ -455,25 +555,19 @@ train_args=(
   --batch_size="$batch_size_per_gpu" \
   --gradient_accumulation_steps="$gradient_accumulation_steps" \
   --num_workers="$num_workers" \
-  --motion_balanced_sampling.enabled="$motion_balanced_sampling" \
-  --motion_balanced_sampling.priority_fraction="$motion_priority_fraction" \
-  --motion_balanced_sampling.ee_translation_threshold_m="$motion_ee_translation_threshold_m" \
-  --motion_balanced_sampling.ee_rotation_threshold_rad="$motion_ee_rotation_threshold_rad" \
-  --motion_balanced_sampling.gripper_change_threshold="$motion_gripper_change_threshold" \
+  "${sampling_args[@]}" \
   --log_freq="$log_freq" \
   --eval_steps="$eval_steps" \
   --max_eval_samples="$max_eval_samples" \
   --env_eval_freq=0 \
   --save_checkpoint=true \
   --save_freq="$save_freq" \
+  --keep_last_checkpoints="$keep_last_checkpoints" \
+  --keep_checkpoint_every_n_steps="$keep_checkpoint_every_n_steps" \
   --wandb.enable="$wandb_enable" \
   --wandb.project="$wandb_project" \
   --wandb.disable_artifact=true
 )
-
-if [[ -n "$dataset_episodes" ]]; then
-  train_args+=(--dataset.episodes="$dataset_episodes")
-fi
 
 if [[ "$dry_run" == "true" ]]; then
   printf 'CUDA_VISIBLE_DEVICES=%q lerobot_train' "$gpu_ids"
@@ -538,8 +632,18 @@ echo "GPUs:             $gpu_ids ($num_gpus process(es))"
 if (( num_gpus > 1 )); then
   echo "DDP port:         $main_process_port"
 fi
-echo "Dataset:          $dataset_root"
-echo "Motion sampling:  enabled=$motion_balanced_sampling, priority=$motion_priority_fraction, translation=${motion_ee_translation_threshold_m}m, rotation=${motion_ee_rotation_threshold_rad}rad, gripper=$motion_gripper_change_threshold"
+if [[ -z "$resume_checkpoint" ]]; then
+  echo "Dataset:          $dataset_root"
+  echo "Image source:     $image_source (sim probability=$mixed_sim_probability)"
+else
+  echo "Dataset:          restored from checkpoint unless explicitly overridden"
+  echo "Image source:     restored from checkpoint unless explicitly overridden"
+fi
+if [[ -z "$resume_checkpoint" ]]; then
+  echo "Motion sampling:  enabled=$motion_balanced_sampling, priority=$motion_priority_fraction, translation=${motion_ee_translation_threshold_m}m, rotation=${motion_ee_rotation_threshold_rad}rad, gripper=$motion_gripper_change_threshold"
+else
+  echo "Motion sampling:  restored from checkpoint unless explicitly overridden"
+fi
 if [[ -z "$resume_checkpoint" ]]; then
   echo "Action timing:    ${control_frequency_hz}Hz, chunk=$action_chunk_size, execute=$action_steps_to_execute (dt derived automatically)"
 else
@@ -547,7 +651,12 @@ else
 fi
 echo "Train/eval split: eval_split=$eval_split"
 echo "Steps:            $steps optimizer updates"
-echo "Action semantics: $action_semantics_profile ($ee_target_dataset_semantics, EE source=$ee_supervision_source, mask=$ee_delta_supervision_mode, gripper=$gripper_target_representation, loss=$action_loss_schema)"
+echo "Checkpoints:      every $save_freq steps; keep latest $keep_last_checkpoints and every ${keep_checkpoint_every_n_steps}-step milestone"
+if [[ -z "$resume_checkpoint" ]]; then
+  echo "Action semantics: $action_semantics_profile ($ee_target_dataset_semantics, EE source=$ee_supervision_source, mask=$ee_delta_supervision_mode, gripper=$gripper_target_representation, loss=$action_loss_schema)"
+else
+  echo "Action semantics: restored from checkpoint"
+fi
 echo "Seed:             $seed"
 echo "Batch per GPU:    $batch_size_per_gpu"
 echo "Gradient accum:   $gradient_accumulation_steps (computed)"

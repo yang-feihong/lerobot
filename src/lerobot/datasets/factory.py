@@ -187,6 +187,11 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 return_uint8=True,
                 depth_output_unit=cfg.dataset.depth_output_unit,
                 tolerance_s=cfg.tolerance_s,
+                image_source=cfg.dataset.image_source,
+                sim_image_manifest=cfg.dataset.sim_image_manifest,
+                sim_image_root=cfg.dataset.sim_image_root,
+                mixed_sim_probability=cfg.dataset.mixed_sim_probability,
+                image_source_seed=cfg.dataset.image_source_seed,
             )
         else:
             dataset = StreamingLeRobotDataset(
@@ -279,6 +284,11 @@ def make_train_eval_datasets(
         video_backend=cfg.dataset.video_backend,
         return_uint8=True,
         tolerance_s=cfg.tolerance_s,
+        image_source=cfg.dataset.image_source,
+        sim_image_manifest=cfg.dataset.sim_image_manifest,
+        sim_image_root=cfg.dataset.sim_image_root,
+        mixed_sim_probability=cfg.dataset.mixed_sim_probability,
+        image_source_seed=cfg.dataset.image_source_seed,
     )
 
     eval_dataset = LeRobotDataset(
@@ -291,6 +301,11 @@ def make_train_eval_datasets(
         video_backend=cfg.dataset.video_backend,
         return_uint8=True,
         tolerance_s=cfg.tolerance_s,
+        image_source=cfg.dataset.image_source,
+        sim_image_manifest=cfg.dataset.sim_image_manifest,
+        sim_image_root=cfg.dataset.sim_image_root,
+        mixed_sim_probability=cfg.dataset.mixed_sim_probability,
+        image_source_seed=cfg.dataset.image_source_seed,
     )
 
     if cfg.dataset.use_imagenet_stats:

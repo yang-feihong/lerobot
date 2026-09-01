@@ -37,6 +37,11 @@ class DatasetConfig:
     revision: str | None = None
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_video_backend)
+    image_source: str = "real"
+    sim_image_manifest: str | None = None
+    sim_image_root: str | None = None
+    mixed_sim_probability: float = 0.5
+    image_source_seed: int = 0
     # When True, RGB video frames are returned as uint8 tensors (0-255) instead of float32 (0.0-1.0).
     # This reduces memory and speeds up DataLoader IPC. The training pipeline handles the conversion.
     return_uint8: bool = False
@@ -55,6 +60,17 @@ class DatasetConfig:
     eval_task_variant: bool = False
 
     def __post_init__(self) -> None:
+        if self.image_source not in ("real", "sim", "mixed"):
+            raise ValueError(f"dataset.image_source must be real, sim or mixed, got {self.image_source!r}")
+        if self.image_source != "real" and (self.sim_image_manifest is None or self.sim_image_root is None):
+            raise ValueError(
+                "dataset.sim_image_manifest and dataset.sim_image_root are required "
+                f"for image_source={self.image_source!r}"
+            )
+        if not 0.0 <= self.mixed_sim_probability <= 1.0:
+            raise ValueError("dataset.mixed_sim_probability must be in [0, 1]")
+        if self.streaming and self.image_source != "real":
+            raise ValueError("Simulator image sources are not supported by streaming datasets")
         if self.depth_output_unit not in (DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT):
             raise ValueError(
                 f"depth_output_unit must be '{DEPTH_METER_UNIT}' or '{DEPTH_MILLIMETER_UNIT}', got {self.depth_output_unit!r}"

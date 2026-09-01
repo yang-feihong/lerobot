@@ -95,13 +95,9 @@ def test_ee_state_delta_uses_one_fixed_inference_time_reference():
     targets = reference.unsqueeze(1).repeat(1, 2, 1)
     targets[0, 0, 6] += 0.1
     targets[0, 1, 6] += 0.3
-    deltas = absolute_ee_pose_to_reference_delta(
-        targets, reference, rotation_representation="rotvec"
-    )
+    deltas = absolute_ee_pose_to_reference_delta(targets, reference, rotation_representation="rotvec")
     torch.testing.assert_close(deltas[0, :, 3], torch.tensor([0.1, 0.3]))
-    reconstructed = ee_reference_delta_to_absolute(
-        deltas, reference, rotation_representation="rotvec"
-    )
+    reconstructed = ee_reference_delta_to_absolute(deltas, reference, rotation_representation="rotvec")
     torch.testing.assert_close(reconstructed, targets)
 
 
@@ -161,9 +157,7 @@ def test_processor_reads_ee_state_anchor_without_using_it_as_supervision():
 
 @pytest.mark.parametrize("b2_representation", ["velocity", "pose_delta"])
 @pytest.mark.parametrize("z1_representation", ["ee_delta", "ee_state_delta"])
-def test_all_supported_b2_z1_representation_combinations(
-    b2_representation: str, z1_representation: str
-):
+def test_all_supported_b2_z1_representation_combinations(b2_representation: str, z1_representation: str):
     horizon = 4
     action_count = horizon + int(z1_representation == "ee_delta")
     identity = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
@@ -212,9 +206,7 @@ def test_all_supported_combinations_construct_formal_processor_pipelines(
     config.io_schema_resolved = True
     config.action_dt_seconds = 0.02
     config.state_feature_indices = list(range(19 if z1_representation == "ee_state_delta" else 10))
-    config.ee_state_anchor_indices = (
-        list(range(49, 58)) if z1_representation == "ee_state_delta" else None
-    )
+    config.ee_state_anchor_indices = list(range(49, 58)) if z1_representation == "ee_state_delta" else None
     name_fn = b2_pose_delta_action_names if b2_representation == "pose_delta" else b2_execution_action_names
     config.action_feature_names = name_fn(
         list(CONTROL_EXTENDED_DATASET_ACTION_NAMES), **action_schema_kwargs(config)
@@ -326,6 +318,20 @@ def test_new_action_schema_retains_explicit_gates_and_completion():
         include_task_complete=False,
     )
     torch.testing.assert_close(without_optional_groups, action[..., :1, :3])
+
+
+def test_b2_only_action_names_do_not_validate_disabled_ee_representation():
+    names = b2_pose_delta_action_names(
+        list(DATASET_ACTION_NAMES),
+        z1_representation="ee_state_delta",
+        ee_delta_rotation_representation="rotvec",
+        predict_arm_teleop_inactive=False,
+        predict_arm_reset=False,
+        predict_ee_pose=False,
+        predict_gripper=False,
+        include_task_complete=False,
+    )
+    assert names == ["b2_delta_x", "b2_delta_y", "b2_delta_yaw"]
 
 
 def test_processor_uses_new_schema_without_mutating_raw_transition():

@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import shutil
 from pathlib import Path
 
 from huggingface_hub import HfApi, snapshot_download
@@ -88,6 +89,33 @@ def update_last_checkpoint(checkpoint_dir: Path) -> Path:
         last_checkpoint_dir.unlink()
     relative_target = checkpoint_dir.relative_to(checkpoint_dir.parent)
     last_checkpoint_dir.symlink_to(relative_target)
+
+
+def prune_checkpoints(
+    checkpoints_dir: Path,
+    keep_last: int,
+    keep_every_n_steps: int = 0,
+) -> list[Path]:
+    """Remove old numbered checkpoints while retaining recent and milestone checkpoints."""
+    if keep_last < 0:
+        raise ValueError(f"keep_last must be non-negative, got {keep_last}")
+    if keep_every_n_steps < 0:
+        raise ValueError(f"keep_every_n_steps must be non-negative, got {keep_every_n_steps}")
+    if keep_last == 0:
+        return []
+
+    numbered = sorted(
+        (path for path in checkpoints_dir.iterdir() if path.is_dir() and path.name.isdigit()),
+        key=lambda path: int(path.name),
+    )
+    retained = set(numbered[-keep_last:])
+    if keep_every_n_steps > 0:
+        retained.update(path for path in numbered if int(path.name) % keep_every_n_steps == 0)
+
+    removed = [path for path in numbered if path not in retained]
+    for path in removed:
+        shutil.rmtree(path)
+    return removed
 
 
 def save_checkpoint(

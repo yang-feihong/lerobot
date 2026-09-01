@@ -24,8 +24,10 @@ from lerobot.scripts.pi05_vla_server import (
     EE_DELTA_ACTION_NAMES,
     EE_POSE_ACTION_NAMES,
     PROTOCOL_VERSION,
+    ActionRecord,
     AsyncRTCPolicy,
     MemoryObservation,
+    SE2TrajectoryController,
     _apply_completion_stop,
     _b2_velocity_smoothing_transition_step,
     _decode_discrete_actions,
@@ -35,10 +37,49 @@ from lerobot.scripts.pi05_vla_server import (
     _smooth_b2_execution_velocity,
     _to_execution_actions,
     decode_observation_packet,
+    encode_action_packet,
     execution_action_names,
 )
 
 EXECUTION_ACTION_NAMES = execution_action_names("ee_delta")
+
+
+def test_action_packet_contains_replayable_model_and_execution_outputs() -> None:
+    record = ActionRecord(
+        sequence=3,
+        source_step=11,
+        inference_seconds=0.2,
+        action_names=("b2_vx",),
+        model_action_names=("model_b2",),
+        control_epoch=7,
+        b2_execution_mode="velocity_chunk",
+        z1_action_representation="ee_state_delta",
+        b2_anchor_kind="actual_state",
+        b2_anchor=np.asarray([1.0, 2.0, 3.0]),
+        b2_reference=torch.ones((2, 3)),
+        ee_anchor_kind="actual_ee_state",
+        ee_anchor=np.arange(9, dtype=np.float32),
+        original=torch.full((2, 1), 0.25),
+        unsmoothed=torch.full((2, 1), 0.5),
+        processed=torch.full((2, 1), 0.75),
+        inference_started_ns=100,
+        inference_finished_ns=200,
+        preprocess_seconds=0.01,
+        predict_seconds=0.15,
+        postprocess_seconds=0.04,
+        observation_received_ns=80,
+        inference_delay_steps=2,
+        velocity_smoothing_transition_step=1,
+        sim_steps_per_wall_second=50.0,
+    )
+
+    with np.load(BytesIO(encode_action_packet(record)), allow_pickle=False) as packet:
+        np.testing.assert_array_equal(packet["original_actions"], record.original.numpy())
+        np.testing.assert_array_equal(packet["unsmoothed_execution_actions"], record.unsmoothed.numpy())
+        np.testing.assert_array_equal(packet["processed_actions"], record.processed.numpy())
+        np.testing.assert_array_equal(packet["b2_reference"], record.b2_reference.numpy())
+        assert int(packet["control_epoch"]) == 7
+        assert float(packet["predict_seconds"]) == pytest.approx(0.15)
 
 
 def test_b2_rtc_pose_delta_prefix_is_reexpressed_in_new_inference_frame() -> None:
@@ -52,12 +93,84 @@ def test_b2_rtc_pose_delta_prefix_is_reexpressed_in_new_inference_frame() -> Non
     torch.testing.assert_close(rebased[:, 2], torch.tensor([0.1, 0.2]), atol=1e-6, rtol=0)
 
 
+def test_se2_feedback_tracks_world_target_in_actual_body_frame_with_rate_limits() -> None:
+    controller = SE2TrajectoryController(50.0)
+    actual = np.asarray([3.5, 19.5, np.pi], dtype=np.float64)
+    target = np.asarray([3.0, 19.5, np.pi], dtype=np.float64)
+    commands = []
+
+    for sim_step in range(50):
+        command = controller.command(
+            control_epoch=0,
+            sim_step=sim_step,
+            actual_pose=actual,
+            target_pose=target,
+        )
+        commands.append(command)
+        actual[0] += np.cos(actual[2]) * command[0] / 50.0
+        actual[1] += np.sin(actual[2]) * command[0] / 50.0
+        actual[2] += command[2] / 50.0
+
+    commands = np.stack(commands)
+    assert commands[0, 0] == pytest.approx(0.03)
+    assert np.abs(np.diff(commands[:, :2], axis=0)).max() <= 1.5 / 50.0 + 1e-9
+    assert np.abs(np.diff(commands[:, 2], axis=0)).max() <= 2.0 / 50.0 + 1e-9
+    assert actual[0] < 3.5
+
+
+def test_se2_feedback_resets_rate_limiter_on_control_epoch_change() -> None:
+    controller = SE2TrajectoryController(50.0)
+    actual = np.zeros(3, dtype=np.float64)
+    target = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+    controller.command(control_epoch=0, sim_step=100, actual_pose=actual, target_pose=target)
+    command = controller.command(
+        control_epoch=1,
+        sim_step=100,
+        actual_pose=actual,
+        target_pose=None,
+    )
+
+    np.testing.assert_array_equal(command, np.zeros(3))
+
+
+def test_server_tracks_rtc_indexed_anchor_trajectory() -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.b2_execution_mode = "se2_feedback"
+    policy._records_lock = Lock()
+    policy._b2_controller_lock = Lock()
+    policy._b2_controller = SE2TrajectoryController(50.0)
+    reference = torch.zeros((50, 3), dtype=torch.float32)
+    reference[:, 0] = torch.linspace(0.01, 0.50, 50)
+    policy._records = {
+        4: SimpleNamespace(
+            sequence=4,
+            control_epoch=2,
+            b2_reference=reference,
+            b2_anchor=np.asarray([3.5, 19.5, np.pi], dtype=np.float32),
+            processed=torch.zeros((50, len(EXECUTION_ACTION_NAMES))),
+        )
+    }
+
+    result = policy.b2_feedback_control(
+        control_epoch=2,
+        sim_step=10,
+        sequence=4,
+        action_index=3,
+        actual_pose=np.asarray([3.5, 19.5, np.pi], dtype=np.float64),
+    )
+
+    assert result["target_index"] == 8
+    assert result["target_pose"][0] < 3.5
+    assert result["command"][0] == pytest.approx(0.03)
+
+
 def test_z1_state_delta_rtc_prefix_is_reexpressed_from_current_actual_state() -> None:
     model_names = (*B2_EXECUTION_VELOCITY_NAMES, *EE_DELTA_ROTVEC_NAMES, *EE_DELTA_ACTION_NAMES[6:9])
     policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
     policy._action_unnormalizer = lambda transition: transition
     policy._action_normalizer = lambda transition: transition
     policy.b2_action_representation = "velocity"
+    policy.b2_execution_mode = "velocity_chunk"
     policy.z1_action_representation = "ee_state_delta"
     policy.model_action_names = model_names
     prefix = torch.zeros(2, len(model_names))
@@ -209,11 +322,7 @@ def test_continuous_gripper_is_not_thresholded() -> None:
 
 
 def test_continuous_ee_schema_defaults_missing_arm_modes_to_active() -> None:
-    names = tuple(
-        ["b2_vx", "b2_vy", "b2_omega_z"]
-        + list(EE_DELTA_ACTION_NAMES)
-        + ["gripper_target"]
-    )
+    names = tuple(["b2_vx", "b2_vy", "b2_omega_z"] + list(EE_DELTA_ACTION_NAMES) + ["gripper_target"])
     actions = torch.zeros((2, len(names)))
 
     execution = _to_execution_actions(actions, names, "ee_delta")
@@ -254,6 +363,7 @@ def test_infer_records_model_action_names_and_source_step_anchor(
     policy.gripper_nonnegative_value = 0.0
     policy.z1_action_representation = z1_representation
     policy.b2_action_representation = "velocity"
+    policy.b2_execution_mode = "velocity_chunk"
     policy.action_names = EXECUTION_ACTION_NAMES
     policy.stop_on_model_task_complete = False
     policy._task_complete_latched = False
@@ -264,6 +374,7 @@ def test_infer_records_model_action_names_and_source_step_anchor(
 
     record = policy._infer(
         SimpleNamespace(
+            control_epoch=3,
             sim_step=25,
             server_received_ns=0,
             executed_ee_target=np.zeros(9, dtype=np.float32),
@@ -277,6 +388,9 @@ def test_infer_records_model_action_names_and_source_step_anchor(
     assert record.original.shape == (2, len(model_names))
     assert record.processed.shape == (2, len(EXECUTION_ACTION_NAMES))
     assert record.source_step == 25
+    assert record.control_epoch == 3
+    assert record.b2_execution_mode == "velocity_chunk"
+    assert record.b2_reference is None
     assert record.ee_anchor_kind == expected_anchor_kind
     np.testing.assert_array_equal(record.ee_anchor, expected_anchor)
     assert record.b2_anchor_kind == "actual_world_pose"
@@ -324,6 +438,7 @@ def test_server_latches_an_executed_completion_until_sim_step_resets() -> None:
             sim_step=step,
             active_sequence=4,
             active_index=active_index,
+            executed_b2_command=np.zeros(3, dtype=np.float32),
             state=np.zeros(1, dtype=np.float32),
             state_names=("state",),
             executed_ee_target=np.zeros(9, dtype=np.float32),
@@ -370,6 +485,7 @@ def test_server_does_not_latch_completion_when_model_stop_is_disabled() -> None:
         sim_step=10,
         active_sequence=4,
         active_index=2,
+        executed_b2_command=np.zeros(3, dtype=np.float32),
         state=np.zeros(1, dtype=np.float32),
         state_names=("state",),
         executed_ee_target=np.zeros(9, dtype=np.float32),
@@ -544,7 +660,13 @@ def test_action_history_uses_last_executed_row_and_low_level_ee_target_feedback(
     processed = torch.zeros((3, len(names)))
     processed[:, names.index("b2_vx")] = torch.tensor([10.0, 20.0, 30.0])
     processed[:, names.index("arm_active")] = 1.0
-    policy._records = {4: SimpleNamespace(processed=processed, action_names=names)}
+    policy._records = {
+        4: SimpleNamespace(
+            processed=processed,
+            action_names=names,
+            b2_execution_mode="velocity_chunk",
+        )
+    }
     policy.source_action_names = ("b2_vx", "height_invariant_ee_x")
     policy.action_history_indices = (0, 1)
     ee_target = np.zeros(9, dtype=np.float32)
@@ -558,6 +680,35 @@ def test_action_history_uses_last_executed_row_and_low_level_ee_target_feedback(
     history = policy._executed_source_action(observation)
 
     torch.testing.assert_close(history, torch.tensor([20.0, 0.42]))
+
+
+def test_feedback_action_history_uses_low_level_executed_b2_command() -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy._records_lock = Lock()
+    names = execution_action_names("ee_delta")
+    processed = torch.zeros((3, len(names)))
+    processed[:, names.index("b2_vx")] = 20.0
+    processed[:, names.index("arm_active")] = 1.0
+    policy._records = {
+        4: SimpleNamespace(
+            sequence=4,
+            processed=processed,
+            action_names=names,
+            b2_execution_mode="se2_feedback",
+        )
+    }
+    policy.source_action_names = ("b2_vx", "b2_vy", "b2_omega_z")
+    policy.action_history_indices = (0, 1, 2)
+    observation = SimpleNamespace(
+        active_sequence=4,
+        active_index=2,
+        executed_b2_command=np.asarray([0.2, -0.1, 0.3], dtype=np.float32),
+        executed_ee_target=np.zeros(9, dtype=np.float32),
+    )
+
+    history = policy._executed_source_action(observation)
+
+    torch.testing.assert_close(history, torch.tensor([0.2, -0.1, 0.3]))
 
 
 def test_rtc_skipped_prefix_keeps_previous_plan_and_delays_new_transition() -> None:
@@ -626,6 +777,7 @@ def test_memory_sampling_is_right_aligned_and_marks_episode_start_padding() -> N
             state_names=("state",),
             active_sequence=-1,
             active_index=0,
+            executed_b2_command=np.zeros(3, dtype=np.float32),
             executed_ee_target=np.zeros(9, dtype=np.float32),
         )
         for step in range(10, 21)
@@ -645,6 +797,7 @@ def test_memory_sampling_rejects_a_missing_50hz_sample() -> None:
             state_names=("state",),
             active_sequence=-1,
             active_index=0,
+            executed_b2_command=np.zeros(3, dtype=np.float32),
             executed_ee_target=np.zeros(9, dtype=np.float32),
         )
         for step in (10, 11, 12, 14)
@@ -654,10 +807,11 @@ def test_memory_sampling_rejects_a_missing_50hz_sample() -> None:
         AsyncRTCPolicy._sample_memory_records(history, current_step=14, count=2, stride=1)
 
 
-def test_protocol_v5_decodes_consecutive_50hz_telemetry_history() -> None:
+def test_protocol_v6_decodes_consecutive_50hz_telemetry_history() -> None:
     state_names = ("state_a", "state_b")
     states = np.asarray([[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]], dtype=np.float32)
     ee_targets = np.zeros((3, len(EE_POSE_ACTION_NAMES)), dtype=np.float32)
+    b2_commands = np.asarray([[0.1, 0.0, 0.0], [0.2, -0.1, 0.0], [0.3, -0.1, 0.2]], dtype=np.float32)
     ok, jpeg = __import__("cv2").imencode(".jpg", np.zeros((4, 4, 3), dtype=np.uint8))
     assert ok
     body = BytesIO()
@@ -678,6 +832,7 @@ def test_protocol_v5_decodes_consecutive_50hz_telemetry_history() -> None:
         history_states=states,
         history_active_sequences=np.asarray([2, 3, 3]),
         history_active_indices=np.asarray([12, 1, 2]),
+        history_executed_b2_commands=b2_commands,
         history_executed_ee_targets=ee_targets,
         base_jpeg=jpeg,
         wrist_jpeg=jpeg,
@@ -688,3 +843,4 @@ def test_protocol_v5_decodes_consecutive_50hz_telemetry_history() -> None:
     assert packet.control_epoch == 7
     assert [record.sim_step for record in packet.telemetry_history] == [10, 11, 12]
     np.testing.assert_array_equal(packet.telemetry_history[-1].state, states[-1])
+    np.testing.assert_array_equal(packet.telemetry_history[-1].executed_b2_command, b2_commands[-1])

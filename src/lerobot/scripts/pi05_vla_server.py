@@ -45,7 +45,15 @@ from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.utils import init_logging
 
 LOG = logging.getLogger("pi05_vla_server")
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
+B2_POSE_DELTA_CONTROL_MODES = ("differentiate", "se2_feedback")
+B2_FEEDBACK_LOOKAHEAD_STEPS = 5
+B2_FEEDBACK_POSITION_GAIN = 2.0
+B2_FEEDBACK_YAW_GAIN = 2.5
+B2_FEEDBACK_MAX_LINEAR_SPEED = 0.6
+B2_FEEDBACK_MAX_YAW_RATE = 0.8
+B2_FEEDBACK_MAX_LINEAR_ACCELERATION = 1.5
+B2_FEEDBACK_MAX_YAW_ACCELERATION = 2.0
 EXECUTION_ACTION_PREFIX_NAMES = (
     "b2_vx",
     "b2_vy",
@@ -68,7 +76,9 @@ EE_POSE_ACTION_NAMES = (
 EE_DELTA_ACTION_NAMES = tuple(
     name.replace("height_invariant_ee_", "height_invariant_ee_delta_") for name in EE_POSE_ACTION_NAMES
 )
-EE_STATE_NAMES = tuple(name.replace("height_invariant_ee_", "height_invariant_ee_state_") for name in EE_POSE_ACTION_NAMES)
+EE_STATE_NAMES = tuple(
+    name.replace("height_invariant_ee_", "height_invariant_ee_state_") for name in EE_POSE_ACTION_NAMES
+)
 EXECUTION_ACTION_SUFFIX_NAMES = (
     "gripper_target",
     "task_complete",
@@ -76,6 +86,87 @@ EXECUTION_ACTION_SUFFIX_NAMES = (
 B2_EXECUTION_VELOCITY_NAMES = ("b2_vx", "b2_vy", "b2_omega_z")
 B2_OBSERVED_VELOCITY_NAMES = ("b2_body_vx", "b2_body_vy", "b2_body_wz")
 B2_GLOBAL_POSE_NAMES = ("b2_position_x", "b2_position_y", "b2_yaw")
+
+
+def _wrap_angle(value: float) -> float:
+    return math.atan2(math.sin(value), math.cos(value))
+
+
+def _relative_se2_target_to_world(relative_pose: np.ndarray, anchor: np.ndarray) -> np.ndarray:
+    if relative_pose.shape != (3,) or anchor.shape != (3,):
+        raise ValueError("SE(2) target and anchor must both have shape (3,)")
+    anchor_cos = math.cos(float(anchor[2]))
+    anchor_sin = math.sin(float(anchor[2]))
+    return np.asarray(
+        (
+            anchor[0] + anchor_cos * relative_pose[0] - anchor_sin * relative_pose[1],
+            anchor[1] + anchor_sin * relative_pose[0] + anchor_cos * relative_pose[1],
+            _wrap_angle(float(anchor[2] + relative_pose[2])),
+        ),
+        dtype=np.float64,
+    )
+
+
+class SE2TrajectoryController:
+    def __init__(self, control_frequency_hz: float):
+        self.control_frequency_hz = float(control_frequency_hz)
+        self._control_epoch: int | None = None
+        self._last_step = -1
+        self._last_command = np.zeros(3, dtype=np.float64)
+
+    def command(
+        self,
+        *,
+        control_epoch: int,
+        sim_step: int,
+        actual_pose: np.ndarray,
+        target_pose: np.ndarray | None,
+    ) -> np.ndarray:
+        if actual_pose.shape != (3,) or not np.isfinite(actual_pose).all():
+            raise ValueError(f"Invalid B2 actual pose: {actual_pose}")
+        if target_pose is None:
+            requested = np.zeros(3, dtype=np.float64)
+        else:
+            if target_pose.shape != (3,) or not np.isfinite(target_pose).all():
+                raise ValueError(f"Invalid B2 target pose: {target_pose}")
+            world_error = target_pose[:2] - actual_pose[:2]
+            yaw_cos = math.cos(float(actual_pose[2]))
+            yaw_sin = math.sin(float(actual_pose[2]))
+            body_error = np.asarray(
+                (
+                    yaw_cos * world_error[0] + yaw_sin * world_error[1],
+                    -yaw_sin * world_error[0] + yaw_cos * world_error[1],
+                )
+            )
+            requested = np.asarray(
+                (
+                    B2_FEEDBACK_POSITION_GAIN * body_error[0],
+                    B2_FEEDBACK_POSITION_GAIN * body_error[1],
+                    B2_FEEDBACK_YAW_GAIN * _wrap_angle(float(target_pose[2] - actual_pose[2])),
+                ),
+                dtype=np.float64,
+            )
+            requested[:2] = np.clip(
+                requested[:2], -B2_FEEDBACK_MAX_LINEAR_SPEED, B2_FEEDBACK_MAX_LINEAR_SPEED
+            )
+            requested[2] = np.clip(requested[2], -B2_FEEDBACK_MAX_YAW_RATE, B2_FEEDBACK_MAX_YAW_RATE)
+
+        if self._control_epoch != control_epoch or sim_step <= self._last_step:
+            self._control_epoch = control_epoch
+            self._last_step = sim_step - 1
+            self._last_command.fill(0.0)
+        step_delta = sim_step - self._last_step
+        max_change = np.asarray(
+            (
+                B2_FEEDBACK_MAX_LINEAR_ACCELERATION,
+                B2_FEEDBACK_MAX_LINEAR_ACCELERATION,
+                B2_FEEDBACK_MAX_YAW_ACCELERATION,
+            )
+        ) * (step_delta / self.control_frequency_hz)
+        command = self._last_command + np.clip(requested - self._last_command, -max_change, max_change)
+        self._last_step = sim_step
+        self._last_command = command
+        return command.copy()
 
 
 def _reanchor_b2_pose_delta(
@@ -134,7 +225,9 @@ def _to_execution_actions(
         raise ValueError(f"Invalid named postprocessed actions: shape={tuple(actions.shape)}, names={names}")
     columns = {name: actions[:, index] for index, name in enumerate(names)}
     output_names = execution_action_names(z1_action_representation)
-    if z1_action_representation in {"ee_delta", "ee_state_delta"} and set(EE_DELTA_ROTVEC_NAMES).issubset(columns):
+    if z1_action_representation in {"ee_delta", "ee_state_delta"} and set(EE_DELTA_ROTVEC_NAMES).issubset(
+        columns
+    ):
         rotvec = torch.stack([columns[name] for name in EE_DELTA_ROTVEC_NAMES], dim=-1)
         rot6d = _matrix_to_rot6d(_rotvec_to_matrix(rotvec))
         for index, name in enumerate(EE_DELTA_ACTION_NAMES[:6]):
@@ -316,6 +409,7 @@ class MemoryObservation:
     state_names: tuple[str, ...]
     active_sequence: int
     active_index: int
+    executed_b2_command: np.ndarray
     executed_ee_target: np.ndarray
 
 
@@ -411,8 +505,7 @@ def _load_checkpoint_contract(
         missing_anchor_state = tuple(name for name in EE_STATE_NAMES if name not in source_state_names)
         if missing_anchor_state:
             raise ValueError(
-                "ee_state_delta checkpoint is missing source EE anchor fields: "
-                f"{missing_anchor_state}"
+                f"ee_state_delta checkpoint is missing source EE anchor fields: {missing_anchor_state}"
             )
     state_dim = _feature_shape(raw_config["input_features"][OBS_STATE])[-1]
     if state_dim != len(state_names):
@@ -510,12 +603,14 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
         history_states = np.asarray(packet["history_states"], dtype=np.float32)
         history_active_sequences = np.asarray(packet["history_active_sequences"], dtype=np.int64).reshape(-1)
         history_active_indices = np.asarray(packet["history_active_indices"], dtype=np.int64).reshape(-1)
+        history_executed_b2_commands = np.asarray(packet["history_executed_b2_commands"], dtype=np.float32)
         history_executed_ee_targets = np.asarray(packet["history_executed_ee_targets"], dtype=np.float32)
         history_count = len(history_sim_steps)
         expected_shapes = (
             history_states.shape == (history_count, state.size)
             and history_active_sequences.shape == (history_count,)
             and history_active_indices.shape == (history_count,)
+            and history_executed_b2_commands.shape == (history_count, 3)
             and history_executed_ee_targets.shape == (history_count, len(EE_POSE_ACTION_NAMES))
         )
         if history_count == 0 or not expected_shapes:
@@ -523,12 +618,13 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
                 "Invalid 50 Hz telemetry history shapes: "
                 f"steps={history_sim_steps.shape}, states={history_states.shape}, "
                 f"sequences={history_active_sequences.shape}, indices={history_active_indices.shape}, "
-                f"ee={history_executed_ee_targets.shape}"
+                f"b2={history_executed_b2_commands.shape}, ee={history_executed_ee_targets.shape}"
             )
         if np.any(np.diff(history_sim_steps) != 1):
             raise ValueError("50 Hz telemetry history must contain consecutive simulation steps")
         if (
             not np.isfinite(history_states).all()
+            or not np.isfinite(history_executed_b2_commands).all()
             or not np.isfinite(history_executed_ee_targets).all()
             or np.any(history_active_indices < 0)
         ):
@@ -551,6 +647,7 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
                 state_names=state_names,
                 active_sequence=int(history_active_sequences[index]),
                 active_index=int(history_active_indices[index]),
+                executed_b2_command=history_executed_b2_commands[index].copy(),
                 executed_ee_target=history_executed_ee_targets[index].copy(),
             )
             for index in range(history_count)
@@ -591,10 +688,33 @@ def encode_action_packet(record: ActionRecord) -> bytes:
         source_step=np.asarray(record.source_step, dtype=np.int64),
         inference_seconds=np.asarray(record.inference_seconds, dtype=np.float64),
         action_names=np.asarray(record.action_names, dtype=np.str_),
+        model_action_names=np.asarray(record.model_action_names, dtype=np.str_),
+        control_epoch=np.asarray(record.control_epoch, dtype=np.int64),
+        b2_execution_mode=np.asarray(record.b2_execution_mode, dtype=np.str_),
         z1_action_representation=np.asarray(record.z1_action_representation, dtype=np.str_),
+        b2_anchor_kind=np.asarray(record.b2_anchor_kind, dtype=np.str_),
+        b2_anchor=record.b2_anchor,
+        b2_reference=(
+            record.b2_reference.numpy().astype(np.float32, copy=False)
+            if record.b2_reference is not None
+            else np.empty((0, 3), dtype=np.float32)
+        ),
         ee_anchor_kind=np.asarray(record.ee_anchor_kind, dtype=np.str_),
         ee_anchor=record.ee_anchor,
+        original_actions=record.original.numpy().astype(np.float32, copy=False),
+        unsmoothed_execution_actions=record.unsmoothed.numpy().astype(np.float32, copy=False),
         processed_actions=record.processed.numpy().astype(np.float32, copy=False),
+        inference_started_ns=np.asarray(record.inference_started_ns, dtype=np.int64),
+        inference_finished_ns=np.asarray(record.inference_finished_ns, dtype=np.int64),
+        observation_received_ns=np.asarray(record.observation_received_ns, dtype=np.int64),
+        preprocess_seconds=np.asarray(record.preprocess_seconds, dtype=np.float64),
+        predict_seconds=np.asarray(record.predict_seconds, dtype=np.float64),
+        postprocess_seconds=np.asarray(record.postprocess_seconds, dtype=np.float64),
+        inference_delay_steps=np.asarray(record.inference_delay_steps, dtype=np.int64),
+        velocity_smoothing_transition_step=np.asarray(
+            record.velocity_smoothing_transition_step, dtype=np.int64
+        ),
+        sim_steps_per_wall_second=np.asarray(record.sim_steps_per_wall_second, dtype=np.float64),
     )
     return output.getvalue()
 
@@ -629,9 +749,12 @@ class ActionRecord:
     inference_seconds: float
     action_names: tuple[str, ...]
     model_action_names: tuple[str, ...]
+    control_epoch: int
+    b2_execution_mode: str
     z1_action_representation: str
     b2_anchor_kind: str
     b2_anchor: np.ndarray
+    b2_reference: torch.Tensor | None
     ee_anchor_kind: str
     ee_anchor: np.ndarray
     original: torch.Tensor
@@ -704,6 +827,9 @@ class RolloutRecorder:
                 history_active_indices=np.asarray(
                     [record.active_index for record in packet.telemetry_history], dtype=np.int64
                 ),
+                history_executed_b2_commands=np.stack(
+                    [record.executed_b2_command for record in packet.telemetry_history]
+                ),
                 history_executed_ee_targets=np.stack(
                     [record.executed_ee_target for record in packet.telemetry_history]
                 ),
@@ -738,9 +864,16 @@ class RolloutRecorder:
                 source_step=np.asarray(record.source_step),
                 action_names=np.asarray(record.action_names),
                 model_action_names=np.asarray(record.model_action_names),
+                control_epoch=np.asarray(record.control_epoch),
+                b2_execution_mode=np.asarray(record.b2_execution_mode),
                 z1_action_representation=np.asarray(record.z1_action_representation),
                 b2_anchor_kind=np.asarray(record.b2_anchor_kind),
                 b2_anchor=record.b2_anchor,
+                b2_reference=(
+                    record.b2_reference.numpy()
+                    if record.b2_reference is not None
+                    else np.empty((0, 3), dtype=np.float32)
+                ),
                 ee_anchor_kind=np.asarray(record.ee_anchor_kind),
                 ee_anchor=record.ee_anchor,
                 original_actions=record.original.numpy(),
@@ -842,8 +975,7 @@ class AsyncRTCPolicy:
             raise ValueError("Checkpoint does not define named actions")
         self.postprocessed_action_names = tuple(str(name) for name in names)
         self.model_action_names = tuple(
-            str(name)
-            for name in (self.policy.config.action_feature_names or self.postprocessed_action_names)
+            str(name) for name in (self.policy.config.action_feature_names or self.postprocessed_action_names)
         )
         self.discrete_action_training_mode = contract.discrete_action_training_mode
         self.gripper_target_representation = contract.gripper_target_representation
@@ -851,6 +983,13 @@ class AsyncRTCPolicy:
         self.gripper_nonnegative_value = contract.gripper_nonnegative_value
         self.z1_action_representation = contract.z1_action_representation
         self.b2_action_representation = contract.model_action_representation
+        self.b2_pose_delta_control_mode = args.b2_pose_delta_control_mode
+        self.b2_execution_mode = (
+            "se2_feedback"
+            if self.b2_action_representation == "pose_delta"
+            and self.b2_pose_delta_control_mode == "se2_feedback"
+            else "velocity_chunk"
+        )
         self.action_names = execution_action_names(self.z1_action_representation)
         self.source_state_names = contract.source_state_names
         self.selected_state_names = contract.selected_state_names
@@ -903,6 +1042,8 @@ class AsyncRTCPolicy:
         self._last_error: str | None = None
         self._inference_count = 0
         self._warmup_inferences = int(args.warmup_inferences)
+        self._b2_controller = SE2TrajectoryController(self.low_level_hz)
+        self._b2_controller_lock = Lock()
         self.recorder.event(
             "vla_loading_finished",
             action_names=self.action_names,
@@ -916,8 +1057,10 @@ class AsyncRTCPolicy:
             z1_model_action_representation=contract.z1_action_representation,
             ee_delta_rotation_representation=contract.ee_delta_rotation_representation,
             b2_execution_action_representation="velocity",
+            b2_pose_delta_control_mode=self.b2_pose_delta_control_mode,
+            b2_execution_mode=self.b2_execution_mode,
             z1_execution_action_representation=contract.z1_action_representation,
-            execution_action_protocol="rtc_action_packet_v5_50hz_history_with_anchor",
+            execution_action_protocol="rtc_action_packet_v6_optional_high_level_se2_feedback",
             stop_on_model_task_complete=self.stop_on_model_task_complete,
             b2_velocity_smoothing="causal_first_order_low_pass",
             b2_velocity_smoothing_time_constant_s=self.b2_velocity_smoothing_time_constant_s,
@@ -1075,6 +1218,53 @@ class AsyncRTCPolicy:
             record = self._latest_record
             return record if record is not None and record.sequence > sequence else None
 
+    def b2_feedback_control(
+        self,
+        *,
+        control_epoch: int,
+        sim_step: int,
+        sequence: int,
+        action_index: int,
+        actual_pose: np.ndarray,
+    ) -> dict[str, object]:
+        if self.b2_execution_mode != "se2_feedback":
+            raise ValueError("B2 SE(2) feedback is not enabled")
+        with self._records_lock:
+            record = self._records.get(sequence)
+        target_index = -1
+        target_pose = None
+        if record is not None:
+            if record.control_epoch != control_epoch:
+                raise ValueError(
+                    f"B2 control epoch mismatch: record={record.control_epoch}, request={control_epoch}"
+                )
+            if record.b2_reference is None:
+                raise RuntimeError("SE(2) feedback record has no B2 reference trajectory")
+            target_index = min(
+                max(action_index, 0) + B2_FEEDBACK_LOOKAHEAD_STEPS,
+                len(record.b2_reference) - 1,
+            )
+            target_pose = _relative_se2_target_to_world(
+                record.b2_reference[target_index].numpy().astype(np.float64, copy=False),
+                record.b2_anchor.astype(np.float64, copy=False),
+            )
+        with self._b2_controller_lock:
+            command = self._b2_controller.command(
+                control_epoch=control_epoch,
+                sim_step=sim_step,
+                actual_pose=actual_pose,
+                target_pose=target_pose,
+            )
+        return {
+            "control_epoch": control_epoch,
+            "sim_step": sim_step,
+            "sequence": sequence,
+            "action_index": action_index,
+            "target_index": target_index,
+            "target_pose": actual_pose.tolist() if target_pose is None else target_pose.tolist(),
+            "command": command.tolist(),
+        }
+
     def health(self) -> dict[str, object]:
         with self._records_lock:
             latest = self._latest_record
@@ -1085,6 +1275,7 @@ class AsyncRTCPolicy:
             "inference_count": self._inference_count,
             "latest_sequence": latest.sequence if latest else 0,
             "latest_source_step": latest.source_step if latest else -1,
+            "b2_execution_mode": self.b2_execution_mode,
             "last_error": self._last_error,
         }
 
@@ -1094,9 +1285,7 @@ class AsyncRTCPolicy:
         missing = tuple(name for name in B2_GLOBAL_POSE_NAMES if name not in indices)
         if missing:
             raise ValueError(f"Simulator observation is missing B2 global-pose fields: {missing}")
-        return packet.state[[indices[name] for name in B2_GLOBAL_POSE_NAMES]].astype(
-            np.float32, copy=True
-        )
+        return packet.state[[indices[name] for name in B2_GLOBAL_POSE_NAMES]].astype(np.float32, copy=True)
 
     @staticmethod
     def _apply_action_processor(step, action: torch.Tensor) -> torch.Tensor:
@@ -1114,7 +1303,9 @@ class AsyncRTCPolicy:
     ) -> torch.Tensor:
         physical = self._apply_action_processor(self._action_unnormalizer, normalized_prefix)
         if self.b2_action_representation == "pose_delta":
-            indices = [self.model_action_names.index(name) for name in ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")]
+            indices = [
+                self.model_action_names.index(name) for name in ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")
+            ]
             old_anchor = torch.as_tensor(record.b2_anchor, dtype=physical.dtype, device=physical.device)
             new_anchor = torch.as_tensor(
                 self._b2_global_pose(packet), dtype=physical.dtype, device=physical.device
@@ -1132,9 +1323,7 @@ class AsyncRTCPolicy:
                 raise ValueError("Model action names do not contain a complete EE-delta representation")
             indices = [self.model_action_names.index(name) for name in ee_names]
             old_anchor = torch.as_tensor(record.ee_anchor, dtype=physical.dtype, device=physical.device)
-            new_anchor = torch.as_tensor(
-                packet.actual_ee_state, dtype=physical.dtype, device=physical.device
-            )
+            new_anchor = torch.as_tensor(packet.actual_ee_state, dtype=physical.dtype, device=physical.device)
             absolute_targets = ee_reference_delta_to_absolute(
                 physical[:, indices].unsqueeze(0),
                 old_anchor.unsqueeze(0),
@@ -1259,6 +1448,14 @@ class AsyncRTCPolicy:
         executed_index = min(record.active_index, len(action_record.processed)) - 1
         executed = action_record.processed[executed_index]
         columns = {name: executed[index] for index, name in enumerate(action_record.action_names)}
+        if action_record.b2_execution_mode == "se2_feedback":
+            columns.update(
+                zip(
+                    B2_EXECUTION_VELOCITY_NAMES,
+                    torch.from_numpy(record.executed_b2_command),
+                    strict=True,
+                )
+            )
         columns["arm_teleop_inactive"] = 1.0 - columns["arm_active"]
         columns.update(zip(EE_POSE_ACTION_NAMES, torch.from_numpy(record.executed_ee_target), strict=True))
         try:
@@ -1370,6 +1567,19 @@ class AsyncRTCPolicy:
                 prev_chunk_left_over=prefix,
             )
             original = actions.squeeze(0).detach().cpu().clone()
+            b2_reference = None
+            if self.b2_execution_mode == "se2_feedback":
+                physical_model_actions = (
+                    self._apply_action_processor(self._action_unnormalizer, actions.squeeze(0))
+                    .detach()
+                    .cpu()
+                    .to(torch.float32)
+                )
+                reference_indices = [
+                    self.model_action_names.index(name)
+                    for name in ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")
+                ]
+                b2_reference = physical_model_actions[:, reference_indices].clone()
             predicted = time.perf_counter()
             postprocessed = self.postprocessor(actions).squeeze(0).detach().cpu().to(torch.float32)
             postprocessed = _decode_discrete_actions(
@@ -1418,9 +1628,12 @@ class AsyncRTCPolicy:
             inference_seconds=elapsed,
             action_names=self.action_names,
             model_action_names=self.model_action_names,
+            control_epoch=packet.control_epoch,
+            b2_execution_mode=self.b2_execution_mode,
             z1_action_representation=self.z1_action_representation,
             b2_anchor_kind="actual_world_pose",
             b2_anchor=self._b2_global_pose(packet),
+            b2_reference=b2_reference,
             ee_anchor_kind=(
                 "actual_ee_state"
                 if self.z1_action_representation == "ee_state_delta"
@@ -1532,7 +1745,26 @@ class VLARequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_POST(self) -> None:  # noqa: N802
-        if urlparse(self.path).path != "/v1/observations":
+        path = urlparse(self.path).path
+        if path == "/v1/b2-control":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 4096:
+                    raise ValueError(f"Invalid Content-Length: {length}")
+                request_value = json.loads(self.rfile.read(length))
+                result = self.engine.b2_feedback_control(
+                    control_epoch=int(request_value["control_epoch"]),
+                    sim_step=int(request_value["sim_step"]),
+                    sequence=int(request_value["sequence"]),
+                    action_index=int(request_value["action_index"]),
+                    actual_pose=np.asarray(request_value["actual_pose"], dtype=np.float64),
+                )
+                self._write_json(HTTPStatus.OK, result)
+            except Exception as exc:
+                LOG.warning("Rejected B2 feedback state: %s", exc)
+                self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        if path != "/v1/observations":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         try:
@@ -1585,6 +1817,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--low-level-hz", type=float, default=50.0)
     parser.add_argument("--stop-on-model-task-complete", type=_parse_bool, required=True)
     parser.add_argument("--b2-velocity-smoothing-time-constant-s", type=float, required=True)
+    parser.add_argument(
+        "--b2-pose-delta-control-mode",
+        choices=B2_POSE_DELTA_CONTROL_MODES,
+        required=True,
+    )
     parser.add_argument("--rtc-execution-horizon", type=int, default=13)
     parser.add_argument("--rtc-max-guidance-weight", type=float, default=10.0)
     parser.add_argument(

@@ -26,6 +26,7 @@ from lerobot.common.train_utils import (
     load_training_num_processes,
     load_training_state,
     load_training_step,
+    prune_checkpoints,
     push_checkpoint_to_hub,
     save_checkpoint,
     save_training_state,
@@ -97,6 +98,38 @@ def test_update_last_checkpoint(tmp_path):
     last_checkpoint = tmp_path / LAST_CHECKPOINT_LINK
     assert last_checkpoint.is_symlink()
     assert last_checkpoint.resolve() == checkpoint
+
+
+def test_prune_checkpoints_keeps_latest_and_milestones(tmp_path):
+    checkpoints_dir = tmp_path / CHECKPOINTS_DIR
+    checkpoints_dir.mkdir()
+    for step in range(500, 25_001, 500):
+        (checkpoints_dir / f"{step:06d}").mkdir()
+    (checkpoints_dir / "notes").mkdir()
+    update_last_checkpoint(checkpoints_dir / "025000")
+
+    removed = prune_checkpoints(checkpoints_dir, keep_last=2, keep_every_n_steps=10_000)
+
+    assert {path.name for path in removed} == {
+        f"{step:06d}" for step in range(500, 24_001, 500) if step not in {10_000, 20_000}
+    }
+    assert {path.name for path in checkpoints_dir.iterdir()} == {
+        "010000",
+        "020000",
+        "024500",
+        "025000",
+        "last",
+        "notes",
+    }
+    assert (checkpoints_dir / "last").resolve() == checkpoints_dir / "025000"
+
+
+def test_prune_checkpoints_keep_last_zero_disables_pruning(tmp_path):
+    for name in ("000500", "001000", "001500"):
+        (tmp_path / name).mkdir()
+
+    assert prune_checkpoints(tmp_path, keep_last=0, keep_every_n_steps=1_000) == []
+    assert {path.name for path in tmp_path.iterdir()} == {"000500", "001000", "001500"}
 
 
 @patch("lerobot.common.train_utils.save_training_state")

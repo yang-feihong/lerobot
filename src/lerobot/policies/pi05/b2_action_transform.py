@@ -35,8 +35,7 @@ CONTROL_EE_ACTION_NAMES = tuple(f"control_{name}" for name in DATASET_ACTION_NAM
 CONTROL_EXTENDED_DATASET_ACTION_NAMES = (*DATASET_ACTION_NAMES, *CONTROL_EE_ACTION_NAMES)
 CONTROL_EXTENDED_DATASET_ACTION_DIM = len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)
 HEIGHT_INVARIANT_EE_STATE_NAMES = tuple(
-    name.replace("height_invariant_ee_", "height_invariant_ee_state_")
-    for name in DATASET_ACTION_NAMES[5:14]
+    name.replace("height_invariant_ee_", "height_invariant_ee_state_") for name in DATASET_ACTION_NAMES[5:14]
 )
 RAW_EE_STATE_SLICE = slice(49, 58)
 DATASET_B2_TWIST_SLICE = slice(0, 3)
@@ -152,7 +151,9 @@ def ee_delta_transition_validity(
         target_active = (target[..., 3] < 0.5) & (target[..., 4] < 0.5)
         valid = source_active & target_active
     elif supervision_mode == "all":
-        valid = torch.ones(action.shape[:-2] + (action.shape[-2] - 1,), dtype=torch.bool, device=action.device)
+        valid = torch.ones(
+            action.shape[:-2] + (action.shape[-2] - 1,), dtype=torch.bool, device=action.device
+        )
     else:
         raise ValueError(
             f"Unknown EE-delta supervision mode {supervision_mode!r}; expected 'active_only' or 'all'"
@@ -224,9 +225,7 @@ def integrate_body_twist(twist: Tensor, dt: float, is_pad: Tensor | None = None)
     return torch.stack((delta_body_x, delta_body_y, delta_yaw), dim=-1)
 
 
-def integrate_body_twist_to_pose_delta(
-    twist: Tensor, dt: float, is_pad: Tensor | None = None
-) -> Tensor:
+def integrate_body_twist_to_pose_delta(twist: Tensor, dt: float, is_pad: Tensor | None = None) -> Tensor:
     """Integrate body-frame velocity commands into poses relative to the chunk start."""
     increments = integrate_body_twist(twist, dt, is_pad)
     position = torch.zeros(increments.shape[:-2] + (2,), dtype=twist.dtype, device=twist.device)
@@ -236,9 +235,7 @@ def integrate_body_twist_to_pose_delta(
         dx, dy, dyaw = increments[..., step, :].unbind(dim=-1)
         cos_yaw = torch.cos(yaw)
         sin_yaw = torch.sin(yaw)
-        position = position + torch.stack(
-            (cos_yaw * dx - sin_yaw * dy, sin_yaw * dx + cos_yaw * dy), dim=-1
-        )
+        position = position + torch.stack((cos_yaw * dx - sin_yaw * dy, sin_yaw * dx + cos_yaw * dy), dim=-1)
         yaw = yaw + dyaw
         outputs.append(torch.cat((position, yaw.unsqueeze(-1)), dim=-1))
     return torch.stack(outputs, dim=-2)
@@ -606,9 +603,11 @@ def b2_execution_action_names(
         include_task_complete=include_task_complete,
     )
     names = [dataset_names[i] for i in indices]
-    if z1_representation in {"ee_delta", "ee_state_delta"}:
-        ee_indices = [i for i, name in enumerate(names) if name.startswith("height_invariant_ee_")]
-        if ee_delta_rotation_representation == "rotvec" and ee_indices:
+    ee_indices = [i for i, name in enumerate(names) if name.startswith("height_invariant_ee_")]
+    if ee_indices:
+        if z1_representation not in {"ee_delta", "ee_state_delta"}:
+            raise ValueError(f"Unknown Z1 action representation: {z1_representation!r}")
+        if ee_delta_rotation_representation == "rotvec":
             first, last = ee_indices[0], ee_indices[-1] + 1
             names = (
                 names[:first]
@@ -626,8 +625,6 @@ def b2_execution_action_names(
             raise ValueError(
                 f"Unknown EE delta rotation representation: {ee_delta_rotation_representation!r}"
             )
-    else:
-        raise ValueError(f"Unknown Z1 action representation: {z1_representation!r}")
     return names
 
 
@@ -695,7 +692,9 @@ def make_pi05_action_stats(
         )
     q01_exact = torch.as_tensor(transformed_action_stats["q01"]).reshape(-1)
     if expected_names is None or q01_exact.numel() != len(expected_names):
-        raise ValueError("Exact transformed-action statistics do not match the configured model action schema")
+        raise ValueError(
+            "Exact transformed-action statistics do not match the configured model action schema"
+        )
     stats[ACTION] = deepcopy(transformed_action_stats)
     if state_indices is not None and "observation.state" in stats:
         state_stats = stats["observation.state"]

@@ -565,9 +565,7 @@ def make_policy(
     if ds_meta is not None and env_cfg is not None:
         raise ValueError("Provide at most one of dataset metadata or a sim env.")
     checkpoint_only = ds_meta is None and env_cfg is None
-    if checkpoint_only and (
-        not cfg.pretrained_path or not cfg.input_features or not cfg.output_features
-    ):
+    if checkpoint_only and (not cfg.pretrained_path or not cfg.input_features or not cfg.output_features):
         raise ValueError(
             "Checkpoint-only policy loading requires pretrained_path and persisted input/output features."
         )
@@ -666,7 +664,9 @@ def make_policy(
                 raise ValueError("PI0.5 B2+Z1 supervision must use the stored control-action channels")
             cfg.ee_state_anchor_indices = None
             if cfg.z1_action_representation == "ee_state_delta":
-                missing = [name for name in HEIGHT_INVARIANT_EE_STATE_NAMES if name not in dataset_state_names]
+                missing = [
+                    name for name in HEIGHT_INVARIANT_EE_STATE_NAMES if name not in dataset_state_names
+                ]
                 if missing:
                     raise ValueError(
                         "ee_state_delta requires inference-time height-invariant EE state channels; "
@@ -684,9 +684,8 @@ def make_policy(
                 )
             checkpoint_schema_resolved = cfg.io_schema_resolved
             checkpoint_action_names = cfg.dataset_action_feature_names
-            action_names_compatible = (
-                checkpoint_action_names is None
-                or checkpoint_action_names == list(dataset_action_names)
+            action_names_compatible = checkpoint_action_names is None or checkpoint_action_names == list(
+                dataset_action_names
             )
             if cfg.io_schema_resolved and not action_names_compatible:
                 raise ValueError(
@@ -798,7 +797,11 @@ def make_policy(
 
         policy = policy_cls.from_pretrained(**kwargs)
         policy = PeftModel.from_pretrained(
-            policy, peft_pretrained_path, config=peft_config, is_trainable=True
+            policy,
+            peft_pretrained_path,
+            config=peft_config,
+            is_trainable=True,
+            torch_device=cfg.device,
         )
         if isinstance(cfg, PI05Config):
             policy._enable_lora_full_finetuning_modules()  # type: ignore[attr-defined]

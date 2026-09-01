@@ -21,6 +21,10 @@ import torch
 
 pytest.importorskip("transformers")
 
+from lerobot.optim import (  # noqa: E402
+    ConstantWithWarmupSchedulerConfig,
+    CosineDecayWithWarmupSchedulerConfig,
+)
 from lerobot.policies.factory import make_policy_config  # noqa: E402
 from lerobot.policies.pi05 import (  # noqa: E402
     PI05Config,
@@ -29,6 +33,27 @@ from lerobot.policies.pi05 import (  # noqa: E402
 )
 from lerobot.utils.random_utils import set_seed
 from tests.utils import require_cuda, require_hf_token  # noqa: E402
+
+
+def test_pi05_scheduler_defaults_to_warmup_then_constant():
+    config = PI05Config()
+
+    scheduler = config.get_scheduler_preset()
+
+    assert isinstance(scheduler, ConstantWithWarmupSchedulerConfig)
+    assert scheduler.num_warmup_steps == 1_000
+
+
+def test_pi05_cosine_scheduler_remains_an_explicit_option():
+    config = PI05Config(lr_scheduler_type="cosine_decay_with_warmup")
+
+    scheduler = config.get_scheduler_preset()
+
+    assert isinstance(scheduler, CosineDecayWithWarmupSchedulerConfig)
+    assert scheduler.num_warmup_steps == config.scheduler_warmup_steps
+    assert scheduler.num_decay_steps == config.scheduler_decay_steps
+    assert scheduler.peak_lr == config.optimizer_lr
+    assert scheduler.decay_lr == config.scheduler_decay_lr
 
 
 @require_cuda
