@@ -20,6 +20,8 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 
 from lerobot.common.train_utils import (
+    _append_peft_base_weights,
+    _peft_modules_to_save_from_state_dict,
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_batch_size,
@@ -154,6 +156,103 @@ def test_save_checkpoint_peft(mock_save_training_state, tmp_path, optimizer):
     cfg.save_pretrained.assert_called_once()
     policy.config.save_pretrained.assert_called_once()
     mock_save_training_state.assert_called_once()
+
+
+def test_peft_modules_to_save_uses_supplied_state_dict(monkeypatch):
+    peft = pytest.importorskip("peft")
+    import torch
+
+    wrapper = peft.utils.other.ModulesToSaveWrapper(torch.nn.Linear(2, 1), "default")
+    policy = torch.nn.Sequential(wrapper)
+    supplied_weight = torch.randn_like(wrapper.modules_to_save["default"].weight)
+    supplied_bias = torch.randn_like(wrapper.modules_to_save["default"].bias)
+    supplied_state = {
+        "modules_to_save.default.weight": supplied_weight,
+        "modules_to_save.default.bias": supplied_bias,
+    }
+
+    def unexpected_state_dict_call(*args, **kwargs):
+        raise AssertionError("PEFT re-read a wrapped module instead of using the supplied state dict")
+
+    monkeypatch.setattr(wrapper.modules_to_save["default"], "state_dict", unexpected_state_dict_call)
+    with _peft_modules_to_save_from_state_dict(policy):
+        extracted = wrapper.adapter_state_dict("default", supplied_state)
+
+    assert set(extracted) == {"weight", "bias"}
+    assert extracted["weight"] is supplied_weight
+    assert extracted["bias"] is supplied_bias
+    with pytest.raises(AssertionError, match="PEFT re-read"):
+        wrapper.adapter_state_dict("default", supplied_state)
+
+
+def test_peft_save_pretrained_does_not_reread_modules_to_save(tmp_path, monkeypatch):
+    peft = pytest.importorskip("peft")
+    import torch
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.body = torch.nn.Linear(2, 2)
+            self.head = torch.nn.Linear(2, 1)
+
+        def forward(self, value):
+            return self.head(self.body(value))
+
+    policy = peft.get_peft_model(
+        TinyModel(),
+        peft.LoraConfig(target_modules=["body"], modules_to_save=["head"]),
+    )
+    supplied_state = policy.state_dict()
+    wrapper = policy.base_model.model.head
+
+    def unexpected_state_dict_call(*args, **kwargs):
+        raise AssertionError("PEFT re-read a wrapped module instead of using the supplied state dict")
+
+    monkeypatch.setattr(wrapper.modules_to_save["default"], "state_dict", unexpected_state_dict_call)
+    with _peft_modules_to_save_from_state_dict(policy):
+        policy.save_pretrained(tmp_path, state_dict=supplied_state)
+
+    assert (tmp_path / "adapter_model.safetensors").is_file()
+    assert (tmp_path / "adapter_config.json").is_file()
+
+
+def test_peft_checkpoint_loads_appended_base_weights(tmp_path):
+    peft = pytest.importorskip("peft")
+    import torch
+    from safetensors import safe_open
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.body = torch.nn.Linear(2, 2)
+            self.memory = torch.nn.Linear(2, 2)
+
+        def forward(self, value):
+            return self.memory(self.body(value))
+
+    policy = peft.get_peft_model(TinyModel(), peft.LoraConfig(target_modules=["body"]))
+    with torch.no_grad():
+        policy.base_model.model.memory.weight.fill_(3.25)
+        policy.base_model.model.memory.bias.fill_(-1.5)
+    supplied_state = policy.state_dict()
+    policy.save_pretrained(tmp_path, state_dict=supplied_state)
+
+    appended = _append_peft_base_weights(tmp_path, supplied_state, key_fragment=".memory.")
+
+    assert appended == 2
+    with safe_open(tmp_path / "adapter_model.safetensors", framework="pt") as adapter_file:
+        assert "base_model.model.memory.weight" in adapter_file
+        assert "base_model.model.memory.bias" in adapter_file
+
+    reloaded = peft.PeftModel.from_pretrained(TinyModel(), tmp_path)
+    torch.testing.assert_close(
+        reloaded.base_model.model.memory.weight,
+        torch.full_like(reloaded.base_model.model.memory.weight, 3.25),
+    )
+    torch.testing.assert_close(
+        reloaded.base_model.model.memory.bias,
+        torch.full_like(reloaded.base_model.model.memory.bias, -1.5),
+    )
 
 
 def test_save_training_state(tmp_path, optimizer, scheduler):
