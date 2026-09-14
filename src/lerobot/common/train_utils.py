@@ -13,7 +13,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 
 from huggingface_hub import HfApi, snapshot_download
@@ -40,6 +42,71 @@ from lerobot.utils.constants import (
 from lerobot.utils.hub import find_latest_hub_checkpoint
 from lerobot.utils.io_utils import load_json, write_json
 from lerobot.utils.random_utils import load_rng_state, save_rng_state
+
+
+@contextmanager
+def _peft_modules_to_save_from_state_dict(policy):
+    """Keep PEFT checkpoint export from re-reading FSDP-wrapped modules.
+
+    PEFT's ``ModulesToSaveWrapper.adapter_state_dict`` discovers its keys by calling
+    ``state_dict()`` on the wrapped module even when a complete state dict was supplied by the
+    caller. Nested FSDP modules turn that discovery call into another all-gather. At checkpoint
+    time only rank 0 serializes, so that extra collective deadlocks against the other ranks'
+    barrier.
+
+    The supplied module-relative state dict already contains the exact keys PEFT needs. During
+    serialization, read those keys directly and restore PEFT's methods immediately afterwards.
+    """
+    from peft.utils.other import ModulesToSaveWrapper
+
+    patched_modules = []
+    for module in policy.modules():
+        if not isinstance(module, ModulesToSaveWrapper):
+            continue
+        original_method = module.adapter_state_dict
+
+        def adapter_state_dict(adapter_name, state_dict):
+            prefix = f"modules_to_save.{adapter_name}."
+            return {key.removeprefix(prefix): value for key, value in state_dict.items() if key.startswith(prefix)}
+
+        module.adapter_state_dict = adapter_state_dict
+        patched_modules.append((module, original_method))
+
+    try:
+        yield
+    finally:
+        for module, original_method in patched_modules:
+            module.adapter_state_dict = original_method
+
+
+def _append_peft_base_weights(
+    pretrained_dir: Path,
+    model_state_dict: dict,
+    *,
+    key_fragment: str,
+) -> int:
+    """Add fully fine-tuned base weights to a PEFT adapter checkpoint.
+
+    PEFT saves LoRA tensors and ``modules_to_save`` but omits base parameters that were made
+    trainable after adapter injection. PI0.5 does this for MEM-ViT, so those tensors must be kept
+    alongside the adapter for resume and inference to reproduce the trained model.
+    """
+    from peft.utils.constants import SAFETENSORS_WEIGHTS_NAME
+    from safetensors.torch import load_file, save_file
+
+    extra_state = {key: value for key, value in model_state_dict.items() if key_fragment in key}
+    if not extra_state:
+        raise RuntimeError(f"No state-dict keys matched required PEFT base-weight fragment {key_fragment!r}")
+
+    adapter_path = pretrained_dir / SAFETENSORS_WEIGHTS_NAME
+    adapter_state = load_file(adapter_path)
+    adapter_state.update(extra_state)
+    adapter_state = {key: value.contiguous() for key, value in adapter_state.items()}
+
+    temporary_path = adapter_path.with_suffix(f"{adapter_path.suffix}.tmp")
+    save_file(adapter_state, temporary_path, metadata={"format": "pt"})
+    temporary_path.replace(adapter_path)
+    return len(extra_state)
 
 
 def get_step_identifier(step: int, total_steps: int) -> str:
@@ -171,7 +238,21 @@ def save_checkpoint(
             Defaults to None.
     """
     pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
-    policy.save_pretrained(pretrained_dir, state_dict=model_state_dict)
+    if cfg.peft is not None and model_state_dict is not None:
+        with _peft_modules_to_save_from_state_dict(policy):
+            policy.save_pretrained(pretrained_dir, state_dict=model_state_dict)
+        policy_cfg = getattr(policy, "config", None)
+        if getattr(policy_cfg, "mem_vit_enabled", False) and not getattr(
+            policy_cfg, "freeze_vision_encoder", False
+        ):
+            appended = _append_peft_base_weights(
+                pretrained_dir,
+                model_state_dict,
+                key_fragment=".vision_tower.",
+            )
+            logging.info("Stored %d full-trained MEM-ViT tensors in the PEFT checkpoint", appended)
+    else:
+        policy.save_pretrained(pretrained_dir, state_dict=model_state_dict)
     cfg.save_pretrained(pretrained_dir)
     if cfg.peft is not None:
         # When using PEFT, policy.save_pretrained will only write the adapter weights + config, not the
