@@ -34,6 +34,7 @@ from lerobot.scripts.pi05_vla_server import (
     _load_checkpoint_contract,
     _reanchor_b2_pose_delta,
     _resolve_checkpoint_action_representations,
+    _rtc_enabled_for_chunk_scheduling,
     _smooth_b2_execution_velocity,
     _to_execution_actions,
     decode_observation_packet,
@@ -586,6 +587,7 @@ def test_zero_time_constant_disables_b2_velocity_smoothing() -> None:
 
 def test_rtc_chunk_smoothing_continues_from_last_executed_command() -> None:
     policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.chunk_scheduling_mode = "RTC"
     policy.action_names = EXECUTION_ACTION_NAMES
     policy._records_lock = Lock()
     processed = torch.zeros((4, len(EXECUTION_ACTION_NAMES)))
@@ -604,6 +606,7 @@ def test_rtc_chunk_smoothing_continues_from_last_executed_command() -> None:
 
 def test_first_chunk_smoothing_uses_observed_body_velocity() -> None:
     policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.chunk_scheduling_mode = "RTC"
     policy.action_names = EXECUTION_ACTION_NAMES
     policy._records_lock = Lock()
     policy._records = {}
@@ -619,6 +622,43 @@ def test_first_chunk_smoothing_uses_observed_body_velocity() -> None:
 
     torch.testing.assert_close(anchor, torch.tensor([0.1, 0.2, 0.3]))
     assert prefix is None
+
+
+def test_sync_server_disables_rtc_prefix_delay_and_previous_velocity_context() -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.chunk_scheduling_mode = "SYNC"
+    policy.low_level_hz = 50.0
+    packet = SimpleNamespace(active_sequence=7, active_index=25)
+
+    assert not _rtc_enabled_for_chunk_scheduling("SYNC")
+    assert policy._previous_prefix(packet) is None
+    assert policy._estimated_delay() == (0, 50.0)
+    anchor, prefix = policy._b2_velocity_filter_context(packet)
+    torch.testing.assert_close(anchor, torch.zeros(3))
+    assert prefix is None
+
+
+def test_rtc_server_keeps_prefix_and_measured_delay_behavior() -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.chunk_scheduling_mode = "RTC"
+    policy.device = torch.device("cpu")
+    policy.low_level_hz = 50.0
+    policy.rtc_config = SimpleNamespace(execution_horizon=2)
+    policy.b2_action_representation = "velocity"
+    policy.z1_action_representation = "ee_delta"
+    policy._records_lock = Lock()
+    policy._records = {7: SimpleNamespace(original=torch.arange(12).reshape(4, 3).float())}
+    policy._mailbox_condition = Lock()
+    policy._sim_rates = [50.0]
+    policy._latencies = [0.21]
+    packet = SimpleNamespace(active_sequence=7, active_index=1)
+
+    assert _rtc_enabled_for_chunk_scheduling("RTC")
+    torch.testing.assert_close(
+        policy._previous_prefix(packet),
+        torch.tensor([[3.0, 4.0, 5.0], [6.0, 7.0, 8.0]]),
+    )
+    assert policy._estimated_delay() == (11, 50.0)
 
 
 def test_source_state_requires_model_fields_but_not_unused_dataset_storage_fields() -> None:

@@ -886,6 +886,25 @@ def test_check_cached_episodes_sufficient(tmp_path, lerobot_dataset_factory):
     assert sparse_dataset.reader._check_cached_episodes_sufficient() is False
 
 
+def test_sim_image_source_does_not_require_native_videos(tmp_path, lerobot_dataset_factory):
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "sim_only",
+        total_episodes=2,
+        total_frames=20,
+        use_videos=True,
+    )
+    dataset.reader.hf_dataset = dataset.reader._load_hf_dataset()
+    for episode_index in range(dataset.meta.total_episodes):
+        for video_key in dataset.meta.video_keys:
+            (dataset.root / dataset.meta.get_video_file_path(episode_index, video_key)).unlink(missing_ok=True)
+
+    dataset.reader._image_source = "sim"
+    assert dataset.reader._check_cached_episodes_sufficient() is True
+
+    dataset.reader._image_source = "mixed"
+    assert dataset.reader._check_cached_episodes_sufficient() is False
+
+
 def test_update_chunk_settings(tmp_path, empty_lerobot_dataset_factory):
     """Test the update_chunk_settings functionality for both LeRobotDataset and LeRobotDatasetMetadata."""
     features = {

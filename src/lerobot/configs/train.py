@@ -113,6 +113,9 @@ class TrainPipelineConfig(HubMixin):
     # is to use the configuration from the checkpoint, regardless of what's provided with the training
     # command at the time of resumption (CLI `--*` flags still override).
     resume: bool = False
+    # Resume model/optimizer state while intentionally rebuilding dataset-derived
+    # normalization statistics from an explicitly overridden dataset.
+    resume_with_updated_dataset: bool = False
     # `seed` is used for training (eg: model initialization, dataset shuffling)
     # AND for the evaluation environments.
     seed: int | None = 1000

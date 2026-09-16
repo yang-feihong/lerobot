@@ -97,6 +97,7 @@ class DatasetReader:
         self._image_transforms = image_transforms
         self._return_uint8 = return_uint8
         self._depth_output_unit = depth_output_unit
+        self._image_source = image_source
         self._paired_image_source = None
         if image_source != "real":
             if sim_image_manifest is None or sim_image_root is None:
@@ -204,7 +205,7 @@ class DatasetReader:
         if not requested_episodes.issubset(available_episodes):
             return False
 
-        if len(self._meta.video_keys) > 0:
+        if len(self._meta.video_keys) > 0 and self._image_source != "sim":
             for ep_idx in requested_episodes:
                 for vid_key in self._meta.video_keys:
                     video_path = self.root / self._meta.get_video_file_path(ep_idx, vid_key)

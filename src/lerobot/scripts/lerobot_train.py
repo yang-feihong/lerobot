@@ -819,11 +819,30 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         "Cannot resume EE-delta training without checkpoint-local transformed-action "
                         f"statistics: {resume_stats_path}"
                     )
-                transformed_action_stats_payload = load_transformed_action_stats(resume_stats_path)
-                validate_transformed_action_stats(transformed_action_stats_payload, dataset, policy.config)
-                assert_transformed_action_stats_equal(
-                    transformed_action_stats_payload, measured_action_stats_payload
-                )
+                saved_action_stats_payload = load_transformed_action_stats(resume_stats_path)
+                if cfg.resume_with_updated_dataset:
+                    if saved_action_stats_payload["schema"] != measured_action_stats_payload["schema"]:
+                        raise ValueError(
+                            "Cannot resume with an updated dataset when the transformed-action schema changed"
+                        )
+                    logging.warning(
+                        "Resuming with an explicitly updated dataset: replacing checkpoint transformed-action "
+                        "statistics (%d frames, %d episodes) with freshly measured statistics "
+                        "(%d frames, %d episodes)",
+                        saved_action_stats_payload["dataset"]["num_frames"],
+                        saved_action_stats_payload["dataset"]["num_episodes"],
+                        measured_action_stats_payload["dataset"]["num_frames"],
+                        measured_action_stats_payload["dataset"]["num_episodes"],
+                    )
+                    transformed_action_stats_payload = measured_action_stats_payload
+                else:
+                    transformed_action_stats_payload = saved_action_stats_payload
+                    validate_transformed_action_stats(
+                        transformed_action_stats_payload, dataset, policy.config
+                    )
+                    assert_transformed_action_stats_equal(
+                        transformed_action_stats_payload, measured_action_stats_payload
+                    )
             else:
                 transformed_action_stats_payload = measured_action_stats_payload
             save_transformed_action_stats(transformed_action_stats_payload, output_stats_path)

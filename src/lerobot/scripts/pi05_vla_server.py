@@ -207,6 +207,15 @@ def _parse_bool(value: str) -> bool:
     raise argparse.ArgumentTypeError(f"Expected a boolean, got {value!r}")
 
 
+CHUNK_SCHEDULING_MODES = ("RTC", "SYNC")
+
+
+def _rtc_enabled_for_chunk_scheduling(mode: str) -> bool:
+    if mode not in CHUNK_SCHEDULING_MODES:
+        raise ValueError(f"Unknown chunk scheduling mode: {mode!r}")
+    return mode == "RTC"
+
+
 def execution_action_names(z1_action_representation: str) -> tuple[str, ...]:
     if z1_action_representation in {"ee_delta", "ee_state_delta"}:
         ee_names = EE_DELTA_ACTION_NAMES
@@ -906,11 +915,16 @@ class RolloutRecorder:
 
 
 class AsyncRTCPolicy:
-    """Latest-only observation mailbox plus a single asynchronous GPU worker."""
+    """Asynchronous inference worker with selectable RTC or synchronous scheduling."""
 
     def __init__(self, args: argparse.Namespace):
+        self.chunk_scheduling_mode = str(args.chunk_scheduling_mode)
         self.recorder = RolloutRecorder(args.rollout_dir)
-        self.recorder.event("vla_loading_started", policy_path=args.policy_path)
+        self.recorder.event(
+            "vla_loading_started",
+            policy_path=args.policy_path,
+            chunk_scheduling_mode=self.chunk_scheduling_mode,
+        )
         policy_path = _resolve_policy_path(args.policy_path)
         config = PreTrainedConfig.from_pretrained(policy_path)
         config.pretrained_path = policy_path
@@ -942,7 +956,7 @@ class AsyncRTCPolicy:
         )
 
         rtc_config = RTCConfig(
-            enabled=True,
+            enabled=_rtc_enabled_for_chunk_scheduling(self.chunk_scheduling_mode),
             prefix_attention_schedule=RTCAttentionSchedule(args.rtc_schedule.upper()),
             max_guidance_weight=args.rtc_max_guidance_weight,
             execution_horizon=args.rtc_execution_horizon,
@@ -1275,6 +1289,7 @@ class AsyncRTCPolicy:
             "inference_count": self._inference_count,
             "latest_sequence": latest.sequence if latest else 0,
             "latest_source_step": latest.source_step if latest else -1,
+            "chunk_scheduling_mode": self.chunk_scheduling_mode,
             "b2_execution_mode": self.b2_execution_mode,
             "last_error": self._last_error,
         }
@@ -1338,6 +1353,8 @@ class AsyncRTCPolicy:
         return self._apply_action_processor(self._action_normalizer, physical)
 
     def _previous_prefix(self, packet: ObservationPacket) -> torch.Tensor | None:
+        if self.chunk_scheduling_mode == "SYNC":
+            return None
         if packet.active_sequence < 0:
             return None
         with self._records_lock:
@@ -1371,6 +1388,8 @@ class AsyncRTCPolicy:
         return padded
 
     def _estimated_delay(self) -> tuple[int, float]:
+        if self.chunk_scheduling_mode == "SYNC":
+            return 0, self.low_level_hz
         with self._mailbox_condition:
             sim_rate = max(self._sim_rates) if self._sim_rates else self.low_level_hz
         if not self._latencies:
@@ -1539,6 +1558,8 @@ class AsyncRTCPolicy:
     def _b2_velocity_filter_context(
         self, packet: ObservationPacket
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.chunk_scheduling_mode == "SYNC":
+            return torch.zeros(3, dtype=torch.float32), None
         if packet.active_sequence >= 0 and packet.active_index > 0:
             with self._records_lock:
                 active_record = self._records.get(packet.active_sequence)
@@ -1815,6 +1836,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--high-level-hz", type=float, default=4.0)
     parser.add_argument("--low-level-hz", type=float, default=50.0)
+    parser.add_argument(
+        "--chunk-scheduling-mode",
+        choices=CHUNK_SCHEDULING_MODES,
+        default="RTC",
+    )
     parser.add_argument("--stop-on-model-task-complete", type=_parse_bool, required=True)
     parser.add_argument("--b2-velocity-smoothing-time-constant-s", type=float, required=True)
     parser.add_argument(

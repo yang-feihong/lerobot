@@ -276,6 +276,20 @@ def test_save_episode_tasks_is_additive(tmp_path):
     assert len(meta.tasks) == 2
 
 
+def test_loaded_tasks_use_task_strings_as_index(tmp_path):
+    root = tmp_path / "reloaded_tasks"
+    meta = LeRobotDatasetMetadata.create(
+        repo_id="test/reloaded_tasks", fps=DEFAULT_FPS, features=SIMPLE_FEATURES, root=root, use_videos=False
+    )
+    meta.save_episode_tasks(["open the door"])
+
+    reloaded = LeRobotDatasetMetadata(repo_id="test/reloaded_tasks", root=root)
+
+    assert reloaded.get_task_index("open the door") == 0
+    reloaded.save_episode_tasks(["open the door"])
+    assert list(reloaded.tasks.index) == ["open the door"]
+
+
 def test_get_task_index_returns_none_for_unknown(tmp_path):
     """get_task_index() returns None for an unknown task."""
     root = tmp_path / "unknown_ds"

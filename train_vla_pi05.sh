@@ -63,6 +63,9 @@ finetune_mode="lora"
 
 dataset_repo_id="local/b2_z1_vla"
 dataset_root="/data/b2_z1_vla_lerobot"
+# Empty keeps LeRobot's platform-dependent decoder selection. Set explicitly
+# when an installed torchcodec package is incompatible with the runtime image.
+video_backend=""
 # CLI: --image-source=real|sim|mixed. Simulated images require the physically
 # paired manifest and rollout root for the selected dataset.
 image_source="real" # "real", "sim", or "mixed"
@@ -117,6 +120,7 @@ output_root="/data/b2_z1_vla_pi05_outputs"
 # numeric checkpoint directory or its `last` symlink. The checkpoint's saved
 # optimizer, scheduler, RNG, data-order and W&B run state are restored.
 resume_checkpoint=""
+resume_with_updated_dataset="false"
 
 # Used only when finetune_mode="lora". Action expert/projections are full fine-tuned;
 # PaliGemma/VLM backbone uses LoRA. In non-MEM mode, ViT also uses LoRA.
@@ -217,6 +221,7 @@ while (( $# > 0 )); do
     --finetune-mode=*) finetune_mode="${1#*=}" ;;
     --dataset-repo-id=*) dataset_repo_id="${1#*=}"; dataset_repo_id_explicit="true" ;;
     --dataset-root=*) dataset_root="${1#*=}"; dataset_root_explicit="true" ;;
+    --video-backend=*) video_backend="${1#*=}" ;;
     --dataset-episodes=*) dataset_episodes="${1#*=}"; dataset_episodes_explicit="true" ;;
     --image-source=*) image_source="${1#*=}"; image_source_explicit="true" ;;
     --sim-image-manifest=*) sim_image_manifest="${1#*=}"; sim_image_manifest_explicit="true" ;;
@@ -241,6 +246,7 @@ while (( $# > 0 )); do
     --wandb-project=*) wandb_project_override="${1#*=}" ;;
     --wandb-enable=*) wandb_enable="${1#*=}" ;;
     --resume-checkpoint=*) resume_checkpoint="${1#*=}" ;;
+    --resume-with-updated-dataset=*) resume_with_updated_dataset="${1#*=}" ;;
     --dry-run=*) dry_run="${1#*=}" ;;
     *)
       echo "Unknown argument: $1" >&2
@@ -264,6 +270,10 @@ if [[ "$image_source" != "real" && "$image_source" != "sim" && "$image_source" !
 fi
 if [[ "$image_source" != "real" && ( -z "$sim_image_manifest" || -z "$sim_image_root" ) ]]; then
   echo "Sim and mixed image sources require --sim-image-manifest and --sim-image-root." >&2
+  exit 2
+fi
+if [[ -n "$video_backend" && "$video_backend" != "pyav" && "$video_backend" != "torchcodec" && "$video_backend" != "video_reader" ]]; then
+  echo "Video backend must be pyav, torchcodec or video_reader." >&2
   exit 2
 fi
 
@@ -334,7 +344,15 @@ if [[ -n "$resume_checkpoint" ]]; then
   fi
   output_dir="$(dirname "$(dirname "$resume_checkpoint")")"
   job_name="$(basename "$output_dir")"
-  resume_args+=(--config_path="$resume_config" --resume=true)
+  if [[ "$resume_with_updated_dataset" != "true" && "$resume_with_updated_dataset" != "false" ]]; then
+    echo "--resume-with-updated-dataset must be true or false, got $resume_with_updated_dataset" >&2
+    exit 2
+  fi
+  resume_args+=(
+    --config_path="$resume_config"
+    --resume=true
+    --resume_with_updated_dataset="$resume_with_updated_dataset"
+  )
   policy_source_args=()
   log_file="$log_dir/${job_name}_resume_${timestamp}.log"
   pid_file="$log_dir/${job_name}_resume_${timestamp}.pid"
@@ -435,6 +453,9 @@ else
   [[ "$sim_image_manifest_explicit" == "false" ]] || dataset_args+=(--dataset.sim_image_manifest="$sim_image_manifest")
   [[ "$sim_image_root_explicit" == "false" ]] || dataset_args+=(--dataset.sim_image_root="$sim_image_root")
   [[ "$mixed_sim_probability_explicit" == "false" ]] || dataset_args+=(--dataset.mixed_sim_probability="$mixed_sim_probability")
+fi
+if [[ -n "$video_backend" ]]; then
+  dataset_args+=(--dataset.video_backend="$video_backend")
 fi
 
 sampling_args=()

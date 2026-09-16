@@ -108,7 +108,10 @@ class PairedImageSource:
             with episode.correspondence.open(newline="", encoding="utf-8") as stream:
                 rows = list(csv.DictReader(stream))
             source = np.asarray([float(row["source_time_s"]) for row in rows])
-            if len(source) == 0 or np.any(np.diff(source) <= 0.0):
+            # A simulator recording can contain one or more terminal frames
+            # after the source episode has ended.  They legitimately map to
+            # the same final source timestamp; only backwards time is invalid.
+            if len(source) == 0 or np.any(np.diff(source) < 0.0):
                 raise ValueError(f"Invalid frame correspondence: {episode.correspondence}")
             simulator = np.arange(len(source), dtype=np.float64) / episode.video_fps
             self._correspondence_cache[episode_index] = source, simulator
