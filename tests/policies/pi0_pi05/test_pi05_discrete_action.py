@@ -45,6 +45,35 @@ def test_gate_loss_uses_inactive_reset_and_completion_ground_truth_masks():
     assert "gate_loss/arm_teleop_inactive" in info
 
 
+def test_gate_loss_rejects_overlapping_arm_modes():
+    policy = PI05Policy.__new__(PI05Policy)
+    torch.nn.Module.__init__(policy)
+    names = ["b2_delta_x", "b2_delta_y", "b2_delta_yaw", *DATASET_ACTION_NAMES[3:]]
+    policy.config = SimpleNamespace(
+        action_bool_loss_weight=4.0,
+        action_continuous_loss_weight=1.0,
+        action_masked_continuous_min_weight=0.0,
+        action_bool_balance_eps=1e-3,
+        action_bool_true_fractions={"arm_teleop_inactive": 0.25, "arm_reset": 0.1},
+        action_gripper_target_true_side="negative",
+        io_schema_resolved=True,
+        b2_action_representation="pose_delta",
+        z1_action_representation="ee_delta",
+        action_feature_names=names,
+    )
+    actions = -torch.ones(1, 2, len(names))
+    actions[0, 0, names.index("arm_teleop_inactive")] = 1.0
+    actions[0, 0, names.index("arm_reset")] = 1.0
+
+    with pytest.raises(ValueError, match="cannot both be true"):
+        policy._b2_z1_gate_action_loss(
+            torch.ones_like(actions),
+            actions,
+            "mean",
+            ee_delta_is_valid=torch.ones(1, 2, dtype=torch.bool),
+        )
+
+
 def test_disabling_inactive_prediction_removes_its_output_and_ee_mask():
     policy = PI05Policy.__new__(PI05Policy)
     torch.nn.Module.__init__(policy)

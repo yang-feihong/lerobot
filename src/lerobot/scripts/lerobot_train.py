@@ -437,7 +437,7 @@ def resolve_task_complete_sampling(dataset, policy_cfg) -> tuple[list[int], dict
     if policy_cfg.type != "pi05" or not policy_cfg.action_predict_task_complete:
         return None
     action_names = dataset.meta.features.get(ACTION, {}).get("names") or []
-    if tuple(action_names) != DATASET_ACTION_NAMES:
+    if tuple(action_names[: len(DATASET_ACTION_NAMES)]) != DATASET_ACTION_NAMES:
         return None
     tail_seconds = policy_cfg.task_complete_sample_tail_seconds
     tail_frames = None if tail_seconds is None else int(np.ceil(float(tail_seconds) * dataset.meta.fps))
@@ -505,7 +505,7 @@ def configure_action_bool_balance(
     action_names = dataset.meta.features.get(ACTION, {}).get("names") or []
     from lerobot.policies.pi05.b2_action_transform import DATASET_ACTION_NAMES
 
-    if tuple(action_names) != DATASET_ACTION_NAMES:
+    if tuple(action_names[: len(DATASET_ACTION_NAMES)]) != DATASET_ACTION_NAMES:
         return None
 
     enabled = {
@@ -560,6 +560,16 @@ def configure_action_bool_balance(
             actions = np.asarray(batch[ACTION])
             batch_episode_indices = np.asarray(batch["episode_index"], dtype=np.int64)
             frame_indices = np.asarray(batch["frame_index"], dtype=np.int64)
+            if {"arm_teleop_inactive", "arm_reset"}.issubset(action_indices):
+                inactive = actions[:, action_indices["arm_teleop_inactive"]] > 0
+                reset = actions[:, action_indices["arm_reset"]] > 0
+                invalid = np.flatnonzero(inactive & reset)
+                if len(invalid):
+                    row = int(invalid[0])
+                    raise ValueError(
+                        "Invalid arm mode label: arm_teleop_inactive and arm_reset are both true at "
+                        f"episode={int(batch_episode_indices[row])}, frame={int(frame_indices[row])}"
+                    )
             label_multiplicity = np.fromiter(
                 (
                     episode_multiplicities[int(episode_index)][int(frame_index)]
@@ -588,21 +598,18 @@ def configure_action_bool_balance(
     true_fractions: dict[str, float] = {}
     bool_weight = float(policy_cfg.action_bool_loss_weight)
     for name, (positive, negative) in counts.items():
-        if positive == 0 or negative == 0:
-            raise ValueError(
-                f"Cannot class-balance {name}: the train split must contain both classes, "
-                f"got positive={positive}, negative={negative}."
-            )
         known = positive + negative
         true_fraction = positive / known
         true_fractions[name] = true_fraction
+        has_both_classes = positive > 0 and negative > 0
         stats[name] = {
             "positive_labels": positive,
             "negative_labels": negative,
             "known_labels": known,
             "true_fraction": true_fraction,
-            "true_weight": bool_weight * 0.5 / true_fraction,
-            "false_weight": bool_weight * 0.5 / (1.0 - true_fraction),
+            "has_both_classes": has_both_classes,
+            "true_weight": bool_weight * 0.5 / true_fraction if has_both_classes else bool_weight,
+            "false_weight": bool_weight * 0.5 / (1.0 - true_fraction) if has_both_classes else bool_weight,
         }
 
     saved_fractions = dict(getattr(policy_cfg, "action_bool_true_fractions", {}))

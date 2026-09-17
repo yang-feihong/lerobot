@@ -72,9 +72,17 @@ def test_policy_factory_resolves_control_action_and_named_ee_state(monkeypatch, 
     assert policy.config.action_feature_names[3] == "arm_teleop_inactive"
     assert policy.config.action_feature_names[-1] == "task_complete"
 
-    disabled = policy_factory.make_policy(PI05Config(device="cpu", action_predict_arm_teleop_inactive=False), ds_meta=meta)
-    assert disabled.config.output_features[ACTION].shape == (15,)
+    disabled = policy_factory.make_policy(
+        PI05Config(
+            device="cpu",
+            action_predict_arm_teleop_inactive=False,
+            action_predict_arm_reset=False,
+        ),
+        ds_meta=meta,
+    )
+    assert disabled.config.output_features[ACTION].shape == (14,)
     assert "arm_teleop_inactive" not in disabled.config.action_feature_names
+    assert "arm_reset" not in disabled.config.action_feature_names
 
 
 def test_policy_factory_resolves_joint_control_ee_supervision(monkeypatch, tmp_path):
@@ -165,6 +173,33 @@ def test_current_config_defaults_to_control_action() -> None:
     assert PI05Config().ee_delta_supervision_mode == "all"
     assert PI05Config().gripper_target_representation == "continuous_position"
     assert PI05Config().ee_supervision_source == "control_action"
+
+
+def test_arm_mode_flow_channels_must_be_enabled_together() -> None:
+    with pytest.raises(ValueError, match="must be enabled or disabled together"):
+        PI05Config(action_predict_arm_teleop_inactive=True, action_predict_arm_reset=False)
+    with pytest.raises(ValueError, match="must be enabled or disabled together"):
+        PI05Config(action_predict_arm_teleop_inactive=False, action_predict_arm_reset=True)
+
+
+def test_metadata_records_paired_flow_arm_mode_contract() -> None:
+    action = PI05Config(
+        discrete_action_training_mode="continuous_flow",
+        action_predict_arm_teleop_inactive=True,
+        action_predict_arm_reset=True,
+    ).deployment_metadata()["action"]
+
+    assert action["arm_mode_encoding"] == {
+        "representation": "paired_flow_channels",
+        "channels": ["arm_teleop_inactive", "arm_reset"],
+        "states": {
+            "teleop": {"arm_teleop_inactive": 0, "arm_reset": 0},
+            "inactive": {"arm_teleop_inactive": 1, "arm_reset": 0},
+            "reset": {"arm_teleop_inactive": 0, "arm_reset": 1},
+        },
+        "invalid": {"arm_teleop_inactive": 1, "arm_reset": 1},
+        "training": "flow_matching_with_class_balanced_channel_loss",
+    }
 
 
 def test_saved_config_without_current_semantic_fields_loads_current_defaults(tmp_path) -> None:

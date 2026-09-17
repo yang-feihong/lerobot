@@ -266,6 +266,7 @@ def _decode_discrete_actions(
     gripper_target_representation: str,
     gripper_negative_value: float,
     gripper_nonnegative_value: float,
+    arm_mode_encoding: str | None = None,
 ) -> torch.Tensor:
     """Apply the checkpoint's normalized-domain discrete protocol to physical actions."""
     if normalized_actions.shape != postprocessed_actions.shape:
@@ -279,12 +280,30 @@ def _decode_discrete_actions(
         )
     if mode not in {"continuous_flow", "structured_temporal"}:
         raise ValueError(f"Unsupported discrete action training mode: {mode!r}")
+    if arm_mode_encoding not in {None, "paired_flow_channels"}:
+        raise ValueError(f"Unsupported arm mode encoding: {arm_mode_encoding!r}")
     decoded = postprocessed_actions.clone()
     indices = {name: index for index, name in enumerate(names)}
-    for name in ("arm_teleop_inactive", "arm_reset"):
-        if name in indices:
-            index = indices[name]
-            decoded[:, index] = (normalized_actions[:, index] > 0).to(decoded.dtype)
+    arm_mode_names = ("arm_teleop_inactive", "arm_reset")
+    if arm_mode_encoding == "paired_flow_channels":
+        if mode != "continuous_flow":
+            raise ValueError("paired_flow_channels requires continuous_flow training")
+        if not set(arm_mode_names).issubset(indices):
+            raise ValueError(f"paired_flow_channels requires both arm mode channels: {names}")
+        arm_mode_indices = [indices[name] for name in arm_mode_names]
+        normalized_arm_modes = normalized_actions[:, arm_mode_indices]
+        prototypes = normalized_arm_modes.new_tensor(((-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0)))
+        state_indices = torch.argmin(
+            torch.sum((normalized_arm_modes[:, None, :] - prototypes[None, :, :]) ** 2, dim=-1),
+            dim=-1,
+        )
+        physical_states = decoded.new_tensor(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)))
+        decoded[:, arm_mode_indices] = physical_states[state_indices]
+    else:
+        for name in arm_mode_names:
+            if name in indices:
+                index = indices[name]
+                decoded[:, index] = (normalized_actions[:, index] > 0).to(decoded.dtype)
     if gripper_target_representation not in {"binary_position", "continuous_position"}:
         raise ValueError(f"Unsupported gripper target representation: {gripper_target_representation!r}")
     if "gripper_target" in indices and gripper_target_representation == "binary_position":
@@ -402,6 +421,7 @@ class CheckpointContract:
     selected_state_names: tuple[str, ...]
     source_action_names: tuple[str, ...]
     discrete_action_training_mode: str
+    arm_mode_encoding: str | None
     ee_target_dataset_semantics: str
     ee_delta_supervision_mode: str
     gripper_target_representation: str
@@ -483,6 +503,8 @@ def _load_checkpoint_contract(
         int(metadata_version), action, raw_config
     )
     expected = config.deployment_metadata()
+    if "arm_mode_encoding" not in action:
+        expected["action"].pop("arm_mode_encoding", None)
     if saved != expected:
         raise ValueError("pi05_deployment_metadata.json disagrees with checkpoint config.json")
     discrete_mode = str(action.get("discrete_training_mode", "continuous_flow"))
@@ -491,6 +513,23 @@ def _load_checkpoint_contract(
     config_mode = str(raw_config.get("discrete_action_training_mode", "continuous_flow"))
     if config_mode != discrete_mode:
         raise ValueError("Discrete action training mode disagrees between metadata and config.json")
+    arm_mode_metadata = action.get("arm_mode_encoding")
+    arm_mode_encoding = None
+    if arm_mode_metadata is not None:
+        expected_arm_mode_metadata = {
+            "representation": "paired_flow_channels",
+            "channels": ["arm_teleop_inactive", "arm_reset"],
+            "states": {
+                "teleop": {"arm_teleop_inactive": 0, "arm_reset": 0},
+                "inactive": {"arm_teleop_inactive": 1, "arm_reset": 0},
+                "reset": {"arm_teleop_inactive": 0, "arm_reset": 1},
+            },
+            "invalid": {"arm_teleop_inactive": 1, "arm_reset": 1},
+            "training": "flow_matching_with_class_balanced_channel_loss",
+        }
+        if arm_mode_metadata != expected_arm_mode_metadata:
+            raise ValueError(f"Unsupported arm mode encoding: {arm_mode_metadata!r}")
+        arm_mode_encoding = "paired_flow_channels"
     gripper_target_representation = str(action.get("gripper_target_representation", "binary_position"))
     if gripper_target_representation != config.gripper_target_representation:
         raise ValueError("Gripper target representation disagrees between metadata and config.json")
@@ -542,6 +581,7 @@ def _load_checkpoint_contract(
         selected_state_names=state_names,
         source_action_names=source_action_names,
         discrete_action_training_mode=discrete_mode,
+        arm_mode_encoding=arm_mode_encoding,
         ee_target_dataset_semantics=str(action.get("ee_target_dataset_semantics", "legacy_raw")),
         ee_delta_supervision_mode=str(action.get("ee_delta_supervision_mode", "active_only")),
         gripper_target_representation=gripper_target_representation,
@@ -992,6 +1032,7 @@ class AsyncRTCPolicy:
             str(name) for name in (self.policy.config.action_feature_names or self.postprocessed_action_names)
         )
         self.discrete_action_training_mode = contract.discrete_action_training_mode
+        self.arm_mode_encoding = contract.arm_mode_encoding
         self.gripper_target_representation = contract.gripper_target_representation
         self.gripper_negative_value = contract.gripper_negative_value
         self.gripper_nonnegative_value = contract.gripper_nonnegative_value
@@ -1084,6 +1125,7 @@ class AsyncRTCPolicy:
                 else "not_present_low_level_always_ee"
             ),
             discrete_action_training_mode=self.discrete_action_training_mode,
+            arm_mode_encoding=self.arm_mode_encoding,
             ee_target_dataset_semantics=contract.ee_target_dataset_semantics,
             ee_delta_supervision_mode=contract.ee_delta_supervision_mode,
             gripper_target_representation=self.gripper_target_representation,
@@ -1292,6 +1334,22 @@ class AsyncRTCPolicy:
             "chunk_scheduling_mode": self.chunk_scheduling_mode,
             "b2_execution_mode": self.b2_execution_mode,
             "last_error": self._last_error,
+        }
+
+    def set_chunk_scheduling_mode(self, mode: str) -> dict[str, object]:
+        if mode not in CHUNK_SCHEDULING_MODES:
+            raise ValueError(
+                f"Unknown chunk scheduling mode {mode!r}; expected one of {CHUNK_SCHEDULING_MODES}"
+            )
+        previous = self.chunk_scheduling_mode
+        self.chunk_scheduling_mode = mode
+        self.rtc_config.enabled = _rtc_enabled_for_chunk_scheduling(mode)
+        LOG.info("Chunk scheduling mode changed: %s -> %s", previous, mode)
+        return {
+            "accepted": previous != mode,
+            "previous_mode": previous,
+            "chunk_scheduling_mode": mode,
+            "rtc_enabled": self.rtc_config.enabled,
         }
 
     @staticmethod
@@ -1608,6 +1666,7 @@ class AsyncRTCPolicy:
                 postprocessed,
                 self.postprocessed_action_names,
                 mode=self.discrete_action_training_mode,
+                arm_mode_encoding=self.arm_mode_encoding,
                 gripper_target_representation=self.gripper_target_representation,
                 gripper_negative_value=self.gripper_negative_value,
                 gripper_nonnegative_value=self.gripper_nonnegative_value,
@@ -1767,6 +1826,20 @@ class VLARequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        if path == "/v1/chunk-scheduling-mode":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 4096:
+                    raise ValueError(f"Invalid Content-Length: {length}")
+                request_value = json.loads(self.rfile.read(length))
+                result = self.engine.set_chunk_scheduling_mode(
+                    str(request_value["mode"]).upper()
+                )
+                self._write_json(HTTPStatus.OK, result)
+            except Exception as exc:
+                LOG.warning("Rejected chunk scheduling mode: %s", exc)
+                self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
         if path == "/v1/b2-control":
             try:
                 length = int(self.headers.get("Content-Length", "0"))

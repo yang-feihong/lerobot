@@ -25,9 +25,9 @@ state_use_b2_angular_velocity="false"
 b2_action_representation="velocity" # "velocity" or "pose_delta"
 z1_action_representation="ee_delta" # "ee_delta" (adjacent target) or "ee_state_delta" (inference-time state anchor)
 ee_delta_rotation_representation="rotvec" # "rotvec" for new EE-delta checkpoints
-action_semantics_profile="joint_control_ee_v1"
-predict_arm_teleop_inactive="false"
-predict_arm_reset="false"
+action_semantics_profile="joint_control_arm_mode_v2"
+predict_arm_teleop_inactive="true"
+predict_arm_reset="true"
 predict_ee_pose="true"
 predict_gripper="true"
 predict_task_complete="false"
@@ -36,7 +36,7 @@ ee_target_dataset_semantics="joint_control_inactive_interpolated"
 ee_supervision_source="control_action"
 ee_delta_supervision_mode="all" # "active_only" or "all"
 gripper_target_representation="continuous_position"
-action_loss_schema="uniform_valid"
+action_loss_schema="auto"
 task_complete_sample_tail_seconds="2.0"
 new_module_optimizer_lr_multiplier="40.0"
 structured_action_crf_initial_stay_bias="4.0"
@@ -183,6 +183,19 @@ case "$action_semantics_profile" in
     gripper_target_representation="continuous_position"
     action_loss_schema="uniform_valid"
     ;;
+  joint_control_arm_mode_v2)
+    predict_arm_teleop_inactive="true"
+    predict_arm_reset="true"
+    predict_ee_pose="true"
+    predict_gripper="true"
+    predict_task_complete="false"
+    discrete_action_training_mode="continuous_flow"
+    ee_target_dataset_semantics="joint_control_inactive_interpolated"
+    ee_supervision_source="control_action"
+    ee_delta_supervision_mode="all"
+    gripper_target_representation="continuous_position"
+    action_loss_schema="auto"
+    ;;
   custom) ;;
   *)
     echo "Unknown action_semantics_profile=$action_semantics_profile" >&2
@@ -280,6 +293,9 @@ fi
 case "$action_semantics_profile" in
   joint_control_ee_v1)
     expected_semantics=(false false true true false continuous_flow joint_control_inactive_interpolated control_action all continuous_position uniform_valid)
+    ;;
+  joint_control_arm_mode_v2)
+    expected_semantics=(true true true true false continuous_flow joint_control_inactive_interpolated control_action all continuous_position auto)
     ;;
   custom)
     expected_semantics=()

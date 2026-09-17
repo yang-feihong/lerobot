@@ -3,7 +3,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from lerobot.policies.pi05.b2_action_transform import DATASET_ACTION_NAMES
+from lerobot.policies.pi05.b2_action_transform import (
+    CONTROL_EXTENDED_DATASET_ACTION_NAMES,
+    DATASET_ACTION_NAMES,
+)
 from lerobot.scripts.lerobot_train import configure_action_bool_balance, resolve_task_complete_sampling
 from lerobot.utils.constants import ACTION
 
@@ -37,11 +40,11 @@ class _FakeHFDataset:
         }
 
 
-def _fake_dataset(actions: np.ndarray):
+def _fake_dataset(actions: np.ndarray, action_names=DATASET_ACTION_NAMES):
     return SimpleNamespace(
         meta=SimpleNamespace(
             fps=10,
-            features={ACTION: {"names": list(DATASET_ACTION_NAMES)}},
+            features={ACTION: {"names": list(action_names)}},
             episodes=_Episodes(len(actions)),
         ),
         episodes=[0],
@@ -136,3 +139,87 @@ def test_continuous_gripper_does_not_create_a_boolean_prior():
     )
 
     assert stats is None
+
+
+def test_boolean_priors_support_control_extended_dataset_actions():
+    actions = np.zeros((5, len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)), dtype=np.float32)
+    actions[:, 3] = [1, 1, 0, 0, 0]
+    actions[:, 4] = [0, 0, 1, 0, 0]
+    policy_cfg = SimpleNamespace(
+        type="pi05",
+        action_predict_arm_teleop_inactive=True,
+        action_predict_arm_reset=True,
+        action_predict_gripper=True,
+        action_predict_task_complete=False,
+        gripper_target_representation="continuous_position",
+        action_gripper_target_true_side="negative",
+        action_bool_loss_weight=4.0,
+        action_bool_true_fractions={},
+        chunk_size=3,
+        control_frequency_hz=10,
+    )
+
+    stats = configure_action_bool_balance(
+        SimpleNamespace(trainable_config=policy_cfg, resume=False),
+        _fake_dataset(actions, CONTROL_EXTENDED_DATASET_ACTION_NAMES),
+    )
+
+    assert stats is not None
+    assert set(stats) == {"arm_teleop_inactive", "arm_reset"}
+    assert policy_cfg.action_bool_true_fractions == {
+        "arm_teleop_inactive": pytest.approx(0.25),
+        "arm_reset": pytest.approx(0.25),
+    }
+
+
+def test_stage_dataset_without_reset_positive_keeps_the_flow_channel():
+    actions = np.zeros((5, len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)), dtype=np.float32)
+    actions[:, 3] = [1, 1, 0, 0, 0]
+    policy_cfg = SimpleNamespace(
+        type="pi05",
+        action_predict_arm_teleop_inactive=True,
+        action_predict_arm_reset=True,
+        action_predict_gripper=True,
+        action_predict_task_complete=False,
+        gripper_target_representation="continuous_position",
+        action_gripper_target_true_side="negative",
+        action_bool_loss_weight=4.0,
+        action_bool_true_fractions={},
+        chunk_size=3,
+        control_frequency_hz=10,
+    )
+
+    stats = configure_action_bool_balance(
+        SimpleNamespace(trainable_config=policy_cfg, resume=False),
+        _fake_dataset(actions, CONTROL_EXTENDED_DATASET_ACTION_NAMES),
+    )
+
+    assert stats["arm_reset"]["has_both_classes"] is False
+    assert stats["arm_reset"]["true_fraction"] == 0.0
+    assert stats["arm_reset"]["true_weight"] == 4.0
+    assert stats["arm_reset"]["false_weight"] == 4.0
+    assert policy_cfg.action_bool_true_fractions["arm_reset"] == 0.0
+
+
+def test_arm_mode_overlap_is_rejected_during_dataset_preflight():
+    actions = np.zeros((5, len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)), dtype=np.float32)
+    actions[2, 3:5] = 1.0
+    policy_cfg = SimpleNamespace(
+        type="pi05",
+        action_predict_arm_teleop_inactive=True,
+        action_predict_arm_reset=True,
+        action_predict_gripper=False,
+        action_predict_task_complete=False,
+        gripper_target_representation="continuous_position",
+        action_gripper_target_true_side="negative",
+        action_bool_loss_weight=4.0,
+        action_bool_true_fractions={},
+        chunk_size=3,
+        control_frequency_hz=10,
+    )
+
+    with pytest.raises(ValueError, match="episode=0, frame=2"):
+        configure_action_bool_balance(
+            SimpleNamespace(trainable_config=policy_cfg, resume=False),
+            _fake_dataset(actions, CONTROL_EXTENDED_DATASET_ACTION_NAMES),
+        )

@@ -1,3 +1,4 @@
+import json
 from io import BytesIO
 from threading import Lock
 from types import SimpleNamespace
@@ -256,6 +257,14 @@ def test_server_loads_current_contract_for_all_representation_pairs(
     assert contract.metadata_version == 10
     assert contract.model_action_representation == b2_representation
     assert contract.z1_action_representation == z1_representation
+    assert contract.arm_mode_encoding == "paired_flow_channels"
+
+    metadata_path = tmp_path / "pi05_deployment_metadata.json"
+    legacy_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    legacy_metadata["action"].pop("arm_mode_encoding")
+    metadata_path.write_text(json.dumps(legacy_metadata), encoding="utf-8")
+    legacy_contract = _load_checkpoint_contract(tmp_path, config, 50.0)
+    assert legacy_contract.arm_mode_encoding is None
 
 
 def _schema_v2_names() -> tuple[str, ...]:
@@ -302,6 +311,39 @@ def test_server_decodes_normalized_discrete_outputs_to_physical_commands(mode: s
         torch.tensor([-1.0471976, 0.0, -1.0471976, 0.0]),
     )
     assert decoded[:, names.index("task_complete")].tolist() == [0.0, 1.0, 1.0, 1.0]
+
+
+def test_server_projects_paired_arm_flow_channels_to_ik_bridge_states() -> None:
+    names = _schema_v2_names()
+    normalized = torch.zeros((4, len(names)))
+    postprocessed = torch.zeros_like(normalized)
+    inactive_index = names.index("arm_teleop_inactive")
+    reset_index = names.index("arm_reset")
+    normalized[:, [inactive_index, reset_index]] = torch.tensor(
+        [
+            [-0.8, -0.7],
+            [0.9, -0.6],
+            [-0.4, 0.8],
+            [0.9, 0.8],
+        ]
+    )
+
+    decoded = _decode_discrete_actions(
+        normalized,
+        postprocessed,
+        names,
+        mode="continuous_flow",
+        arm_mode_encoding="paired_flow_channels",
+        gripper_target_representation="binary_position",
+        gripper_negative_value=-1.0471976,
+        gripper_nonnegative_value=0.0,
+    )
+    execution = _to_execution_actions(decoded, names, "ee_delta")
+
+    assert decoded[:, inactive_index].tolist() == [0.0, 1.0, 0.0, 1.0]
+    assert decoded[:, reset_index].tolist() == [0.0, 0.0, 1.0, 0.0]
+    assert execution[:, EXECUTION_ACTION_NAMES.index("arm_active")].tolist() == [1.0, 0.0, 1.0, 0.0]
+    assert execution[:, EXECUTION_ACTION_NAMES.index("arm_reset")].tolist() == [0.0, 0.0, 1.0, 0.0]
 
 
 def test_continuous_gripper_is_not_thresholded() -> None:
@@ -359,6 +401,7 @@ def test_infer_records_model_action_names_and_source_step_anchor(
     policy.postprocessed_action_names = model_names
     policy.model_action_names = model_names
     policy.discrete_action_training_mode = "continuous_flow"
+    policy.arm_mode_encoding = None
     policy.gripper_target_representation = "continuous_position"
     policy.gripper_negative_value = -1.0471976
     policy.gripper_nonnegative_value = 0.0
@@ -636,6 +679,30 @@ def test_sync_server_disables_rtc_prefix_delay_and_previous_velocity_context() -
     anchor, prefix = policy._b2_velocity_filter_context(packet)
     torch.testing.assert_close(anchor, torch.zeros(3))
     assert prefix is None
+
+
+def test_chunk_scheduling_mode_switch_updates_rtc_without_reloading_policy() -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.chunk_scheduling_mode = "RTC"
+    policy.rtc_config = SimpleNamespace(enabled=True)
+
+    result = policy.set_chunk_scheduling_mode("SYNC")
+
+    assert result == {
+        "accepted": True,
+        "previous_mode": "RTC",
+        "chunk_scheduling_mode": "SYNC",
+        "rtc_enabled": False,
+    }
+    assert policy.chunk_scheduling_mode == "SYNC"
+    assert not policy.rtc_config.enabled
+    assert policy.set_chunk_scheduling_mode("SYNC")["accepted"] is False
+    rtc_result = policy.set_chunk_scheduling_mode("RTC")
+    assert rtc_result["accepted"] is True
+    assert policy.chunk_scheduling_mode == "RTC"
+    assert policy.rtc_config.enabled
+    with pytest.raises(ValueError, match="Unknown chunk scheduling mode"):
+        policy.set_chunk_scheduling_mode("invalid")
 
 
 def test_rtc_server_keeps_prefix_and_measured_delay_behavior() -> None:

@@ -2159,6 +2159,8 @@ class PI05Policy(PreTrainedPolicy):
         true_fraction = self.config.action_bool_true_fractions.get(name)
         if true_fraction is None:
             return self._balanced_bool_weights(target_true, valid_mask)
+        if true_fraction <= 0.0 or true_fraction >= 1.0:
+            return valid_mask.to(dtype=torch.float32)
         true_weight = 0.5 / true_fraction
         false_weight = 0.5 / (1.0 - true_fraction)
         return torch.where(target_true, true_weight, false_weight).to(dtype=torch.float32) * valid_mask.to(
@@ -2245,13 +2247,26 @@ class PI05Policy(PreTrainedPolicy):
             global_true_fraction = self.config.action_bool_true_fractions.get(name)
             if global_true_fraction is not None:
                 bool_dim_stats[f"gate_global_true_frac/{name}"] = float(global_true_fraction)
-                bool_dim_stats[f"gate_weight/{name}_true"] = float(bool_weight * 0.5 / global_true_fraction)
-                bool_dim_stats[f"gate_weight/{name}_false"] = float(
-                    bool_weight * 0.5 / (1.0 - global_true_fraction)
-                )
+                if global_true_fraction <= 0.0 or global_true_fraction >= 1.0:
+                    bool_dim_stats[f"gate_weight/{name}_true"] = bool_weight
+                    bool_dim_stats[f"gate_weight/{name}_false"] = bool_weight
+                else:
+                    bool_dim_stats[f"gate_weight/{name}_true"] = float(
+                        bool_weight * 0.5 / global_true_fraction
+                    )
+                    bool_dim_stats[f"gate_weight/{name}_false"] = float(
+                        bool_weight * 0.5 / (1.0 - global_true_fraction)
+                    )
 
         arm_teleop_inactive = bool_targets.get("arm_teleop_inactive")
         arm_reset = bool_targets.get("arm_reset")
+        if arm_teleop_inactive is not None and arm_reset is not None:
+            overlap = arm_teleop_inactive & arm_reset & execution_valid
+            if bool(overlap.any()):
+                raise ValueError(
+                    "arm_teleop_inactive and arm_reset cannot both be true; "
+                    "they jointly encode TELEOP/INACTIVE/RESET"
+                )
         b2_continuous_mask = execution_valid
         ee_continuous_mask = execution_valid
         if arm_teleop_inactive is not None:
@@ -2308,12 +2323,16 @@ class PI05Policy(PreTrainedPolicy):
             global_true_fraction = self.config.action_bool_true_fractions.get("task_complete")
             if global_true_fraction is not None:
                 bool_dim_stats["gate_global_true_frac/task_complete"] = float(global_true_fraction)
-                bool_dim_stats["gate_weight/task_complete_true"] = float(
-                    bool_weight * 0.5 / global_true_fraction
-                )
-                bool_dim_stats["gate_weight/task_complete_false"] = float(
-                    bool_weight * 0.5 / (1.0 - global_true_fraction)
-                )
+                if global_true_fraction <= 0.0 or global_true_fraction >= 1.0:
+                    bool_dim_stats["gate_weight/task_complete_true"] = bool_weight
+                    bool_dim_stats["gate_weight/task_complete_false"] = bool_weight
+                else:
+                    bool_dim_stats["gate_weight/task_complete_true"] = float(
+                        bool_weight * 0.5 / global_true_fraction
+                    )
+                    bool_dim_stats["gate_weight/task_complete_false"] = float(
+                        bool_weight * 0.5 / (1.0 - global_true_fraction)
+                    )
 
         weighted = torch.cat([part.reshape(losses.shape[0], -1) for part in weighted_parts], dim=1)
         weights = torch.cat([part.reshape(losses.shape[0], -1) for part in weight_parts], dim=1)
@@ -2422,6 +2441,8 @@ class PI05Policy(PreTrainedPolicy):
                 reset_fraction = self.config.action_bool_true_fractions.get("arm_reset")
                 inactive_fraction = self.config.action_bool_true_fractions.get("arm_teleop_inactive")
                 if reset_fraction is not None and inactive_fraction is not None:
+                    reset_fraction = max(1e-6, reset_fraction)
+                    inactive_fraction = max(1e-6, inactive_fraction)
                     ee_fraction = max(1e-6, 1.0 - reset_fraction - inactive_fraction)
                     class_weights = emissions.new_tensor(
                         [1.0 / ee_fraction, 1.0 / inactive_fraction, 1.0 / reset_fraction]

@@ -241,6 +241,11 @@ class PI05Config(PreTrainedConfig):
                 "discrete_action_training_mode must be 'continuous_flow' or "
                 f"'structured_temporal', got {self.discrete_action_training_mode!r}"
             )
+        if self.action_predict_arm_teleop_inactive != self.action_predict_arm_reset:
+            raise ValueError(
+                "arm_teleop_inactive and arm_reset jointly encode the mutually exclusive "
+                "TELEOP/INACTIVE/RESET arm mode and must be enabled or disabled together"
+            )
         if self.discrete_action_training_mode == "structured_temporal" and not all(
             (
                 self.action_predict_arm_teleop_inactive,
@@ -316,11 +321,11 @@ class PI05Config(PreTrainedConfig):
         invalid_bool_fractions = {
             name: fraction
             for name, fraction in self.action_bool_true_fractions.items()
-            if not 0.0 < fraction < 1.0
+            if not 0.0 <= fraction <= 1.0
         }
         if invalid_bool_fractions:
             raise ValueError(
-                f"action_bool_true_fractions must be strictly between 0 and 1, got {invalid_bool_fractions}"
+                f"action_bool_true_fractions must be between 0 and 1 inclusive, got {invalid_bool_fractions}"
             )
         if self.action_continuous_loss_weight <= 0:
             raise ValueError(
@@ -522,6 +527,22 @@ class PI05Config(PreTrainedConfig):
                 "ee_delta_supervision_mode": self.ee_delta_supervision_mode,
                 "flow_loss_schema": self.action_loss_schema,
                 "gripper_target_representation": self.gripper_target_representation,
+                "arm_mode_encoding": (
+                    {
+                        "representation": "paired_flow_channels",
+                        "channels": ["arm_teleop_inactive", "arm_reset"],
+                        "states": {
+                            "teleop": {"arm_teleop_inactive": 0, "arm_reset": 0},
+                            "inactive": {"arm_teleop_inactive": 1, "arm_reset": 0},
+                            "reset": {"arm_teleop_inactive": 0, "arm_reset": 1},
+                        },
+                        "invalid": {"arm_teleop_inactive": 1, "arm_reset": 1},
+                        "training": "flow_matching_with_class_balanced_channel_loss",
+                    }
+                    if self.action_predict_arm_teleop_inactive
+                    and self.discrete_action_training_mode == "continuous_flow"
+                    else None
+                ),
                 "discrete_temporal_structure": (
                     {
                         "arm_mode": {
