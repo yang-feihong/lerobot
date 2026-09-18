@@ -1017,7 +1017,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # Compile model if requested
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
-            self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
+            # Keep RTC scheduling and guidance outside the compiled graph: their prefix length
+            # and delay change online. The denoising core has stable shapes and accounts for
+            # nearly all repeated compute across the inference steps.
+            self.denoise_step = torch.compile(self.denoise_step, mode=config.compile_mode)
             # Also compile the main forward pass used during training
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 

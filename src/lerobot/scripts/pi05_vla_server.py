@@ -611,6 +611,34 @@ def _resolve_policy_path(path: str | Path) -> Path:
     raise FileNotFoundError(f"Cannot resolve a policy checkpoint from {path}")
 
 
+def _checkpoint_hot_swap_signature(policy_path: Path) -> str:
+    """Return a conservative signature for in-process PEFT weight replacement."""
+    documents = {}
+    for name in (
+        "config.json",
+        "adapter_config.json",
+        "pi05_deployment_metadata.json",
+        "policy_preprocessor.json",
+        "policy_postprocessor.json",
+    ):
+        path = policy_path / name
+        if not path.is_file():
+            raise FileNotFoundError(f"Checkpoint is missing hot-swap metadata: {path}")
+        documents[name] = json.loads(path.read_text(encoding="utf-8"))
+    config = documents["config.json"]
+    for runtime_override in (
+        "pretrained_path",
+        "pretrained_revision",
+        "device",
+        "compile_model",
+        "compile_mode",
+        "num_inference_steps",
+    ):
+        config.pop(runtime_override, None)
+    canonical = json.dumps(documents, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _decode_jpeg(encoded: np.ndarray, name: str) -> np.ndarray:
     image = cv2.imdecode(np.asarray(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
     if image is None:
@@ -966,6 +994,8 @@ class AsyncRTCPolicy:
             chunk_scheduling_mode=self.chunk_scheduling_mode,
         )
         policy_path = _resolve_policy_path(args.policy_path)
+        self.policy_path = policy_path
+        self._hot_swap_signature = _checkpoint_hot_swap_signature(policy_path)
         config = PreTrainedConfig.from_pretrained(policy_path)
         config.pretrained_path = policy_path
         config.device = args.device
@@ -973,10 +1003,24 @@ class AsyncRTCPolicy:
         contract = _load_checkpoint_contract(policy_path, config, float(args.low_level_hz))
         if args.num_inference_steps is not None:
             config.num_inference_steps = args.num_inference_steps
+        if args.compile_model is not None:
+            config.compile_model = args.compile_model
+        if args.compile_mode is not None:
+            config.compile_mode = args.compile_mode
 
         LOG.info("Loading checkpoint-only policy=%s", policy_path)
         self.policy = make_policy(config)
         self.policy.eval()
+        if hasattr(self.policy, "active_adapters") and hasattr(self.policy, "set_adapter"):
+            active_adapters = list(self.policy.active_adapters)
+            if len(active_adapters) != 1:
+                raise ValueError(f"Expected one active PEFT adapter, got {active_adapters}")
+            self._active_adapter_name = str(active_adapters[0])
+            self.policy.set_adapter(self._active_adapter_name, inference_mode=True)
+        else:
+            raise TypeError("PI0.5 deployment requires a PEFT policy with adapter switching support")
+        if hasattr(self.policy, "gradient_checkpointing_disable"):
+            self.policy.gradient_checkpointing_disable()
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             policy_cfg=config,
             pretrained_path=str(policy_path),
@@ -1080,6 +1124,7 @@ class AsyncRTCPolicy:
         self._image_history: deque[ObservationPacket] = deque(maxlen=256)
 
         self._mailbox_condition = Condition()
+        self._model_lock = Lock()
         self._mailbox: ObservationPacket | None = None
         self._mailbox_version = 0
         self._last_inferred_version = 0
@@ -1164,6 +1209,94 @@ class AsyncRTCPolicy:
             warmup_inferences=self._warmup_inferences,
         )
 
+    def _reset_runtime_after_model_switch(self) -> None:
+        with self._mailbox_condition:
+            self._mailbox = None
+            self._observation_history.clear()
+            self._image_history.clear()
+            self._previous_observation_clock = None
+            self._last_inferred_version = self._mailbox_version
+        with self._records_lock:
+            self._records.clear()
+            self._latest_record = None
+        self._latencies.clear()
+        self._sim_rates.clear()
+        self._control_epoch = None
+        self._task_complete_latched = False
+        self._last_error = None
+
+    def hot_swap_checkpoint(self, value: str | Path) -> dict[str, object]:
+        """Replace compatible PEFT weights without reconstructing the base model."""
+        started = time.perf_counter()
+        policy_path = _resolve_policy_path(value)
+        signature = _checkpoint_hot_swap_signature(policy_path)
+        if signature != self._hot_swap_signature:
+            return {
+                "accepted": False,
+                "hot_swap_supported": False,
+                "reason": "checkpoint architecture, deployment contract, or processor schema differs",
+                "current_model": str(self.policy_path),
+                "requested_model": str(policy_path),
+            }
+
+        config = PreTrainedConfig.from_pretrained(policy_path)
+        config.pretrained_path = policy_path
+        config.device = str(self.device)
+        _load_checkpoint_contract(policy_path, config, self.low_level_hz)
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=config,
+            pretrained_path=str(policy_path),
+            pretrained_revision=getattr(config, "pretrained_revision", None),
+        )
+        action_unnormalizers = [
+            step for step in postprocessor.steps if isinstance(step, UnnormalizerProcessorStep)
+        ]
+        if len(action_unnormalizers) != 1:
+            raise ValueError(f"Expected one action unnormalizer, got {len(action_unnormalizers)}")
+        action_unnormalizer = action_unnormalizers[0]
+        action_normalizer = NormalizerProcessorStep(
+            features=action_unnormalizer.features,
+            norm_map=action_unnormalizer.norm_map,
+            stats=action_unnormalizer.stats,
+            device=self.device,
+        )
+
+        from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
+
+        adapter_state = load_peft_weights(str(policy_path), device="cpu")
+        with self._model_lock:
+            load_result = set_peft_model_state_dict(
+                self.policy,
+                adapter_state,
+                adapter_name=self._active_adapter_name,
+            )
+            if load_result.unexpected_keys:
+                raise ValueError(
+                    f"Hot-swapped adapter has unexpected keys: {load_result.unexpected_keys[:8]}"
+                )
+            self.preprocessor = preprocessor
+            self.postprocessor = postprocessor
+            self._action_unnormalizer = action_unnormalizer
+            self._action_normalizer = action_normalizer
+            self.policy_path = policy_path
+            self._reset_runtime_after_model_switch()
+            self._warmup()
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self.recorder.event(
+            "vla_checkpoint_hot_swapped",
+            policy_path=str(policy_path),
+            elapsed_ms=elapsed_ms,
+            active_adapter=self._active_adapter_name,
+        )
+        LOG.info("Hot-swapped checkpoint=%s in %.3fs", policy_path, elapsed_ms / 1000.0)
+        return {
+            "accepted": True,
+            "hot_swap_supported": True,
+            "load_strategy": "hot_swap",
+            "current_model": str(policy_path),
+            "elapsed_ms": elapsed_ms,
+        }
+
     def start(self) -> None:
         self._warmup()
         self._worker.start()
@@ -1197,14 +1330,23 @@ class AsyncRTCPolicy:
         if self._warmup_inferences == 0:
             return
         started = time.perf_counter()
-        for _ in range(self._warmup_inferences):
+        rtc_prefix = None
+        for warmup_index in range(self._warmup_inferences):
             batch = self.preprocessor(self._warmup_batch())
             with torch.inference_mode():
                 actions = self.policy.predict_action_chunk(
                     batch,
                     inference_delay=0,
-                    prev_chunk_left_over=None,
+                    prev_chunk_left_over=rtc_prefix,
                 )
+                if (
+                    warmup_index == 0
+                    and self.chunk_scheduling_mode == "RTC"
+                    and self._warmup_inferences > 1
+                ):
+                    # Keep the prefix independent from torch.compile's reusable CUDA graph
+                    # outputs, then exercise RTC guidance before the service reports ready.
+                    rtc_prefix = actions.detach().cpu().clone().to(self.device)
                 self.postprocessor(actions).detach().cpu()
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -1327,6 +1469,8 @@ class AsyncRTCPolicy:
         return {
             "ok": self._worker.is_alive() and self._last_error is None,
             "protocol_version": PROTOCOL_VERSION,
+            "policy_path": str(self.policy_path),
+            "active_adapter": self._active_adapter_name,
             "worker_alive": self._worker.is_alive(),
             "inference_count": self._inference_count,
             "latest_sequence": latest.sequence if latest else 0,
@@ -1631,6 +1775,10 @@ class AsyncRTCPolicy:
         return self._observed_b2_velocity(packet), None
 
     def _infer(self, packet: ObservationPacket) -> ActionRecord:
+        with self._model_lock:
+            return self._infer_unlocked(packet)
+
+    def _infer_unlocked(self, packet: ObservationPacket) -> ActionRecord:
         started_ns = time.monotonic_ns()
         started = time.perf_counter()
         batch = self.preprocessor(self._make_batch(packet))
@@ -1826,6 +1974,19 @@ class VLARequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        if path == "/v1/model":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 16384:
+                    raise ValueError(f"Invalid Content-Length: {length}")
+                request_value = json.loads(self.rfile.read(length))
+                result = self.engine.hot_swap_checkpoint(str(request_value["path"]))
+                status = HTTPStatus.OK if result["accepted"] else HTTPStatus.CONFLICT
+                self._write_json(status, result)
+            except Exception as exc:
+                LOG.exception("Checkpoint hot swap failed")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            return
         if path == "/v1/chunk-scheduling-mode":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -1904,6 +2065,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-path", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-inference-steps", type=int)
+    parser.add_argument(
+        "--compile-model",
+        type=_parse_bool,
+        default=None,
+        help="Override the checkpoint torch.compile setting for inference.",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"),
+        default=None,
+        help="torch.compile mode; only used when compilation is enabled.",
+    )
     parser.add_argument("--warmup-inferences", type=int, default=1)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)

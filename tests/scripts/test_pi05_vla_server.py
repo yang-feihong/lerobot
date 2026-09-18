@@ -31,6 +31,7 @@ from lerobot.scripts.pi05_vla_server import (
     SE2TrajectoryController,
     _apply_completion_stop,
     _b2_velocity_smoothing_transition_step,
+    _checkpoint_hot_swap_signature,
     _decode_discrete_actions,
     _load_checkpoint_contract,
     _reanchor_b2_pose_delta,
@@ -44,6 +45,34 @@ from lerobot.scripts.pi05_vla_server import (
 )
 
 EXECUTION_ACTION_NAMES = execution_action_names("ee_delta")
+
+
+def test_checkpoint_hot_swap_signature_requires_identical_runtime_schema(tmp_path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    names = (
+        "config.json",
+        "adapter_config.json",
+        "pi05_deployment_metadata.json",
+        "policy_preprocessor.json",
+        "policy_postprocessor.json",
+    )
+    for directory in (first, second):
+        directory.mkdir()
+        for name in names:
+            (directory / name).write_text(json.dumps({"name": name, "schema": 1}))
+
+    (first / "config.json").write_text(
+        json.dumps({"name": "config.json", "schema": 1, "pretrained_path": "/base/model"})
+    )
+    (second / "config.json").write_text(
+        json.dumps({"name": "config.json", "schema": 1, "pretrained_path": "/resume/checkpoint"})
+    )
+
+    assert _checkpoint_hot_swap_signature(first) == _checkpoint_hot_swap_signature(second)
+
+    (second / "config.json").write_text(json.dumps({"name": "config.json", "schema": 2}))
+    assert _checkpoint_hot_swap_signature(first) != _checkpoint_hot_swap_signature(second)
 
 
 def test_action_packet_contains_replayable_model_and_execution_outputs() -> None:
@@ -389,6 +418,7 @@ def test_infer_records_model_action_names_and_source_step_anchor(
 ) -> None:
     model_names = (*B2_EXECUTION_VELOCITY_NAMES, *EE_DELTA_ACTION_NAMES, "gripper_target")
     policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy._model_lock = Lock()
     policy.preprocessor = lambda batch: batch
     policy.postprocessor = lambda actions: actions
     policy.policy = SimpleNamespace(
