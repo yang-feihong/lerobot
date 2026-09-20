@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.pi05.b2_action_transform import (
     CONTROL_EXTENDED_DATASET_ACTION_NAMES,
     EE_DELTA_ROTVEC_NAMES,
@@ -19,6 +19,7 @@ from lerobot.policies.pi05.b2_action_transform import (
     se2_increment_to_body_twist,
 )
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.processor import NormalizerProcessorStep, UnnormalizerProcessorStep
 from lerobot.scripts.pi05_vla_server import (
     B2_EXECUTION_VELOCITY_NAMES,
     B2_GLOBAL_POSE_NAMES,
@@ -218,6 +219,58 @@ def test_z1_state_delta_rtc_prefix_is_reexpressed_from_current_actual_state() ->
 
     x_index = model_names.index("height_invariant_ee_delta_x")
     torch.testing.assert_close(rebased[:, x_index], torch.tensor([0.5, 1.5]))
+
+
+def test_rtc_reanchor_skips_coupled_b2_group_with_degenerate_quantile_scale() -> None:
+    model_names = (
+        "b2_delta_x",
+        "b2_delta_y",
+        "b2_delta_yaw",
+        *EE_DELTA_ROTVEC_NAMES,
+        *EE_DELTA_ACTION_NAMES[6:9],
+    )
+    stats = {
+        "action": {
+            "q01": np.asarray([0.0, 0.0, 0.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]),
+            "q99": np.asarray([0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+        }
+    }
+    processor_kwargs = {
+        "features": {"action": PolicyFeature(FeatureType.ACTION, (len(model_names),))},
+        "norm_map": {FeatureType.ACTION: NormalizationMode.QUANTILES},
+        "stats": stats,
+    }
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy._action_unnormalizer = UnnormalizerProcessorStep(**processor_kwargs)
+    policy._action_normalizer = NormalizerProcessorStep(**processor_kwargs)
+    policy.b2_action_representation = "pose_delta"
+    policy.z1_action_representation = "ee_state_delta"
+    policy.model_action_names = model_names
+    prefix = torch.zeros((2, len(model_names)))
+    prefix[:, :3] = -1.0
+    prefix[:, model_names.index("height_invariant_ee_delta_x")] = torch.tensor([0.5, 1.0])
+    identity = np.asarray([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    old_ee_anchor = np.concatenate((identity, np.zeros(3, dtype=np.float32)))
+    new_ee_anchor = np.concatenate((identity, np.asarray([0.25, 0.0, 0.0], dtype=np.float32)))
+
+    rebased = policy._reanchor_rtc_prefix(
+        prefix,
+        SimpleNamespace(
+            b2_anchor=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+            ee_anchor=old_ee_anchor,
+        ),
+        SimpleNamespace(
+            state_names=B2_GLOBAL_POSE_NAMES,
+            state=np.asarray([0.02, -0.01, 0.01], dtype=np.float32),
+            actual_ee_state=new_ee_anchor,
+        ),
+    )
+
+    torch.testing.assert_close(rebased[:, :3], prefix[:, :3])
+    x_index = model_names.index("height_invariant_ee_delta_x")
+    torch.testing.assert_close(rebased[:, x_index], torch.tensor([0.25, 0.75]))
+    assert torch.isfinite(rebased).all()
+    assert torch.max(torch.abs(rebased)) <= 1.0
 
 
 def test_metadata_v2_is_rejected() -> None:

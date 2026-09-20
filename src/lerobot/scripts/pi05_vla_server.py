@@ -27,7 +27,7 @@ import cv2
 import numpy as np
 import torch
 
-from lerobot.configs import PreTrainedConfig, RTCAttentionSchedule
+from lerobot.configs import FeatureType, NormalizationMode, PreTrainedConfig, RTCAttentionSchedule
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.pi05.b2_action_transform import (
     EE_DELTA_ROTVEC_NAMES,
@@ -86,6 +86,42 @@ EXECUTION_ACTION_SUFFIX_NAMES = (
 B2_EXECUTION_VELOCITY_NAMES = ("b2_vx", "b2_vy", "b2_omega_z")
 B2_OBSERVED_VELOCITY_NAMES = ("b2_body_vx", "b2_body_vy", "b2_body_wz")
 B2_GLOBAL_POSE_NAMES = ("b2_position_x", "b2_position_y", "b2_yaw")
+
+
+def _rtc_reanchor_group_is_well_conditioned(
+    normalizer: NormalizerProcessorStep | UnnormalizerProcessorStep,
+    action_names: tuple[str, ...],
+    group_names: tuple[str, ...],
+) -> bool:
+    """Whether every action in a coupled pose group has a usable normalization scale."""
+    if not hasattr(normalizer, "_tensor_stats"):
+        return True
+    stats = normalizer._tensor_stats.get("action")  # noqa: SLF001
+    if not stats:
+        return True
+    mode = normalizer.norm_map.get(FeatureType.ACTION, NormalizationMode.IDENTITY)
+    if mode == NormalizationMode.IDENTITY:
+        return True
+    if mode == NormalizationMode.QUANTILES:
+        lower, upper = stats.get("q01"), stats.get("q99")
+    elif mode == NormalizationMode.QUANTILE10:
+        lower, upper = stats.get("q10"), stats.get("q90")
+    elif mode == NormalizationMode.MIN_MAX:
+        lower, upper = stats.get("min"), stats.get("max")
+    elif mode == NormalizationMode.MEAN_STD:
+        upper = stats.get("std")
+        lower = None if upper is None else torch.zeros_like(upper)
+    else:
+        raise ValueError(f"Unsupported action normalization mode for RTC: {mode}")
+    if lower is None or upper is None:
+        raise ValueError(f"Missing action normalization statistics for RTC mode {mode}")
+    indices = torch.as_tensor(
+        [action_names.index(name) for name in group_names],
+        dtype=torch.long,
+        device=lower.device,
+    )
+    scales = torch.abs((upper - lower).index_select(0, indices))
+    return bool(torch.all(torch.isfinite(scales) & (scales > normalizer.eps)).item())
 
 
 def _wrap_angle(value: float) -> float:
@@ -1144,6 +1180,17 @@ class AsyncRTCPolicy:
         self._warmup_inferences = int(args.warmup_inferences)
         self._b2_controller = SE2TrajectoryController(self.low_level_hz)
         self._b2_controller_lock = Lock()
+        b2_rtc_reanchor, ee_rtc_reanchor, _, _ = self._rtc_reanchor_status()
+        if self.b2_action_representation == "pose_delta" and not b2_rtc_reanchor:
+            LOG.warning(
+                "B2 RTC prefix re-anchoring is disabled because its coupled SE(2) "
+                "normalization group has a degenerate scale"
+            )
+        if self.z1_action_representation == "ee_state_delta" and not ee_rtc_reanchor:
+            LOG.warning(
+                "Z1 RTC prefix re-anchoring is disabled because its coupled SE(3) "
+                "normalization group has a degenerate scale"
+            )
         self.recorder.event(
             "vla_loading_finished",
             action_names=self.action_names,
@@ -1159,7 +1206,9 @@ class AsyncRTCPolicy:
             b2_execution_action_representation="velocity",
             b2_pose_delta_control_mode=self.b2_pose_delta_control_mode,
             b2_execution_mode=self.b2_execution_mode,
+            b2_rtc_prefix_reanchor_enabled=b2_rtc_reanchor,
             z1_execution_action_representation=contract.z1_action_representation,
+            ee_rtc_prefix_reanchor_enabled=ee_rtc_reanchor,
             execution_action_protocol="rtc_action_packet_v6_optional_high_level_se2_feedback",
             stop_on_model_task_complete=self.stop_on_model_task_complete,
             b2_velocity_smoothing="causal_first_order_low_pass",
@@ -1279,6 +1328,7 @@ class AsyncRTCPolicy:
             self._action_unnormalizer = action_unnormalizer
             self._action_normalizer = action_normalizer
             self.policy_path = policy_path
+            b2_rtc_reanchor, ee_rtc_reanchor, _, _ = self._rtc_reanchor_status()
             self._reset_runtime_after_model_switch()
             self._warmup()
         elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -1287,6 +1337,8 @@ class AsyncRTCPolicy:
             policy_path=str(policy_path),
             elapsed_ms=elapsed_ms,
             active_adapter=self._active_adapter_name,
+            b2_rtc_prefix_reanchor_enabled=b2_rtc_reanchor,
+            ee_rtc_prefix_reanchor_enabled=ee_rtc_reanchor,
         )
         LOG.info("Hot-swapped checkpoint=%s in %.3fs", policy_path, elapsed_ms / 1000.0)
         return {
@@ -1512,6 +1564,33 @@ class AsyncRTCPolicy:
             raise TypeError(f"Action processor returned {type(result)}")
         return result
 
+    def _rtc_reanchor_status(self) -> tuple[bool, bool, tuple[str, ...], str]:
+        b2_names = ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")
+        b2_enabled = self.b2_action_representation == "pose_delta" and (
+            _rtc_reanchor_group_is_well_conditioned(
+                self._action_unnormalizer, self.model_action_names, b2_names
+            )
+        )
+        if set(EE_DELTA_ROTVEC_NAMES).issubset(self.model_action_names):
+            rotation_representation = "rotvec"
+            ee_names = (*EE_DELTA_ROTVEC_NAMES, *EE_DELTA_ACTION_NAMES[6:9])
+        elif set(EE_DELTA_ACTION_NAMES).issubset(self.model_action_names):
+            rotation_representation = "rot6d"
+            ee_names = EE_DELTA_ACTION_NAMES
+        else:
+            ee_names = ()
+            rotation_representation = ""
+        ee_enabled = (
+            self.z1_action_representation == "ee_state_delta"
+            and bool(ee_names)
+            and (
+                _rtc_reanchor_group_is_well_conditioned(
+                    self._action_unnormalizer, self.model_action_names, ee_names
+                )
+            )
+        )
+        return b2_enabled, ee_enabled, ee_names, rotation_representation
+
     def _reanchor_rtc_prefix(
         self,
         normalized_prefix: torch.Tensor,
@@ -1519,25 +1598,19 @@ class AsyncRTCPolicy:
         packet: ObservationPacket,
     ) -> torch.Tensor:
         physical = self._apply_action_processor(self._action_unnormalizer, normalized_prefix)
-        if self.b2_action_representation == "pose_delta":
-            indices = [
-                self.model_action_names.index(name) for name in ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")
-            ]
+        b2_reanchor, ee_reanchor, ee_names, rotation_representation = self._rtc_reanchor_status()
+        if b2_reanchor:
+            b2_names = ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")
+            indices = [self.model_action_names.index(name) for name in b2_names]
             old_anchor = torch.as_tensor(record.b2_anchor, dtype=physical.dtype, device=physical.device)
             new_anchor = torch.as_tensor(
                 self._b2_global_pose(packet), dtype=physical.dtype, device=physical.device
             )
             physical[:, indices] = _reanchor_b2_pose_delta(physical[:, indices], old_anchor, new_anchor)
 
-        if self.z1_action_representation == "ee_state_delta":
-            if set(EE_DELTA_ROTVEC_NAMES).issubset(self.model_action_names):
-                rotation_representation = "rotvec"
-                ee_names = (*EE_DELTA_ROTVEC_NAMES, *EE_DELTA_ACTION_NAMES[6:9])
-            elif set(EE_DELTA_ACTION_NAMES).issubset(self.model_action_names):
-                rotation_representation = "rot6d"
-                ee_names = EE_DELTA_ACTION_NAMES
-            else:
-                raise ValueError("Model action names do not contain a complete EE-delta representation")
+        if self.z1_action_representation == "ee_state_delta" and not ee_names:
+            raise ValueError("Model action names do not contain a complete EE-delta representation")
+        if ee_reanchor:
             indices = [self.model_action_names.index(name) for name in ee_names]
             old_anchor = torch.as_tensor(record.ee_anchor, dtype=physical.dtype, device=physical.device)
             new_anchor = torch.as_tensor(packet.actual_ee_state, dtype=physical.dtype, device=physical.device)
@@ -1552,7 +1625,10 @@ class AsyncRTCPolicy:
                 rotation_representation=rotation_representation,
             ).squeeze(0)
 
-        return self._apply_action_processor(self._action_normalizer, physical)
+        normalized = self._apply_action_processor(self._action_normalizer, physical)
+        if not torch.isfinite(normalized).all():
+            raise RuntimeError("RTC prefix re-anchoring produced non-finite normalized actions")
+        return normalized
 
     def _previous_prefix(self, packet: ObservationPacket) -> torch.Tensor | None:
         if self.chunk_scheduling_mode == "SYNC":
@@ -1570,15 +1646,22 @@ class AsyncRTCPolicy:
             return None
         if self.b2_action_representation == "pose_delta" or self.z1_action_representation == "ee_state_delta":
             prefix = self._reanchor_rtc_prefix(prefix, record, packet)
+            b2_reanchored, ee_reanchored, _, _ = self._rtc_reanchor_status()
             self.recorder.event(
                 "rtc_prefix_reanchored",
                 active_sequence=record.sequence,
                 active_index=index,
                 source_step=packet.sim_step,
-                b2_reanchored=self.b2_action_representation == "pose_delta",
+                b2_reanchored=b2_reanchored,
+                b2_reanchor_skipped_degenerate_normalization=(
+                    self.b2_action_representation == "pose_delta" and not b2_reanchored
+                ),
                 b2_old_anchor=record.b2_anchor.tolist(),
                 b2_new_anchor=self._b2_global_pose(packet).tolist(),
-                ee_reanchored=self.z1_action_representation == "ee_state_delta",
+                ee_reanchored=ee_reanchored,
+                ee_reanchor_skipped_degenerate_normalization=(
+                    self.z1_action_representation == "ee_state_delta" and not ee_reanchored
+                ),
                 ee_old_anchor=record.ee_anchor.tolist(),
                 ee_new_anchor=packet.actual_ee_state.tolist(),
             )

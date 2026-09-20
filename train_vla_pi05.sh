@@ -101,6 +101,13 @@ motion_priority_fraction="0.5"
 motion_ee_translation_threshold_m="0.05"
 motion_ee_rotation_threshold_rad="0.17453292519943295"
 motion_gripper_change_threshold="0.5"
+dataset_mixture_sampling="false"
+dataset_mixture_manifest=""
+# A mixture manifest describes source membership in a losslessly merged dataset:
+# {"sources":[
+#   {"name":"stage1_stage2","weight":0.8,"episode_range":[0,1085]},
+#   {"name":"standalone_stage2","weight":0.2,"episode_range":[1085,2225]}
+# ]}
 
 # Fraction of episodes held out for periodic validation.
 eval_split="0.1"
@@ -164,6 +171,8 @@ motion_priority_fraction_explicit="false"
 motion_ee_translation_threshold_m_explicit="false"
 motion_ee_rotation_threshold_rad_explicit="false"
 motion_gripper_change_threshold_explicit="false"
+dataset_mixture_sampling_explicit="false"
+dataset_mixture_manifest_explicit="false"
 for argument in "$@"; do
   if [[ "$argument" == --action-semantics-profile=* ]]; then
     action_semantics_profile="${argument#*=}"
@@ -231,6 +240,8 @@ while (( $# > 0 )); do
     --motion-ee-translation-threshold-m=*) motion_ee_translation_threshold_m="${1#*=}"; motion_ee_translation_threshold_m_explicit="true" ;;
     --motion-ee-rotation-threshold-rad=*) motion_ee_rotation_threshold_rad="${1#*=}"; motion_ee_rotation_threshold_rad_explicit="true" ;;
     --motion-gripper-change-threshold=*) motion_gripper_change_threshold="${1#*=}"; motion_gripper_change_threshold_explicit="true" ;;
+    --dataset-mixture-sampling=*) dataset_mixture_sampling="${1#*=}"; dataset_mixture_sampling_explicit="true" ;;
+    --dataset-mixture-manifest=*) dataset_mixture_manifest="${1#*=}"; dataset_mixture_manifest_explicit="true" ;;
     --finetune-mode=*) finetune_mode="${1#*=}" ;;
     --dataset-repo-id=*) dataset_repo_id="${1#*=}"; dataset_repo_id_explicit="true" ;;
     --dataset-root=*) dataset_root="${1#*=}"; dataset_root_explicit="true" ;;
@@ -482,13 +493,20 @@ if [[ -z "$resume_checkpoint" ]]; then
     --motion_balanced_sampling.ee_translation_threshold_m="$motion_ee_translation_threshold_m"
     --motion_balanced_sampling.ee_rotation_threshold_rad="$motion_ee_rotation_threshold_rad"
     --motion_balanced_sampling.gripper_change_threshold="$motion_gripper_change_threshold"
+    --dataset_mixture_sampling.enabled="$dataset_mixture_sampling"
   )
+  if [[ "$dataset_mixture_sampling" == "true" ]]; then
+    [[ -n "$dataset_mixture_manifest" ]] || { echo "--dataset-mixture-manifest is required" >&2; exit 2; }
+    sampling_args+=(--dataset_mixture_sampling.manifest_path="$dataset_mixture_manifest")
+  fi
 else
   [[ "$motion_balanced_sampling_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.enabled="$motion_balanced_sampling")
   [[ "$motion_priority_fraction_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.priority_fraction="$motion_priority_fraction")
   [[ "$motion_ee_translation_threshold_m_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.ee_translation_threshold_m="$motion_ee_translation_threshold_m")
   [[ "$motion_ee_rotation_threshold_rad_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.ee_rotation_threshold_rad="$motion_ee_rotation_threshold_rad")
   [[ "$motion_gripper_change_threshold_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.gripper_change_threshold="$motion_gripper_change_threshold")
+  [[ "$dataset_mixture_sampling_explicit" == "false" ]] || sampling_args+=(--dataset_mixture_sampling.enabled="$dataset_mixture_sampling")
+  [[ "$dataset_mixture_manifest_explicit" == "false" ]] || sampling_args+=(--dataset_mixture_sampling.manifest_path="$dataset_mixture_manifest")
 fi
 if [[ "$dataset_episodes_explicit" == "true" ]]; then
   dataset_args+=(--dataset.episodes="$dataset_episodes")
@@ -678,6 +696,7 @@ else
 fi
 if [[ -z "$resume_checkpoint" ]]; then
   echo "Motion sampling:  enabled=$motion_balanced_sampling, priority=$motion_priority_fraction, translation=${motion_ee_translation_threshold_m}m, rotation=${motion_ee_rotation_threshold_rad}rad, gripper=$motion_gripper_change_threshold"
+  echo "Dataset mixture:  enabled=$dataset_mixture_sampling, manifest=${dataset_mixture_manifest:-none}"
 else
   echo "Motion sampling:  restored from checkpoint unless explicitly overridden"
 fi

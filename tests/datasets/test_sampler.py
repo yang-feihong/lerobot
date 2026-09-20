@@ -157,6 +157,77 @@ def test_priority_sampling_disabled_preserves_original_order():
     assert list(disabled) == list(original)
 
 
+def test_dataset_mixture_sampling_uses_exact_source_ratio_and_motion_balance():
+    sampler = EpisodeAwareSampler(
+        [0, 10],
+        [10, 20],
+        shuffle=True,
+        seed=9,
+        priority_frame_indices=[1, 2, 11, 12],
+        priority_fraction=0.5,
+        source_episode_indices=[[0], [1]],
+        source_weights=[0.8, 0.2],
+    )
+    epoch = list(sampler)
+    assert len(epoch) == 20
+    assert sum(index < 10 for index in epoch) == 16
+    assert sum(index >= 10 for index in epoch) == 4
+    assert sum(index in {1, 2} for index in epoch) >= 8
+    assert sum(index in {11, 12} for index in epoch) >= 2
+    reproduced = EpisodeAwareSampler(
+        [0, 10],
+        [10, 20],
+        shuffle=True,
+        seed=9,
+        priority_frame_indices=[1, 2, 11, 12],
+        priority_fraction=0.5,
+        source_episode_indices=[[0], [1]],
+        source_weights=[0.8, 0.2],
+    )
+    assert list(reproduced) == epoch
+    resumed = EpisodeAwareSampler(
+        [0, 10],
+        [10, 20],
+        shuffle=True,
+        seed=9,
+        priority_frame_indices=[1, 2, 11, 12],
+        priority_fraction=0.5,
+        source_episode_indices=[[0], [1]],
+        source_weights=[0.8, 0.2],
+    )
+    resumed.load_state_dict({"epoch": 0, "start_index": 7})
+    assert list(resumed) == epoch[7:]
+
+
+def test_dataset_mixture_sampling_intersects_global_sources_with_episode_subset():
+    sampler = EpisodeAwareSampler(
+        [0, 4, 8, 12],
+        [4, 8, 12, 16],
+        episode_indices_to_use=[0, 2, 3],
+        shuffle=True,
+        seed=9,
+        source_episode_indices=[[0, 1], [2, 3]],
+        source_weights=[0.8, 0.2],
+    )
+
+    epoch = list(sampler)
+    assert len(epoch) == 12
+    assert sum(index < 4 for index in epoch) == 10
+    assert sum(index >= 8 for index in epoch) == 2
+    assert all(index < 4 or index >= 8 for index in epoch)
+
+
+def test_dataset_mixture_sampling_requires_episode_partition():
+    with pytest.raises(ValueError, match="eligible frame"):
+        EpisodeAwareSampler(
+            [0, 5],
+            [5, 10],
+            shuffle=True,
+            source_episode_indices=[[0], [2]],
+            source_weights=[0.5, 0.5],
+        )
+
+
 def test_negative_drop_first_frames_raises():
     with pytest.raises(ValueError, match="drop_n_first_frames must be >= 0"):
         EpisodeAwareSampler([0], [10], drop_n_first_frames=-1)

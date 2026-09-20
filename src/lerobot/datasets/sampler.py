@@ -56,6 +56,8 @@ class EpisodeAwareSampler:
         absolute_to_relative_idx: dict[int, int] | None = None,
         priority_frame_indices: list[int] | np.ndarray | None = None,
         priority_fraction: float = 0.0,
+        source_episode_indices: list[list[int]] | None = None,
+        source_weights: list[float] | None = None,
     ):
         """
         Args:
@@ -111,6 +113,7 @@ class EpisodeAwareSampler:
 
         self._starts = starts[used]
         self._cum_lengths = np.cumsum(lengths[used])
+        self._used_episode_indices = np.flatnonzero(used)
         self._num_frames = int(self._cum_lengths[-1])
         self.shuffle = shuffle
         self.seed = seed
@@ -121,6 +124,101 @@ class EpisodeAwareSampler:
         self._priority_positions = self._resolve_priority_positions(priority_frame_indices)
         if priority_fraction > 0.0 and len(self._priority_positions) == 0:
             raise ValueError("priority_fraction is nonzero but no priority frames remain in the sampler")
+        self._source_positions = self._resolve_source_positions(source_episode_indices, source_weights)
+
+    def _resolve_source_positions(
+        self,
+        source_episode_indices: list[list[int]] | None,
+        source_weights: list[float] | None,
+    ) -> list[np.ndarray] | None:
+        if source_episode_indices is None and source_weights is None:
+            self.source_weights = None
+            return None
+        if source_episode_indices is None or source_weights is None:
+            raise ValueError("source_episode_indices and source_weights must be provided together")
+        if len(source_episode_indices) != len(source_weights) or len(source_weights) < 2:
+            raise ValueError("source episode groups and weights must have the same length of at least two")
+        weights = np.asarray(source_weights, dtype=np.float64)
+        if np.any(weights <= 0.0) or not np.all(np.isfinite(weights)):
+            raise ValueError("source_weights must be finite and strictly positive")
+        self.source_weights = weights / weights.sum()
+
+        episode_to_position = {
+            int(episode): position for position, episode in enumerate(self._used_episode_indices)
+        }
+        source_positions: list[np.ndarray] = []
+        claimed: set[int] = set()
+        eligible_episodes = {int(value) for value in self._used_episode_indices}
+        for group in source_episode_indices:
+            group_set = {int(episode) for episode in group} & eligible_episodes
+            overlap = claimed & group_set
+            if overlap:
+                raise ValueError(f"source episode groups overlap: {sorted(overlap)[:10]}")
+            claimed.update(group_set)
+            parts = []
+            for episode in group:
+                position = episode_to_position.get(int(episode))
+                if position is None:
+                    continue
+                begin = int(self._cum_lengths[position - 1]) if position > 0 else 0
+                end = int(self._cum_lengths[position])
+                parts.append(np.arange(begin, end, dtype=np.int64))
+            if not parts:
+                raise ValueError("every source must contain at least one eligible frame")
+            source_positions.append(np.concatenate(parts))
+        if claimed != eligible_episodes:
+            missing = sorted(eligible_episodes - claimed)
+            raise ValueError(
+                "source episode groups must partition all eligible episodes; "
+                f"missing={missing[:10]}"
+            )
+        self._source_priority_positions = [
+            np.intersect1d(positions, self._priority_positions, assume_unique=True)
+            for positions in source_positions
+        ]
+        return source_positions
+
+    @staticmethod
+    def _weighted_counts(total: int, weights: np.ndarray) -> np.ndarray:
+        exact = total * weights
+        counts = np.floor(exact).astype(np.int64)
+        remainder = total - int(counts.sum())
+        if remainder:
+            order = np.argsort(-(exact - counts), kind="stable")
+            counts[order[:remainder]] += 1
+        return counts
+
+    @staticmethod
+    def _draw_from_pool(pool: torch.Tensor, count: int, generator: torch.Generator) -> torch.Tensor:
+        parts = []
+        remaining = count
+        while remaining > 0:
+            take = min(remaining, len(pool))
+            parts.append(pool[torch.randperm(len(pool), generator=generator)[:take]])
+            remaining -= take
+        return torch.cat(parts) if parts else torch.empty(0, dtype=torch.int64)
+
+    def _mixture_order(self, generator: torch.Generator) -> torch.Tensor:
+        counts = self._weighted_counts(self._num_frames, self.source_weights)
+        source_parts = []
+        for positions, priority_positions, count in zip(
+            self._source_positions, self._source_priority_positions, counts, strict=True
+        ):
+            source_pool = torch.from_numpy(positions)
+            priority_count = round(int(count) * self.priority_fraction)
+            uniform_count = int(count) - priority_count
+            uniform = self._draw_from_pool(source_pool, uniform_count, generator)
+            if priority_count:
+                source_priority = torch.from_numpy(priority_positions)
+                if len(source_priority) == 0:
+                    raise ValueError("a weighted dataset source has no motion-priority frames")
+                priority = self._draw_from_pool(source_priority, priority_count, generator)
+                source_order = torch.cat((uniform, priority))
+            else:
+                source_order = uniform
+            source_parts.append(source_order)
+        combined = torch.cat(source_parts)
+        return combined[torch.randperm(len(combined), generator=generator)]
 
     def _resolve_priority_positions(
         self, priority_frame_indices: list[int] | np.ndarray | None
@@ -180,7 +278,9 @@ class EpisodeAwareSampler:
     def _iter_epoch(self, epoch: int, start: int) -> Iterator[int]:
         if self.shuffle:
             generator = self._epoch_generator(epoch)
-            if self.priority_fraction == 0.0:
+            if self._source_positions is not None:
+                order = self._mixture_order(generator)
+            elif self.priority_fraction == 0.0:
                 order = torch.randperm(self._num_frames, generator=generator)
             else:
                 priority_count = round(self._num_frames * self.priority_fraction)

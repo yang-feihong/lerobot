@@ -27,6 +27,7 @@ from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_IMAGES, OBS_PREF
 
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
+from .mixture_sampling import load_dataset_mixture_manifest
 from .multi_dataset import MultiLeRobotDataset
 from .streaming_dataset import StreamingLeRobotDataset
 
@@ -248,9 +249,22 @@ def make_train_eval_datasets(
 
     episode_tasks = full_dataset.meta.episodes["tasks"]
     task_to_episodes: dict[str, list[int]] = {}
+    mixture_source_by_episode: dict[int, str] = {}
+    if cfg.dataset_mixture_sampling.enabled:
+        sources = load_dataset_mixture_manifest(
+            cfg.dataset_mixture_sampling.manifest_path,
+            # The manifest describes the aggregate dataset's global episode-index
+            # space, even when cfg.dataset.episodes selects only a subset.
+            num_episodes=full_dataset.meta.total_episodes,
+        )
+        for source in sources:
+            mixture_source_by_episode.update(
+                (episode_index, source.name) for episode_index in source.episode_indices
+            )
     for ep_idx in base_episodes:
         task_key = episode_tasks[ep_idx][0] if episode_tasks[ep_idx] else ""
-        task_to_episodes.setdefault(task_key, []).append(ep_idx)
+        split_key = f"{mixture_source_by_episode.get(ep_idx, '')}\0{task_key}"
+        task_to_episodes.setdefault(split_key, []).append(ep_idx)
 
     train_episodes, eval_episodes = [], []
     for eps in task_to_episodes.values():

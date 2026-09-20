@@ -61,6 +61,23 @@ class MotionBalancedSamplingConfig:
                 raise ValueError(f"motion_balanced_sampling.{name} must be > 0, got {value}")
 
 
+@dataclass
+class DatasetMixtureSamplingConfig:
+    """Sample logical source datasets from one losslessly merged dataset at fixed ratios.
+
+    ``manifest_path`` points to JSON whose ``sources`` entries contain ``name``, ``weight`` and
+    half-open ``episode_range`` fields.  Keeping the source membership beside the merged dataset
+    avoids duplicating video while preserving explicit source-level sampling semantics.
+    """
+
+    enabled: bool = False
+    manifest_path: str | None = None
+
+    def validate(self) -> None:
+        if self.enabled and not self.manifest_path:
+            raise ValueError("dataset_mixture_sampling.manifest_path is required when enabled")
+
+
 def _migrate_legacy_rabc_fields(config: dict[str, Any]) -> dict[str, Any] | None:
     """Return migrated payload for legacy RA-BC fields, or None when no migration is needed."""
     legacy_fields = (
@@ -162,6 +179,9 @@ class TrainPipelineConfig(HubMixin):
     sample_weighting: SampleWeightingConfig | None = None
     motion_balanced_sampling: MotionBalancedSamplingConfig = field(
         default_factory=MotionBalancedSamplingConfig
+    )
+    dataset_mixture_sampling: DatasetMixtureSamplingConfig = field(
+        default_factory=DatasetMixtureSamplingConfig
     )
 
     # Rename map for the observation to override the image and state keys
@@ -317,6 +337,9 @@ class TrainPipelineConfig(HubMixin):
                 f"got {self.keep_checkpoint_every_n_steps}"
             )
         self.motion_balanced_sampling.validate()
+        self.dataset_mixture_sampling.validate()
+        if self.dataset_mixture_sampling.enabled and self.dataset.streaming:
+            raise ValueError("dataset mixture sampling is not supported for streaming datasets")
 
         # Remote runs auto-generate the repo_id in submit_to_hf (the policy may only be
         # resolved here, from --policy.path), so don't demand it up front for them.

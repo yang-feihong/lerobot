@@ -56,6 +56,7 @@ from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
 from lerobot.datasets.factory import make_train_eval_datasets
+from lerobot.datasets.mixture_sampling import load_dataset_mixture_manifest
 from lerobot.datasets.motion_balanced_sampling import build_motion_priority_pool
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
@@ -1108,6 +1109,20 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # same permutation. accelerate then shards it disjointly across ranks via BatchSamplerShard
         # without needing a `generator` attribute to synchronize an RNG, and resume is sample-exact.
         shuffle = False
+        mixture_sources = None
+        if cfg.dataset_mixture_sampling.enabled:
+            mixture_sources = load_dataset_mixture_manifest(
+                cfg.dataset_mixture_sampling.manifest_path,
+                # The manifest is defined in the aggregate dataset's global episode-index
+                # space.  ``dataset.num_episodes`` only counts the post-split training subset;
+                # the sampler below intersects each global source range with that subset.
+                num_episodes=dataset.meta.total_episodes,
+            )
+            if is_main_process:
+                logging.info(
+                    "Dataset mixture sampling: %s",
+                    ", ".join(f"{source.name}={source.weight:.1%}" for source in mixture_sources),
+                )
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],
             capped_train_to or dataset.meta.episodes["dataset_to_index"],
@@ -1118,6 +1133,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             absolute_to_relative_idx=dataset.absolute_to_relative_idx,
             priority_frame_indices=priority_frame_indices,
             priority_fraction=priority_fraction,
+            source_episode_indices=(
+                [source.episode_indices for source in mixture_sources] if mixture_sources else None
+            ),
+            source_weights=([source.weight for source in mixture_sources] if mixture_sources else None),
         )
         if cfg.resume and step > 0:
             # The resume offset depends on the (num_processes, batch_size) that produced `step`, so
