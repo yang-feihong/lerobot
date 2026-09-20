@@ -47,9 +47,34 @@ class RTCConfig:
     debug: bool = False
     debug_maxlen: int = 100
 
+    # Existing guided inpainting remains the default. "training" selects hard
+    # prefix conditioning learned with TrainingRTCConfig.
+    mode: str = "inference"
+
     def __post_init__(self):
         """Validate RTC configuration parameters."""
+        if self.mode not in {"inference", "training"}:
+            raise ValueError(f"RTC mode must be 'inference' or 'training', got {self.mode!r}")
         if self.max_guidance_weight <= 0:
             raise ValueError(f"max_guidance_weight must be positive, got {self.max_guidance_weight}")
         if self.debug_maxlen <= 0:
             raise ValueError(f"debug_maxlen must be positive, got {self.debug_maxlen}")
+
+
+@dataclass
+class TrainingRTCConfig:
+    """Optional clean-prefix conditioning during flow-matching training.
+
+    ``simulated_delay`` is an exclusive upper bound, matching the reference
+    implementations: a value of 5 trains delays 0, 1, 2, 3, and 4.
+    """
+
+    enabled: bool = False
+    simulated_delay: int = 5
+    delay_distribution: str = "exponential"
+
+    def __post_init__(self):
+        if type(self.simulated_delay) is not int or self.simulated_delay < 1:
+            raise ValueError("training RTC simulated_delay must be a positive integer")
+        if self.delay_distribution not in {"exponential", "uniform"}:
+            raise ValueError("training RTC delay_distribution must be 'exponential' or 'uniform'")

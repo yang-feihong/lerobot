@@ -27,7 +27,7 @@ from lerobot.optim import (
 )
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
-from ..rtc.configuration_rtc import RTCConfig
+from ..rtc.configuration_rtc import RTCConfig, TrainingRTCConfig
 
 DEFAULT_IMAGE_SIZE = 224
 PI05_DEPLOYMENT_METADATA_NAME = "pi05_deployment_metadata.json"
@@ -102,6 +102,8 @@ class PI05Config(PreTrainedConfig):
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
+    # Training objective is independent of the deployment RTC mode.
+    training_rtc_config: TrainingRTCConfig | None = None
 
     image_resolution: tuple[int, int] = (
         DEFAULT_IMAGE_SIZE,
@@ -223,6 +225,19 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
             )
+
+        if self.training_rtc_config is not None and self.training_rtc_config.enabled:
+            if self.training_rtc_config.simulated_delay > self.chunk_size:
+                raise ValueError("training RTC simulated_delay must not exceed chunk_size")
+            if self.discrete_action_training_mode != "continuous_flow":
+                raise ValueError("training RTC requires discrete_action_training_mode='continuous_flow'")
+        if (
+            self.rtc_config is not None
+            and self.rtc_config.enabled
+            and self.rtc_config.mode == "training"
+            and not (self.training_rtc_config is not None and self.training_rtc_config.enabled)
+        ):
+            raise ValueError("RTC mode='training' requires an enabled training_rtc_config checkpoint")
 
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")
@@ -474,6 +489,10 @@ class PI05Config(PreTrainedConfig):
             return value
 
         rtc = None if self.rtc_config is None else json_value(asdict(self.rtc_config))
+        # Old deployment contracts are compared exactly when resuming. Keep
+        # defaults byte-for-byte equivalent in structure to those checkpoints.
+        if rtc is not None and rtc.get("mode") == "inference":
+            rtc.pop("mode")
         image_features = {
             key: {"shape": list(feature.shape), "type": feature.type.value}
             for key, feature in self.image_features.items()
@@ -494,6 +513,11 @@ class PI05Config(PreTrainedConfig):
                 "tokenizer_max_length": self.tokenizer_max_length,
                 "num_inference_steps": self.num_inference_steps,
                 "rtc": rtc,
+                **(
+                    {"training_rtc": asdict(self.training_rtc_config)}
+                    if self.training_rtc_config is not None and self.training_rtc_config.enabled
+                    else {}
+                ),
             },
             "timing": {
                 "control_frequency_hz": control_hz,

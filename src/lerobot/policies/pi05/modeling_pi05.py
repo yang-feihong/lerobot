@@ -60,6 +60,11 @@ from lerobot.utils.constants import (
 
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
+from ..rtc.training_rtc import (
+    make_training_rtc_time,
+    prepare_training_rtc_prefix,
+    sample_training_rtc_delay,
+)
 from .b2_action_transform import EE_DELTA_VALID_KEY
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 
@@ -1263,13 +1268,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Embed timestep using sine-cosine positional encoding
         time_emb = create_sinusoidal_pos_embedding(
-            timestep,
+            timestep.reshape(-1),
             self.action_in_proj.out_features,
             min_period=self.config.min_period,
             max_period=self.config.max_period,
             device=timestep.device,
         )
         time_emb = time_emb.type(dtype=timestep.dtype)
+        if timestep.ndim == 2:
+            time_emb = time_emb.reshape(*timestep.shape, -1)
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
@@ -1319,7 +1326,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return_action_features: bool = False,
     ) -> Tensor | tuple[Tensor, Tensor]:
         """Do a full training forward pass and compute the loss."""
-        time_expanded = time[:, None, None]
+        training_rtc = getattr(self.config, "training_rtc_config", None)
+        if training_rtc is not None and training_rtc.enabled and time.ndim == 1:
+            delay = sample_training_rtc_delay(training_rtc, actions.shape[0], actions.device)
+            time, _ = make_training_rtc_time(time, delay, actions.shape[1])
+        time_expanded = time[..., None] if time.ndim == 2 else time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
@@ -1375,6 +1386,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
         losses = F.mse_loss(u_t, v_t, reduction="none")
+        if training_rtc is not None and training_rtc.enabled:
+            losses = losses.masked_fill((time == 0)[..., None], 0)
         if return_action_features:
             return losses, suffix_out
         return losses
@@ -1406,6 +1419,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
         noise = self._zero_structured_discrete_channels(noise)
+
+        training_rtc_sampling = self._rtc_enabled() and self.config.rtc_config.mode == "training"
+        if training_rtc_sampling:
+            training_rtc = getattr(self.config, "training_rtc_config", None)
+            if training_rtc is None or not training_rtc.enabled:
+                raise ValueError("Training RTC sampling requires an enabled training_rtc_config checkpoint")
+            prefix_content, action_prefix_mask = prepare_training_rtc_prefix(
+                noise, kwargs.get("prev_chunk_left_over"), kwargs.get("inference_delay"), training_rtc
+            )
 
         state = kwargs.get("state")
         action_history = kwargs.get("action_history")
@@ -1443,10 +1465,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         dt = -1.0 / num_steps
 
-        x_t = noise
+        x_t = (
+            torch.where(action_prefix_mask[..., None], prefix_content, noise)
+            if training_rtc_sampling
+            else noise
+        )
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            if training_rtc_sampling:
+                time_tensor = torch.where(action_prefix_mask, 0.0, time_tensor[:, None])
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
                 return self.denoise_step(
@@ -1456,7 +1484,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     timestep=current_timestep,
                 )
 
-            if self._rtc_enabled():
+            if training_rtc_sampling:
+                v_t = denoise_step_partial_call(x_t)
+                v_t = v_t.masked_fill(action_prefix_mask[..., None], 0)
+            elif self._rtc_enabled():
                 inference_delay = kwargs.get("inference_delay")
                 prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
                 execution_horizon = kwargs.get("execution_horizon")
@@ -1475,6 +1506,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             v_t = self._zero_structured_discrete_channels(v_t)
 
             x_t = x_t + dt * v_t
+            if training_rtc_sampling:
+                x_t = torch.where(action_prefix_mask[..., None], prefix_content, x_t)
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
@@ -2169,9 +2202,7 @@ class PI05Policy(PreTrainedPolicy):
                 "Unsupported action_loss_schema="
                 f"{schema!r}. Expected one of: 'auto', 'always', 'off', 'uniform_valid'."
             )
-        return self.config.io_schema_resolved and action_dim == len(
-            self.config.action_feature_names or []
-        )
+        return self.config.io_schema_resolved and action_dim == len(self.config.action_feature_names or [])
 
     @staticmethod
     def _uniform_valid_action_loss(
@@ -2310,9 +2341,7 @@ class PI05Policy(PreTrainedPolicy):
             if name not in name_to_dim:
                 continue
             true_side = (
-                self.config.action_gripper_target_true_side
-                if name == "gripper_target"
-                else "positive"
+                self.config.action_gripper_target_true_side if name == "gripper_target" else "positive"
             )
             dim = name_to_dim[name]
             target = self._normalized_bool_mask(actions, dim, true_side=true_side)
@@ -2369,6 +2398,12 @@ class PI05Policy(PreTrainedPolicy):
                 continuous_weight,
             ),
         ]:
+            training_rtc = getattr(self.config, "training_rtc_config", None)
+            if training_rtc is not None and training_rtc.enabled and weights.numel():
+                # The optional floor for inactive continuous channels must not
+                # reintroduce known prefixes or dataset padding into the loss.
+                dim_losses = dim_losses * valid_mask[..., None]
+                weights = weights * valid_mask[..., None]
             weighted_parts.append(dim_losses)
             weight_parts.append(weights)
 
@@ -2754,6 +2789,22 @@ class PI05Policy(PreTrainedPolicy):
         noise = self.model._zero_structured_discrete_channels(noise)
         time = self.model.sample_time(actions.shape[0], actions.device)
 
+        # Training RTC conditions on clean future actions that will execute while
+        # the next chunk is computed. These are distinct from action history.
+        training_rtc = getattr(self.config, "training_rtc_config", None)
+        action_is_pad = batch.get(f"{ACTION}_is_pad")
+        rtc_prefix_mask = None
+        if training_rtc is not None and training_rtc.enabled:
+            delay = sample_training_rtc_delay(
+                training_rtc, actions.shape[0], actions.device, action_is_pad=action_is_pad
+            )
+            time, rtc_prefix_mask = make_training_rtc_time(time, delay, actions.shape[1])
+            action_is_pad = (
+                rtc_prefix_mask
+                if action_is_pad is None
+                else action_is_pad.to(device=actions.device, dtype=torch.bool) | rtc_prefix_mask
+            )
+
         # Compute loss (no separate state needed for PI05)
         model_output = self.model.forward(
             images,
@@ -2783,6 +2834,11 @@ class PI05Policy(PreTrainedPolicy):
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
         }
+        if rtc_prefix_mask is not None:
+            valid = ~action_is_pad
+            per_dim = (losses * valid[..., None]).sum(dim=(0, 1)) / valid.sum().clamp_min(1)
+            loss_dict["loss_per_dim"] = per_dim.detach().cpu().tolist()
+            loss_dict["training_rtc_delay_mean"] = float(delay.float().mean().item())
         if self.config.mem_vit_enabled:
             loss_dict["mem_image_num_frames"] = float(mem_vit_lengths.float().mean().item())
             loss_dict["mem_image_window_num_frames"] = float(mem_vit_window_num_frames)
@@ -2820,7 +2876,7 @@ class PI05Policy(PreTrainedPolicy):
             loss = self._uniform_valid_action_loss(
                 losses,
                 reduction,
-                batch.get(f"{ACTION}_is_pad"),
+                action_is_pad,
             )
             scalar_loss = loss.mean() if loss.ndim else loss
             loss_dict["loss"] = scalar_loss.item()
@@ -2831,10 +2887,15 @@ class PI05Policy(PreTrainedPolicy):
                 losses,
                 actions[:, :, :original_action_dim],
                 reduction,
-                batch.get(f"{ACTION}_is_pad"),
+                action_is_pad,
                 batch.get(EE_DELTA_VALID_KEY),
             )
             loss_dict.update(gate_loss_dict)
+            return loss, loss_dict
+
+        if rtc_prefix_mask is not None:
+            loss = self._uniform_valid_action_loss(losses, reduction, action_is_pad)
+            loss_dict["loss"] = (loss.mean() if loss.ndim else loss).item()
             return loss, loss_dict
 
         if reduction == "none":

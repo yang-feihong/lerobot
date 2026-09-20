@@ -159,6 +159,12 @@ class RTCProcessor:
             https://www.physicalintelligence.company/download/real_time_chunking.pdf
         """
 
+        if self.rtc_config.mode != "inference":
+            raise ValueError(
+                "RTC mode='training' requires a policy with a training RTC sampler; "
+                "RTCProcessor.denoise_step only supports mode='inference'"
+            )
+
         # In the original implementation, the time goes from 0 to 1 and
         # In our implementation, the time goes from 1 to 0
         # So we need to invert the time

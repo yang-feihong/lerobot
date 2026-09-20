@@ -87,6 +87,11 @@ scheduler_decay_lr="2.5e-6" # used only by cosine_decay_with_warmup
 action_chunk_size="50"
 action_steps_to_execute="25"
 control_frequency_hz="50"
+# Optional training-time RTC. 5 samples delays 0..4 (exclusive upper bound).
+# Runtime inference RTC remains a separate deployment choice.
+training_rtc="false"
+training_rtc_simulated_delay="5"
+training_rtc_delay_distribution="exponential"
 # Training batch semantics are independent of the selected GPU count:
 #   global_batch_size = batch_size_per_gpu * number_of_gpus * computed_grad_accum
 # Keeping global_batch_size / batch_size_per_gpu a multiple of 24 supports the
@@ -166,6 +171,9 @@ motion_priority_fraction_explicit="false"
 motion_ee_translation_threshold_m_explicit="false"
 motion_ee_rotation_threshold_rad_explicit="false"
 motion_gripper_change_threshold_explicit="false"
+training_rtc_explicit="false"
+training_rtc_simulated_delay_explicit="false"
+training_rtc_delay_distribution_explicit="false"
 for argument in "$@"; do
   if [[ "$argument" == --action-semantics-profile=* ]]; then
     action_semantics_profile="${argument#*=}"
@@ -210,6 +218,9 @@ while (( $# > 0 )); do
     --base-policy=*) base_policy="${1#*=}" ;;
     --state-action-encoding=*) state_action_encoding="${1#*=}" ;;
     --action-history-enabled=*) action_history_enabled="${1#*=}" ;;
+    --training-rtc=*) training_rtc="${1#*=}"; training_rtc_explicit="true" ;;
+    --training-rtc-simulated-delay=*) training_rtc_simulated_delay="${1#*=}"; training_rtc_simulated_delay_explicit="true" ;;
+    --training-rtc-delay-distribution=*) training_rtc_delay_distribution="${1#*=}"; training_rtc_delay_distribution_explicit="true" ;;
     --b2-action-representation=*) b2_action_representation="${1#*=}" ;;
     --z1-action-representation=*) z1_action_representation="${1#*=}" ;;
     --action-semantics-profile=*) action_semantics_profile="${1#*=}" ;;
@@ -274,6 +285,29 @@ while (( $# > 0 )); do
   esac
   shift
 done
+
+if [[ "$training_rtc" != "true" && "$training_rtc" != "false" ]]; then
+  echo "--training-rtc must be true or false." >&2
+  exit 2
+fi
+if [[ ! "$training_rtc_simulated_delay" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--training-rtc-simulated-delay must be a positive integer (exclusive upper bound)." >&2
+  exit 2
+fi
+if [[ "$training_rtc_delay_distribution" != "exponential" && "$training_rtc_delay_distribution" != "uniform" ]]; then
+  echo "--training-rtc-delay-distribution must be exponential or uniform." >&2
+  exit 2
+fi
+if [[ -z "$resume_checkpoint" && "$training_rtc" == "true" ]]; then
+  if (( training_rtc_simulated_delay > action_chunk_size )); then
+    echo "--training-rtc-simulated-delay must not exceed action chunk size ($action_chunk_size)." >&2
+    exit 2
+  fi
+  if [[ "$discrete_action_training_mode" != "continuous_flow" ]]; then
+    echo "Training RTC requires --discrete-action-training-mode=continuous_flow." >&2
+    exit 2
+  fi
+fi
 
 if [[ -z "$resume_checkpoint" ]]; then
   case "$finetune_mode" in
@@ -401,6 +435,44 @@ else
   job_name="${timestamp}_${job_prefix}"
   log_file="$log_dir/${job_name}.log"
   pid_file="$log_dir/${job_name}.pid"
+fi
+
+policy_training_rtc_args=()
+if [[ -z "$resume_checkpoint" ]]; then
+  policy_training_rtc_args+=(
+    --policy.training_rtc_config.enabled="$training_rtc"
+    --policy.training_rtc_config.simulated_delay="$training_rtc_simulated_delay"
+    --policy.training_rtc_config.delay_distribution="$training_rtc_delay_distribution"
+  )
+elif [[ "$training_rtc_explicit" == "true" || "$training_rtc_simulated_delay_explicit" == "true" || "$training_rtc_delay_distribution_explicit" == "true" ]]; then
+  # Resume must preserve the training objective and RNG/data-order semantics.
+  # Explicit matching values are accepted as assertions, never as overrides.
+  rtc_config_python="${LEROBOT_RUNTIME_BIN:+$LEROBOT_RUNTIME_BIN/python}"
+  rtc_config_python="${rtc_config_python:-python3}"
+  "$rtc_config_python" - "$resume_config" \
+    "$training_rtc_explicit" "$training_rtc" \
+    "$training_rtc_simulated_delay_explicit" "$training_rtc_simulated_delay" \
+    "$training_rtc_delay_distribution_explicit" "$training_rtc_delay_distribution" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    saved = json.load(stream).get("policy", {}).get("training_rtc_config") or {}
+checks = (
+    ("enabled", False, sys.argv[2], sys.argv[3] == "true"),
+    ("simulated_delay", 5, sys.argv[4], int(sys.argv[5])),
+    ("delay_distribution", "exponential", sys.argv[6], sys.argv[7]),
+)
+for field, default, explicit, requested in checks:
+    if explicit == "true" and requested != saved.get(field, default):
+        print(
+            f"Resume preserves checkpoint training_rtc_config.{field}={saved.get(field, default)!r}; "
+            f"requested {requested!r}. Start a new fine-tuning run with --base-policy=<checkpoint>/pretrained_model "
+            "to change the training RTC objective.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+PY
 fi
 
 policy_io_args=()
@@ -610,6 +682,7 @@ train_args=(
   "${policy_runtime_args[@]}" \
   "${policy_mem_args[@]}" \
   "${policy_history_args[@]}" \
+  "${policy_training_rtc_args[@]}" \
   --policy.push_to_hub=false \
   "${peft_args[@]}" \
   --output_dir="$output_dir" \
@@ -683,6 +756,11 @@ echo "VLA training started"
 echo "PID:              $pid"
 echo "Resume checkpoint: ${resume_checkpoint:-none}"
 echo "MEM:              $enable_mem"
+if [[ -z "$resume_checkpoint" ]]; then
+  echo "Training RTC:     enabled=$training_rtc, simulated_delay=$training_rtc_simulated_delay (exclusive), distribution=$training_rtc_delay_distribution"
+else
+  echo "Training RTC:     restored from checkpoint"
+fi
 if [[ -n "$resume_checkpoint" ]]; then
   echo "Deployment metadata: restored from $resume_checkpoint/pretrained_model/pi05_deployment_metadata.json"
 else

@@ -121,7 +121,9 @@ class PiGemmaRMSNorm(nn.Module):
         if cond.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected cond dim {self.cond_dim}, got {cond.shape[-1]}")
         modulation = self.dense(cond)
-        if len(x.shape) == 3:
+        # A global condition broadcasts across tokens; a per-token RTC condition
+        # already has the same leading dimensions as the hidden states.
+        if x.ndim == 3 and modulation.ndim == 2:
             modulation = modulation.unsqueeze(1)
         scale, shift, gate = modulation.chunk(3, dim=-1)
         normed = normed * (1 + scale.float()) + shift.float()

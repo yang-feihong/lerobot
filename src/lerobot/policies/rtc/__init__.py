@@ -16,7 +16,7 @@
 
 from .action_interpolator import ActionInterpolator
 from .action_queue import ActionQueue
-from .configuration_rtc import RTCConfig
+from .configuration_rtc import RTCConfig, TrainingRTCConfig
 from .latency_tracker import LatencyTracker
 from .modeling_rtc import RTCProcessor
 from .relative import reanchor_relative_rtc_prefix
@@ -27,5 +27,6 @@ __all__ = [
     "LatencyTracker",
     "RTCConfig",
     "RTCProcessor",
+    "TrainingRTCConfig",
     "reanchor_relative_rtc_prefix",
 ]

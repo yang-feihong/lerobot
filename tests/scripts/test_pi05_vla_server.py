@@ -1,3 +1,4 @@
+import sys
 from io import BytesIO
 from threading import Lock
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from lerobot.policies.pi05.b2_action_transform import (
     se2_increment_to_body_twist,
 )
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.rtc import RTCConfig, TrainingRTCConfig
 from lerobot.scripts.pi05_vla_server import (
     B2_EXECUTION_VELOCITY_NAMES,
     B2_GLOBAL_POSE_NAMES,
@@ -31,6 +33,7 @@ from lerobot.scripts.pi05_vla_server import (
     _apply_completion_stop,
     _b2_velocity_smoothing_transition_step,
     _decode_discrete_actions,
+    _deployment_rtc_config,
     _load_checkpoint_contract,
     _reanchor_b2_pose_delta,
     _resolve_checkpoint_action_representations,
@@ -39,6 +42,7 @@ from lerobot.scripts.pi05_vla_server import (
     decode_observation_packet,
     encode_action_packet,
     execution_action_names,
+    parse_args,
 )
 
 EXECUTION_ACTION_NAMES = execution_action_names("ee_delta")
@@ -71,6 +75,8 @@ def test_action_packet_contains_replayable_model_and_execution_outputs() -> None
         inference_delay_steps=2,
         velocity_smoothing_transition_step=1,
         sim_steps_per_wall_second=50.0,
+        rtc_mode="training",
+        rtc_conditioning_delay_steps=2,
     )
 
     with np.load(BytesIO(encode_action_packet(record)), allow_pickle=False) as packet:
@@ -80,6 +86,161 @@ def test_action_packet_contains_replayable_model_and_execution_outputs() -> None
         np.testing.assert_array_equal(packet["b2_reference"], record.b2_reference.numpy())
         assert int(packet["control_epoch"]) == 7
         assert float(packet["predict_seconds"]) == pytest.approx(0.15)
+        assert str(packet["rtc_mode"]) == "training"
+        assert int(packet["rtc_conditioning_delay_steps"]) == 2
+
+
+@pytest.mark.parametrize("rtc_mode", [None, "inference", "training", "off"])
+def test_server_rtc_cli_defaults_to_existing_inference_mode(monkeypatch, rtc_mode) -> None:
+    argv = [
+        "pi05_vla_server",
+        "--policy-path",
+        "/unused/checkpoint",
+        "--stop-on-model-task-complete",
+        "false",
+        "--b2-velocity-smoothing-time-constant-s",
+        "0",
+        "--b2-pose-delta-control-mode",
+        "differentiate",
+    ]
+    if rtc_mode is not None:
+        argv.extend(["--rtc-mode", rtc_mode])
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert parse_args().rtc_mode == (rtc_mode or "inference")
+
+
+@pytest.mark.parametrize("rtc_mode", ["inference", "training", "off"])
+def test_server_selects_rtc_mode_without_changing_training_config(rtc_mode: str) -> None:
+    training_config = TrainingRTCConfig(enabled=True)
+    config = SimpleNamespace(training_rtc_config=training_config)
+    args = SimpleNamespace(
+        rtc_mode=rtc_mode,
+        rtc_schedule="EXP",
+        rtc_max_guidance_weight=10.0,
+        rtc_execution_horizon=13,
+    )
+
+    rtc_config = _deployment_rtc_config(config, args)
+
+    assert rtc_config.enabled == (rtc_mode != "off")
+    assert rtc_config.mode == ("training" if rtc_mode == "training" else "inference")
+    assert config.training_rtc_config is training_config
+
+
+@pytest.mark.parametrize("training_config", [None, TrainingRTCConfig(enabled=False)])
+def test_server_rejects_training_rtc_for_checkpoint_without_training(training_config) -> None:
+    with pytest.raises(ValueError, match="checkpoint fine-tuned"):
+        _deployment_rtc_config(
+            SimpleNamespace(training_rtc_config=training_config), SimpleNamespace(rtc_mode="training")
+        )
+
+
+@pytest.mark.parametrize("rtc_mode", ["inference", "training", "off"])
+def test_server_preserves_prefix_padding_only_for_inference_rtc(rtc_mode: str) -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.rtc_mode = rtc_mode
+    policy.rtc_config = RTCConfig(execution_horizon=4)
+    policy._records_lock = Lock()
+    policy.device = torch.device("cpu")
+    policy.b2_action_representation = "velocity"
+    policy.z1_action_representation = "ee_delta"
+    original = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    policy._records = {7: SimpleNamespace(original=original)}
+
+    prefix = policy._previous_prefix(SimpleNamespace(active_sequence=7, active_index=2))
+
+    if rtc_mode == "off":
+        assert prefix is None
+    elif rtc_mode == "training":
+        torch.testing.assert_close(prefix, original[2:])
+    else:
+        torch.testing.assert_close(prefix, torch.cat([original[2:], torch.zeros(2, 3)]))
+
+
+@pytest.mark.parametrize("rtc_mode", ["inference", "training"])
+def test_server_reanchors_prefix_before_rtc_conditioning(rtc_mode: str) -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.rtc_mode = rtc_mode
+    policy.rtc_config = RTCConfig(execution_horizon=2)
+    policy._records_lock = Lock()
+    policy.device = torch.device("cpu")
+    policy.b2_action_representation = "pose_delta"
+    policy.z1_action_representation = "ee_delta"
+    original = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+    record = SimpleNamespace(
+        sequence=7,
+        original=original,
+        b2_anchor=np.zeros(3),
+        ee_anchor=np.zeros(9),
+    )
+    policy._records = {7: record}
+    calls = []
+
+    def reanchor(prefix, previous, packet):
+        calls.append((prefix.clone(), previous, packet))
+        return prefix + 1
+
+    policy._reanchor_rtc_prefix = reanchor
+    policy._b2_global_pose = lambda _packet: np.ones(3)
+    policy.recorder = SimpleNamespace(event=lambda *_args, **_kwargs: None)
+    packet = SimpleNamespace(active_sequence=7, active_index=1, sim_step=10, actual_ee_state=np.ones(9))
+
+    prefix = policy._previous_prefix(packet)
+
+    assert len(calls) == 1
+    assert calls[0][1] is record
+    assert calls[0][2] is packet
+    torch.testing.assert_close(calls[0][0], original[1:])
+    torch.testing.assert_close(prefix, original[1:] + 1)
+
+
+@pytest.mark.parametrize("delay", [0, 4])
+def test_server_training_rtc_passes_supported_delay_and_real_prefix(delay: int) -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.rtc_mode = "training"
+    policy.training_rtc_max_delay = 4
+    prefix = torch.randn(4, 3)
+    policy._previous_prefix = lambda _packet: prefix
+
+    conditioning = policy._rtc_conditioning(SimpleNamespace(), delay)
+
+    assert conditioning["inference_delay"] == delay
+    assert conditioning["prev_chunk_left_over"] is prefix
+
+
+@pytest.mark.parametrize(
+    ("delay", "prefix_length", "error"),
+    [(5, 8, "trained maximum 4"), (4, 3, "available queued prefix")],
+)
+def test_server_training_rtc_rejects_unsupported_delay(delay, prefix_length, error) -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.rtc_mode = "training"
+    policy.training_rtc_max_delay = 4
+    policy._previous_prefix = lambda _packet: torch.zeros(prefix_length, 3)
+
+    with pytest.raises(ValueError, match=error):
+        policy._rtc_conditioning(SimpleNamespace(), delay)
+
+
+def test_server_training_rtc_cold_start_does_not_freeze_an_unavailable_prefix() -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.rtc_mode = "training"
+    policy.training_rtc_max_delay = 4
+    policy._previous_prefix = lambda _packet: None
+
+    assert policy._rtc_conditioning(SimpleNamespace(), 70) == {
+        "inference_delay": 0,
+        "prev_chunk_left_over": None,
+    }
+
+
+def test_server_off_skips_prefix_lookup_and_sampler_conditioning() -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.rtc_mode = "off"
+    policy._previous_prefix = lambda _packet: pytest.fail("RTC off must not retrieve a previous prefix")
+
+    assert policy._rtc_conditioning(SimpleNamespace(), 70) == {}
 
 
 def test_b2_rtc_pose_delta_prefix_is_reexpressed_in_new_inference_frame() -> None:
@@ -339,21 +500,29 @@ def test_continuous_ee_schema_defaults_missing_arm_modes_to_active() -> None:
         ("ee_state_delta", "actual_ee_state", np.ones(9, dtype=np.float32)),
     ],
 )
+@pytest.mark.parametrize("rtc_mode", ["inference", "training", "off"])
 def test_infer_records_model_action_names_and_source_step_anchor(
     z1_representation: str,
     expected_anchor_kind: str,
     expected_anchor: np.ndarray,
+    rtc_mode: str,
 ) -> None:
     model_names = (*B2_EXECUTION_VELOCITY_NAMES, *EE_DELTA_ACTION_NAMES, "gripper_target")
     policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.rtc_mode = rtc_mode
+    policy.training_rtc_max_delay = 4
     policy.preprocessor = lambda batch: batch
     policy.postprocessor = lambda actions: actions
-    policy.policy = SimpleNamespace(
-        predict_action_chunk=lambda *_args, **_kwargs: torch.zeros((1, 2, len(model_names)))
-    )
+    predict_calls = []
+
+    def predict(_batch, **kwargs):
+        predict_calls.append(kwargs)
+        return torch.zeros((1, 2, len(model_names)))
+
+    policy.policy = SimpleNamespace(predict_action_chunk=predict)
     policy._make_batch = lambda _packet: {}
     policy._previous_prefix = lambda _packet: None
-    policy._estimated_delay = lambda: (0, 50.0)
+    policy._estimated_delay = lambda: (7, 50.0)
     policy._b2_velocity_filter_context = lambda _packet: (torch.zeros(3), None)
     policy.postprocessed_action_names = model_names
     policy.model_action_names = model_names
@@ -395,6 +564,17 @@ def test_infer_records_model_action_names_and_source_step_anchor(
     np.testing.assert_array_equal(record.ee_anchor, expected_anchor)
     assert record.b2_anchor_kind == "actual_world_pose"
     np.testing.assert_allclose(record.b2_anchor, [1.0, 2.0, 0.3])
+    assert record.rtc_mode == rtc_mode
+    assert record.inference_delay_steps == 7
+    assert len(policy._latencies) == 1
+    assert policy._next_sequence == 2
+    if rtc_mode == "off":
+        assert predict_calls == [{}]
+        assert record.rtc_conditioning_delay_steps == 0
+    else:
+        conditioning_delay = 7 if rtc_mode == "inference" else 0
+        assert predict_calls == [{"inference_delay": conditioning_delay, "prev_chunk_left_over": None}]
+        assert record.rtc_conditioning_delay_steps == conditioning_delay
 
 
 def test_formal_server_rejects_legacy_arm_active_semantics() -> None:
