@@ -643,6 +643,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     cfg.validate()
 
+    if (
+        getattr(cfg.policy, "mem_vit_enabled", False)
+        and getattr(cfg.policy, "mem_vit_finetune_mode", "full") == "lora"
+        and not getattr(cfg.policy, "freeze_vision_encoder", False)
+        and cfg.peft is None
+        and not getattr(cfg.policy, "use_peft", False)
+    ):
+        raise ValueError("mem_vit_finetune_mode=lora requires PEFT (--peft.method_type=LORA).")
+
     # Create Accelerator if not provided
     # It will automatically detect if running in distributed mode or single-process mode
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes

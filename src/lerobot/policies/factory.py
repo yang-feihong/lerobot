@@ -804,9 +804,7 @@ def make_policy(
             torch_device=cfg.device,
         )
         if isinstance(cfg, PI05Config):
-            policy._enable_lora_full_finetuning_modules()  # type: ignore[attr-defined]
-            if cfg.mem_vit_enabled and not cfg.freeze_vision_encoder:
-                policy._enable_mem_vit_full_finetuning()  # type: ignore[attr-defined]
+            policy._restore_peft_trainability()  # type: ignore[attr-defined]
 
     else:
         # Make a fresh policy.

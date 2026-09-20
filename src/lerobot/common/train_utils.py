@@ -241,18 +241,23 @@ def save_checkpoint(
     if cfg.peft is not None and model_state_dict is not None:
         with _peft_modules_to_save_from_state_dict(policy):
             policy.save_pretrained(pretrained_dir, state_dict=model_state_dict)
-        policy_cfg = getattr(policy, "config", None)
-        if getattr(policy_cfg, "mem_vit_enabled", False) and not getattr(
-            policy_cfg, "freeze_vision_encoder", False
-        ):
-            appended = _append_peft_base_weights(
-                pretrained_dir,
-                model_state_dict,
-                key_fragment=".vision_tower.",
-            )
-            logging.info("Stored %d full-trained MEM-ViT tensors in the PEFT checkpoint", appended)
     else:
         policy.save_pretrained(pretrained_dir, state_dict=model_state_dict)
+    policy_cfg = getattr(policy, "config", None)
+    if (
+        cfg.peft is not None
+        and getattr(policy_cfg, "mem_vit_enabled", False)
+        and not getattr(policy_cfg, "freeze_vision_encoder", False)
+        and getattr(policy_cfg, "mem_vit_finetune_mode", "full") == "full"
+    ):
+        # LoRA/frozen vision weights are reconstructed from the base MEM checkpoint.
+        # Only full MEM fine-tuning needs the updated base tensors, including under DDP.
+        appended = _append_peft_base_weights(
+            pretrained_dir,
+            model_state_dict if model_state_dict is not None else policy.state_dict(),
+            key_fragment=".vision_tower.",
+        )
+        logging.info("Stored %d full-trained MEM-ViT tensors in the PEFT checkpoint", appended)
     cfg.save_pretrained(pretrained_dir)
     if cfg.peft is not None:
         # When using PEFT, policy.save_pretrained will only write the adapter weights + config, not the

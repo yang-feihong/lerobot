@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -241,8 +242,9 @@ def test_peft_checkpoint_loads_appended_base_weights(tmp_path):
 
     assert appended == 2
     with safe_open(tmp_path / "adapter_model.safetensors", framework="pt") as adapter_file:
-        assert "base_model.model.memory.weight" in adapter_file
-        assert "base_model.model.memory.bias" in adapter_file
+        saved_keys = adapter_file.keys()
+        assert "base_model.model.memory.weight" in saved_keys
+        assert "base_model.model.memory.bias" in saved_keys
 
     reloaded = peft.PeftModel.from_pretrained(TinyModel(), tmp_path)
     torch.testing.assert_close(
@@ -253,6 +255,49 @@ def test_peft_checkpoint_loads_appended_base_weights(tmp_path):
         reloaded.base_model.model.memory.bias,
         torch.full_like(reloaded.base_model.model.memory.bias, -1.5),
     )
+
+
+@pytest.mark.parametrize("gathered", [False, True])
+@pytest.mark.parametrize(
+    "mode,frozen,expected_append",
+    [
+        (None, False, True),
+        ("full", False, True),
+        ("lora", False, False),
+        ("frozen", False, False),
+        ("full", True, False),
+    ],
+)
+def test_save_checkpoint_only_appends_full_mem_weights(tmp_path, gathered, mode, frozen, expected_append):
+    import torch
+
+    policy = Mock()
+    policy.config = SimpleNamespace(
+        mem_vit_enabled=True, freeze_vision_encoder=frozen, save_pretrained=Mock()
+    )
+    if mode is not None:
+        policy.config.mem_vit_finetune_mode = mode
+    supplied_state = {"base_model.model.vision_tower.weight": torch.ones(2)}
+    policy.state_dict.return_value = supplied_state
+    cfg = SimpleNamespace(peft=object(), save_pretrained=Mock())
+    with (
+        patch("lerobot.common.train_utils._peft_modules_to_save_from_state_dict"),
+        patch("lerobot.common.train_utils._append_peft_base_weights") as append,
+        patch("lerobot.common.train_utils.save_training_state"),
+    ):
+        save_checkpoint(
+            tmp_path, 1, cfg, policy, optimizer=None, model_state_dict=supplied_state if gathered else None
+        )
+    if expected_append:
+        append.assert_called_once_with(
+            tmp_path / "pretrained_model", supplied_state, key_fragment=".vision_tower."
+        )
+    else:
+        append.assert_not_called()
+    if expected_append and not gathered:
+        policy.state_dict.assert_called_once_with()
+    else:
+        policy.state_dict.assert_not_called()
 
 
 def test_save_training_state(tmp_path, optimizer, scheduler):

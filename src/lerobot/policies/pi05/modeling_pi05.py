@@ -17,6 +17,7 @@
 import builtins
 import logging
 import math
+import re
 import types
 from collections import deque
 from pathlib import Path
@@ -676,6 +677,7 @@ class PaliGemmaWithExpertModel(
         freeze_vision_encoder: bool = False,
         train_expert_only: bool = False,
         mem_vit_enabled: bool = False,
+        mem_vit_finetune_mode: str = "full",
         mem_vit_num_frames: int = 1,
         mem_vit_temporal_every: int = 4,
         mem_vit_use_original_for_k1: bool = True,
@@ -683,9 +685,12 @@ class PaliGemmaWithExpertModel(
         if use_adarms is None:
             use_adarms = [False, False]
         super().__init__()
-        self.freeze_vision_encoder = freeze_vision_encoder
+        self.freeze_vision_encoder = freeze_vision_encoder or (
+            mem_vit_enabled and mem_vit_finetune_mode == "frozen"
+        )
         self.train_expert_only = train_expert_only
         self.mem_vit_enabled = mem_vit_enabled
+        self.mem_vit_finetune_mode = mem_vit_finetune_mode
         self.mem_vit_num_frames = mem_vit_num_frames
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
@@ -761,15 +766,20 @@ class PaliGemmaWithExpertModel(
                 param.data = param.data.to(dtype=torch.float32)
 
     def _set_requires_grad(self):
-        if self.freeze_vision_encoder:
-            self.paligemma.model.vision_tower.eval()
+        if self.freeze_vision_encoder or (self.mem_vit_enabled and self.mem_vit_finetune_mode == "lora"):
             for param in self.paligemma.model.vision_tower.parameters():
                 param.requires_grad = False
+        if self.freeze_vision_encoder:
+            self.paligemma.model.vision_tower.eval()
         if self.train_expert_only:
             self.paligemma.eval()
             for param in self.paligemma.parameters():
                 param.requires_grad = False
-            if self.mem_vit_enabled and not self.freeze_vision_encoder:
+            if (
+                self.mem_vit_enabled
+                and not self.freeze_vision_encoder
+                and self.mem_vit_finetune_mode == "full"
+            ):
                 self.paligemma.model.vision_tower.train()
                 for param in self.paligemma.model.vision_tower.parameters():
                     param.requires_grad = True
@@ -986,6 +996,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
             mem_vit_enabled=config.mem_vit_enabled,
+            mem_vit_finetune_mode=config.mem_vit_finetune_mode,
             mem_vit_num_frames=config.mem_vit_num_frames,
             mem_vit_temporal_every=config.mem_vit_temporal_every,
             mem_vit_use_original_for_k1=config.mem_vit_use_original_for_k1,
@@ -1562,6 +1573,8 @@ class PI05Policy(PreTrainedPolicy):
 
     def _enable_lora_full_finetuning_modules(self) -> None:
         """Keep full-trained VLA adaptation modules trainable after PEFT freezes the base policy."""
+        from peft.utils.other import ModulesToSaveWrapper
+
         full_train_modules = [
             self.model.paligemma_with_expert.gemma_expert,
             self.model.action_in_proj,
@@ -1585,15 +1598,87 @@ class PI05Policy(PreTrainedPolicy):
             )
         for module in full_train_modules:
             module.train()
-            for param in module.parameters():
-                param.requires_grad = True
+            if self.config.peft_train_active_modules_only and isinstance(module, ModulesToSaveWrapper):
+                # Attribute access (e.g. gemma_expert.model and CRF.nll) is forwarded
+                # to this same active copy by PEFT. The original copy is never used
+                # while adapters are enabled and must not enter the optimizer/DDP.
+                module.requires_grad_(False)
+                for adapter_name in module.active_adapters:
+                    module.modules_to_save[adapter_name].requires_grad_(True)
+            else:
+                module.requires_grad_(True)
+
+        # The policy consumes expert hidden states, never its language-model head.
+        # Keep checkpoint structure intact without optimizing this unused tensor.
+        if self.config.peft_train_active_modules_only:
+            self.model.paligemma_with_expert.gemma_expert.lm_head.requires_grad_(False)
+            # The joint forward returns only the expert's action features to the
+            # loss. The last prefix layer contributes keys/values, but its output
+            # projection and MLP cannot affect any action or later prefix layer.
+            last_prefix_layer = self.model.paligemma_with_expert.paligemma.model.language_model.layers[-1]
+            last_prefix_layer.self_attn.o_proj.requires_grad_(False)
+            last_prefix_layer.mlp.requires_grad_(False)
 
     def _enable_mem_vit_full_finetuning(self) -> None:
         """Keep MEM-ViT trainable when PEFT freezes the rest of the base policy."""
+        if (
+            not self.config.mem_vit_enabled
+            or self.config.freeze_vision_encoder
+            or self.config.mem_vit_finetune_mode != "full"
+        ):
+            return
         vision_tower = self.model.paligemma_with_expert.paligemma.model.vision_tower
         vision_tower.train()
         for param in vision_tower.parameters():
             param.requires_grad = True
+
+    def _restore_peft_trainability(self) -> None:
+        """Apply the same training contract after inserting or loading adapters."""
+        self._enable_lora_full_finetuning_modules()
+        vision_tower = self.model.paligemma_with_expert.paligemma.model.vision_tower
+        if self.config.freeze_vision_encoder or (
+            self.config.mem_vit_enabled and self.config.mem_vit_finetune_mode == "frozen"
+        ):
+            vision_tower.requires_grad_(False)
+            vision_tower.eval()
+        elif self.config.mem_vit_enabled and self.config.mem_vit_finetune_mode == "full":
+            self._enable_mem_vit_full_finetuning()
+        elif self.config.mem_vit_enabled:
+            # PEFT chooses which adapters are active/trainable. Never re-enable
+            # the SigLIP base weights when restoring MEM LoRA training.
+            for name, param in vision_tower.named_parameters():
+                if "lora_" not in name:
+                    param.requires_grad_(False)
+            if not any(
+                "lora_" in name and param.requires_grad for name, param in vision_tower.named_parameters()
+            ):
+                raise ValueError(
+                    "mem_vit_finetune_mode='lora' requires trainable vision LoRA adapters; "
+                    "check PEFT target_modules/exclude_modules, or select 'frozen' to freeze MEM-ViT."
+                )
+
+    def _validate_peft_config(self, peft_config) -> None:
+        super()._validate_peft_config(peft_config)
+        if (
+            self.config.mem_vit_enabled
+            and self.config.mem_vit_finetune_mode == "lora"
+            and not self.config.freeze_vision_encoder
+            and peft_config.peft_type != "LORA"
+        ):
+            raise ValueError("mem_vit_finetune_mode='lora' requires a LoRA PEFT configuration")
+        if self.config.freeze_vision_encoder or (
+            self.config.mem_vit_enabled and self.config.mem_vit_finetune_mode != "lora"
+        ):
+            # Enforce the vision policy even when callers override target_modules
+            # or supply an entire PEFT config (which bypasses policy defaults).
+            vision_exclusion = r".*\.paligemma_with_expert\.paligemma\.model\.vision_tower(?:\..*)?"
+            exclusions = getattr(peft_config, "exclude_modules", None)
+            if isinstance(exclusions, str):
+                vision_exclusion = f"(?:{vision_exclusion})|(?:{exclusions})"
+            elif exclusions:
+                suffixes = "|".join(re.escape(name) for name in exclusions)
+                vision_exclusion = f"(?:{vision_exclusion})|(?:.*\\.)?(?:{suffixes})"
+            peft_config.exclude_modules = vision_exclusion
 
     def wrap_with_peft(
         self,
@@ -1604,9 +1689,7 @@ class PI05Policy(PreTrainedPolicy):
             peft_config=peft_config,
             peft_cli_overrides=peft_cli_overrides,
         )
-        self._enable_lora_full_finetuning_modules()
-        if self.config.mem_vit_enabled and not self.config.freeze_vision_encoder:
-            self._enable_mem_vit_full_finetuning()
+        self._restore_peft_trainability()
         return peft_model
 
     @classmethod
@@ -2769,11 +2852,11 @@ class PI05Policy(PreTrainedPolicy):
         LoRA is the low-rank adaptation on top of expert fine-tuning: the
         action expert and PI0.5 action/state/time projection layers are full
         fine-tuned and saved, while the PaliGemma/VLM backbone receives LoRA
-        adapters. In non-MEM mode this includes ViT LoRA. In MEM mode, MEM-ViT
-        is full fine-tuned instead of receiving LoRA adapters.
+        adapters. MEM-ViT can be full fine-tuned, LoRA adapted, or frozen.
+        Explicit vision freezing takes precedence in both MEM and non-MEM modes.
         """
         transformer_projections = (
-            "q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|fc1|fc2|patch_embedding|linear"
+            "q_proj|k_proj|v_proj|o_proj|out_proj|gate_proj|up_proj|down_proj|fc1|fc2|patch_embedding|linear"
         )
         target_modules = rf".*\.paligemma_with_expert\.paligemma\..*\.({transformer_projections})"
         modules_to_save = [
@@ -2801,6 +2884,8 @@ class PI05Policy(PreTrainedPolicy):
             "target_modules": target_modules,
             "modules_to_save": modules_to_save,
         }
-        if self.config.mem_vit_enabled:
+        if self.config.freeze_vision_encoder or (
+            self.config.mem_vit_enabled and self.config.mem_vit_finetune_mode != "lora"
+        ):
             peft_targets["exclude_modules"] = r".*\.paligemma_with_expert\.paligemma\.model\.vision_tower\..*"
         return peft_targets
