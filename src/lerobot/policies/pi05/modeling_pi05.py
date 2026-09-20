@@ -925,7 +925,8 @@ class PaliGemmaWithExpertModel(
                         position_ids,
                         adarms_cond,
                         use_reentrant=False,
-                        preserve_rng_state=False,
+                        # LoRA projections can apply dropout during joint attention/MLP.
+                        preserve_rng_state=True,
                         layers=layers,
                         rotary_emb=rotary_emb,
                     )
@@ -1066,8 +1067,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
         if self.gradient_checkpointing_enabled and self.training:
+            # Recompute stochastic adapters with the original forward's dropout mask.
             return torch.utils.checkpoint.checkpoint(
-                func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
+                func, *args, use_reentrant=False, preserve_rng_state=True, **kwargs
             )
         return func(*args, **kwargs)
 
