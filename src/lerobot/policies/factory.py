@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict, Unpack
 
 import torch
@@ -65,6 +66,29 @@ from .vla_jepa.configuration_vla_jepa import VLAJEPAConfig
 from .vqbet.configuration_vqbet import VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig
 from .xvla.configuration_xvla import XVLAConfig
+
+
+def _validate_embedded_mem_vit_weights(checkpoint: str | Path, cfg: PI05Config) -> None:
+    if not cfg.mem_vit_base_weights_embedded:
+        return
+
+    from peft.utils.constants import SAFETENSORS_WEIGHTS_NAME
+    from safetensors import safe_open
+    from transformers.utils import cached_file
+
+    adapter_file = cached_file(checkpoint, SAFETENSORS_WEIGHTS_NAME, local_files_only=False)
+    if adapter_file is None:
+        raise FileNotFoundError(f"Embedded MEM-ViT checkpoint is missing {SAFETENSORS_WEIGHTS_NAME}")
+    with safe_open(adapter_file, framework="pt") as handle:
+        tensor_names = handle.keys()
+        tensor_count = sum(
+            ".vision_tower." in key and ".lora_" not in key for key in tensor_names
+        )
+    if tensor_count != cfg.mem_vit_embedded_tensor_count:
+        raise RuntimeError(
+            "Embedded MEM-ViT tensor manifest disagrees with adapter weights: "
+            f"config={cfg.mem_vit_embedded_tensor_count}, adapter={tensor_count}"
+        )
 
 
 def _reconnect_relative_absolute_steps(
@@ -774,6 +798,8 @@ def make_policy(
         # hyperparameters that we want to vary).
         kwargs["pretrained_name_or_path"] = cfg.pretrained_path
         kwargs["revision"] = cfg.pretrained_revision
+        if isinstance(cfg, PI05Config):
+            kwargs["strict"] = checkpoint_only
         policy = policy_cls.from_pretrained(**kwargs)
     elif cfg.pretrained_path and cfg.use_peft:
         # Load a pretrained PEFT model on top of the policy. The pretrained path points to the folder/repo
@@ -785,8 +811,14 @@ def make_policy(
 
         peft_pretrained_path = str(cfg.pretrained_path)
         peft_config = PeftConfig.from_pretrained(peft_pretrained_path)
+        if isinstance(cfg, PI05Config):
+            _validate_embedded_mem_vit_weights(peft_pretrained_path, cfg)
 
         kwargs["pretrained_name_or_path"] = peft_config.base_model_name_or_path
+        if isinstance(cfg, PI05Config):
+            # Adaptation modules and embedded MEM base tensors are restored by
+            # the PEFT checkpoint immediately after the base policy is built.
+            kwargs["strict"] = False
         if not kwargs["pretrained_name_or_path"]:
             # This means that there's a bug or we trained a policy from scratch using PEFT.
             # It is more likely that this is a bug so we'll raise an error.
@@ -804,9 +836,7 @@ def make_policy(
             torch_device=cfg.device,
         )
         if isinstance(cfg, PI05Config):
-            policy._enable_lora_full_finetuning_modules()  # type: ignore[attr-defined]
-            if cfg.mem_vit_enabled and not cfg.freeze_vision_encoder:
-                policy._enable_mem_vit_full_finetuning()  # type: ignore[attr-defined]
+            policy._restore_peft_trainability()  # type: ignore[attr-defined]
 
     else:
         # Make a fresh policy.

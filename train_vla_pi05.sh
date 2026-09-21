@@ -48,13 +48,12 @@ gpu_ids="0,1,2"
 main_process_port="29500"
 
 # Choose exactly one fine-tuning mode:
-#   expert = freeze PaliGemma/VLM and full fine-tune only the action expert/projections.
-#            Measured peak, batch_size=2/grad_accum=4:
-#              non-MEM ≈ 11.0GB; MEM(K=6, full MEM-ViT) ≈ 17.2GB.
+#   expert = freeze PaliGemma/VLM and full fine-tune the action expert/projections.
+#            MEM-ViT training is controlled separately below (defaults to full).
 #   lora   = full fine-tune the action expert/projections, plus LoRA on the
-#            PaliGemma/VLM backbone. Recommended on this RTX 4090 machine.
-#            Measured peak, batch_size=2/grad_accum=4:
-#              non-MEM ≈ 13.4GB; MEM(K=6, full MEM-ViT) ≈ 19.0GB.
+#            PaliGemma/VLM backbone and, by default, MEM-ViT when enabled.
+#            Full MEM-ViT training has OOMed with DDP at batch_size=2 on 24GB.
+#            MEM LoRA/frozen modes still require measuring the actual workload.
 #   full   = full VLA fine-tuning without LoRA.
 #            Does not fit on this RTX 4090 with AdamW: batch_size=1 OOM at ≈23.5GB
 #            during optimizer-state initialization. Plan for at least 32GB, preferably
@@ -130,13 +129,18 @@ resume_checkpoint=""
 resume_with_updated_dataset="false"
 
 # Used only when finetune_mode="lora". Action expert/projections are full fine-tuned;
-# PaliGemma/VLM backbone uses LoRA. In non-MEM mode, ViT also uses LoRA.
-# In MEM mode, MEM-ViT is full fine-tuned instead of using LoRA adapters.
+# PaliGemma/VLM backbone uses LoRA. In non-MEM mode, unfrozen ViT also uses LoRA.
 lora_rank="16"
 lora_alpha="32"
+# Freezes the entire visual encoder, including MEM when enabled. This takes
+# precedence over mem_vit_finetune_mode; the language model keeps its chosen mode.
+freeze_vision_encoder="false"
 
 # MEM-only configuration. Used only when enable_mem="true".
 mem_vit_checkpoint="/data/mem_vit_distill_outputs/mem_vit_distill_20260716_142702/mem_vit_distill_latest.pt"
+# auto selects lora with finetune_mode=lora, otherwise full (legacy behavior).
+# Explicit CLI modes are full, lora, frozen. Resume restores the saved strategy.
+mem_vit_finetune_mode="auto"
 
 # Choose one MEM window mode when enable_mem="true".
 mem_fixed_num_frames="6"
@@ -216,6 +220,18 @@ while (( $# > 0 )); do
     --gpu-id=*) gpu_ids="${1#*=}" ;;
     --main-process-port=*) main_process_port="${1#*=}" ;;
     --enable-mem=*) enable_mem="${1#*=}" ;;
+    --mem-vit-finetune-mode=*)
+      mem_vit_finetune_mode="${1#*=}"
+      case "$mem_vit_finetune_mode" in
+        full|lora|frozen) ;;
+        *) echo "--mem-vit-finetune-mode must be full, lora or frozen." >&2; exit 2 ;;
+      esac
+      ;;
+    --freeze-vision-encoder=*) freeze_vision_encoder="${1#*=}" ;;
+    --mem-vit-checkpoint=*) mem_vit_checkpoint="${1#*=}" ;;
+    --lora-rank=*) lora_rank="${1#*=}" ;;
+    --lora-alpha=*) lora_alpha="${1#*=}" ;;
+    --base-policy=*) base_policy="${1#*=}" ;;
     --state-action-encoding=*) state_action_encoding="${1#*=}" ;;
     --action-history-enabled=*) action_history_enabled="${1#*=}" ;;
     --b2-action-representation=*) b2_action_representation="${1#*=}" ;;
@@ -245,7 +261,13 @@ while (( $# > 0 )); do
     --finetune-mode=*) finetune_mode="${1#*=}" ;;
     --dataset-repo-id=*) dataset_repo_id="${1#*=}"; dataset_repo_id_explicit="true" ;;
     --dataset-root=*) dataset_root="${1#*=}"; dataset_root_explicit="true" ;;
-    --video-backend=*) video_backend="${1#*=}" ;;
+    --video-backend=*)
+      video_backend="${1#*=}"
+      case "$video_backend" in
+        ""|pyav|torchcodec|video_reader) ;;
+        *) echo "--video-backend must be empty, pyav, torchcodec or video_reader." >&2; exit 2 ;;
+      esac
+      ;;
     --dataset-episodes=*) dataset_episodes="${1#*=}"; dataset_episodes_explicit="true" ;;
     --image-source=*) image_source="${1#*=}"; image_source_explicit="true" ;;
     --sim-image-manifest=*) sim_image_manifest="${1#*=}"; sim_image_manifest_explicit="true" ;;
@@ -279,6 +301,39 @@ while (( $# > 0 )); do
   esac
   shift
 done
+
+if [[ -z "$resume_checkpoint" ]]; then
+  case "$finetune_mode" in
+    lora|expert|full) ;;
+    *) echo "Unknown finetune_mode=$finetune_mode. Expected one of: lora, expert, full." >&2; exit 2 ;;
+  esac
+  if [[ "$freeze_vision_encoder" != "true" && "$freeze_vision_encoder" != "false" ]]; then
+    echo "--freeze-vision-encoder must be true or false." >&2
+    exit 2
+  fi
+  if [[ "$finetune_mode" == "lora" ]]; then
+    if [[ ! "$lora_rank" =~ ^[1-9][0-9]*$ || ! "$lora_alpha" =~ ^[1-9][0-9]*$ ]]; then
+      echo "--lora-rank and --lora-alpha must be positive integers." >&2
+      exit 2
+    fi
+  fi
+  if [[ "$enable_mem" == "true" ]]; then
+    if [[ "$freeze_vision_encoder" == "true" || "$mem_vit_finetune_mode" == "frozen" ]]; then
+      mem_vit_finetune_mode="frozen"
+      freeze_vision_encoder="true"
+    elif [[ "$mem_vit_finetune_mode" == "auto" ]]; then
+      if [[ "$finetune_mode" == "lora" ]]; then
+        mem_vit_finetune_mode="lora"
+      else
+        mem_vit_finetune_mode="full"
+      fi
+    fi
+    if [[ "$mem_vit_finetune_mode" == "lora" && "$finetune_mode" != "lora" ]]; then
+      echo "MEM LoRA requires --finetune-mode=lora." >&2
+      exit 2
+    fi
+  fi
+fi
 
 if [[ "$b2_action_representation" != "velocity" && "$b2_action_representation" != "pose_delta" ]]; then
   echo "B2 representation must be velocity or pose_delta." >&2
@@ -434,6 +489,7 @@ if [[ "$enable_mem" == "true" && -z "$resume_checkpoint" ]]; then
     exit 1
   fi
   policy_mem_args+=(--policy.mem_vit_checkpoint="$mem_vit_checkpoint")
+  policy_mem_args+=(--policy.mem_vit_finetune_mode="$mem_vit_finetune_mode")
   policy_mem_args+=(--policy.mem_vit_frame_interval_seconds="$mem_frame_interval_seconds")
   if [[ -n "$mem_random_min_num_frames" || -n "$mem_random_max_num_frames" ]]; then
     if [[ -z "$mem_random_min_num_frames" || -z "$mem_random_max_num_frames" ]]; then
@@ -519,6 +575,7 @@ if [[ -z "$resume_checkpoint" ]]; then
   case "$finetune_mode" in
     lora)
       train_expert_only="false"
+      policy_runtime_args+=(--policy.peft_train_active_modules_only=true)
       peft_args+=(--peft.method_type=LORA)
       peft_args+=(--peft.r="$lora_rank")
       peft_args+=(--peft.lora_alpha="$lora_alpha")
@@ -538,6 +595,7 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.device=cuda
     --policy.dtype=bfloat16
     --policy.gradient_checkpointing=true
+    --policy.freeze_vision_encoder="$freeze_vision_encoder"
     --policy.train_expert_only="$train_expert_only"
     --policy.optimizer_lr="$optimizer_lr"
     --policy.lr_scheduler_type="$lr_scheduler_type"
@@ -681,7 +739,22 @@ else
   echo "State arm q/qd/gripper: $state_use_arm_joint_positions/$state_use_arm_joint_velocities/$state_use_arm_gripper_feedback"
   echo "State B2 q/qd/trunk/v/w: $state_use_b2_joint_positions/$state_use_b2_joint_velocities/$state_use_b2_trunk_pose/$state_use_b2_linear_velocity/$state_use_b2_angular_velocity"
 fi
-echo "Finetune mode:    $finetune_mode"
+if [[ -z "$resume_checkpoint" ]]; then
+  echo "Finetune mode:    $finetune_mode"
+  if [[ "$enable_mem" == "true" ]]; then
+    echo "Vision strategy:  MEM $mem_vit_finetune_mode (freeze_vision_encoder=$freeze_vision_encoder)"
+  elif [[ "$freeze_vision_encoder" == "true" || "$finetune_mode" == "expert" ]]; then
+    echo "Vision strategy:  SigLIP frozen"
+  else
+    echo "Vision strategy:  SigLIP $finetune_mode"
+  fi
+  if [[ "$finetune_mode" == "lora" ]]; then
+    echo "LoRA rank/alpha:  $lora_rank/$lora_alpha"
+  fi
+else
+  echo "Finetune mode:    restored from checkpoint"
+  echo "Vision strategy:  restored from checkpoint"
+fi
 echo "Train expert only: $train_expert_only"
 echo "GPUs:             $gpu_ids ($num_gpus process(es))"
 if (( num_gpus > 1 )); then

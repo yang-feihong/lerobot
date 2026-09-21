@@ -31,6 +31,7 @@ from lerobot.optim import (
     save_scheduler_state,
 )
 from lerobot.policies import PreTrainedPolicy
+from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import (
     CHECKPOINTS_DIR,
@@ -85,16 +86,20 @@ def _append_peft_base_weights(
     *,
     key_fragment: str,
 ) -> int:
-    """Add fully fine-tuned base weights to a PEFT adapter checkpoint.
+    """Add required base weights to a PEFT adapter checkpoint.
 
-    PEFT saves LoRA tensors and ``modules_to_save`` but omits base parameters that were made
-    trainable after adapter injection. PI0.5 does this for MEM-ViT, so those tensors must be kept
-    alongside the adapter for resume and inference to reproduce the trained model.
+    PEFT saves LoRA tensors and ``modules_to_save`` but omits the MEM-ViT base tensors. Keeping
+    those tensors alongside every MEM adapter makes resume and inference independent of the
+    distillation checkpoint's original host path.
     """
     from peft.utils.constants import SAFETENSORS_WEIGHTS_NAME
     from safetensors.torch import load_file, save_file
 
-    extra_state = {key: value for key, value in model_state_dict.items() if key_fragment in key}
+    extra_state = {
+        key: value
+        for key, value in model_state_dict.items()
+        if key_fragment in key and ".lora_" not in key
+    }
     if not extra_state:
         raise RuntimeError(f"No state-dict keys matched required PEFT base-weight fragment {key_fragment!r}")
 
@@ -238,21 +243,29 @@ def save_checkpoint(
             Defaults to None.
     """
     pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
+    policy_cfg = policy.config
+    embed_mem_vit_base = (
+        cfg.peft is not None and isinstance(policy_cfg, PI05Config) and policy_cfg.mem_vit_enabled
+    )
     if cfg.peft is not None and model_state_dict is not None:
         with _peft_modules_to_save_from_state_dict(policy):
             policy.save_pretrained(pretrained_dir, state_dict=model_state_dict)
-        policy_cfg = getattr(policy, "config", None)
-        if getattr(policy_cfg, "mem_vit_enabled", False) and not getattr(
-            policy_cfg, "freeze_vision_encoder", False
-        ):
-            appended = _append_peft_base_weights(
-                pretrained_dir,
-                model_state_dict,
-                key_fragment=".vision_tower.",
-            )
-            logging.info("Stored %d full-trained MEM-ViT tensors in the PEFT checkpoint", appended)
     else:
         policy.save_pretrained(pretrained_dir, state_dict=model_state_dict)
+    if embed_mem_vit_base:
+        appended = _append_peft_base_weights(
+            pretrained_dir,
+            model_state_dict if model_state_dict is not None else policy.state_dict(),
+            key_fragment=".vision_tower.",
+        )
+        if appended == 0:
+            raise RuntimeError("MEM-ViT checkpoint export found no vision tower tensors")
+        policy_cfg.mem_vit_base_weights_embedded = True
+        policy_cfg.mem_vit_embedded_tensor_count = appended
+        if isinstance(cfg.policy, PI05Config):
+            cfg.policy.mem_vit_base_weights_embedded = True
+            cfg.policy.mem_vit_embedded_tensor_count = appended
+        logging.info("Stored %d MEM-ViT base tensors in the PEFT checkpoint", appended)
     cfg.save_pretrained(pretrained_dir)
     if cfg.peft is not None:
         # When using PEFT, policy.save_pretrained will only write the adapter weights + config, not the

@@ -585,7 +585,7 @@ def configure_action_bool_balance(
                     applicable = actions[:, completion_dim] <= 0
                 if (
                     name == "gripper_target"
-                    and getattr(policy_cfg, "action_gripper_target_true_side", "negative") == "negative"
+                    and policy_cfg.action_gripper_target_true_side == "negative"
                 ):
                     target_true = actions[:, dim] < 0
                 else:
@@ -613,7 +613,7 @@ def configure_action_bool_balance(
             "false_weight": bool_weight * 0.5 / (1.0 - true_fraction) if has_both_classes else bool_weight,
         }
 
-    saved_fractions = dict(getattr(policy_cfg, "action_bool_true_fractions", {}))
+    saved_fractions = dict(policy_cfg.action_bool_true_fractions)
     if cfg.resume and saved_fractions and saved_fractions != true_fractions:
         raise ValueError(
             "Resume train-split boolean priors disagree with the checkpoint: "
@@ -650,6 +650,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     from accelerate.utils import DistributedDataParallelKwargs, DistributedType
 
     cfg.validate()
+
+    if isinstance(cfg.policy, PI05Config) and (
+        cfg.policy.mem_vit_enabled
+        and cfg.policy.mem_vit_finetune_mode == "lora"
+        and not cfg.policy.freeze_vision_encoder
+        and cfg.peft is None
+        and not cfg.policy.use_peft
+    ):
+        raise ValueError("mem_vit_finetune_mode=lora requires PEFT (--peft.method_type=LORA).")
 
     # Create Accelerator if not provided
     # It will automatically detect if running in distributed mode or single-process mode

@@ -17,6 +17,8 @@
 import builtins
 import logging
 import math
+import os
+import re
 import types
 from collections import deque
 from pathlib import Path
@@ -492,12 +494,12 @@ def _mem_sparse_attention_forward(
     No new learnable parameters are introduced. It reuses this SigLIP attention
     module's original q_proj/k_proj/v_proj/out_proj.
     """
-    num_frames = getattr(self, "mem_num_frames", MEM_VIT_NUM_FRAMES)
+    num_frames = self.mem_num_frames
 
     # Original-forward escape hatch for K=1.
     # Default is False because we want to test whether the new forward naturally
     # degenerates to original SigLIP attention when K=1.
-    if num_frames <= 1 and getattr(self, "mem_use_original_for_k1", MEM_VIT_USE_ORIGINAL_FOR_K1):
+    if num_frames <= 1 and self.mem_use_original_for_k1:
         return self._original_forward(hidden_states, attention_mask=attention_mask, **kwargs)
 
     if attention_mask is not None:
@@ -517,7 +519,7 @@ def _mem_sparse_attention_forward(
     batch_size = bk // num_frames
     num_heads = self.num_heads
     head_dim = self.head_dim
-    frame_mask = getattr(self, "mem_frame_mask", None)
+    frame_mask = self.mem_frame_mask
     if frame_mask is not None:
         frame_mask = frame_mask.to(device=hidden_states.device, dtype=torch.bool)
         if tuple(frame_mask.shape) != (batch_size, num_frames):
@@ -635,15 +637,62 @@ def _patch_siglip_vision_tower_for_mem_vit(
 
         attn.mem_num_frames = num_frames
         attn.mem_use_original_for_k1 = use_original_for_k1
+        attn.mem_frame_mask = None
         attn.forward = types.MethodType(_mem_sparse_attention_forward, attn)
 
 
-def _load_mem_vit_vision_checkpoint(vision_tower: nn.Module, checkpoint_path: str | Path) -> None:
+def _resolve_mem_vit_checkpoint(checkpoint_path: str | Path) -> Path:
     path = Path(checkpoint_path).expanduser()
     if path.is_dir():
         path = path / "mem_vit_distill_latest.pt"
-    if not path.is_file():
-        raise FileNotFoundError(f"MEM-ViT checkpoint not found: {path}")
+    if path.is_file():
+        return path
+
+    override = os.environ.get("LEROBOT_MEM_VIT_CHECKPOINT")
+    if override:
+        override_path = Path(override).expanduser()
+        if override_path.is_dir():
+            override_path = override_path / path.name
+        if not override_path.is_file():
+            raise FileNotFoundError(
+                "LEROBOT_MEM_VIT_CHECKPOINT does not resolve to a file: "
+                f"{override_path} (checkpoint recorded {path})"
+            )
+        return override_path
+
+    search_roots_value = os.environ.get(
+        "LEROBOT_MEM_VIT_SEARCH_ROOTS", "/data/mem_vit_distill_outputs"
+    )
+    search_roots = [Path(value).expanduser() for value in search_roots_value.split(os.pathsep) if value]
+    candidates: list[Path] = []
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+        direct_candidates = (root / path.name, root / path.parent.name / path.name)
+        candidates.extend(candidate for candidate in direct_candidates if candidate.is_file())
+        if not any(candidate.is_file() for candidate in direct_candidates):
+            candidates.extend(candidate for candidate in root.glob(f"*/{path.name}") if candidate.is_file())
+    unique_candidates = list(dict.fromkeys(candidate.resolve() for candidate in candidates))
+    if len(unique_candidates) == 1:
+        logging.warning(
+            "Remapped unavailable MEM-ViT checkpoint %s to %s",
+            path,
+            unique_candidates[0],
+        )
+        return unique_candidates[0]
+    if len(unique_candidates) > 1:
+        raise FileNotFoundError(
+            f"MEM-ViT checkpoint path is unavailable and basename {path.name!r} is ambiguous under "
+            f"{search_roots}: {unique_candidates}. Set LEROBOT_MEM_VIT_CHECKPOINT explicitly."
+        )
+    raise FileNotFoundError(
+        f"MEM-ViT checkpoint not found: {path}. Set LEROBOT_MEM_VIT_CHECKPOINT or "
+        "LEROBOT_MEM_VIT_SEARCH_ROOTS for checkpoints moved from their training host."
+    )
+
+
+def _load_mem_vit_vision_checkpoint(vision_tower: nn.Module, checkpoint_path: str | Path) -> None:
+    path = _resolve_mem_vit_checkpoint(checkpoint_path)
 
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(checkpoint, dict) or "student_vision_tower" not in checkpoint:
@@ -676,6 +725,7 @@ class PaliGemmaWithExpertModel(
         freeze_vision_encoder: bool = False,
         train_expert_only: bool = False,
         mem_vit_enabled: bool = False,
+        mem_vit_finetune_mode: str = "full",
         mem_vit_num_frames: int = 1,
         mem_vit_temporal_every: int = 4,
         mem_vit_use_original_for_k1: bool = True,
@@ -683,9 +733,12 @@ class PaliGemmaWithExpertModel(
         if use_adarms is None:
             use_adarms = [False, False]
         super().__init__()
-        self.freeze_vision_encoder = freeze_vision_encoder
+        self.freeze_vision_encoder = freeze_vision_encoder or (
+            mem_vit_enabled and mem_vit_finetune_mode == "frozen"
+        )
         self.train_expert_only = train_expert_only
         self.mem_vit_enabled = mem_vit_enabled
+        self.mem_vit_finetune_mode = mem_vit_finetune_mode
         self.mem_vit_num_frames = mem_vit_num_frames
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
@@ -761,15 +814,20 @@ class PaliGemmaWithExpertModel(
                 param.data = param.data.to(dtype=torch.float32)
 
     def _set_requires_grad(self):
-        if self.freeze_vision_encoder:
-            self.paligemma.model.vision_tower.eval()
+        if self.freeze_vision_encoder or (self.mem_vit_enabled and self.mem_vit_finetune_mode == "lora"):
             for param in self.paligemma.model.vision_tower.parameters():
                 param.requires_grad = False
+        if self.freeze_vision_encoder:
+            self.paligemma.model.vision_tower.eval()
         if self.train_expert_only:
             self.paligemma.eval()
             for param in self.paligemma.parameters():
                 param.requires_grad = False
-            if self.mem_vit_enabled and not self.freeze_vision_encoder:
+            if (
+                self.mem_vit_enabled
+                and not self.freeze_vision_encoder
+                and self.mem_vit_finetune_mode == "full"
+            ):
                 self.paligemma.model.vision_tower.train()
                 for param in self.paligemma.model.vision_tower.parameters():
                     param.requires_grad = True
@@ -915,7 +973,8 @@ class PaliGemmaWithExpertModel(
                         position_ids,
                         adarms_cond,
                         use_reentrant=False,
-                        preserve_rng_state=False,
+                        # LoRA projections can apply dropout during joint attention/MLP.
+                        preserve_rng_state=True,
                         layers=layers,
                         rotary_emb=rotary_emb,
                     )
@@ -986,6 +1045,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
             mem_vit_enabled=config.mem_vit_enabled,
+            mem_vit_finetune_mode=config.mem_vit_finetune_mode,
             mem_vit_num_frames=config.mem_vit_num_frames,
             mem_vit_temporal_every=config.mem_vit_temporal_every,
             mem_vit_use_original_for_k1=config.mem_vit_use_original_for_k1,
@@ -1058,8 +1118,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
         if self.gradient_checkpointing_enabled and self.training:
+            # Recompute stochastic adapters with the original forward's dropout mask.
             return torch.utils.checkpoint.checkpoint(
-                func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
+                func, *args, use_reentrant=False, preserve_rng_state=True, **kwargs
             )
         return func(*args, **kwargs)
 
@@ -1565,6 +1626,8 @@ class PI05Policy(PreTrainedPolicy):
 
     def _enable_lora_full_finetuning_modules(self) -> None:
         """Keep full-trained VLA adaptation modules trainable after PEFT freezes the base policy."""
+        from peft.utils.other import ModulesToSaveWrapper
+
         full_train_modules = [
             self.model.paligemma_with_expert.gemma_expert,
             self.model.action_in_proj,
@@ -1588,15 +1651,91 @@ class PI05Policy(PreTrainedPolicy):
             )
         for module in full_train_modules:
             module.train()
-            for param in module.parameters():
-                param.requires_grad = True
+            if self.config.peft_train_active_modules_only and isinstance(module, ModulesToSaveWrapper):
+                # Attribute access (e.g. gemma_expert.model and CRF.nll) is forwarded
+                # to this same active copy by PEFT. The original copy is never used
+                # while adapters are enabled and must not enter the optimizer/DDP.
+                module.requires_grad_(False)
+                for adapter_name in module.active_adapters:
+                    module.modules_to_save[adapter_name].requires_grad_(True)
+            else:
+                module.requires_grad_(True)
+
+        # The policy consumes expert hidden states, never its language-model head.
+        # Keep checkpoint structure intact without optimizing this unused tensor.
+        if self.config.peft_train_active_modules_only:
+            self.model.paligemma_with_expert.gemma_expert.lm_head.requires_grad_(False)
+            # The joint forward returns only the expert's action features to the
+            # loss. The last prefix layer contributes keys/values, but its output
+            # projection and MLP cannot affect any action or later prefix layer.
+            last_prefix_layer = self.model.paligemma_with_expert.paligemma.model.language_model.layers[-1]
+            last_prefix_layer.self_attn.o_proj.requires_grad_(False)
+            last_prefix_layer.mlp.requires_grad_(False)
 
     def _enable_mem_vit_full_finetuning(self) -> None:
         """Keep MEM-ViT trainable when PEFT freezes the rest of the base policy."""
+        if (
+            not self.config.mem_vit_enabled
+            or self.config.freeze_vision_encoder
+            or self.config.mem_vit_finetune_mode != "full"
+        ):
+            return
         vision_tower = self.model.paligemma_with_expert.paligemma.model.vision_tower
         vision_tower.train()
         for param in vision_tower.parameters():
             param.requires_grad = True
+
+    def _restore_peft_trainability(self) -> None:
+        """Apply the same training contract after inserting or loading adapters."""
+        self._enable_lora_full_finetuning_modules()
+        vision_tower = self.model.paligemma_with_expert.paligemma.model.vision_tower
+        if self.config.freeze_vision_encoder or (
+            self.config.mem_vit_enabled and self.config.mem_vit_finetune_mode == "frozen"
+        ):
+            vision_tower.requires_grad_(False)
+            vision_tower.eval()
+        elif self.config.mem_vit_enabled and self.config.mem_vit_finetune_mode == "full":
+            self._enable_mem_vit_full_finetuning()
+        elif self.config.mem_vit_enabled:
+            # PEFT chooses which adapters are active/trainable. Never re-enable
+            # the SigLIP base weights when restoring MEM LoRA training.
+            for name, param in vision_tower.named_parameters():
+                if "lora_" not in name:
+                    param.requires_grad_(False)
+            if not any(
+                "lora_" in name and param.requires_grad for name, param in vision_tower.named_parameters()
+            ):
+                raise ValueError(
+                    "mem_vit_finetune_mode='lora' requires trainable vision LoRA adapters; "
+                    "check PEFT target_modules/exclude_modules, or select 'frozen' to freeze MEM-ViT."
+                )
+
+    def _validate_peft_config(self, peft_config) -> None:
+        super()._validate_peft_config(peft_config)
+        if (
+            self.config.mem_vit_enabled
+            and self.config.mem_vit_finetune_mode == "lora"
+            and not self.config.freeze_vision_encoder
+            and peft_config.peft_type != "LORA"
+        ):
+            raise ValueError("mem_vit_finetune_mode='lora' requires a LoRA PEFT configuration")
+        if self.config.freeze_vision_encoder or (
+            self.config.mem_vit_enabled and self.config.mem_vit_finetune_mode != "lora"
+        ):
+            # Enforce the vision policy even when callers override target_modules
+            # or supply an entire PEFT config (which bypasses policy defaults).
+            vision_exclusion = r".*\.paligemma_with_expert\.paligemma\.model\.vision_tower(?:\..*)?"
+            if not hasattr(peft_config, "exclude_modules"):
+                raise TypeError(
+                    f"{type(peft_config).__name__} cannot express the required vision-module exclusion"
+                )
+            exclusions = peft_config.exclude_modules
+            if isinstance(exclusions, str):
+                vision_exclusion = f"(?:{vision_exclusion})|(?:{exclusions})"
+            elif exclusions:
+                suffixes = "|".join(re.escape(name) for name in exclusions)
+                vision_exclusion = f"(?:{vision_exclusion})|(?:.*\\.)?(?:{suffixes})"
+            peft_config.exclude_modules = vision_exclusion
 
     def wrap_with_peft(
         self,
@@ -1607,9 +1746,7 @@ class PI05Policy(PreTrainedPolicy):
             peft_config=peft_config,
             peft_cli_overrides=peft_cli_overrides,
         )
-        self._enable_lora_full_finetuning_modules()
-        if self.config.mem_vit_enabled and not self.config.freeze_vision_encoder:
-            self._enable_mem_vit_full_finetuning()
+        self._restore_peft_trainability()
         return peft_model
 
     @classmethod
@@ -1658,28 +1795,25 @@ class PI05Policy(PreTrainedPolicy):
         # Load state dict (expects keys with "model." prefix)
         try:
             print(f"Loading model from: {pretrained_name_or_path}")
-            try:
-                from transformers.utils import cached_file
+            from transformers.utils import cached_file
 
-                resolved_file = cached_file(
-                    pretrained_name_or_path,
-                    "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    token=kwargs.get("token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
-                )
-                from safetensors.torch import load_file
+            resolved_file = cached_file(
+                pretrained_name_or_path,
+                "model.safetensors",
+                cache_dir=kwargs.get("cache_dir"),
+                force_download=kwargs.get("force_download", False),
+                resume_download=kwargs.get("resume_download"),
+                proxies=kwargs.get("proxies"),
+                token=kwargs.get("token"),
+                revision=kwargs.get("revision"),
+                local_files_only=kwargs.get("local_files_only", False),
+            )
+            if resolved_file is None:
+                raise FileNotFoundError(f"model.safetensors not found in {pretrained_name_or_path}")
+            from safetensors.torch import load_file
 
-                original_state_dict = load_file(resolved_file)
-                print("✓ Loaded state dict from model.safetensors")
-            except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
-                return model
+            original_state_dict = load_file(resolved_file)
+            print("✓ Loaded state dict from model.safetensors")
 
             # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
@@ -1699,20 +1833,7 @@ class PI05Policy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
-            # MEM mode adds a small continuous state-memory projection that is not present
-            # in the base PI0.5 checkpoint, so allow those new parameters to initialize
-            # from scratch while still reporting all missing/unexpected keys.
-            has_new_observation_modules = (
-                getattr(model.config, "mem_vit_enabled", False)
-                or getattr(model.config, "state_action_encoding", "text") == "continuous"
-                or getattr(model.config, "action_history_enabled", False)
-                or getattr(model.config, "discrete_action_training_mode", "continuous_flow")
-                == "structured_temporal"
-            )
-            effective_strict = strict and not has_new_observation_modules
-            missing_keys, unexpected_keys = model.load_state_dict(
-                remapped_state_dict, strict=effective_strict
-            )
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1737,10 +1858,14 @@ class PI05Policy(PreTrainedPolicy):
             if not missing_keys and not unexpected_keys:
                 print("All keys loaded successfully!")
 
-        except Exception as e:
-            print(f"Warning: Could not load state dict: {e}")
+        except Exception:
+            logging.exception("Failed to load PI0.5 checkpoint from %s", pretrained_name_or_path)
+            raise
 
-        if getattr(model.config, "mem_vit_checkpoint", None) is not None:
+        if (
+            model.config.mem_vit_checkpoint is not None
+            and not model.config.mem_vit_base_weights_embedded
+        ):
             _load_mem_vit_vision_checkpoint(
                 model.model.paligemma_with_expert.paligemma.model.vision_tower,
                 model.config.mem_vit_checkpoint,
@@ -2793,11 +2918,11 @@ class PI05Policy(PreTrainedPolicy):
         LoRA is the low-rank adaptation on top of expert fine-tuning: the
         action expert and PI0.5 action/state/time projection layers are full
         fine-tuned and saved, while the PaliGemma/VLM backbone receives LoRA
-        adapters. In non-MEM mode this includes ViT LoRA. In MEM mode, MEM-ViT
-        is full fine-tuned instead of receiving LoRA adapters.
+        adapters. MEM-ViT can be full fine-tuned, LoRA adapted, or frozen.
+        Explicit vision freezing takes precedence in both MEM and non-MEM modes.
         """
         transformer_projections = (
-            "q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|fc1|fc2|patch_embedding|linear"
+            "q_proj|k_proj|v_proj|o_proj|out_proj|gate_proj|up_proj|down_proj|fc1|fc2|patch_embedding|linear"
         )
         target_modules = rf".*\.paligemma_with_expert\.paligemma\..*\.({transformer_projections})"
         modules_to_save = [
@@ -2825,6 +2950,8 @@ class PI05Policy(PreTrainedPolicy):
             "target_modules": target_modules,
             "modules_to_save": modules_to_save,
         }
-        if self.config.mem_vit_enabled:
+        if self.config.freeze_vision_encoder or (
+            self.config.mem_vit_enabled and self.config.mem_vit_finetune_mode != "lora"
+        ):
             peft_targets["exclude_modules"] = r".*\.paligemma_with_expert\.paligemma\.model\.vision_tower\..*"
         return peft_targets

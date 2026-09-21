@@ -130,6 +130,9 @@ class PI05Config(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
+    # Old optimizer checkpoints included PEFT's unused original copies. Opt in
+    # for new runs so restoring old optimizer parameter groups remains possible.
+    peft_train_active_modules_only: bool = False
     # State/action memory projections and structured action heads do not exist in the
     # base PI0.5 checkpoint. Train these randomly initialized modules faster than the
     # pretrained backbone and action expert.
@@ -180,6 +183,13 @@ class PI05Config(PreTrainedConfig):
     # MEM-ViT settings. Passing mem_vit_checkpoint also enables MEM-ViT.
     mem_vit_enabled: bool = False
     mem_vit_checkpoint: str | None = None
+    # Set when a PEFT checkpoint contains the complete MEM-ViT base tensors.
+    # Historical checkpoints leave this false and need the distillation asset.
+    mem_vit_base_weights_embedded: bool = False
+    mem_vit_embedded_tensor_count: int = 0
+    # Preserve historical checkpoints' full MEM-ViT tuning unless explicitly changed.
+    # freeze_vision_encoder takes precedence over this setting.
+    mem_vit_finetune_mode: str = "full"  # "full", "lora", or "frozen"
     mem_vit_num_frames: int = 6
     mem_vit_min_num_frames: int | None = None
     mem_vit_max_num_frames: int | None = None
@@ -349,6 +359,16 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(f"dataset_frequency_hz must be positive, got {self.dataset_frequency_hz}")
         if self.mem_vit_checkpoint is not None:
             self.mem_vit_enabled = True
+        if self.mem_vit_embedded_tensor_count < 0:
+            raise ValueError("mem_vit_embedded_tensor_count must be non-negative")
+        if self.mem_vit_base_weights_embedded != (self.mem_vit_embedded_tensor_count > 0):
+            raise ValueError(
+                "mem_vit_base_weights_embedded and mem_vit_embedded_tensor_count disagree"
+            )
+        if self.mem_vit_base_weights_embedded and not self.mem_vit_enabled:
+            raise ValueError("embedded MEM-ViT weights require mem_vit_enabled=true")
+        if self.mem_vit_finetune_mode not in {"full", "lora", "frozen"}:
+            raise ValueError("mem_vit_finetune_mode must be 'full', 'lora', or 'frozen'")
         if self.mem_vit_enabled and self.mem_vit_frame_interval_seconds is None:
             raise ValueError("MEM deployment requires mem_vit_frame_interval_seconds")
         if self.mem_vit_num_frames < 1:
