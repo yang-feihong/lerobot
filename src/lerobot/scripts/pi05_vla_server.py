@@ -252,6 +252,19 @@ def _rtc_enabled_for_chunk_scheduling(mode: str) -> bool:
     return mode == "RTC"
 
 
+def _deployment_rtc_config(config: PreTrainedConfig, args: argparse.Namespace) -> RTCConfig:
+    """Derive deployment conditioning from checkpoint training metadata."""
+    training_config = config.training_rtc_config
+    mode = "training" if training_config is not None and training_config.enabled else "inference"
+    return RTCConfig(
+        enabled=_rtc_enabled_for_chunk_scheduling(args.chunk_scheduling_mode),
+        mode=mode,
+        prefix_attention_schedule=RTCAttentionSchedule(args.rtc_schedule.upper()),
+        max_guidance_weight=args.rtc_max_guidance_weight,
+        execution_horizon=args.rtc_execution_horizon,
+    )
+
+
 def execution_action_names(z1_action_representation: str) -> tuple[str, ...]:
     if z1_action_representation in {"ee_delta", "ee_state_delta"}:
         ee_names = EE_DELTA_ACTION_NAMES
@@ -824,6 +837,8 @@ def encode_action_packet(record: ActionRecord) -> bytes:
         predict_seconds=np.asarray(record.predict_seconds, dtype=np.float64),
         postprocess_seconds=np.asarray(record.postprocess_seconds, dtype=np.float64),
         inference_delay_steps=np.asarray(record.inference_delay_steps, dtype=np.int64),
+        rtc_mode=np.asarray(record.rtc_mode, dtype=np.str_),
+        rtc_conditioning_delay_steps=np.asarray(record.rtc_conditioning_delay_steps, dtype=np.int64),
         velocity_smoothing_transition_step=np.asarray(
             record.velocity_smoothing_transition_step, dtype=np.int64
         ),
@@ -882,6 +897,8 @@ class ActionRecord:
     inference_delay_steps: int
     velocity_smoothing_transition_step: int
     sim_steps_per_wall_second: float
+    rtc_mode: str = "inference"
+    rtc_conditioning_delay_steps: int = 0
 
 
 class RolloutRecorder:
@@ -996,6 +1013,8 @@ class RolloutRecorder:
                 inference_started_ns=np.asarray(record.inference_started_ns),
                 inference_finished_ns=np.asarray(record.inference_finished_ns),
                 inference_delay_steps=np.asarray(record.inference_delay_steps),
+                rtc_mode=np.asarray(record.rtc_mode),
+                rtc_conditioning_delay_steps=np.asarray(record.rtc_conditioning_delay_steps),
                 velocity_smoothing_transition_step=np.asarray(record.velocity_smoothing_transition_step),
                 sim_steps_per_wall_second=np.asarray(record.sim_steps_per_wall_second),
             )
@@ -1009,6 +1028,8 @@ class RolloutRecorder:
             postprocess_ms=record.postprocess_seconds * 1000.0,
             inference_ms=record.inference_seconds * 1000.0,
             inference_delay_steps=record.inference_delay_steps,
+            rtc_mode=record.rtc_mode,
+            rtc_conditioning_delay_steps=record.rtc_conditioning_delay_steps,
             b2_anchor_kind=record.b2_anchor_kind,
             b2_anchor=record.b2_anchor.tolist(),
             ee_anchor_kind=record.ee_anchor_kind,
@@ -1043,6 +1064,12 @@ class AsyncRTCPolicy:
             config.compile_model = args.compile_model
         if args.compile_mode is not None:
             config.compile_mode = args.compile_mode
+        self.rtc_config = _deployment_rtc_config(config, args)
+        config.rtc_config = self.rtc_config
+        training_config = config.training_rtc_config
+        self.training_rtc_max_delay = (
+            training_config.simulated_delay - 1 if self.rtc_config.mode == "training" else None
+        )
 
         LOG.info("Loading checkpoint-only policy=%s", policy_path)
         self.policy = make_policy(config)
@@ -1075,15 +1102,8 @@ class AsyncRTCPolicy:
             device=self.device,
         )
 
-        rtc_config = RTCConfig(
-            enabled=_rtc_enabled_for_chunk_scheduling(self.chunk_scheduling_mode),
-            prefix_attention_schedule=RTCAttentionSchedule(args.rtc_schedule.upper()),
-            max_guidance_weight=args.rtc_max_guidance_weight,
-            execution_horizon=args.rtc_execution_horizon,
-        )
-        self.policy.config.rtc_config = rtc_config
+        self.policy.config.rtc_config = self.rtc_config
         self.policy.init_rtc_processor()
-        self.rtc_config = rtc_config
         self.low_level_hz = float(args.low_level_hz)
         self.stop_on_model_task_complete = bool(args.stop_on_model_task_complete)
         self.b2_velocity_smoothing_time_constant_s = float(args.b2_velocity_smoothing_time_constant_s)
@@ -1210,6 +1230,9 @@ class AsyncRTCPolicy:
             z1_execution_action_representation=contract.z1_action_representation,
             ee_rtc_prefix_reanchor_enabled=ee_rtc_reanchor,
             execution_action_protocol="rtc_action_packet_v6_optional_high_level_se2_feedback",
+            rtc_mode=self.rtc_config.mode,
+            training_rtc_max_delay=self.training_rtc_max_delay,
+            training_rtc_delay_overflow="error" if self.rtc_config.mode == "training" else None,
             stop_on_model_task_complete=self.stop_on_model_task_complete,
             b2_velocity_smoothing="causal_first_order_low_pass",
             b2_velocity_smoothing_time_constant_s=self.b2_velocity_smoothing_time_constant_s,
@@ -1386,11 +1409,16 @@ class AsyncRTCPolicy:
         for warmup_index in range(self._warmup_inferences):
             batch = self.preprocessor(self._warmup_batch())
             with torch.inference_mode():
-                actions = self.policy.predict_action_chunk(
-                    batch,
-                    inference_delay=0,
-                    prev_chunk_left_over=rtc_prefix,
-                )
+                conditioning: dict[str, object] = {}
+                if self.rtc_config.enabled:
+                    warmup_delay = 0
+                    if self.rtc_config.mode == "training" and rtc_prefix is not None:
+                        warmup_delay = min(1, self.training_rtc_max_delay)
+                    conditioning = {
+                        "inference_delay": warmup_delay,
+                        "prev_chunk_left_over": rtc_prefix,
+                    }
+                actions = self.policy.predict_action_chunk(batch, **conditioning)
                 if (
                     warmup_index == 0
                     and self.chunk_scheduling_mode == "RTC"
@@ -1529,6 +1557,8 @@ class AsyncRTCPolicy:
             "latest_source_step": latest.source_step if latest else -1,
             "chunk_scheduling_mode": self.chunk_scheduling_mode,
             "b2_execution_mode": self.b2_execution_mode,
+            "rtc_mode": self.rtc_config.mode,
+            "training_rtc_max_delay": self.training_rtc_max_delay,
             "last_error": self._last_error,
         }
 
@@ -1665,6 +1695,10 @@ class AsyncRTCPolicy:
                 ee_old_anchor=record.ee_anchor.tolist(),
                 ee_new_anchor=packet.actual_ee_state.tolist(),
             )
+        if self.rtc_config.mode == "training":
+            # Hard conditioning must only freeze actions that are really queued.
+            # The inference-RTC execution horizon and zero padding do not apply.
+            return prefix
         horizon = self.rtc_config.execution_horizon
         if len(prefix) >= horizon:
             return prefix[:horizon]
@@ -1680,6 +1714,27 @@ class AsyncRTCPolicy:
         if not self._latencies:
             return 0, sim_rate
         return int(math.ceil(max(self._latencies) * sim_rate)), sim_rate
+
+    def _rtc_conditioning(self, packet: ObservationPacket, inference_delay_steps: int) -> dict[str, object]:
+        if self.chunk_scheduling_mode == "SYNC":
+            return {}
+        prefix = self._previous_prefix(packet)
+        delay = inference_delay_steps
+        if self.rtc_config.mode == "training":
+            # First chunks and drained queues have no actions to freeze.
+            delay = inference_delay_steps if prefix is not None else 0
+            if delay > self.training_rtc_max_delay:
+                raise ValueError(
+                    f"Training-RTC estimated inference delay {delay} exceeds the checkpoint's "
+                    f"trained maximum {self.training_rtc_max_delay}; fine-tune with a larger "
+                    "training_rtc_config.simulated_delay"
+                )
+            if prefix is not None and delay > len(prefix):
+                raise ValueError(
+                    f"Training-RTC estimated inference delay {delay} exceeds the available "
+                    f"queued prefix ({len(prefix)} actions)"
+                )
+        return {"inference_delay": delay, "prev_chunk_left_over": prefix}
 
     @staticmethod
     def _sample_memory_records(
@@ -1866,16 +1921,11 @@ class AsyncRTCPolicy:
         started = time.perf_counter()
         batch = self.preprocessor(self._make_batch(packet))
         preprocessed = time.perf_counter()
-        prefix = self._previous_prefix(packet)
         inference_delay_steps, sim_rate = self._estimated_delay()
-        # RTC prefix guidance is a closed-form forward correction, so this
-        # online path never needs autograd or tensor version counters.
+        conditioning = self._rtc_conditioning(packet, inference_delay_steps)
+        # Both RTC modes operate without autograd or tensor version counters.
         with torch.inference_mode():
-            actions = self.policy.predict_action_chunk(
-                batch,
-                inference_delay=inference_delay_steps,
-                prev_chunk_left_over=prefix,
-            )
+            actions = self.policy.predict_action_chunk(batch, **conditioning)
             original = actions.squeeze(0).detach().cpu().clone()
             b2_reference = None
             if self.b2_execution_mode == "se2_feedback":
@@ -1965,6 +2015,8 @@ class AsyncRTCPolicy:
             postprocess_seconds=finished - predicted,
             observation_received_ns=packet.server_received_ns,
             inference_delay_steps=inference_delay_steps,
+            rtc_mode=self.rtc_config.mode,
+            rtc_conditioning_delay_steps=int(conditioning.get("inference_delay", 0)),
             velocity_smoothing_transition_step=smoothing_transition_step,
             sim_steps_per_wall_second=sim_rate,
         )
