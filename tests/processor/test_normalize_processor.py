@@ -261,6 +261,185 @@ def test_quantile_unnormalization():
     assert torch.allclose(recovered_action, original_action, atol=1e-6)
 
 
+@pytest.fixture(params=[NormalizationMode.QUANTILES, NormalizationMode.QUANTILE10])
+def quantile_mode_and_keys(request):
+    if request.param == NormalizationMode.QUANTILES:
+        return request.param, "q01", "q99"
+    return request.param, "q10", "q90"
+
+
+@pytest.mark.parametrize("feature_type", [FeatureType.ACTION, FeatureType.STATE])
+def test_quantile_sparse_dimensions_use_min_max(quantile_mode_and_keys, feature_type):
+    """Sparse base motion stays finite without changing constant or ordinary dimensions."""
+    mode, lower_key, upper_key = quantile_mode_and_keys
+    key = ACTION if feature_type == FeatureType.ACTION else OBS_STATE
+    features = {key: PolicyFeature(feature_type, (5,))}
+    norm_map = {feature_type: mode}
+    # Base x/y/yaw reproduce the failing run's statistics. The fourth dimension
+    # checks that fallback replaces both bounds, including a nonzero offset.
+    stats = {
+        key: {
+            lower_key: [0.0, 0.0, 0.0, 2.0, -1.0],
+            upper_key: [0.0, 0.0, 0.0, 2.0, 1.0],
+            "min": [0.0, -0.3459999, 0.0, 1.0, -5.0],
+            "max": [0.20693749, 0.0, 0.0, 5.0, 5.0],
+        }
+    }
+    normalizer = NormalizerProcessorStep(
+        features=features, norm_map=norm_map, stats=stats, quantile_fallback_to_min_max=True
+    )
+    unnormalizer = UnnormalizerProcessorStep(
+        features=features, norm_map=norm_map, stats=stats, quantile_fallback_to_min_max=True
+    )
+    # Include batch and action-chunk dimensions to exercise broadcasting.
+    original = torch.tensor(
+        [
+            [[0.0, -0.3459999, 0.0, 1.0, -3.0], [0.103468745, -0.17299995, 0.0, 3.0, 0.0]],
+            [[0.20693749, 0.0, 0.0, 5.0, 3.0], [0.0, 0.0, 0.0, 2.0, 1.0]],
+        ]
+    )
+    # The last dimension retains quantile scaling and is intentionally not clipped.
+    expected = torch.tensor(
+        [
+            [[-1.0, -1.0, -1.0, -1.0, -3.0], [0.0, 0.0, -1.0, 0.0, 0.0]],
+            [[1.0, 1.0, -1.0, 1.0, 3.0], [-1.0, 1.0, -1.0, -0.5, 1.0]],
+        ]
+    )
+    if feature_type == FeatureType.ACTION:
+        transition = create_transition(action=original)
+    else:
+        transition = create_transition(observation={key: original})
+
+    normalized = normalizer(transition)
+    restored = unnormalizer(normalized)
+    if feature_type == FeatureType.ACTION:
+        actual = normalized[TransitionKey.ACTION]
+        recovered = restored[TransitionKey.ACTION]
+    else:
+        actual = normalized[TransitionKey.OBSERVATION][key]
+        recovered = restored[TransitionKey.OBSERVATION][key]
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(recovered, original)
+
+
+@pytest.mark.parametrize("quantile_span", [5e-9, 1e-8])
+def test_quantile_near_zero_span_uses_min_max(quantile_mode_and_keys, quantile_span):
+    """A nonzero quantile interval at or below epsilon also needs usable bounds."""
+    mode, lower_key, upper_key = quantile_mode_and_keys
+    features = {ACTION: PolicyFeature(FeatureType.ACTION, (1,))}
+    norm_map = {FeatureType.ACTION: mode}
+    stats = {ACTION: {lower_key: [0.0], upper_key: [quantile_span], "min": [0.0], "max": [2.0]}}
+    normalizer = NormalizerProcessorStep(
+        features=features, norm_map=norm_map, stats=stats, quantile_fallback_to_min_max=True
+    )
+    unnormalizer = UnnormalizerProcessorStep(
+        features=features, norm_map=norm_map, stats=stats, quantile_fallback_to_min_max=True
+    )
+    original = torch.tensor([[0.0], [1.0], [2.0]])
+
+    normalized = normalizer(create_transition(action=original))
+
+    torch.testing.assert_close(normalized[TransitionKey.ACTION], torch.tensor([[-1.0], [0.0], [1.0]]))
+    torch.testing.assert_close(unnormalizer(normalized)[TransitionKey.ACTION], original)
+
+
+@pytest.mark.parametrize("range_keys", [(), ("min",), ("max",), ("min", "max")])
+def test_quantile_without_usable_min_max_preserves_behavior(quantile_mode_and_keys, range_keys):
+    """Missing bounds and truly constant dimensions keep the legacy epsilon behavior."""
+    mode, lower_key, upper_key = quantile_mode_and_keys
+    features = {ACTION: PolicyFeature(FeatureType.ACTION, (2,))}
+    norm_map = {FeatureType.ACTION: mode}
+    feature_stats = {lower_key: [0.0, 0.0], upper_key: [0.0, 5e-9]}
+    available_range = {"min": [0.0, 0.0], "max": [0.0, 5e-9]}
+    feature_stats.update({key: available_range[key] for key in range_keys})
+    stats = {ACTION: feature_stats}
+    normalizer = NormalizerProcessorStep(
+        features=features, norm_map=norm_map, stats=stats, quantile_fallback_to_min_max=True
+    )
+    unnormalizer = UnnormalizerProcessorStep(
+        features=features, norm_map=norm_map, stats=stats, quantile_fallback_to_min_max=True
+    )
+    original = torch.tensor([[0.0, 0.0], [1e-8, 5e-9]])
+
+    normalized = normalizer(create_transition(action=original))
+
+    torch.testing.assert_close(normalized[TransitionKey.ACTION], torch.tensor([[-1.0, -1.0], [1.0, 1.0]]))
+    torch.testing.assert_close(
+        unnormalizer(normalized)[TransitionKey.ACTION], original, atol=1e-15, rtol=1e-6
+    )
+
+
+def test_quantile_fallback_survives_pipeline_save_load(quantile_mode_and_keys, tmp_path):
+    """Saved training and inference processors must reconstruct the same action scale."""
+    mode, lower_key, upper_key = quantile_mode_and_keys
+    features = {ACTION: PolicyFeature(FeatureType.ACTION, (2,))}
+    norm_map = {FeatureType.ACTION: mode}
+    stats = {ACTION: {lower_key: [0.0, 2.0], upper_key: [0.0, 2.0], "min": [-2.0, 1.0], "max": [0.0, 5.0]}}
+    loaded = []
+    for processor_type, name in [
+        (NormalizerProcessorStep, "preprocessor"),
+        (UnnormalizerProcessorStep, "postprocessor"),
+    ]:
+        pipeline = DataProcessorPipeline(
+            steps=[
+                processor_type(
+                    features=features, norm_map=norm_map, stats=stats, quantile_fallback_to_min_max=True
+                )
+            ],
+            name=name,
+            to_transition=identity_transition,
+            to_output=identity_transition,
+        )
+        pipeline.save_pretrained(tmp_path)
+        loaded.append(
+            DataProcessorPipeline.from_pretrained(
+                tmp_path,
+                config_filename=f"{name}.json",
+                to_transition=identity_transition,
+                to_output=identity_transition,
+            )
+        )
+        assert loaded[-1].steps[0].get_config()["quantile_fallback_to_min_max"] is True
+
+    original = torch.tensor([[-2.0, 1.0], [-1.0, 3.0], [0.0, 5.0]])
+    normalized = loaded[0](create_transition(action=original))
+
+    torch.testing.assert_close(
+        normalized[TransitionKey.ACTION], torch.tensor([[-1.0, -1.0], [0.0, 0.0], [1.0, 1.0]])
+    )
+    torch.testing.assert_close(loaded[1](normalized)[TransitionKey.ACTION], original)
+
+
+def test_quantile_legacy_pipeline_keeps_original_action_scale(quantile_mode_and_keys, tmp_path):
+    """Loading a checkpoint without the new flag must not change its physical actions."""
+    mode, lower_key, upper_key = quantile_mode_and_keys
+    features = {ACTION: PolicyFeature(FeatureType.ACTION, (1,))}
+    norm_map = {FeatureType.ACTION: mode}
+    stats = {ACTION: {lower_key: [0.0], upper_key: [0.0], "min": [-0.3459999], "max": [0.0]}}
+    unnormalizer = UnnormalizerProcessorStep(features=features, norm_map=norm_map, stats=stats)
+    assert "quantile_fallback_to_min_max" not in unnormalizer.get_config()
+    pipeline = DataProcessorPipeline(
+        steps=[unnormalizer],
+        name="legacy_postprocessor",
+        to_transition=identity_transition,
+        to_output=identity_transition,
+    )
+    pipeline.save_pretrained(tmp_path)
+    loaded = DataProcessorPipeline.from_pretrained(
+        tmp_path,
+        config_filename="legacy_postprocessor.json",
+        to_transition=identity_transition,
+        to_output=identity_transition,
+    )
+
+    restored = loaded(create_transition(action=torch.tensor([[-1.0], [0.0], [1.0]])))
+
+    torch.testing.assert_close(
+        restored[TransitionKey.ACTION], torch.tensor([[0.0], [5e-9], [1e-8]]), atol=1e-15, rtol=1e-6
+    )
+
+
 def test_quantile_division_by_zero():
     """Test quantile normalization handles edge case where q01 == q99."""
     features = {

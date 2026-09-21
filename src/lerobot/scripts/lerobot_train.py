@@ -72,6 +72,7 @@ from lerobot.policies.pi05.transformed_action_stats import (
     transformed_action_stats_ee_valid_count,
     validate_transformed_action_stats,
 )
+from lerobot.processor import NormalizerProcessorStep, PolicyProcessorPipeline, UnnormalizerProcessorStep
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import ACTION, PRETRAINED_MODEL_DIR
@@ -87,6 +88,23 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
+
+
+def _configure_quantile_fallback_for_training(
+    preprocessor: PolicyProcessorPipeline,
+    postprocessor: PolicyProcessorPipeline,
+    *,
+    resume: bool,
+    is_reward_model_training: bool,
+) -> None:
+    """Use robust quantile scales for new policies, preserving checkpoint semantics on resume."""
+    if resume or is_reward_model_training:
+        return
+
+    for pipeline in (preprocessor, postprocessor):
+        for step in pipeline.steps:
+            if isinstance(step, NormalizerProcessorStep | UnnormalizerProcessorStep):
+                step.quantile_fallback_to_min_max = True
 
 
 def _wandb_train_metrics(
@@ -1012,6 +1030,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             pretrained_revision=getattr(cfg.policy, "pretrained_revision", None),
             **processor_kwargs,
         )
+
+    _configure_quantile_fallback_for_training(
+        preprocessor,
+        postprocessor,
+        resume=cfg.resume,
+        is_reward_model_training=cfg.is_reward_model_training,
+    )
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
