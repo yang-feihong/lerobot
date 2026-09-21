@@ -343,6 +343,15 @@ def reconcile_pi05_action_representation_processors(
         )
         steps.insert(normalizer_index, desired_pre_step)
 
+    history_quantile_fallback = next(
+        (
+            step.quantile_fallback_to_min_max
+            for step in steps
+            if isinstance(step, NormalizerProcessorStep)
+            and step.normalize_observation_keys == {OBS_ACTION_HISTORY}
+        ),
+        False,
+    )
     history_steps = _action_history_steps(config, raw_dataset_stats)
     steps = [
         step
@@ -360,6 +369,8 @@ def reconcile_pi05_action_representation_processors(
         )
         steps.insert(relative_index, split_step)
         if history_normalizer is not None:
+            # Refreshing stats must preserve the checkpoint's normalization convention.
+            history_normalizer.quantile_fallback_to_min_max = history_quantile_fallback
             main_normalizer_index = next(
                 i for i, step in enumerate(steps) if isinstance(step, NormalizerProcessorStep)
             )

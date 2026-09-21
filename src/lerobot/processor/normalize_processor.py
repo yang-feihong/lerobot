@@ -83,6 +83,11 @@ class _NormalizationMixin:
             calculations.
         normalize_observation_keys: An optional set of keys to selectively apply
             normalization to specific observation features.
+        quantile_fallback_to_min_max: Use the saved min/max bounds for dimensions
+            whose quantile range is no larger than eps but whose full range is
+            non-degenerate. Disabled by default to preserve old checkpoints'
+            action coordinates; new training enables and saves it for both
+            normalization and unnormalization.
         _tensor_stats: An internal dictionary holding the normalization statistics as
             PyTorch tensors.
         _stats_explicitly_provided: Internal flag tracking whether stats were explicitly
@@ -96,6 +101,7 @@ class _NormalizationMixin:
     dtype: torch.dtype | None = None
     eps: float = 1e-8
     normalize_observation_keys: set[str] | None = None
+    quantile_fallback_to_min_max: bool = False
 
     _tensor_stats: dict[str, dict[str, Tensor]] = field(default_factory=dict, init=False, repr=False)
     _stats_explicitly_provided: bool = field(default=False, init=False, repr=False)
@@ -261,6 +267,8 @@ class _NormalizationMixin:
         }
         if self.normalize_observation_keys is not None:
             config["normalize_observation_keys"] = sorted(self.normalize_observation_keys)
+        if self.quantile_fallback_to_min_max:
+            config["quantile_fallback_to_min_max"] = True
         return config
 
     def _normalize_observation(self, observation: RobotObservation, inverse: bool) -> dict[str, Tensor]:
@@ -383,39 +391,46 @@ class _NormalizationMixin:
             # Map from [min, max] to [-1, 1]
             return 2 * (tensor - min_val) / denom - 1
 
-        if norm_mode == NormalizationMode.QUANTILES:
-            q01 = stats.get("q01", None)
-            q99 = stats.get("q99", None)
-            if q01 is None or q99 is None:
+        if norm_mode in (NormalizationMode.QUANTILES, NormalizationMode.QUANTILE10):
+            lower_key, upper_key = (
+                ("q01", "q99") if norm_mode == NormalizationMode.QUANTILES else ("q10", "q90")
+            )
+            lower = stats.get(lower_key)
+            upper = stats.get(upper_key)
+            if lower is None or upper is None:
                 raise ValueError(
-                    "QUANTILES normalization mode requires q01 and q99 stats, please update the dataset with the correct stats using the `augment_dataset_quantile_stats.py` script"
+                    f"{norm_mode.value} normalization mode requires {lower_key} and {upper_key} stats, "
+                    "please update the dataset with the correct stats using the "
+                    "`augment_dataset_quantile_stats.py` script"
                 )
 
-            denom = q99 - q01
-            # Avoid division by zero by adding epsilon when quantiles are identical
+            denom = upper - lower
+            if self.quantile_fallback_to_min_max:
+                minimum, maximum = stats.get("min"), stats.get("max")
+                if minimum is not None and maximum is not None:
+                    full_range = maximum - minimum
+                    # Sparse continuous actions can have identical quantiles while
+                    # still containing real motion. Epsilon is not a useful scale
+                    # for those dimensions. Use saved dataset bounds, never batch
+                    # extrema, and share the same offset/scale in both directions.
+                    use_min_max = (
+                        (denom.abs() <= self.eps)
+                        & torch.isfinite(minimum)
+                        & torch.isfinite(maximum)
+                        & torch.isfinite(full_range)
+                        & (full_range > self.eps)
+                    )
+                    lower = torch.where(use_min_max, minimum, lower)
+                    denom = torch.where(use_min_max, full_range, denom)
+
+            # Preserve the legacy mapping for genuinely constant dimensions and
+            # old statistics without usable min/max bounds.
             denom = torch.where(
                 denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
             )
             if inverse:
-                return (tensor + 1.0) * denom / 2.0 + q01
-            return 2.0 * (tensor - q01) / denom - 1.0
-
-        if norm_mode == NormalizationMode.QUANTILE10:
-            q10 = stats.get("q10", None)
-            q90 = stats.get("q90", None)
-            if q10 is None or q90 is None:
-                raise ValueError(
-                    "QUANTILE10 normalization mode requires q10 and q90 stats, please update the dataset with the correct stats using the `augment_dataset_quantile_stats.py` script"
-                )
-
-            denom = q90 - q10
-            # Avoid division by zero by adding epsilon when quantiles are identical
-            denom = torch.where(
-                denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
-            )
-            if inverse:
-                return (tensor + 1.0) * denom / 2.0 + q10
-            return 2.0 * (tensor - q10) / denom - 1.0
+                return (tensor + 1.0) * denom / 2.0 + lower
+            return 2.0 * (tensor - lower) / denom - 1.0
 
         # If necessary stats are missing, return input unchanged.
         return tensor
