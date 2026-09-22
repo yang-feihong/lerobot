@@ -1,6 +1,7 @@
 import json
+import time
 from io import BytesIO
-from threading import Lock
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 
 import numpy as np
@@ -48,6 +49,62 @@ from lerobot.scripts.pi05_vla_server import (
 )
 
 EXECUTION_ACTION_NAMES = execution_action_names("ee_delta")
+
+
+def test_inference_worker_immediately_consumes_an_observation_waiting_in_the_mailbox() -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy._stop = Event()
+    policy._mailbox_condition = __import__("threading").Condition()
+    policy._mailbox = None
+    policy._mailbox_version = 0
+    policy._last_inferred_version = 0
+    policy._records_lock = Lock()
+    policy._records = {}
+    policy._latest_record = None
+    policy._inference_count = 0
+    policy._last_error = None
+    policy.recorder = SimpleNamespace(action=lambda _: None)
+    first_started = Event()
+    release_first = Event()
+    second_started = Event()
+    starts: list[float] = []
+
+    def infer(packet: SimpleNamespace) -> SimpleNamespace:
+        starts.append(time.monotonic())
+        if packet.sim_step == 1:
+            first_started.set()
+            assert release_first.wait(timeout=1.0)
+        else:
+            second_started.set()
+            policy._stop.set()
+        return SimpleNamespace(
+            sequence=packet.sim_step,
+            source_step=packet.sim_step,
+            inference_seconds=0.0,
+            inference_delay_steps=0,
+            processed=torch.zeros(1, 1),
+        )
+
+    policy._infer = infer
+    worker = Thread(target=policy._run)
+    worker.start()
+
+    with policy._mailbox_condition:
+        policy._mailbox = SimpleNamespace(sim_step=1)
+        policy._mailbox_version += 1
+        policy._mailbox_condition.notify()
+    assert first_started.wait(timeout=1.0)
+    with policy._mailbox_condition:
+        policy._mailbox = SimpleNamespace(sim_step=2)
+        policy._mailbox_version += 1
+        policy._mailbox_condition.notify()
+    released_at = time.monotonic()
+    release_first.set()
+
+    assert second_started.wait(timeout=1.0)
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert starts[1] - released_at < 0.1
 
 
 def test_checkpoint_hot_swap_signature_requires_identical_runtime_schema(tmp_path) -> None:

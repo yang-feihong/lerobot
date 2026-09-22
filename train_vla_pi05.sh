@@ -62,9 +62,9 @@ finetune_mode="lora"
 
 dataset_repo_id="local/b2_z1_vla"
 dataset_root="/data/b2_z1_vla_lerobot"
-# Empty keeps LeRobot's platform-dependent decoder selection. Set explicitly
-# when an installed torchcodec package is incompatible with the runtime image.
-video_backend=""
+# PyAV is the deployment image's supported and reproducible video decoder.
+# Override explicitly only when validating another installed backend.
+video_backend="pyav"
 # CLI: --image-source=real|sim|mixed. Simulated images require the physically
 # paired manifest and rollout root for the selected dataset.
 image_source="real" # "real", "sim", or "mixed"

@@ -1107,7 +1107,6 @@ class AsyncRTCPolicy:
         self.low_level_hz = float(args.low_level_hz)
         self.stop_on_model_task_complete = bool(args.stop_on_model_task_complete)
         self.b2_velocity_smoothing_time_constant_s = float(args.b2_velocity_smoothing_time_constant_s)
-        self.period_s = 1.0 / float(args.high_level_hz)
         self.camera_keys = contract.camera_keys
         self.base_camera_key, self.wrist_camera_key = _camera_bindings(self.camera_keys)
         self.camera_shapes = {key: _feature_shape(config.input_features[key]) for key in self.camera_keys}
@@ -2024,7 +2023,6 @@ class AsyncRTCPolicy:
         return record
 
     def _run(self) -> None:
-        next_start = 0.0
         while not self._stop.is_set():
             with self._mailbox_condition:
                 self._mailbox_condition.wait_for(
@@ -2042,19 +2040,6 @@ class AsyncRTCPolicy:
                 version = self._mailbox_version
             if packet is None or version == self._last_inferred_version:
                 continue
-            remaining = next_start - time.perf_counter()
-            if remaining > 0 and self._stop.wait(remaining):
-                return
-            # A newer observation may have arrived while enforcing the 4 Hz
-            # start-rate cap. Refresh once so an older mailbox item is never
-            # inferred merely because it was current before the wait.
-            with self._mailbox_condition:
-                if self._mailbox_version != version:
-                    packet = self._mailbox
-                    version = self._mailbox_version
-            if packet is None or version == self._last_inferred_version:
-                continue
-            inference_started = time.perf_counter()
             try:
                 record = self._infer(packet)
                 with self._records_lock:
@@ -2080,9 +2065,6 @@ class AsyncRTCPolicy:
                 LOG.exception("Inference failed for sim_step=%d", packet.sim_step)
                 if self._stop.wait(0.5):
                     return
-            # Cap inference starts at high_level_hz. If inference itself is
-            # slower than the period, immediately consume the newest mailbox.
-            next_start = inference_started + self.period_s
 
 
 class VLARequestHandler(BaseHTTPRequestHandler):
@@ -2215,7 +2197,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-inferences", type=int, default=1)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--high-level-hz", type=float, default=4.0)
+    parser.add_argument(
+        "--high-level-hz",
+        type=float,
+        default=4.0,
+        help="Declared observation input frequency; inference itself is never rate-limited.",
+    )
     parser.add_argument("--low-level-hz", type=float, default=50.0)
     parser.add_argument(
         "--chunk-scheduling-mode",
