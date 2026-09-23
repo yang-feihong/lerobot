@@ -199,6 +199,33 @@ def test_dataset_mixture_sampling_uses_exact_source_ratio_and_motion_balance():
     assert list(resumed) == epoch[7:]
 
 
+def test_static_horizon_sampling_drops_interior_wait_and_preserves_source_ratio():
+    kwargs = {
+        "dataset_from_indices": [0, 10],
+        "dataset_to_indices": [10, 20],
+        "shuffle": True,
+        "seed": 19,
+        "interior_static_frame_indices": [0, 1, 10, 11],
+        "terminal_static_frame_indices": [8, 9, 18, 19],
+        "interior_static_weight": 0.0,
+        "terminal_static_weight": 1.0,
+        "source_episode_indices": [[0], [1]],
+        "source_weights": [0.75, 0.25],
+    }
+    sampler = EpisodeAwareSampler(**kwargs)
+    epoch = list(sampler)
+    assert len(epoch) == 20
+    assert not ({0, 1, 10, 11} & set(epoch))
+    assert sum(index < 10 for index in epoch) == 15
+    assert sum(index >= 10 for index in epoch) == 5
+
+    reproduced = EpisodeAwareSampler(**kwargs)
+    assert list(reproduced) == epoch
+    resumed = EpisodeAwareSampler(**kwargs)
+    resumed.load_state_dict({"epoch": 0, "start_index": 6})
+    assert list(resumed) == epoch[6:]
+
+
 def test_dataset_mixture_sampling_intersects_global_sources_with_episode_subset():
     sampler = EpisodeAwareSampler(
         [0, 4, 8, 12],

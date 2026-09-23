@@ -1,15 +1,68 @@
+from random import Random
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from lerobot.datasets.factory import resolve_delta_timestamps
+from lerobot.datasets.factory import resolve_delta_timestamps, resolve_random_history_sampling
+from lerobot.datasets.temporal_history import RandomHistorySamplingConfig
 from lerobot.policies.pi05.processor_pi05 import (
     OBS_ACTION_HISTORY,
     Pi05SplitActionHistoryProcessorStep,
 )
 from lerobot.types import TransitionKey
 from lerobot.utils.constants import ACTION, OBS_STATE
+
+
+def test_hierarchical_history_sampling_is_ordered_bounded_and_nonuniform():
+    config = RandomHistorySamplingConfig(
+        keys=("observation.images.base", "observation.images.wrist"),
+        num_frames=6,
+        fps=50,
+        nominal_interval_seconds=0.5,
+        global_interval_std_seconds=0.15,
+        local_interval_std_seconds=0.05,
+        min_interval_seconds=0.25,
+        max_interval_seconds=1.0,
+    )
+    rng = Random(7)
+    samples = [config.sample_delta_indices(rng) for _ in range(128)]
+
+    assert all(offsets[-1] == 0 for offsets in samples)
+    assert all(
+        all(left < right for left, right in zip(offsets, offsets[1:], strict=False))
+        for offsets in samples
+    )
+    gaps = [
+        right - left
+        for offsets in samples
+        for left, right in zip(offsets, offsets[1:], strict=False)
+    ]
+    assert min(gaps) >= 13
+    assert max(gaps) <= 50
+    assert len({tuple(offsets) for offsets in samples}) > 100
+
+
+def test_random_history_sampling_resolves_only_configured_cameras():
+    selected_key = "observation.images.base"
+    ignored_key = "observation.images.debug"
+    config = SimpleNamespace(
+        mem_vit_random_interval_sampling=True,
+        mem_vit_num_frames=6,
+        mem_vit_frame_interval_seconds=0.5,
+        mem_vit_global_interval_std_seconds=0.15,
+        mem_vit_local_interval_std_seconds=0.05,
+        mem_vit_min_interval_seconds=0.25,
+        mem_vit_max_interval_seconds=1.0,
+        image_features={selected_key: object()},
+    )
+    metadata = SimpleNamespace(fps=50, camera_keys=[selected_key, ignored_key])
+
+    sampling = resolve_random_history_sampling(config, metadata, seed=123)
+
+    assert sampling is not None
+    assert sampling.keys == (selected_key,)
+    assert sampling.seed == 123
 
 
 def test_mem_modalities_use_independent_50hz_sampling_clocks():

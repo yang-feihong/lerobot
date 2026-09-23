@@ -89,11 +89,12 @@ class WandBLogger:
         os.environ["WANDB_SILENT"] = "True"
         import wandb
 
+        resume_training_run = cfg.resume and cfg.wandb.resume_training_run
         wandb_run_id = (
             cfg.wandb.run_id
-            if cfg.wandb.run_id
+            if resume_training_run and cfg.wandb.run_id
             else get_wandb_run_id_from_filesystem(self.log_dir)
-            if cfg.resume
+            if resume_training_run
             else None
         )
         wandb.init(
@@ -109,7 +110,7 @@ class WandBLogger:
             save_code=False,
             # TODO(rcadene): split train and eval, and run async eval with job_type="eval"
             job_type="train_eval",
-            resume="must" if cfg.resume else None,
+            resume="must" if resume_training_run else None,
             mode=self.cfg.mode if self.cfg.mode in ["online", "offline", "disabled"] else "online",
             settings=wandb.Settings(
                 console="off",

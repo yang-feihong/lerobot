@@ -96,6 +96,9 @@ class WandBConfig:
     entity: str | None = None
     notes: str | None = None
     run_id: str | None = None
+    # Continue the checkpoint's W&B run unless this resume intentionally forks
+    # into a distinct experiment.
+    resume_training_run: bool = True
     mode: str | None = None  # Allowed values: 'online', 'offline' 'disabled'. Defaults to 'online'
     add_tags: bool = True  # If True, save configuration as tags in the WandB run.
 

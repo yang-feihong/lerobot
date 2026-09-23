@@ -18,6 +18,7 @@
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from random import Random
 
 import datasets
 import torch
@@ -40,6 +41,7 @@ from .io_utils import (
     load_nested_dataset,
 )
 from .paired_image_source import PairedImageSource
+from .temporal_history import RandomHistorySamplingConfig
 from .video_utils import decode_video_frames
 
 
@@ -65,6 +67,7 @@ class DatasetReader:
         sim_image_root: str | Path | None = None,
         mixed_sim_probability: float = 0.5,
         image_source_seed: int = 0,
+        random_history_sampling: RandomHistorySamplingConfig | None = None,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -98,6 +101,8 @@ class DatasetReader:
         self._return_uint8 = return_uint8
         self._depth_output_unit = depth_output_unit
         self._image_source = image_source
+        self._random_history_sampling = random_history_sampling
+        self._random_history_rng: Random | None = None
         self._paired_image_source = None
         if image_source != "real":
             if sim_image_manifest is None or sim_image_root is None:
@@ -239,15 +244,30 @@ class DatasetReader:
         ep = self._meta.episodes[ep_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
+        delta_indices = self.delta_indices
+        if self._random_history_sampling is not None:
+            if self._random_history_rng is None:
+                worker_info = torch.utils.data.get_worker_info()
+                worker_seed = torch.initial_seed() if worker_info is None else worker_info.seed
+                self._random_history_rng = Random(worker_seed ^ self._random_history_sampling.seed)
+            sampled_indices = self._random_history_sampling.sample_delta_indices(
+                self._random_history_rng
+            )
+            delta_indices = dict(self.delta_indices)
+            for key in self._random_history_sampling.keys:
+                if key not in delta_indices:
+                    raise KeyError(f"Random history feature {key!r} has no delta timestamps")
+                delta_indices[key] = sampled_indices
+
         query_indices = {
             key: [max(ep_start, min(ep_end - 1, abs_idx + delta)) for delta in delta_idx]
-            for key, delta_idx in self.delta_indices.items()
+            for key, delta_idx in delta_indices.items()
         }
         padding = {
             f"{key}_is_pad": torch.BoolTensor(
                 [(abs_idx + delta < ep_start) | (abs_idx + delta >= ep_end) for delta in delta_idx]
             )
-            for key, delta_idx in self.delta_indices.items()
+            for key, delta_idx in delta_indices.items()
         }
         return query_indices, padding
 

@@ -172,6 +172,64 @@ def test_boolean_priors_support_control_extended_dataset_actions():
     }
 
 
+def test_resume_rejects_changed_boolean_priors_without_updated_dataset_opt_in():
+    actions = np.zeros((5, len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)), dtype=np.float32)
+    actions[:, 3] = [1, 1, 0, 0, 0]
+    policy_cfg = SimpleNamespace(
+        type="pi05",
+        action_predict_arm_teleop_inactive=True,
+        action_predict_arm_reset=False,
+        action_predict_gripper=False,
+        action_predict_task_complete=False,
+        gripper_target_representation="continuous_position",
+        action_gripper_target_true_side="negative",
+        action_bool_loss_weight=4.0,
+        action_bool_true_fractions={"arm_teleop_inactive": 0.5},
+        chunk_size=3,
+        control_frequency_hz=10,
+    )
+
+    with pytest.raises(ValueError, match="boolean priors disagree"):
+        configure_action_bool_balance(
+            SimpleNamespace(
+                trainable_config=policy_cfg,
+                resume=True,
+                resume_with_updated_dataset=False,
+            ),
+            _fake_dataset(actions, CONTROL_EXTENDED_DATASET_ACTION_NAMES),
+        )
+
+
+def test_resume_recomputes_boolean_priors_for_explicitly_updated_dataset():
+    actions = np.zeros((5, len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)), dtype=np.float32)
+    actions[:, 3] = [1, 1, 0, 0, 0]
+    policy_cfg = SimpleNamespace(
+        type="pi05",
+        action_predict_arm_teleop_inactive=True,
+        action_predict_arm_reset=False,
+        action_predict_gripper=False,
+        action_predict_task_complete=False,
+        gripper_target_representation="continuous_position",
+        action_gripper_target_true_side="negative",
+        action_bool_loss_weight=4.0,
+        action_bool_true_fractions={"arm_teleop_inactive": 0.5},
+        chunk_size=3,
+        control_frequency_hz=10,
+    )
+
+    stats = configure_action_bool_balance(
+        SimpleNamespace(
+            trainable_config=policy_cfg,
+            resume=True,
+            resume_with_updated_dataset=True,
+        ),
+        _fake_dataset(actions, CONTROL_EXTENDED_DATASET_ACTION_NAMES),
+    )
+
+    assert stats["arm_teleop_inactive"]["true_fraction"] == pytest.approx(0.25)
+    assert policy_cfg.action_bool_true_fractions == {"arm_teleop_inactive": pytest.approx(0.25)}
+
+
 def test_stage_dataset_without_reset_positive_keeps_the_flow_channel():
     actions = np.zeros((5, len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)), dtype=np.float32)
     actions[:, 3] = [1, 1, 0, 0, 0]

@@ -56,6 +56,10 @@ class EpisodeAwareSampler:
         absolute_to_relative_idx: dict[int, int] | None = None,
         priority_frame_indices: list[int] | np.ndarray | None = None,
         priority_fraction: float = 0.0,
+        interior_static_frame_indices: list[int] | np.ndarray | None = None,
+        terminal_static_frame_indices: list[int] | np.ndarray | None = None,
+        interior_static_weight: float = 1.0,
+        terminal_static_weight: float = 1.0,
         source_episode_indices: list[list[int]] | None = None,
         source_weights: list[float] | None = None,
     ):
@@ -79,6 +83,17 @@ class EpisodeAwareSampler:
             raise ValueError(f"priority_fraction must be in [0, 1), got {priority_fraction}")
         if priority_fraction > 0.0 and not shuffle:
             raise ValueError("priority sampling requires shuffle=True")
+        if not 0.0 <= interior_static_weight <= 1.0:
+            raise ValueError("interior_static_weight must be in [0, 1]")
+        if terminal_static_weight <= 0.0:
+            raise ValueError("terminal_static_weight must be > 0")
+        static_sampling_enabled = (
+            interior_static_frame_indices is not None or terminal_static_frame_indices is not None
+        )
+        if static_sampling_enabled and not shuffle:
+            raise ValueError("static-horizon sampling requires shuffle=True")
+        if static_sampling_enabled and priority_fraction > 0.0:
+            raise ValueError("priority sampling and static-horizon sampling cannot be combined")
 
         from_indices = np.asarray(dataset_from_indices, dtype=np.int64)
         to_indices = np.asarray(dataset_to_indices, dtype=np.int64)
@@ -124,6 +139,19 @@ class EpisodeAwareSampler:
         self._priority_positions = self._resolve_priority_positions(priority_frame_indices)
         if priority_fraction > 0.0 and len(self._priority_positions) == 0:
             raise ValueError("priority_fraction is nonzero but no priority frames remain in the sampler")
+        self._sampling_weights = None
+        if static_sampling_enabled:
+            interior_positions = self._resolve_priority_positions(interior_static_frame_indices)
+            terminal_positions = self._resolve_priority_positions(terminal_static_frame_indices)
+            overlap = np.intersect1d(interior_positions, terminal_positions, assume_unique=True)
+            if len(overlap):
+                raise ValueError("interior and terminal static frame pools overlap")
+            weights = np.ones(self._num_frames, dtype=np.float64)
+            weights[interior_positions] = interior_static_weight
+            weights[terminal_positions] = terminal_static_weight
+            if not np.any(weights > 0.0):
+                raise ValueError("static-horizon weights remove every eligible frame")
+            self._sampling_weights = weights
         self._source_positions = self._resolve_source_positions(source_episode_indices, source_weights)
 
     def _resolve_source_positions(
@@ -169,8 +197,7 @@ class EpisodeAwareSampler:
         if claimed != eligible_episodes:
             missing = sorted(eligible_episodes - claimed)
             raise ValueError(
-                "source episode groups must partition all eligible episodes; "
-                f"missing={missing[:10]}"
+                f"source episode groups must partition all eligible episodes; missing={missing[:10]}"
             )
         self._source_priority_positions = [
             np.intersect1d(positions, self._priority_positions, assume_unique=True)
@@ -205,6 +232,16 @@ class EpisodeAwareSampler:
             self._source_positions, self._source_priority_positions, counts, strict=True
         ):
             source_pool = torch.from_numpy(positions)
+            if self._sampling_weights is not None:
+                weights = torch.from_numpy(self._sampling_weights[positions])
+                selected = torch.multinomial(
+                    weights,
+                    int(count),
+                    replacement=True,
+                    generator=generator,
+                )
+                source_parts.append(source_pool[selected])
+                continue
             priority_count = round(int(count) * self.priority_fraction)
             uniform_count = int(count) - priority_count
             uniform = self._draw_from_pool(source_pool, uniform_count, generator)
@@ -280,6 +317,13 @@ class EpisodeAwareSampler:
             generator = self._epoch_generator(epoch)
             if self._source_positions is not None:
                 order = self._mixture_order(generator)
+            elif self._sampling_weights is not None:
+                order = torch.multinomial(
+                    torch.from_numpy(self._sampling_weights),
+                    self._num_frames,
+                    replacement=True,
+                    generator=generator,
+                )
             elif self.priority_fraction == 0.0:
                 order = torch.randperm(self._num_frames, generator=generator)
             else:

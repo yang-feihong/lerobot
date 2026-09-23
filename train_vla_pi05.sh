@@ -100,11 +100,14 @@ training_rtc_delay_distribution="uniform"
 batch_size_per_gpu="2"
 global_batch_size="48"
 num_workers="4"
-motion_balanced_sampling="true"
+motion_balanced_sampling="false" # legacy-only; new runs use static-horizon sampling below
 motion_priority_fraction="0.5"
 motion_ee_translation_threshold_m="0.05"
 motion_ee_rotation_threshold_rad="0.17453292519943295"
 motion_gripper_change_threshold="0.5"
+static_horizon_sampling="true"
+interior_static_weight="0.0"
+terminal_static_weight="1.0" # increase above 1.0 to strengthen terminal holds
 dataset_mixture_sampling="false"
 dataset_mixture_manifest=""
 # A mixture manifest describes source membership in a losslessly merged dataset:
@@ -132,6 +135,10 @@ output_root="/data/b2_z1_vla_pi05_outputs"
 # optimizer, scheduler, RNG, data-order and W&B run state are restored.
 resume_checkpoint=""
 resume_with_updated_dataset="false"
+# Set a basename to fork the saved model/optimizer/scheduler state into a new
+# output directory and a new W&B run. Empty keeps the historical in-place
+# resume behavior.
+resume_new_run_name=""
 
 # Used only when finetune_mode="lora". Action expert/projections are full fine-tuned;
 # PaliGemma/VLM backbone uses LoRA. In non-MEM mode, unfrozen ViT also uses LoRA.
@@ -149,10 +156,17 @@ mem_vit_finetune_mode="auto"
 
 # Choose one MEM window mode when enable_mem="true".
 mem_fixed_num_frames="6"
-mem_random_min_num_frames=""
-mem_random_max_num_frames=""
+mem_random_min_num_frames="1"
+mem_random_max_num_frames="6"
 # MEM image sampling interval in seconds.
 mem_frame_interval_seconds="0.5"
+# Training samples one shared interval bias per history window, then samples
+# every adjacent frame gap independently around it.
+mem_random_interval_sampling="true"
+mem_global_interval_std_seconds="0.15"
+mem_local_interval_std_seconds="0.05"
+mem_min_interval_seconds="0.25"
+mem_max_interval_seconds="1.0"
 # "text": current state in the prompt; "continuous": linear state-history tokens.
 state_action_encoding="text"
 # With 50 Hz data, 13 samples at 0.04 s intervals cover 0.48 s.
@@ -180,6 +194,9 @@ motion_priority_fraction_explicit="false"
 motion_ee_translation_threshold_m_explicit="false"
 motion_ee_rotation_threshold_rad_explicit="false"
 motion_gripper_change_threshold_explicit="false"
+static_horizon_sampling_explicit="false"
+interior_static_weight_explicit="false"
+terminal_static_weight_explicit="false"
 dataset_mixture_sampling_explicit="false"
 dataset_mixture_manifest_explicit="false"
 training_rtc_explicit="false"
@@ -237,6 +254,14 @@ while (( $# > 0 )); do
       ;;
     --freeze-vision-encoder=*) freeze_vision_encoder="${1#*=}" ;;
     --mem-vit-checkpoint=*) mem_vit_checkpoint="${1#*=}" ;;
+    --mem-random-min-num-frames=*) mem_random_min_num_frames="${1#*=}" ;;
+    --mem-random-max-num-frames=*) mem_random_max_num_frames="${1#*=}" ;;
+    --mem-frame-interval-seconds=*) mem_frame_interval_seconds="${1#*=}" ;;
+    --mem-random-interval-sampling=*) mem_random_interval_sampling="${1#*=}" ;;
+    --mem-global-interval-std-seconds=*) mem_global_interval_std_seconds="${1#*=}" ;;
+    --mem-local-interval-std-seconds=*) mem_local_interval_std_seconds="${1#*=}" ;;
+    --mem-min-interval-seconds=*) mem_min_interval_seconds="${1#*=}" ;;
+    --mem-max-interval-seconds=*) mem_max_interval_seconds="${1#*=}" ;;
     --lora-rank=*) lora_rank="${1#*=}" ;;
     --lora-alpha=*) lora_alpha="${1#*=}" ;;
     --base-policy=*) base_policy="${1#*=}" ;;
@@ -267,6 +292,9 @@ while (( $# > 0 )); do
     --motion-ee-translation-threshold-m=*) motion_ee_translation_threshold_m="${1#*=}"; motion_ee_translation_threshold_m_explicit="true" ;;
     --motion-ee-rotation-threshold-rad=*) motion_ee_rotation_threshold_rad="${1#*=}"; motion_ee_rotation_threshold_rad_explicit="true" ;;
     --motion-gripper-change-threshold=*) motion_gripper_change_threshold="${1#*=}"; motion_gripper_change_threshold_explicit="true" ;;
+    --static-horizon-sampling=*) static_horizon_sampling="${1#*=}"; static_horizon_sampling_explicit="true" ;;
+    --interior-static-weight=*) interior_static_weight="${1#*=}"; interior_static_weight_explicit="true" ;;
+    --terminal-static-weight=*) terminal_static_weight="${1#*=}"; terminal_static_weight_explicit="true" ;;
     --dataset-mixture-sampling=*) dataset_mixture_sampling="${1#*=}"; dataset_mixture_sampling_explicit="true" ;;
     --dataset-mixture-manifest=*) dataset_mixture_manifest="${1#*=}"; dataset_mixture_manifest_explicit="true" ;;
     --finetune-mode=*) finetune_mode="${1#*=}" ;;
@@ -304,6 +332,7 @@ while (( $# > 0 )); do
     --wandb-enable=*) wandb_enable="${1#*=}" ;;
     --resume-checkpoint=*) resume_checkpoint="${1#*=}" ;;
     --resume-with-updated-dataset=*) resume_with_updated_dataset="${1#*=}" ;;
+    --resume-new-run-name=*) resume_new_run_name="${1#*=}" ;;
     --dry-run=*) dry_run="${1#*=}" ;;
     *)
       echo "Unknown argument: $1" >&2
@@ -469,6 +498,19 @@ if [[ -n "$resume_checkpoint" ]]; then
     --resume=true
     --resume_with_updated_dataset="$resume_with_updated_dataset"
   )
+  if [[ -n "$resume_new_run_name" ]]; then
+    if [[ "$resume_new_run_name" == */* || ! "$resume_new_run_name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+      echo "--resume-new-run-name must be a safe directory basename, got $resume_new_run_name" >&2
+      exit 2
+    fi
+    output_dir="$output_root/$resume_new_run_name"
+    job_name="$resume_new_run_name"
+    if [[ -e "$output_dir" ]]; then
+      echo "Forked resume output already exists: $output_dir" >&2
+      exit 1
+    fi
+    resume_args+=(--wandb.resume_training_run=false)
+  fi
   policy_source_args=()
   log_file="$log_dir/${job_name}_resume_${timestamp}.log"
   pid_file="$log_dir/${job_name}_resume_${timestamp}.pid"
@@ -563,6 +605,11 @@ if [[ "$enable_mem" == "true" && -z "$resume_checkpoint" ]]; then
   policy_mem_args+=(--policy.mem_vit_checkpoint="$mem_vit_checkpoint")
   policy_mem_args+=(--policy.mem_vit_finetune_mode="$mem_vit_finetune_mode")
   policy_mem_args+=(--policy.mem_vit_frame_interval_seconds="$mem_frame_interval_seconds")
+  policy_mem_args+=(--policy.mem_vit_random_interval_sampling="$mem_random_interval_sampling")
+  policy_mem_args+=(--policy.mem_vit_global_interval_std_seconds="$mem_global_interval_std_seconds")
+  policy_mem_args+=(--policy.mem_vit_local_interval_std_seconds="$mem_local_interval_std_seconds")
+  policy_mem_args+=(--policy.mem_vit_min_interval_seconds="$mem_min_interval_seconds")
+  policy_mem_args+=(--policy.mem_vit_max_interval_seconds="$mem_max_interval_seconds")
   if [[ -n "$mem_random_min_num_frames" || -n "$mem_random_max_num_frames" ]]; then
     if [[ -z "$mem_random_min_num_frames" || -z "$mem_random_max_num_frames" ]]; then
       echo "mem_random_min_num_frames and mem_random_max_num_frames must be set together." >&2
@@ -617,12 +664,19 @@ sampling_args=()
 if [[ -z "$resume_checkpoint" ]]; then
   sampling_args+=(
     --motion_balanced_sampling.enabled="$motion_balanced_sampling"
-    --motion_balanced_sampling.priority_fraction="$motion_priority_fraction"
-    --motion_balanced_sampling.ee_translation_threshold_m="$motion_ee_translation_threshold_m"
-    --motion_balanced_sampling.ee_rotation_threshold_rad="$motion_ee_rotation_threshold_rad"
-    --motion_balanced_sampling.gripper_change_threshold="$motion_gripper_change_threshold"
+    --static_horizon_sampling.enabled="$static_horizon_sampling"
+    --static_horizon_sampling.interior_weight="$interior_static_weight"
+    --static_horizon_sampling.terminal_weight="$terminal_static_weight"
     --dataset_mixture_sampling.enabled="$dataset_mixture_sampling"
   )
+  if [[ "$motion_balanced_sampling" == "true" ]]; then
+    sampling_args+=(
+      --motion_balanced_sampling.priority_fraction="$motion_priority_fraction"
+      --motion_balanced_sampling.ee_translation_threshold_m="$motion_ee_translation_threshold_m"
+      --motion_balanced_sampling.ee_rotation_threshold_rad="$motion_ee_rotation_threshold_rad"
+      --motion_balanced_sampling.gripper_change_threshold="$motion_gripper_change_threshold"
+    )
+  fi
   if [[ "$dataset_mixture_sampling" == "true" ]]; then
     [[ -n "$dataset_mixture_manifest" ]] || { echo "--dataset-mixture-manifest is required" >&2; exit 2; }
     sampling_args+=(--dataset_mixture_sampling.manifest_path="$dataset_mixture_manifest")
@@ -633,6 +687,9 @@ else
   [[ "$motion_ee_translation_threshold_m_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.ee_translation_threshold_m="$motion_ee_translation_threshold_m")
   [[ "$motion_ee_rotation_threshold_rad_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.ee_rotation_threshold_rad="$motion_ee_rotation_threshold_rad")
   [[ "$motion_gripper_change_threshold_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.gripper_change_threshold="$motion_gripper_change_threshold")
+  [[ "$static_horizon_sampling_explicit" == "false" ]] || sampling_args+=(--static_horizon_sampling.enabled="$static_horizon_sampling")
+  [[ "$interior_static_weight_explicit" == "false" ]] || sampling_args+=(--static_horizon_sampling.interior_weight="$interior_static_weight")
+  [[ "$terminal_static_weight_explicit" == "false" ]] || sampling_args+=(--static_horizon_sampling.terminal_weight="$terminal_static_weight")
   [[ "$dataset_mixture_sampling_explicit" == "false" ]] || sampling_args+=(--dataset_mixture_sampling.enabled="$dataset_mixture_sampling")
   [[ "$dataset_mixture_manifest_explicit" == "false" ]] || sampling_args+=(--dataset_mixture_sampling.manifest_path="$dataset_mixture_manifest")
 fi
@@ -846,10 +903,11 @@ else
   echo "Image source:     restored from checkpoint unless explicitly overridden"
 fi
 if [[ -z "$resume_checkpoint" ]]; then
-  echo "Motion sampling:  enabled=$motion_balanced_sampling, priority=$motion_priority_fraction, translation=${motion_ee_translation_threshold_m}m, rotation=${motion_ee_rotation_threshold_rad}rad, gripper=$motion_gripper_change_threshold"
+  echo "Motion sampling:  legacy enabled=$motion_balanced_sampling"
+  echo "Static horizons:  enabled=$static_horizon_sampling, interior_weight=$interior_static_weight, terminal_weight=$terminal_static_weight"
   echo "Dataset mixture:  enabled=$dataset_mixture_sampling, manifest=${dataset_mixture_manifest:-none}"
 else
-  echo "Motion sampling:  restored from checkpoint unless explicitly overridden"
+  echo "Sampling:         restored from checkpoint unless explicitly overridden"
 fi
 if [[ -z "$resume_checkpoint" ]]; then
   echo "Action timing:    ${control_frequency_hz}Hz, chunk=$action_chunk_size, execute=$action_steps_to_execute (dt derived automatically)"

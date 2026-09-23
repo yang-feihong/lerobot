@@ -58,6 +58,7 @@ from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
 from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.datasets.mixture_sampling import load_dataset_mixture_manifest
 from lerobot.datasets.motion_balanced_sampling import build_motion_priority_pool
+from lerobot.datasets.static_horizon_sampling import build_static_horizon_pool
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -601,10 +602,7 @@ def configure_action_bool_balance(
                 applicable = np.ones(len(actions), dtype=bool)
                 if name != "task_complete":
                     applicable = actions[:, completion_dim] <= 0
-                if (
-                    name == "gripper_target"
-                    and policy_cfg.action_gripper_target_true_side == "negative"
-                ):
+                if name == "gripper_target" and policy_cfg.action_gripper_target_true_side == "negative":
                     target_true = actions[:, dim] < 0
                 else:
                     target_true = actions[:, dim] > 0
@@ -632,10 +630,22 @@ def configure_action_bool_balance(
         }
 
     saved_fractions = dict(policy_cfg.action_bool_true_fractions)
-    if cfg.resume and saved_fractions and saved_fractions != true_fractions:
+    if (
+        cfg.resume
+        and not cfg.resume_with_updated_dataset
+        and saved_fractions
+        and saved_fractions != true_fractions
+    ):
         raise ValueError(
             "Resume train-split boolean priors disagree with the checkpoint: "
             f"checkpoint={saved_fractions}, current={true_fractions}"
+        )
+    if cfg.resume and cfg.resume_with_updated_dataset and saved_fractions != true_fractions:
+        logging.warning(
+            "Resuming with an explicitly updated dataset: replacing checkpoint boolean priors "
+            "(%s) with freshly measured train-split priors (%s)",
+            saved_fractions,
+            true_fractions,
         )
     policy_cfg.action_bool_true_fractions = true_fractions
     return stats
@@ -1095,6 +1105,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if not cfg.dataset.streaming:
         priority_frame_indices = None
         priority_fraction = 0.0
+        interior_static_frame_indices = None
+        terminal_static_frame_indices = None
+        interior_static_weight = 1.0
+        terminal_static_weight = 1.0
         if cfg.motion_balanced_sampling.enabled:
             if not isinstance(active_cfg, PI05Config):
                 raise ValueError("Motion-balanced sampling currently requires a PI0.5 policy")
@@ -1138,6 +1152,44 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     pool.gripper_frames,
                     100.0 * priority_fraction,
                 )
+        if cfg.static_horizon_sampling.enabled:
+            if not isinstance(active_cfg, PI05Config):
+                raise ValueError("Static-horizon sampling currently requires a PI0.5 policy")
+            from lerobot.policies.pi05.b2_action_transform import action_sample_offsets
+
+            offsets = action_sample_offsets(
+                active_cfg.chunk_size,
+                float(dataset.meta.fps),
+                float(active_cfg.control_frequency_hz or dataset.meta.fps),
+            )
+            static_cfg = cfg.static_horizon_sampling
+            static_pool = None
+            if is_main_process:
+                static_pool = build_static_horizon_pool(
+                    dataset,
+                    horizon_frames=int(offsets[-1]) + 1,
+                    b2_tolerance=static_cfg.b2_tolerance,
+                    gripper_tolerance=static_cfg.gripper_tolerance,
+                )
+            from accelerate.utils import broadcast_object_list
+
+            static_pool = broadcast_object_list([static_pool])[0]
+            if static_pool is None:
+                raise RuntimeError("Failed to broadcast the static-horizon pools")
+            interior_static_frame_indices = static_pool.interior_frame_indices
+            terminal_static_frame_indices = static_pool.terminal_frame_indices
+            interior_static_weight = static_cfg.interior_weight
+            terminal_static_weight = static_cfg.terminal_weight
+            if is_main_process:
+                logging.info(
+                    "Static-horizon sampling: interior=%d/%d weight=%.3f; terminal=%d/%d weight=%.3f",
+                    len(static_pool.interior_frame_indices),
+                    static_pool.total_frames,
+                    interior_static_weight,
+                    len(static_pool.terminal_frame_indices),
+                    static_pool.total_frames,
+                    terminal_static_weight,
+                )
         # All non-streaming (map-style) datasets use EpisodeAwareSampler.
         # The order is a pure function of (seed, epoch), so every rank independently produces the
         # same permutation. accelerate then shards it disjointly across ranks via BatchSamplerShard
@@ -1167,6 +1219,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             absolute_to_relative_idx=dataset.absolute_to_relative_idx,
             priority_frame_indices=priority_frame_indices,
             priority_fraction=priority_fraction,
+            interior_static_frame_indices=interior_static_frame_indices,
+            terminal_static_frame_indices=terminal_static_frame_indices,
+            interior_static_weight=interior_static_weight,
+            terminal_static_weight=terminal_static_weight,
             source_episode_indices=(
                 [source.episode_indices for source in mixture_sources] if mixture_sources else None
             ),

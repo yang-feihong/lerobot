@@ -15,11 +15,14 @@
 # limitations under the License.
 """Contract tests for DatasetReader."""
 
+from random import Random
+
 import pytest
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
 from lerobot.datasets.dataset_reader import DatasetReader
+from lerobot.datasets.temporal_history import RandomHistorySamplingConfig
 from lerobot.utils.import_utils import get_safe_default_video_backend
 
 # ── Loading ──────────────────────────────────────────────────────────
@@ -83,6 +86,33 @@ def test_num_episodes_without_filter(tmp_path, lerobot_dataset_factory):
         root=tmp_path / "ds", total_episodes=3, total_frames=60, use_videos=False
     )
     assert dataset.reader.num_episodes == dataset.meta.total_episodes
+
+
+def test_random_history_uses_one_shared_clock_for_all_cameras(tmp_path, lerobot_dataset_factory):
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "ds", total_episodes=1, total_frames=200, use_videos=False
+    )
+    camera_keys = ("observation.images.base", "observation.images.wrist")
+    sampling = RandomHistorySamplingConfig(
+        keys=camera_keys,
+        num_frames=6,
+        fps=50,
+        nominal_interval_seconds=0.5,
+        global_interval_std_seconds=0.15,
+        local_interval_std_seconds=0.05,
+        min_interval_seconds=0.25,
+        max_interval_seconds=1.0,
+    )
+    reader = dataset.reader
+    reader.delta_indices = {key: [-125, -100, -75, -50, -25, 0] for key in camera_keys}
+    reader._random_history_sampling = sampling
+    reader._random_history_rng = Random(17)
+
+    query_indices, padding = reader._get_query_indices(abs_idx=150, ep_idx=0)
+
+    assert query_indices[camera_keys[0]] == query_indices[camera_keys[1]]
+    assert padding[f"{camera_keys[0]}_is_pad"].tolist() == [False] * 6
+    assert padding[f"{camera_keys[1]}_is_pad"].tolist() == [False] * 6
 
 
 def test_num_frames_with_episode_filter(tmp_path, lerobot_dataset_factory):

@@ -191,6 +191,37 @@ class Pi05ActionRepresentationProcessorStep(ProcessorStep):
     state_indices: tuple[int, ...] = ()
     state_history_length: int = 1
     keep_state_history: bool = False
+    supervise_terminal_static_padding: bool = True
+
+    @staticmethod
+    def _terminal_static_padding_mask(action: torch.Tensor, is_pad: torch.Tensor) -> torch.Tensor:
+        """Unmask trailing repetitions of a legal terminal hold command."""
+        if action.shape[:-1] != is_pad.shape:
+            raise ValueError(
+                f"Action/padding shapes do not align: action={tuple(action.shape)}, "
+                f"is_pad={tuple(is_pad.shape)}"
+            )
+        if action.shape[-1] < 5:
+            raise ValueError("Terminal hold detection requires B2 velocity and arm-mode channels")
+        result = is_pad.to(dtype=torch.bool).clone()
+        flat_action = action.reshape(-1, action.shape[-2], action.shape[-1])
+        flat_pad = result.reshape(-1, result.shape[-1])
+        for row_action, row_pad in zip(flat_action, flat_pad, strict=True):
+            padded = torch.nonzero(row_pad, as_tuple=False).flatten()
+            if len(padded) == 0:
+                continue
+            first_pad = int(padded[0])
+            if first_pad == 0 or not bool(row_pad[first_pad:].all()):
+                continue
+            final = row_action[first_pad - 1]
+            legal_hold = (
+                bool(torch.all(torch.abs(final[:3]) <= 1.0e-6))
+                and bool(final[3] >= 0.5)
+                and bool(final[4] < 0.5)
+            )
+            if legal_hold:
+                row_pad[first_pad:] = False
+        return result
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         new_transition = transition.copy()
@@ -198,6 +229,15 @@ class Pi05ActionRepresentationProcessorStep(ProcessorStep):
         if action is not None and not isinstance(action, torch.Tensor):
             raise ValueError(f"B2 action schema expects a tensor action, got {type(action)}")
         if not self.inverse and action is not None:
+            complementary = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {})
+            pad_key = f"{ACTION}_is_pad"
+            is_pad = complementary.get(pad_key)
+            if self.supervise_terminal_static_padding and is_pad is not None:
+                if not isinstance(is_pad, torch.Tensor):
+                    raise ValueError(f"{pad_key} must be a tensor, got {type(is_pad)}")
+                is_pad = self._terminal_static_padding_mask(action, is_pad)
+                complementary[pad_key] = is_pad
+                new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary
             action = select_dataset_action_supervision(
                 action,
                 source=self.ee_supervision_source,
@@ -234,7 +274,7 @@ class Pi05ActionRepresentationProcessorStep(ProcessorStep):
                 representation=self.representation,
             )
         else:
-            complementary = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
+            complementary = new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
             is_pad = complementary.get(f"{ACTION}_is_pad")
             transformed = encode_b2_action_chunk(
                 action,
@@ -287,6 +327,7 @@ class Pi05ActionRepresentationProcessorStep(ProcessorStep):
             "state_indices": list(self.state_indices),
             "state_history_length": self.state_history_length,
             "keep_state_history": self.keep_state_history,
+            "supervise_terminal_static_padding": self.supervise_terminal_static_padding,
         }
 
 
@@ -332,6 +373,7 @@ def reconcile_pi05_action_representation_processors(
         predict_ee_pose=config.action_predict_ee_pose,
         predict_gripper=config.action_predict_gripper,
         include_task_complete=config.action_predict_task_complete,
+        supervise_terminal_static_padding=config.action_supervise_terminal_static_padding,
     )
     steps = [
         desired_pre_step if isinstance(step, Pi05ActionRepresentationProcessorStep) else step
@@ -556,6 +598,7 @@ def make_pi05_pre_post_processors(
                 predict_ee_pose=config.action_predict_ee_pose,
                 predict_gripper=config.action_predict_gripper,
                 include_task_complete=config.action_predict_task_complete,
+                supervise_terminal_static_padding=config.action_supervise_terminal_static_padding,
             ),
         )
 

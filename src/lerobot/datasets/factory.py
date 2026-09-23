@@ -30,6 +30,7 @@ from .lerobot_dataset import LeRobotDataset
 from .mixture_sampling import load_dataset_mixture_manifest
 from .multi_dataset import MultiLeRobotDataset
 from .streaming_dataset import StreamingLeRobotDataset
+from .temporal_history import RandomHistorySamplingConfig
 
 HEIGHT_INVARIANT_EE_STATE_KEY = "observation.height_invariant_ee_state"
 
@@ -155,6 +156,35 @@ def resolve_delta_timestamps(
     return delta_timestamps
 
 
+def resolve_random_history_sampling(
+    cfg: PreTrainedConfig | RewardModelConfig,
+    ds_meta: LeRobotDatasetMetadata,
+    *,
+    seed: int,
+) -> RandomHistorySamplingConfig | None:
+    """Resolve training-only hierarchical MEM image-history sampling."""
+    if not bool(getattr(cfg, "mem_vit_random_interval_sampling", False)):
+        return None
+
+    image_features = cfg.image_features
+    keys = tuple(
+        key
+        for key in ds_meta.camera_keys
+        if key.startswith(OBS_IMAGES) and (not image_features or key in image_features)
+    )
+    return RandomHistorySamplingConfig(
+        keys=keys,
+        num_frames=int(cfg.mem_vit_num_frames),
+        fps=float(ds_meta.fps),
+        nominal_interval_seconds=float(cfg.mem_vit_frame_interval_seconds),
+        global_interval_std_seconds=float(cfg.mem_vit_global_interval_std_seconds),
+        local_interval_std_seconds=float(cfg.mem_vit_local_interval_std_seconds),
+        min_interval_seconds=float(cfg.mem_vit_min_interval_seconds),
+        max_interval_seconds=float(cfg.mem_vit_max_interval_seconds),
+        seed=seed,
+    )
+
+
 def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
@@ -176,6 +206,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
         delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, ds_meta)
+        random_history_sampling = resolve_random_history_sampling(
+            cfg.trainable_config, ds_meta, seed=cfg.seed
+        )
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
@@ -193,8 +226,11 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 sim_image_root=cfg.dataset.sim_image_root,
                 mixed_sim_probability=cfg.dataset.mixed_sim_probability,
                 image_source_seed=cfg.dataset.image_source_seed,
+                random_history_sampling=random_history_sampling,
             )
         else:
+            if random_history_sampling is not None:
+                raise ValueError("Random MEM history intervals are not supported by streaming datasets")
             dataset = StreamingLeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
@@ -283,6 +319,9 @@ def make_train_eval_datasets(
     )
 
     delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, full_dataset.meta)
+    random_history_sampling = resolve_random_history_sampling(
+        cfg.trainable_config, full_dataset.meta, seed=cfg.seed
+    )
 
     train_image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
@@ -303,6 +342,7 @@ def make_train_eval_datasets(
         sim_image_root=cfg.dataset.sim_image_root,
         mixed_sim_probability=cfg.dataset.mixed_sim_probability,
         image_source_seed=cfg.dataset.image_source_seed,
+        random_history_sampling=random_history_sampling,
     )
 
     eval_dataset = LeRobotDataset(

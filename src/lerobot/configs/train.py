@@ -62,6 +62,38 @@ class MotionBalancedSamplingConfig:
 
 
 @dataclass
+class StaticHorizonSamplingConfig:
+    """Sampling weights for complete static action horizons.
+
+    A terminal static horizon is a legal hold that continues to the end of an
+    episode, including virtual right padding. An interior static horizon is a
+    complete static chunk followed by later motion in the same episode.
+    """
+
+    enabled: bool = False
+    interior_weight: float = 0.0
+    terminal_weight: float = 1.0
+    b2_tolerance: float = 1.0e-6
+    gripper_tolerance: float = 1.0e-6
+
+    def validate(self) -> None:
+        if not 0.0 <= self.interior_weight <= 1.0:
+            raise ValueError(
+                f"static_horizon_sampling.interior_weight must be in [0, 1], got {self.interior_weight}"
+            )
+        if self.terminal_weight <= 0.0:
+            raise ValueError(
+                f"static_horizon_sampling.terminal_weight must be > 0, got {self.terminal_weight}"
+            )
+        for name, value in (
+            ("b2_tolerance", self.b2_tolerance),
+            ("gripper_tolerance", self.gripper_tolerance),
+        ):
+            if value < 0.0:
+                raise ValueError(f"static_horizon_sampling.{name} must be >= 0, got {value}")
+
+
+@dataclass
 class DatasetMixtureSamplingConfig:
     """Sample logical source datasets from one losslessly merged dataset at fixed ratios.
 
@@ -180,6 +212,7 @@ class TrainPipelineConfig(HubMixin):
     motion_balanced_sampling: MotionBalancedSamplingConfig = field(
         default_factory=MotionBalancedSamplingConfig
     )
+    static_horizon_sampling: StaticHorizonSamplingConfig = field(default_factory=StaticHorizonSamplingConfig)
     dataset_mixture_sampling: DatasetMixtureSamplingConfig = field(
         default_factory=DatasetMixtureSamplingConfig
     )
@@ -337,6 +370,9 @@ class TrainPipelineConfig(HubMixin):
                 f"got {self.keep_checkpoint_every_n_steps}"
             )
         self.motion_balanced_sampling.validate()
+        self.static_horizon_sampling.validate()
+        if self.motion_balanced_sampling.enabled and self.static_horizon_sampling.enabled:
+            raise ValueError("motion_balanced_sampling and static_horizon_sampling cannot both be enabled")
         self.dataset_mixture_sampling.validate()
         if self.dataset_mixture_sampling.enabled and self.dataset.streaming:
             raise ValueError("dataset mixture sampling is not supported for streaming datasets")

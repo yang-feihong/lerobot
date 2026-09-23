@@ -99,6 +99,10 @@ class PI05Config(PreTrainedConfig):
     ee_state_anchor_indices: list[int] | None = None
     ee_delta_supervision_mode: str = "all"
     gripper_target_representation: str = "continuous_position"
+    # A legal terminal hold is continued through the right-padded portion of
+    # the action horizon and remains supervised. Non-static endings and
+    # observation/history padding remain masked.
+    action_supervise_terminal_static_padding: bool = True
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
@@ -199,6 +203,14 @@ class PI05Config(PreTrainedConfig):
     # Physical history interval. When set, the loader resolves frame_stride
     # against each dataset's native FPS instead of treating rows as time.
     mem_vit_frame_interval_seconds: float | None = 0.5
+    # Training-only hierarchical history timing augmentation. A sample-level
+    # base interval models systematic speed bias; per-gap jitter models local
+    # timing variation. Deployment keeps the nominal interval above.
+    mem_vit_random_interval_sampling: bool = False
+    mem_vit_global_interval_std_seconds: float = 0.15
+    mem_vit_local_interval_std_seconds: float = 0.05
+    mem_vit_min_interval_seconds: float = 0.25
+    mem_vit_max_interval_seconds: float = 1.0
     mem_vit_temporal_every: int = 4
     mem_vit_use_original_for_k1: bool = True
     state_action_encoding: str = "text"
@@ -405,6 +417,25 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 f"mem_vit_frame_interval_seconds must be positive, got {self.mem_vit_frame_interval_seconds}"
             )
+        if self.mem_vit_random_interval_sampling:
+            if not self.mem_vit_enabled:
+                raise ValueError("Random MEM history intervals require mem_vit_enabled=true")
+            if self.mem_vit_frame_interval_seconds is None:
+                raise ValueError("Random MEM history intervals require a nominal frame interval")
+            if self.mem_vit_global_interval_std_seconds < 0:
+                raise ValueError("mem_vit_global_interval_std_seconds must be non-negative")
+            if self.mem_vit_local_interval_std_seconds < 0:
+                raise ValueError("mem_vit_local_interval_std_seconds must be non-negative")
+            if self.mem_vit_min_interval_seconds <= 0:
+                raise ValueError("mem_vit_min_interval_seconds must be positive")
+            if self.mem_vit_max_interval_seconds < self.mem_vit_min_interval_seconds:
+                raise ValueError("mem_vit_max_interval_seconds must be >= mem_vit_min_interval_seconds")
+            if not (
+                self.mem_vit_min_interval_seconds
+                <= self.mem_vit_frame_interval_seconds
+                <= self.mem_vit_max_interval_seconds
+            ):
+                raise ValueError("mem_vit_frame_interval_seconds must lie within the random interval bounds")
         if self.mem_vit_temporal_every < 1:
             raise ValueError(f"mem_vit_temporal_every must be >= 1, got {self.mem_vit_temporal_every}")
         if self.state_action_encoding not in {"text", "continuous"}:
@@ -711,12 +742,34 @@ class PI05Config(PreTrainedConfig):
                     "min_history_span_seconds": (
                         None
                         if image_history_interval is None
-                        else (min_history_frames - 1) * image_history_interval
+                        else (min_history_frames - 1) * (
+                            self.mem_vit_min_interval_seconds
+                            if self.mem_vit_random_interval_sampling
+                            else image_history_interval
+                        )
                     ),
                     "max_history_span_seconds": (
                         None
                         if image_history_interval is None
-                        else (max_history_frames - 1) * image_history_interval
+                        else (max_history_frames - 1) * (
+                            self.mem_vit_max_interval_seconds
+                            if self.mem_vit_random_interval_sampling
+                            else image_history_interval
+                        )
+                    ),
+                    **(
+                        {
+                            "training_interval_sampling": {
+                                "mode": "hierarchical_truncated_normal",
+                                "nominal_interval_seconds": image_history_interval,
+                                "global_interval_std_seconds": self.mem_vit_global_interval_std_seconds,
+                                "local_interval_std_seconds": self.mem_vit_local_interval_std_seconds,
+                                "min_interval_seconds": self.mem_vit_min_interval_seconds,
+                                "max_interval_seconds": self.mem_vit_max_interval_seconds,
+                            }
+                        }
+                        if self.mem_vit_random_interval_sampling
+                        else {}
                     ),
                 },
                 "state": {

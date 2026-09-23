@@ -30,6 +30,7 @@ from lerobot.utils.constants import HF_LEROBOT_HUB_CACHE
 from .dataset_metadata import CODEBASE_VERSION, LeRobotDatasetMetadata
 from .dataset_reader import DatasetReader
 from .dataset_writer import DatasetWriter
+from .temporal_history import RandomHistorySamplingConfig
 from .utils import (
     create_lerobot_dataset_card,
     get_safe_version,
@@ -70,6 +71,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         sim_image_root: str | Path | None = None,
         mixed_sim_probability: float = 0.5,
         image_source_seed: int = 0,
+        random_history_sampling: RandomHistorySamplingConfig | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -224,6 +226,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._sim_image_root = sim_image_root
         self._mixed_sim_probability = mixed_sim_probability
         self._image_source_seed = image_source_seed
+        self._random_history_sampling = random_history_sampling
 
         if self._requested_root is not None:
             self._requested_root.mkdir(exist_ok=True, parents=True)
@@ -269,6 +272,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             sim_image_root=self._sim_image_root,
             mixed_sim_probability=self._mixed_sim_probability,
             image_source_seed=self._image_source_seed,
+            random_history_sampling=self._random_history_sampling,
         )
         self.image_transforms = image_transforms
 
@@ -345,6 +349,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 sim_image_root=self._sim_image_root,
                 mixed_sim_probability=self._mixed_sim_probability,
                 image_source_seed=self._image_source_seed,
+                random_history_sampling=self._random_history_sampling,
             )
         return self.reader
 
