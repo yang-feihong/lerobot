@@ -57,6 +57,20 @@ def is_task_complete_deployment_metadata_extension(saved: dict[str, Any], curren
         return False
     if current_names != [*saved_names, "task_complete"]:
         return False
+    expected_completion_contract = {
+        "task_complete_deployment_behavior": (
+            None,
+            "stop_before_executing_later_chunk_elements_at_first_true",
+        ),
+        "task_complete_semantics": (
+            None,
+            "explicit_true_in_the_terminal_stage_hold",
+        ),
+    }
+    for key, (saved_value, current_value) in expected_completion_contract.items():
+        if saved_action.get(key) != saved_value or current_action.get(key) != current_value:
+            return False
+        saved_action[key] = current_value
     saved_predict["task_complete"] = True
     saved_action["model_names"] = current_names
     return saved == current

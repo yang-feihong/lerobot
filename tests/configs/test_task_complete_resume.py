@@ -9,11 +9,17 @@ def test_task_complete_metadata_extension_only_allows_appended_completion() -> N
         "action": {
             "model_names": ["b2_vx", "gripper_target"],
             "predict": {"gripper": True, "task_complete": False},
+            "task_complete_deployment_behavior": None,
+            "task_complete_semantics": None,
         },
     }
     extended = deepcopy(saved)
     extended["action"]["model_names"].append("task_complete")
     extended["action"]["predict"]["task_complete"] = True
+    extended["action"]["task_complete_deployment_behavior"] = (
+        "stop_before_executing_later_chunk_elements_at_first_true"
+    )
+    extended["action"]["task_complete_semantics"] = "explicit_true_in_the_terminal_stage_hold"
 
     assert is_task_complete_deployment_metadata_extension(saved, extended)
 
