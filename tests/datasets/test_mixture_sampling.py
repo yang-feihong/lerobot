@@ -11,14 +11,25 @@ def test_load_dataset_mixture_manifest_normalizes_weights(tmp_path):
         json.dumps(
             {
                 "sources": [
-                    {"name": "stage12", "weight": 80, "episode_range": [0, 3]},
-                    {"name": "stage2", "weight": 20, "episode_range": [3, 5]},
+                    {
+                        "name": "source_a",
+                        "semantic_type": "approach",
+                        "weight": 80,
+                        "episode_range": [0, 3],
+                    },
+                    {
+                        "name": "source_b",
+                        "semantic_type": "handle_press",
+                        "weight": 20,
+                        "episode_range": [3, 5],
+                    },
                 ]
             }
         )
     )
     sources = load_dataset_mixture_manifest(path, num_episodes=5)
     assert [source.weight for source in sources] == pytest.approx([0.8, 0.2])
+    assert [source.semantic_type for source in sources] == ["approach", "handle_press"]
     assert sources[0].episode_indices == [0, 1, 2]
     assert sources[1].episode_indices == [3, 4]
 

@@ -30,19 +30,38 @@ def test_gate_loss_uses_inactive_reset_and_completion_ground_truth_masks():
         b2_action_representation="pose_delta",
         z1_action_representation="ee_delta",
         action_feature_names=names,
+        training_rtc_config=None,
     )
     actions = -torch.ones(1, 5, 16)
     actions[0, :, 3] = torch.tensor([-1.0, 1.0, -1.0, -1.0, -1.0])
     actions[0, :, 4] = torch.tensor([-1.0, -1.0, 1.0, -1.0, -1.0])
     actions[0, :, 15] = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0])
     loss, info = policy._b2_z1_gate_action_loss(
-        torch.ones_like(actions), actions, "mean", ee_delta_is_valid=torch.ones(1, 5, dtype=torch.bool)
+        torch.ones_like(actions),
+        actions,
+        "mean",
+        ee_delta_is_valid=torch.ones(1, 5, dtype=torch.bool),
+        loss_semantic_ids=torch.tensor([0]),
+        loss_semantic_names=("approach", "handle_press", "traversal"),
     )
     assert torch.isfinite(loss)
     assert info["continuous_mask_frac/b2_pose_delta"] == pytest.approx(0.6)
     assert info["continuous_mask_frac/ee_pose"] == pytest.approx(0.2)
     assert info["gate_true_frac/task_complete"] == pytest.approx(0.4)
     assert "gate_loss/arm_teleop_inactive" in info
+    contribution_keys = ["loss_contribution/b2", "loss_contribution/z1"]
+    weight_keys = [key for key in info if key.startswith("loss_weight_fraction/")]
+    assert sum(info[key] for key in contribution_keys) == pytest.approx(loss.item())
+    assert sum(info[key] for key in weight_keys) == pytest.approx(1.0)
+    semantic_contribution_keys = [
+        f"loss_contribution/{semantic}/{domain}"
+        for semantic in ("approach", "handle_press", "traversal")
+        for domain in ("b2", "z1")
+    ]
+    assert sum(info[key] for key in semantic_contribution_keys) == pytest.approx(loss.item())
+    assert info["loss_semantic_fraction/approach"] == pytest.approx(1.0)
+    assert info["loss_semantic_fraction/handle_press"] == pytest.approx(0.0)
+    assert info["loss_semantic_fraction/traversal"] == pytest.approx(0.0)
 
 
 def test_gate_loss_rejects_overlapping_arm_modes():
@@ -60,6 +79,7 @@ def test_gate_loss_rejects_overlapping_arm_modes():
         b2_action_representation="pose_delta",
         z1_action_representation="ee_delta",
         action_feature_names=names,
+        training_rtc_config=None,
     )
     actions = -torch.ones(1, 2, len(names))
     actions[0, 0, names.index("arm_teleop_inactive")] = 1.0
@@ -89,6 +109,7 @@ def test_disabling_inactive_prediction_removes_its_output_and_ee_mask():
         b2_action_representation="pose_delta",
         z1_action_representation="ee_delta",
         action_feature_names=names,
+        training_rtc_config=None,
     )
     actions = -torch.ones(1, 3, 15)
     loss, info = policy._b2_z1_gate_action_loss(

@@ -132,7 +132,9 @@ def _wandb_train_metrics(
         if source in tracker_metrics:
             grouped[destination] = tracker_metrics[source]
     for key, value in tracker_metrics.items():
-        if key not in tracker_groups and isinstance(value, int | float):
+        if key.startswith("loss_contribution/train/") and isinstance(value, int | float):
+            grouped[key] = value
+        elif key not in tracker_groups and isinstance(value, int | float):
             grouped[f"training_progress/{key}"] = value
     if not policy_metrics:
         return grouped
@@ -146,6 +148,9 @@ def _wandb_train_metrics(
         "gate_true_frac/": "discrete_action/target_fraction/",
         "gate_global_true_frac/": "discrete_action/global_target_fraction/",
         "gate_weight/": "discrete_action/class_weight/",
+        "loss_contribution/": "loss_contribution/train/",
+        "loss_weight_fraction/": "loss_weight_fraction/train/",
+        "loss_semantic_fraction/": "loss_semantic_fraction/train/",
         "sample_weight_": "sample_weighting/",
     }
     exact_groups = {
@@ -173,7 +178,11 @@ def _wandb_train_metrics(
         matched = False
         for prefix, destination in prefix_groups.items():
             if key.startswith(prefix):
-                grouped[destination + key.removeprefix(prefix)] = value
+                destination_key = destination + key.removeprefix(prefix)
+                # Semantic/domain train contributions are averaged by MetricsTracker over the
+                # complete log window and across ranks. Do not replace them with the final batch.
+                if destination_key not in grouped:
+                    grouped[destination_key] = value
                 matched = True
                 break
         if not matched:
@@ -194,7 +203,15 @@ def _wandb_train_metrics(
 def _is_eval_policy_metric(key: str, value: object) -> bool:
     return isinstance(value, int | float) and (
         key == "continuous_loss"
-        or key.startswith(("discrete_loss/", "discrete_accuracy/"))
+        or key.startswith(
+            (
+                "discrete_loss/",
+                "discrete_accuracy/",
+                "loss_contribution/",
+                "loss_weight_fraction/",
+                "loss_semantic_fraction/",
+            )
+        )
         or any(token in key for token in ("_pred_frac/", "_precision/", "_recall/"))
     )
 
@@ -218,6 +235,12 @@ def _wandb_eval_metrics(
             grouped[f"discrete_action/val_class_metrics/{key}"] = mean
         elif key == "continuous_loss":
             grouped["continuous_action/val_loss"] = mean
+        elif key.startswith("loss_contribution/"):
+            grouped[f"loss_contribution/val/{key.removeprefix('loss_contribution/')}"] = mean
+        elif key.startswith("loss_weight_fraction/"):
+            grouped[f"loss_weight_fraction/val/{key.removeprefix('loss_weight_fraction/')}"] = mean
+        elif key.startswith("loss_semantic_fraction/"):
+            grouped[f"loss_semantic_fraction/val/{key.removeprefix('loss_semantic_fraction/')}"] = mean
     for name, mean in (action_dimension_means or {}).items():
         grouped[f"action_dimensions/val/{name}"] = mean
     return grouped
@@ -294,6 +317,13 @@ def update_policy(
             else:
                 loss, output_dict = policy.forward(batch)
 
+            if output_dict is not None:
+                for output_key, value in output_dict.items():
+                    if output_key.startswith("loss_contribution/") and output_key.count("/") == 2:
+                        meter_key = f"loss_contribution/train/{output_key.removeprefix('loss_contribution/')}"
+                        if meter_key in train_metrics.metrics and isinstance(value, int | float):
+                            setattr(train_metrics, meter_key, float(value))
+
             # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
         # Use accelerator's backward method. Scale the loss so accumulated gradients
@@ -342,6 +372,51 @@ def _resolve_task_variants_path(dataset_root: Path, configured_path: str | None)
     return default_path if default_path.exists() else None
 
 
+_STAGE_SEMANTICS = {
+    "approach": "b2_approach",
+    "handle_press": "handle_press",
+    "traversal": "door_traversal",
+}
+
+
+def _validate_stage_task_variant_binding(dataset_root: Path, variants_path: Path) -> None:
+    info_path = dataset_root / "meta" / "info.json"
+    mixture_path = dataset_root / "meta" / "dataset_mixture.json"
+    info = json.loads(info_path.read_text()) if info_path.is_file() else {}
+    mixture = json.loads(mixture_path.read_text()) if mixture_path.is_file() else None
+    semantic_types = (
+        [str(source.get("semantic_type", "")) for source in mixture.get("sources", [])]
+        if mixture is not None
+        else [str(info.get("semantic_type") or "")]
+    )
+    staged_semantics = [value for value in semantic_types if value in _STAGE_SEMANTICS]
+    if not staged_semantics:
+        return
+
+    binding_path = dataset_root / "meta" / "task_variant_binding.json"
+    if not binding_path.is_file():
+        raise RuntimeError(
+            f"Staged dataset is missing {binding_path}; refusing to train with task variants "
+            "that may still be inherited from full episodes"
+        )
+    binding = json.loads(binding_path.read_text())
+    variants_sha = hashlib.sha256(variants_path.read_bytes()).hexdigest()
+    if binding.get("task_variants_sha256") != variants_sha:
+        raise RuntimeError(
+            "Staged dataset task variants do not match their hard binding: "
+            f"variants={variants_path} binding={binding_path}"
+        )
+
+    if mixture is None:
+        expected_stage = _STAGE_SEMANTICS[staged_semantics[0]]
+        if binding.get("binding") != "stage_annotations" or binding.get("expected_stage") != expected_stage:
+            raise RuntimeError(
+                f"Invalid stage binding for semantic_type={staged_semantics[0]!r}: {binding_path}"
+            )
+    elif binding.get("binding") != "stage_dataset_task_variants":
+        raise RuntimeError(f"Staged mixture is not bound to staged source datasets: {binding_path}")
+
+
 def load_task_variants(dataset_root: Path, configured_path: str | None) -> dict[int, list[str]]:
     """Load optional episode-level task rephrasings.
 
@@ -356,6 +431,7 @@ def load_task_variants(dataset_root: Path, configured_path: str | None) -> dict[
     path = _resolve_task_variants_path(dataset_root, configured_path)
     if path is None:
         return {}
+    _validate_stage_task_variant_binding(dataset_root, path)
 
     raw = json.loads(path.read_text())
     if isinstance(raw, dict) and "episodes" in raw and isinstance(raw["episodes"], dict):
@@ -448,6 +524,93 @@ def apply_task_variants_to_batch(
     if applied:
         batch["task"] = tasks
     return applied
+
+
+def build_episode_semantic_lookup(dataset, mixture_sources) -> tuple[torch.Tensor, tuple[str, ...]] | None:
+    """Resolve arbitrary loss semantics from mixture metadata, never from language text."""
+    if not mixture_sources:
+        semantic_type = dataset.meta.info.semantic_type
+        if not semantic_type:
+            logging.warning("Dataset has no semantic_type metadata; semantic loss metrics disabled")
+            return None
+        return torch.zeros(dataset.meta.total_episodes, dtype=torch.long), (semantic_type,)
+    semantic_names = tuple(dict.fromkeys(source.semantic_type for source in mixture_sources))
+    semantic_to_id = {name: index for index, name in enumerate(semantic_names)}
+    lookup = torch.full((dataset.meta.total_episodes,), -1, dtype=torch.long)
+    for source in mixture_sources:
+        lookup[source.episode_start : source.episode_stop] = semantic_to_id[source.semantic_type]
+    if bool((lookup < 0).any()):
+        logging.warning("Dataset semantic metadata does not cover every episode; metrics disabled")
+        return None
+    return lookup, semantic_names
+
+
+def attach_loss_semantics(
+    batch: dict[str, Any], episode_semantic_lookup: torch.Tensor | None, semantic_names: tuple[str, ...]
+) -> None:
+    if episode_semantic_lookup is None:
+        return
+    episode_indices = batch.get("episode_index")
+    if not isinstance(episode_indices, torch.Tensor):
+        raise ValueError("Semantic loss logging requires tensor episode_index values")
+    lookup = episode_semantic_lookup.to(device=episode_indices.device)
+    batch["loss_semantic_id"] = lookup[episode_indices.to(dtype=torch.long)]
+    batch["loss_semantic_names"] = semantic_names
+
+
+def select_balanced_eval_indices(
+    task_indices: np.ndarray,
+    max_samples: int,
+    *,
+    eligible_indices: list[int] | None = None,
+    source_indices: np.ndarray | None = None,
+    source_weights: dict[int, float] | None = None,
+) -> list[int]:
+    """Select time-spread validation frames from every task/source group."""
+    candidates = (
+        np.asarray(eligible_indices, dtype=np.int64)
+        if eligible_indices is not None
+        else np.arange(len(task_indices), dtype=np.int64)
+    )
+    if source_indices is not None and source_indices.shape != task_indices.shape:
+        raise ValueError("source_indices and task_indices must have the same shape")
+    group_keys = [
+        (int(source_indices[index]), int(task_indices[index]))
+        if source_indices is not None
+        else (int(task_indices[index]),)
+        for index in candidates
+    ]
+    unique_keys = sorted(set(group_keys))
+    if not unique_keys or max_samples <= 0:
+        return []
+    if source_weights is None:
+        normalized_weights = np.full(len(unique_keys), 1.0 / len(unique_keys))
+    else:
+        groups_per_source: dict[int, int] = {}
+        for key in unique_keys:
+            groups_per_source[key[0]] = groups_per_source.get(key[0], 0) + 1
+        raw_weights = np.asarray(
+            [source_weights[key[0]] / groups_per_source[key[0]] for key in unique_keys],
+            dtype=np.float64,
+        )
+        normalized_weights = raw_weights / raw_weights.sum()
+    exact_quotas = normalized_weights * max_samples
+    quotas = np.floor(exact_quotas).astype(np.int64)
+    remainder_order = np.argsort(-(exact_quotas - quotas), kind="stable")
+    quotas[remainder_order[: max_samples - int(quotas.sum())]] += 1
+    selected: list[int] = []
+    key_array = np.asarray(group_keys, dtype=np.int64)
+    for key, quota in zip(unique_keys, quotas.tolist(), strict=True):
+        if quota == 0:
+            continue
+        mask = np.all(key_array == np.asarray(key, dtype=np.int64), axis=1)
+        group_candidates = candidates[mask]
+        if len(group_candidates) <= quota:
+            selected.extend(group_candidates.tolist())
+            continue
+        positions = np.linspace(0, len(group_candidates) - 1, num=quota, dtype=np.int64)
+        selected.extend(group_candidates[positions].tolist())
+    return selected
 
 
 def resolve_task_complete_sampling(dataset, policy_cfg) -> tuple[list[int], dict[int, int]] | None:
@@ -1102,6 +1265,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
+    mixture_sources = None
     if not cfg.dataset.streaming:
         priority_frame_indices = None
         priority_fraction = 0.0
@@ -1195,7 +1359,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # same permutation. accelerate then shards it disjointly across ranks via BatchSamplerShard
         # without needing a `generator` attribute to synchronize an RNG, and resume is sample-exact.
         shuffle = False
-        mixture_sources = None
         if cfg.dataset_mixture_sampling.enabled:
             mixture_sources = load_dataset_mixture_manifest(
                 cfg.dataset_mixture_sampling.manifest_path,
@@ -1263,6 +1426,20 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         shuffle = True
         sampler = None
 
+    semantic_sources = mixture_sources
+    if semantic_sources is None:
+        dataset_mixture_path = dataset.root / "meta/dataset_mixture.json"
+        if dataset_mixture_path.is_file():
+            semantic_sources = load_dataset_mixture_manifest(
+                dataset_mixture_path,
+                num_episodes=dataset.meta.total_episodes,
+            )
+    semantic_metadata = build_episode_semantic_lookup(dataset, semantic_sources)
+    if semantic_metadata is None:
+        episode_semantic_lookup, semantic_names = None, ()
+    else:
+        episode_semantic_lookup, semantic_names = semantic_metadata
+
     # Only swap in the language-aware collate when the dataset actually
     # declares language columns; otherwise stay on PyTorch's default
     # collate so non-language training runs are unaffected.
@@ -1295,17 +1472,26 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             ).indices
         if cfg.max_eval_samples > 0 and hasattr(eval_dataset, "hf_dataset"):
             task_arr = eval_dataset.hf_dataset.data.column("task_index").to_numpy()
-            unique_tasks = sorted(set(task_arr.tolist()))
-            per_task = max(1, cfg.max_eval_samples // len(unique_tasks))
-            selected: list[int] = []
-            for t in unique_tasks:
-                candidates = (
-                    np.asarray(eligible_eval_indices, dtype=np.int64)
-                    if eligible_eval_indices is not None
-                    else np.arange(len(task_arr))
-                )
-                frames = candidates[task_arr[candidates] == t][:per_task]
-                selected.extend(frames.tolist())
+            source_arr = None
+            source_weights = None
+            if semantic_sources:
+                episode_arr = eval_dataset.hf_dataset.data.column("episode_index").to_numpy()
+                source_by_episode = np.full(eval_dataset.meta.total_episodes, -1, dtype=np.int64)
+                for source_index, source in enumerate(semantic_sources):
+                    source_by_episode[source.episode_start : source.episode_stop] = source_index
+                source_arr = source_by_episode[episode_arr]
+                if bool((source_arr < 0).any()):
+                    raise ValueError("Dataset mixture sources do not cover every validation episode")
+                source_weights = {
+                    source_index: source.weight for source_index, source in enumerate(semantic_sources)
+                }
+            selected = select_balanced_eval_indices(
+                task_arr,
+                cfg.max_eval_samples,
+                eligible_indices=eligible_eval_indices,
+                source_indices=source_arr,
+                source_weights=source_weights,
+            )
             eval_ds = torch.utils.data.Subset(eval_dataset, selected)
         elif eligible_eval_indices is not None:
             eval_ds = torch.utils.data.Subset(eval_dataset, eligible_eval_indices)
@@ -1361,6 +1547,17 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if torch.cuda.is_available():
         # max() because headroom is gated by the worst-case rank.
         train_metrics["gpu_mem_gb"] = AverageMeter("mem_gb", ":.2f", reduction="max")
+    semantic_loss_logging_enabled = (
+        episode_semantic_lookup is not None
+        and isinstance(active_cfg, PI05Config)
+        and active_cfg.discrete_action_training_mode == "continuous_flow"
+        and active_cfg.action_loss_schema not in {"off", "uniform_valid"}
+    )
+    if semantic_loss_logging_enabled:
+        for semantic_name in semantic_names:
+            for domain in ("b2", "z1"):
+                key = f"loss_contribution/train/{semantic_name}/{domain}"
+                train_metrics[key] = AverageMeter(key, ":.4f", reduction="mean")
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
     effective_batch_size = cfg.batch_size * cfg.gradient_accumulation_steps * accelerator.num_processes
@@ -1403,6 +1600,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 randomize=cfg.dataset.random_task_variant,
             )
             batch = preprocessor(batch)
+            attach_loss_semantics(batch, episode_semantic_lookup, semantic_names)
             train_tracker.dataloading_s = time.perf_counter() - start_time
 
             train_tracker, output_dict = update_policy(
@@ -1476,6 +1674,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                             randomize=False,
                         )
                     eval_batch = preprocessor(eval_batch)
+                    attach_loss_semantics(eval_batch, episode_semantic_lookup, semantic_names)
                     loss, eval_output = policy.forward(eval_batch)
                     eval_loss_sum += loss.item()
                     n_eval_batches += 1

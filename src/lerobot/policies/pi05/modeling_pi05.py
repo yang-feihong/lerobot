@@ -665,9 +665,7 @@ def _resolve_mem_vit_checkpoint(checkpoint_path: str | Path) -> Path:
             )
         return override_path
 
-    search_roots_value = os.environ.get(
-        "LEROBOT_MEM_VIT_SEARCH_ROOTS", "/data/mem_vit_distill_outputs"
-    )
+    search_roots_value = os.environ.get("LEROBOT_MEM_VIT_SEARCH_ROOTS", "/data/mem_vit_distill_outputs")
     search_roots = [Path(value).expanduser() for value in search_roots_value.split(os.pathsep) if value]
     candidates: list[Path] = []
     for root in search_roots:
@@ -1895,10 +1893,7 @@ class PI05Policy(PreTrainedPolicy):
             logging.exception("Failed to load PI0.5 checkpoint from %s", pretrained_name_or_path)
             raise
 
-        if (
-            model.config.mem_vit_checkpoint is not None
-            and not model.config.mem_vit_base_weights_embedded
-        ):
+        if model.config.mem_vit_checkpoint is not None and not model.config.mem_vit_base_weights_embedded:
             _load_mem_vit_vision_checkpoint(
                 model.model.paligemma_with_expert.paligemma.model.vision_tower,
                 model.config.mem_vit_checkpoint,
@@ -2352,6 +2347,8 @@ class PI05Policy(PreTrainedPolicy):
         reduction: str,
         action_is_pad: Tensor | None = None,
         ee_delta_is_valid: Tensor | None = None,
+        loss_semantic_ids: Tensor | None = None,
+        loss_semantic_names: tuple[str, ...] | None = None,
     ) -> tuple[Tensor, dict]:
         """Reduce PI0.5 action losses with the B2+Z1 gate-aware schema."""
         names = list(self.config.action_feature_names or [])
@@ -2375,6 +2372,7 @@ class PI05Policy(PreTrainedPolicy):
 
         weighted_parts: list[Tensor] = []
         weight_parts: list[Tensor] = []
+        loss_part_names: list[str] = []
         bool_dim_stats: dict[str, float] = {}
         bool_targets: dict[str, Tensor] = {}
         completion_target = None
@@ -2395,6 +2393,7 @@ class PI05Policy(PreTrainedPolicy):
             dim_losses = losses[:, :, dim]
             weighted_parts.append(dim_losses * weights)
             weight_parts.append(weights)
+            loss_part_names.append(name)
             bool_dim_stats[f"gate_true_frac/{name}"] = float(
                 target[execution_valid].float().mean().detach().cpu().item()
             )
@@ -2447,13 +2446,16 @@ class PI05Policy(PreTrainedPolicy):
         )
         b2_dims = [name_to_dim[name] for name in b2_names]
         ee_dims = [i for i, name in enumerate(names) if name.startswith("height_invariant_ee_")]
-        for dim_losses, weights in [
-            self._masked_dim_loss(losses, b2_dims, b2_continuous_mask, continuous_weight),
-            self._masked_dim_loss(
-                losses,
-                ee_dims,
-                ee_continuous_mask,
-                continuous_weight,
+        for part_name, (dim_losses, weights) in [
+            ("b2", self._masked_dim_loss(losses, b2_dims, b2_continuous_mask, continuous_weight)),
+            (
+                "ee",
+                self._masked_dim_loss(
+                    losses,
+                    ee_dims,
+                    ee_continuous_mask,
+                    continuous_weight,
+                ),
             ),
         ]:
             training_rtc = self.config.training_rtc_config
@@ -2464,6 +2466,7 @@ class PI05Policy(PreTrainedPolicy):
                 weights = weights * valid_mask[..., None]
             weighted_parts.append(dim_losses)
             weight_parts.append(weights)
+            loss_part_names.append(part_name)
 
         if completion_target is not None:
             completion_dim = name_to_dim["task_complete"]
@@ -2474,6 +2477,7 @@ class PI05Policy(PreTrainedPolicy):
             completion_losses = losses[:, :, completion_dim]
             weighted_parts.append(completion_losses * completion_weights)
             weight_parts.append(completion_weights)
+            loss_part_names.append("task_complete")
             bool_dim_stats["gate_true_frac/task_complete"] = float(
                 completion_target[completion_valid].float().mean().detach().cpu().item()
             )
@@ -2499,7 +2503,8 @@ class PI05Policy(PreTrainedPolicy):
 
         weighted = torch.cat([part.reshape(losses.shape[0], -1) for part in weighted_parts], dim=1)
         weights = torch.cat([part.reshape(losses.shape[0], -1) for part in weight_parts], dim=1)
-        per_sample_loss = weighted.sum(dim=1) / weights.sum(dim=1).clamp_min(1e-6)
+        total_weight_per_sample = weights.sum(dim=1).clamp_min(1e-6)
+        per_sample_loss = weighted.sum(dim=1) / total_weight_per_sample
 
         loss_dict: dict[str, float] = {
             "gate_aware_action_loss": 1.0,
@@ -2508,6 +2513,47 @@ class PI05Policy(PreTrainedPolicy):
             ),
             "continuous_mask_frac/ee_pose": float(ee_continuous_mask.float().mean().detach().cpu().item()),
         }
+        for part_name, weighted_part, weight_part in zip(
+            loss_part_names, weighted_parts, weight_parts, strict=True
+        ):
+            part_numerator = weighted_part.reshape(losses.shape[0], -1).sum(dim=1)
+            part_weight = weight_part.reshape(losses.shape[0], -1).sum(dim=1)
+            loss_dict[f"loss_contribution/{part_name}"] = float(
+                (part_numerator / total_weight_per_sample).mean().detach().cpu().item()
+            )
+            loss_dict[f"loss_weight_fraction/{part_name}"] = float(
+                (part_weight / total_weight_per_sample).mean().detach().cpu().item()
+            )
+        per_sample_b2 = (
+            weighted_parts[loss_part_names.index("b2")].reshape(losses.shape[0], -1).sum(dim=1)
+            / total_weight_per_sample
+        )
+        per_sample_z1 = per_sample_loss - per_sample_b2
+        loss_dict["loss_contribution/z1"] = float(per_sample_z1.mean().detach().cpu().item())
+        if (loss_semantic_ids is None) != (loss_semantic_names is None):
+            raise ValueError("loss_semantic_id and loss_semantic_names must be provided together")
+        if loss_semantic_ids is not None and loss_semantic_names is not None:
+            loss_semantic_ids = loss_semantic_ids.to(device=losses.device, dtype=torch.long).reshape(-1)
+            if loss_semantic_ids.shape[0] != losses.shape[0]:
+                raise ValueError(
+                    f"loss_semantic_id batch {loss_semantic_ids.shape[0]} does not match "
+                    f"loss batch {losses.shape[0]}"
+                )
+            if not loss_semantic_names:
+                raise ValueError("loss_semantic_names must not be empty")
+            if bool(((loss_semantic_ids < 0) | (loss_semantic_ids >= len(loss_semantic_names))).any()):
+                raise ValueError("loss_semantic_id contains an ID absent from loss_semantic_names")
+            for semantic_id, semantic_name in enumerate(loss_semantic_names):
+                semantic_mask = loss_semantic_ids == semantic_id
+                loss_dict[f"loss_semantic_fraction/{semantic_name}"] = float(
+                    semantic_mask.float().mean().detach().cpu().item()
+                )
+                loss_dict[f"loss_contribution/{semantic_name}/b2"] = float(
+                    (per_sample_b2 * semantic_mask).mean().detach().cpu().item()
+                )
+                loss_dict[f"loss_contribution/{semantic_name}/z1"] = float(
+                    (per_sample_z1 * semantic_mask).mean().detach().cpu().item()
+                )
         loss_dict.update(bool_dim_stats)
         if completion_target is not None:
             loss_dict["gate_true_frac/task_complete"] = bool_dim_stats["gate_true_frac/task_complete"]
@@ -2953,6 +2999,8 @@ class PI05Policy(PreTrainedPolicy):
                 reduction,
                 action_is_pad,
                 batch.get(EE_DELTA_VALID_KEY),
+                batch.get("loss_semantic_id"),
+                batch.get("loss_semantic_names"),
             )
             loss_dict.update(gate_loss_dict)
             return loss, loss_dict

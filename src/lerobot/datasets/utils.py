@@ -132,6 +132,7 @@ class DatasetInfo:
     # Optional metadata
     robot_type: str | None = None
     splits: dict[str, str] = field(default_factory=dict)
+    semantic_type: str | None = None
     # OpenAI-style tool schemas declared by the dataset. ``None`` means the
     # dataset doesn't declare any — readers fall back to ``DEFAULT_TOOLS``.
     tools: list[dict] | None = None
@@ -165,6 +166,8 @@ class DatasetInfo:
                 ft["shape"] = list(ft["shape"])
         if d.get("tools") is None:
             d.pop("tools", None)
+        if d.get("semantic_type") is None:
+            d.pop("semantic_type", None)
         return d
 
     @classmethod

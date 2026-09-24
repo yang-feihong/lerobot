@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import numpy as np
 @dataclass(frozen=True)
 class DatasetMixtureSource:
     name: str
+    semantic_type: str
     weight: float
     episode_start: int
     episode_stop: int
@@ -34,6 +36,14 @@ def load_dataset_mixture_manifest(path: str | Path, *, num_episodes: int) -> lis
         if not name or name in names:
             raise ValueError(f"{manifest_path}: every source name must be non-empty and unique")
         names.add(name)
+        semantic_type = str(raw.get("semantic_type", name)).strip()
+        if not semantic_type:
+            raise ValueError(f"{manifest_path}: source {name!r} needs a non-empty semantic_type")
+        if re.fullmatch(r"[A-Za-z0-9_.-]+", semantic_type) is None:
+            raise ValueError(
+                f"{manifest_path}: source {name!r} semantic_type must contain only letters, "
+                "digits, underscore, dot, or hyphen"
+            )
         weight = float(raw["weight"])
         episode_range = raw.get("episode_range")
         if (
@@ -51,7 +61,7 @@ def load_dataset_mixture_manifest(path: str | Path, *, num_episodes: int) -> lis
         if np.any(owner[start:stop] >= 0):
             raise ValueError(f"{manifest_path}: source {name!r} overlaps another episode range")
         owner[start:stop] = source_index
-        sources.append(DatasetMixtureSource(name, weight, start, stop))
+        sources.append(DatasetMixtureSource(name, semantic_type, weight, start, stop))
 
     if np.any(owner < 0):
         missing = np.flatnonzero(owner < 0)
@@ -63,6 +73,7 @@ def load_dataset_mixture_manifest(path: str | Path, *, num_episodes: int) -> lis
     return [
         DatasetMixtureSource(
             source.name,
+            source.semantic_type,
             source.weight / total_weight,
             source.episode_start,
             source.episode_stop,
