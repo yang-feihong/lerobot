@@ -38,6 +38,30 @@ from .rewards import RewardModelConfig
 TRAIN_CONFIG_NAME = "train_config.json"
 
 
+def is_task_complete_deployment_metadata_extension(saved: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Return whether current only appends the task-complete action contract."""
+    saved = json.loads(json.dumps(saved))
+    current = json.loads(json.dumps(current))
+    try:
+        saved_action = saved["action"]
+        current_action = current["action"]
+        saved_predict = saved_action["predict"]
+        current_predict = current_action["predict"]
+        saved_names = list(saved_action["model_names"])
+        current_names = list(current_action["model_names"])
+    except (KeyError, TypeError):
+        return False
+    if saved_predict.get("task_complete") is not False:
+        return False
+    if current_predict.get("task_complete") is not True:
+        return False
+    if current_names != [*saved_names, "task_complete"]:
+        return False
+    saved_predict["task_complete"] = True
+    saved_action["model_names"] = current_names
+    return saved == current
+
+
 @dataclass
 class MotionBalancedSamplingConfig:
     enabled: bool = False
@@ -304,7 +328,15 @@ class TrainPipelineConfig(HubMixin):
                     )
                 with metadata_path.open() as f:
                     saved_metadata = json.load(f)
-                if saved_metadata != deployment_metadata():
+                current_metadata = deployment_metadata()
+                metadata_matches = saved_metadata == current_metadata
+                task_complete_extension = (
+                    self.resume_with_updated_dataset
+                    and is_task_complete_deployment_metadata_extension(
+                        saved_metadata, current_metadata
+                    )
+                )
+                if not metadata_matches and not task_complete_extension:
                     raise ValueError("Resume checkpoint deployment metadata disagrees with policy config")
         if self.reward_model is not None:
             self.reward_model.pretrained_path = str(policy_dir)
