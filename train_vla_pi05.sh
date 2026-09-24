@@ -202,6 +202,7 @@ dataset_mixture_manifest_explicit="false"
 training_rtc_explicit="false"
 training_rtc_simulated_delay_explicit="false"
 training_rtc_delay_distribution_explicit="false"
+predict_task_complete_explicit="false"
 for argument in "$@"; do
   if [[ "$argument" == --action-semantics-profile=* ]]; then
     action_semantics_profile="${argument#*=}"
@@ -281,7 +282,10 @@ while (( $# > 0 )); do
     --predict-arm-reset=*) predict_arm_reset="${1#*=}" ;;
     --predict-ee-pose=*) predict_ee_pose="${1#*=}" ;;
     --predict-gripper=*) predict_gripper="${1#*=}" ;;
-    --predict-task-complete=*) predict_task_complete="${1#*=}" ;;
+    --predict-task-complete=*)
+      predict_task_complete="${1#*=}"
+      predict_task_complete_explicit="true"
+      ;;
     --new-module-optimizer-lr-multiplier=*) new_module_optimizer_lr_multiplier="${1#*=}" ;;
     --structured-action-crf-initial-stay-bias=*) structured_action_crf_initial_stay_bias="${1#*=}" ;;
     --batch-size-per-gpu=*) batch_size_per_gpu="${1#*=}" ;;
@@ -593,6 +597,44 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.n_action_steps="$action_steps_to_execute"
     --policy.control_frequency_hz="$control_frequency_hz"
   )
+elif [[ "$predict_task_complete_explicit" == "true" ]]; then
+  task_complete_config_python="${LEROBOT_RUNTIME_BIN:+$LEROBOT_RUNTIME_BIN/python}"
+  task_complete_config_python="${task_complete_config_python:-python3}"
+  "$task_complete_config_python" - "$resume_config" "$predict_task_complete" \
+    "$resume_with_updated_dataset" "$resume_new_run_name" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    saved = bool(json.load(stream).get("policy", {}).get("action_predict_task_complete", False))
+requested = sys.argv[2] == "true"
+updated_dataset = sys.argv[3] == "true"
+fork_name = sys.argv[4]
+
+if requested == saved:
+    raise SystemExit(0)
+if saved or not requested:
+    print(
+        "Resume only supports the schema extension action_predict_task_complete=false -> true; "
+        f"checkpoint={saved}, requested={requested}.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+if not updated_dataset:
+    print(
+        "Enabling task_complete on resume requires --resume-with-updated-dataset=true.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+if not fork_name:
+    print(
+        "Enabling task_complete on resume requires --resume-new-run-name=<new-run>; "
+        "the source run cannot be mutated in place.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+PY
+  policy_io_args+=(--policy.action_predict_task_complete=true)
 fi
 
 policy_mem_args=()

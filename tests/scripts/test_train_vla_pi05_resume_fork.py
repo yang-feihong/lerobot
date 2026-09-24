@@ -6,7 +6,6 @@ import shlex
 import subprocess
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).resolve().parents[2] / "train_vla_pi05.sh"
 
 
@@ -69,3 +68,67 @@ def test_resume_fork_rejects_existing_output(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "Forked resume output already exists" in result.stderr
+
+
+def test_resume_fork_can_add_task_complete_output(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "old_run/checkpoints/050000"
+    pretrained = checkpoint / "pretrained_model"
+    pretrained.mkdir(parents=True)
+    (pretrained / "train_config.json").write_text(
+        json.dumps({"policy": {"action_predict_task_complete": False}})
+    )
+    output_root = tmp_path / "outputs"
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT),
+            "--dry-run=true",
+            f"--output-root={output_root}",
+            f"--resume-checkpoint={checkpoint}",
+            "--resume-new-run-name=task_complete_from50k",
+            "--resume-with-updated-dataset=true",
+            "--dataset-root=/data/three_stage_task_complete",
+            "--predict-task-complete=true",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    flags = dict(arg.split("=", 1) for arg in shlex.split(result.stdout) if arg.startswith("--"))
+    assert flags["--policy.action_predict_task_complete"] == "true"
+    assert flags["--resume"] == "true"
+    assert flags["--resume_with_updated_dataset"] == "true"
+    assert flags["--dataset.root"] == "/data/three_stage_task_complete"
+
+
+def test_resume_task_complete_extension_requires_fork_and_updated_dataset(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "old_run/checkpoints/050000"
+    pretrained = checkpoint / "pretrained_model"
+    pretrained.mkdir(parents=True)
+    (pretrained / "train_config.json").write_text(
+        json.dumps({"policy": {"action_predict_task_complete": False}})
+    )
+
+    for extra_arg, expected_error in (
+        ("--resume-new-run-name=task_complete_from50k", "updated-dataset=true"),
+        ("--resume-with-updated-dataset=true", "resume-new-run-name"),
+    ):
+        result = subprocess.run(
+            [
+                "bash",
+                str(SCRIPT),
+                "--dry-run=true",
+                f"--resume-checkpoint={checkpoint}",
+                extra_arg,
+                "--predict-task-complete=true",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert result.returncode == 2
+        assert expected_error in result.stderr
