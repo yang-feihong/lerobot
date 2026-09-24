@@ -754,7 +754,6 @@ def configure_action_bool_balance(
         if missing_names:
             raise ValueError(f"Enabled boolean actions are absent from the dataset: {missing_names}")
         action_indices = {name: action_names.index(name) for name in counts}
-        completion_dim = action_names.index("task_complete")
         columns = dataset.hf_dataset.select_columns([ACTION, "episode_index", "frame_index"]).with_format(
             "numpy"
         )
@@ -781,17 +780,13 @@ def configure_action_bool_balance(
                 count=len(frame_indices),
             )
             for name, dim in action_indices.items():
-                applicable = np.ones(len(actions), dtype=bool)
-                if name != "task_complete":
-                    applicable = actions[:, completion_dim] <= 0
                 if name == "gripper_target" and policy_cfg.action_gripper_target_true_side == "negative":
                     target_true = actions[:, dim] < 0
                 else:
                     target_true = actions[:, dim] > 0
-                applicable_multiplicity = label_multiplicity[applicable]
-                positive = int(label_multiplicity[target_true & applicable].sum())
+                positive = int(label_multiplicity[target_true].sum())
                 counts[name][0] += positive
-                counts[name][1] += int(applicable_multiplicity.sum()) - positive
+                counts[name][1] += int(label_multiplicity.sum()) - positive
 
     stats: dict[str, dict[str, int | float]] = {}
     true_fractions: dict[str, float] = {}

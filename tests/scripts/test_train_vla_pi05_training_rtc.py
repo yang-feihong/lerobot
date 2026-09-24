@@ -52,6 +52,13 @@ def test_training_rtc_default_is_disabled(tmp_path):
     assert resolved["--policy.training_rtc_config.delay_distribution"] == "uniform"
 
 
+def test_task_complete_is_an_orthogonal_optional_output(tmp_path):
+    resolved = flags(dry_run(tmp_path, "--predict-task-complete=true"))
+    assert resolved["--policy.action_predict_task_complete"] == "true"
+    assert resolved["--policy.action_predict_arm_teleop_inactive"] == "true"
+    assert resolved["--policy.action_predict_arm_reset"] == "true"
+
+
 @pytest.mark.parametrize(
     "args",
     [

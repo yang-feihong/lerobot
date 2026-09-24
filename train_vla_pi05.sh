@@ -421,10 +421,10 @@ fi
 
 case "$action_semantics_profile" in
   joint_control_ee_v1)
-    expected_semantics=(false false true true false continuous_flow joint_control_inactive_interpolated control_action all continuous_position uniform_valid)
+    expected_semantics=(false false true true continuous_flow joint_control_inactive_interpolated control_action all continuous_position uniform_valid)
     ;;
   joint_control_arm_mode_v2)
-    expected_semantics=(true true true true false continuous_flow joint_control_inactive_interpolated control_action all continuous_position auto)
+    expected_semantics=(true true true true continuous_flow joint_control_inactive_interpolated control_action all continuous_position auto)
     ;;
   custom)
     expected_semantics=()
@@ -437,7 +437,6 @@ esac
 if (( ${#expected_semantics[@]} )); then
   actual_semantics=(
     "$predict_arm_teleop_inactive" "$predict_arm_reset" "$predict_ee_pose" "$predict_gripper"
-    "$predict_task_complete"
     "$discrete_action_training_mode" "$ee_target_dataset_semantics" "$ee_supervision_source"
     "$ee_delta_supervision_mode"
     "$gripper_target_representation" "$action_loss_schema"

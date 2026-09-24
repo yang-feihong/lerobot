@@ -2378,7 +2378,10 @@ class PI05Policy(PreTrainedPolicy):
         completion_target = None
         if "task_complete" in name_to_dim:
             completion_target = self._normalized_bool_mask(actions, name_to_dim["task_complete"])
-        execution_valid = valid_mask if completion_target is None else (valid_mask & ~completion_target)
+        # Completion is an additional prediction target, not an action-validity
+        # mask.  The terminal hold remains valid supervision for every other
+        # action channel after task_complete becomes true.
+        action_valid = valid_mask
 
         for name in ("arm_teleop_inactive", "arm_reset", "gripper_target"):
             if name not in name_to_dim:
@@ -2389,13 +2392,13 @@ class PI05Policy(PreTrainedPolicy):
             dim = name_to_dim[name]
             target = self._normalized_bool_mask(actions, dim, true_side=true_side)
             bool_targets[name] = target
-            weights = self._global_bool_weights(name, target, execution_valid) * bool_weight
+            weights = self._global_bool_weights(name, target, action_valid) * bool_weight
             dim_losses = losses[:, :, dim]
             weighted_parts.append(dim_losses * weights)
             weight_parts.append(weights)
             loss_part_names.append(name)
             bool_dim_stats[f"gate_true_frac/{name}"] = float(
-                target[execution_valid].float().mean().detach().cpu().item()
+                target[action_valid].float().mean().detach().cpu().item()
             )
             bool_dim_stats[f"gate_loss/{name}"] = float(
                 ((dim_losses * weights).sum() / weights.sum().clamp_min(1e-6)).detach().cpu().item()
@@ -2417,14 +2420,14 @@ class PI05Policy(PreTrainedPolicy):
         arm_teleop_inactive = bool_targets.get("arm_teleop_inactive")
         arm_reset = bool_targets.get("arm_reset")
         if arm_teleop_inactive is not None and arm_reset is not None:
-            overlap = arm_teleop_inactive & arm_reset & execution_valid
+            overlap = arm_teleop_inactive & arm_reset & action_valid
             if bool(overlap.any()):
                 raise ValueError(
                     "arm_teleop_inactive and arm_reset cannot both be true; "
                     "they jointly encode TELEOP/INACTIVE/RESET"
                 )
-        b2_continuous_mask = execution_valid
-        ee_continuous_mask = execution_valid
+        b2_continuous_mask = action_valid
+        ee_continuous_mask = action_valid
         if arm_teleop_inactive is not None:
             ee_continuous_mask = ee_continuous_mask & ~arm_teleop_inactive
         if arm_reset is not None:
@@ -2605,7 +2608,9 @@ class PI05Policy(PreTrainedPolicy):
             true_side=self.config.action_gripper_target_true_side,
         ).long()
         complete = self._normalized_bool_mask(actions, name_to_dim["task_complete"])
-        execution_valid = valid & ~complete
+        # task_complete is supervised alongside the action, never used to
+        # suppress the terminal hold targets of the other channels.
+        action_valid = valid
 
         b2_names = (
             ["b2_delta_x", "b2_delta_y", "b2_delta_yaw"]
@@ -2614,7 +2619,7 @@ class PI05Policy(PreTrainedPolicy):
         )
         b2_dims = [name_to_dim[name] for name in b2_names]
         ee_dims = [index for index, name in enumerate(names) if name.startswith("height_invariant_ee_")]
-        ee_valid = execution_valid & ~inactive & ~reset
+        ee_valid = action_valid & ~inactive & ~reset
         if self.config.z1_action_representation in {"ee_delta", "ee_state_delta"}:
             if ee_delta_is_valid is None:
                 raise ValueError(f"EE-delta training requires {EE_DELTA_VALID_KEY}")
@@ -2629,7 +2634,7 @@ class PI05Policy(PreTrainedPolicy):
         continuous_weights = []
         for part, weights in (
             self._masked_dim_loss(
-                flow_losses, b2_dims, execution_valid, self.config.action_continuous_loss_weight
+                flow_losses, b2_dims, action_valid, self.config.action_continuous_loss_weight
             ),
             self._masked_dim_loss(flow_losses, ee_dims, ee_valid, self.config.action_continuous_loss_weight),
         ):
@@ -2660,13 +2665,13 @@ class PI05Policy(PreTrainedPolicy):
                     weights = class_weights[target] * target_valid
             return (element * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1e-6)
 
-        arm_crf = self.model.arm_mode_crf.nll(logits["arm_mode"], arm_mode, execution_valid)
-        arm_crf = arm_crf / execution_valid.sum(1).clamp_min(1)
-        arm_loss = arm_crf + balanced_emission_loss("arm_mode", logits["arm_mode"], arm_mode, execution_valid)
-        gripper_crf = self.model.gripper_state_crf.nll(logits["gripper_state"], gripper, execution_valid)
-        gripper_crf = gripper_crf / execution_valid.sum(1).clamp_min(1)
+        arm_crf = self.model.arm_mode_crf.nll(logits["arm_mode"], arm_mode, action_valid)
+        arm_crf = arm_crf / action_valid.sum(1).clamp_min(1)
+        arm_loss = arm_crf + balanced_emission_loss("arm_mode", logits["arm_mode"], arm_mode, action_valid)
+        gripper_crf = self.model.gripper_state_crf.nll(logits["gripper_state"], gripper, action_valid)
+        gripper_crf = gripper_crf / action_valid.sum(1).clamp_min(1)
         gripper_loss = gripper_crf + balanced_emission_loss(
-            "gripper_target", logits["gripper_state"], gripper, execution_valid
+            "gripper_target", logits["gripper_state"], gripper, action_valid
         )
         completion_loss = absorbing_hazard_nll(logits["task_complete"], complete, valid)
         completion_state_element = F.binary_cross_entropy_with_logits(
@@ -2717,21 +2722,21 @@ class PI05Policy(PreTrainedPolicy):
             "discrete_loss/arm_mode": float(arm_loss.mean().detach().cpu()),
             "discrete_loss/gripper_target": float(gripper_loss.mean().detach().cpu()),
             "discrete_loss/task_complete": float(completion_loss.mean().detach().cpu()),
-            "discrete_accuracy/arm_mode": masked_accuracy(arm_prediction, arm_mode, execution_valid),
-            "discrete_accuracy/gripper_target": masked_accuracy(gripper_prediction, gripper, execution_valid),
+            "discrete_accuracy/arm_mode": masked_accuracy(arm_prediction, arm_mode, action_valid),
+            "discrete_accuracy/gripper_target": masked_accuracy(gripper_prediction, gripper, action_valid),
             "discrete_accuracy/task_complete": masked_accuracy(complete_prediction, complete, valid),
             "continuous_mask_frac/ee_pose": float(ee_valid.float().mean().detach().cpu()),
             "arm_mode_frac/ee": float(
-                ((arm_mode == 0) & execution_valid).sum().detach().cpu()
-                / execution_valid.sum().clamp_min(1).cpu()
+                ((arm_mode == 0) & action_valid).sum().detach().cpu()
+                / action_valid.sum().clamp_min(1).cpu()
             ),
             "arm_mode_frac/inactive": float(
-                ((arm_mode == 1) & execution_valid).sum().detach().cpu()
-                / execution_valid.sum().clamp_min(1).cpu()
+                ((arm_mode == 1) & action_valid).sum().detach().cpu()
+                / action_valid.sum().clamp_min(1).cpu()
             ),
             "arm_mode_frac/reset": float(
-                ((arm_mode == 2) & execution_valid).sum().detach().cpu()
-                / execution_valid.sum().clamp_min(1).cpu()
+                ((arm_mode == 2) & action_valid).sum().detach().cpu()
+                / action_valid.sum().clamp_min(1).cpu()
             ),
         }
         info.update(
@@ -2739,7 +2744,7 @@ class PI05Policy(PreTrainedPolicy):
                 "arm_mode",
                 arm_prediction,
                 arm_mode,
-                execution_valid,
+                action_valid,
                 (("ee", 0), ("inactive", 1), ("reset", 2)),
             )
         )
@@ -2748,7 +2753,7 @@ class PI05Policy(PreTrainedPolicy):
                 "gripper_target",
                 gripper_prediction,
                 gripper,
-                execution_valid,
+                action_valid,
                 (("open", 0), ("closed", 1)),
             )
         )

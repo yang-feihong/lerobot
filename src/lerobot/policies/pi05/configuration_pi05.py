@@ -705,7 +705,7 @@ class PI05Config(PreTrainedConfig):
                     },
                 },
                 "task_complete_semantics": (
-                    "explicit_true_in_the_post_task_tail_until_ros_bag_end"
+                    "explicit_true_in_the_terminal_stage_hold"
                     if self.action_predict_task_complete
                     else None
                 ),

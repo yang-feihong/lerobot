@@ -13,7 +13,7 @@ from lerobot.policies.pi05.modeling_pi05 import (
 )
 
 
-def test_gate_loss_uses_inactive_reset_and_completion_ground_truth_masks():
+def test_gate_loss_uses_arm_modes_but_completion_does_not_mask_actions():
     policy = PI05Policy.__new__(PI05Policy)
     torch.nn.Module.__init__(policy)
     names = ["b2_delta_x", "b2_delta_y", "b2_delta_yaw", *DATASET_ACTION_NAMES[3:]]
@@ -45,8 +45,8 @@ def test_gate_loss_uses_inactive_reset_and_completion_ground_truth_masks():
         loss_semantic_names=("approach", "handle_press", "traversal"),
     )
     assert torch.isfinite(loss)
-    assert info["continuous_mask_frac/b2_pose_delta"] == pytest.approx(0.6)
-    assert info["continuous_mask_frac/ee_pose"] == pytest.approx(0.2)
+    assert info["continuous_mask_frac/b2_pose_delta"] == pytest.approx(1.0)
+    assert info["continuous_mask_frac/ee_pose"] == pytest.approx(0.6)
     assert info["gate_true_frac/task_complete"] == pytest.approx(0.4)
     assert "gate_loss/arm_teleop_inactive" in info
     contribution_keys = ["loss_contribution/b2", "loss_contribution/z1"]
@@ -300,6 +300,62 @@ def test_structured_ee_delta_loss_uses_both_endpoint_validity_mask() -> None:
     validity = torch.tensor([[True, False, True]])
     _, info = policy._structured_temporal_action_loss(losses, logits, actions, "mean", None, validity)
     assert info["continuous_mask_frac/ee_pose"] == pytest.approx(2 / 3)
+
+
+def test_structured_completion_does_not_mask_terminal_action_supervision() -> None:
+    policy = PI05Policy.__new__(PI05Policy)
+    torch.nn.Module.__init__(policy)
+    policy.model = torch.nn.Module()
+    policy.model.arm_mode_crf = LinearChainCRF(3)
+    policy.model.gripper_state_crf = LinearChainCRF(2)
+    names = ["b2_vx", "b2_vy", "b2_omega_z", *DATASET_ACTION_NAMES[3:]]
+    policy.config = SimpleNamespace(
+        action_feature_names=names,
+        action_gripper_target_true_side="negative",
+        action_bool_true_fractions={
+            "arm_teleop_inactive": 0.5,
+            "arm_reset": 0.5,
+            "gripper_target": 0.5,
+            "task_complete": 0.5,
+        },
+        action_bool_loss_weight=4.0,
+        action_continuous_loss_weight=1.0,
+        action_masked_continuous_min_weight=0.0,
+        b2_action_representation="velocity",
+        z1_action_representation="ee_delta",
+    )
+    actions = -torch.ones((1, 3, len(names)))
+    actions[:, :, names.index("arm_teleop_inactive")] = -1.0
+    actions[:, :, names.index("arm_reset")] = -1.0
+    actions[:, 1:, names.index("task_complete")] = 1.0
+    logits = {
+        "arm_mode": torch.zeros((1, 3, 3)),
+        "gripper_state": torch.zeros((1, 3, 2)),
+        "task_complete": torch.zeros((1, 3)),
+    }
+
+    baseline_losses = torch.ones_like(actions)
+    changed_losses = baseline_losses.clone()
+    changed_losses[:, 1:, :3] = 10.0
+    baseline, info = policy._structured_temporal_action_loss(
+        baseline_losses,
+        logits,
+        actions,
+        "mean",
+        None,
+        torch.ones(1, 3, dtype=torch.bool),
+    )
+    changed, _ = policy._structured_temporal_action_loss(
+        changed_losses,
+        logits,
+        actions,
+        "mean",
+        None,
+        torch.ones(1, 3, dtype=torch.bool),
+    )
+
+    assert info["continuous_mask_frac/ee_pose"] == pytest.approx(1.0)
+    assert changed > baseline
 
 
 def test_structured_mode_removes_discrete_targets_from_flow_input() -> None:

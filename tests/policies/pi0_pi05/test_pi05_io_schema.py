@@ -161,7 +161,7 @@ def test_checkpoint_metadata_describes_explicit_completion_protocol(tmp_path):
     assert "b2_active" not in metadata["action"]["predict"]
     assert (
         metadata["action"]["task_complete_semantics"]
-        == "explicit_true_in_the_post_task_tail_until_ros_bag_end"
+        == "explicit_true_in_the_terminal_stage_hold"
     )
     restored = PreTrainedConfig.from_pretrained(tmp_path)
     assert restored.deployment_metadata() == metadata

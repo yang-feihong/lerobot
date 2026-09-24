@@ -90,7 +90,7 @@ def test_completion_sampling_is_disabled_when_completion_is_not_an_output():
     )
 
 
-def test_all_boolean_priors_use_capped_starts_and_ignore_post_completion_controls():
+def test_all_boolean_priors_use_capped_starts_and_include_terminal_hold_controls():
     actions = np.zeros((5, 16), dtype=np.float32)
     actions[:, 3] = [1, 1, 0, 0, 0]
     actions[:, 4] = [0, 0, 1, 0, 0]
@@ -116,9 +116,9 @@ def test_all_boolean_priors_use_capped_starts_and_ignore_post_completion_control
     assert (
         stats["arm_teleop_inactive"]["positive_labels"],
         stats["arm_teleop_inactive"]["negative_labels"],
-    ) == (3, 3)
-    assert (stats["arm_reset"]["positive_labels"], stats["arm_reset"]["negative_labels"]) == (3, 3)
-    assert (stats["gripper_target"]["positive_labels"], stats["gripper_target"]["negative_labels"]) == (2, 4)
+    ) == (3, 8)
+    assert (stats["arm_reset"]["positive_labels"], stats["arm_reset"]["negative_labels"]) == (3, 8)
+    assert (stats["gripper_target"]["positive_labels"], stats["gripper_target"]["negative_labels"]) == (7, 4)
     assert (stats["task_complete"]["positive_labels"], stats["task_complete"]["negative_labels"]) == (5, 6)
 
 
