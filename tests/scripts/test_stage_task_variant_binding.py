@@ -50,3 +50,38 @@ def test_staged_dataset_rejects_modified_variants_after_binding(tmp_path) -> Non
 
     with pytest.raises(RuntimeError, match="do not match their hard binding"):
         load_task_variants(tmp_path, None)
+
+
+def test_staged_mixture_rejects_sources_that_differ_from_binding(tmp_path) -> None:
+    variants_path = tmp_path / "meta/task_variants.json"
+    write_json(
+        tmp_path / "meta/dataset_mixture.json",
+        {
+            "sources": [
+                {
+                    "name": "stage1_approach",
+                    "semantic_type": "approach",
+                    "weight": 1.0,
+                    "episode_range": [0, 1],
+                }
+            ]
+        },
+    )
+    write_json(variants_path, {"0": ["Approach the door."]})
+    write_json(
+        tmp_path / "meta/task_variant_binding.json",
+        {
+            "binding": "stage_dataset_task_variants",
+            "task_variants_sha256": hashlib.sha256(variants_path.read_bytes()).hexdigest(),
+            "sources": [
+                {
+                    "name": "stage1_approach",
+                    "semantic_type": "handle_press",
+                    "episode_range": [0, 1],
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="sources do not match"):
+        load_task_variants(tmp_path, None)

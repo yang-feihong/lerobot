@@ -413,8 +413,27 @@ def _validate_stage_task_variant_binding(dataset_root: Path, variants_path: Path
             raise RuntimeError(
                 f"Invalid stage binding for semantic_type={staged_semantics[0]!r}: {binding_path}"
             )
-    elif binding.get("binding") != "stage_dataset_task_variants":
-        raise RuntimeError(f"Staged mixture is not bound to staged source datasets: {binding_path}")
+    else:
+        if binding.get("binding") != "stage_dataset_task_variants":
+            raise RuntimeError(f"Staged mixture is not bound to staged source datasets: {binding_path}")
+        expected_sources = [
+            {
+                "name": str(source["name"]),
+                "semantic_type": str(source["semantic_type"]),
+                "episode_range": list(source["episode_range"]),
+            }
+            for source in mixture["sources"]
+        ]
+        bound_sources = [
+            {
+                "name": str(source.get("name", "")),
+                "semantic_type": str(source.get("semantic_type", "")),
+                "episode_range": list(source.get("episode_range", [])),
+            }
+            for source in binding.get("sources", [])
+        ]
+        if bound_sources != expected_sources:
+            raise RuntimeError(f"Staged mixture sources do not match their language binding: {binding_path}")
 
 
 def load_task_variants(dataset_root: Path, configured_path: str | None) -> dict[int, list[str]]:

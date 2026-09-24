@@ -34,6 +34,28 @@ def test_load_dataset_mixture_manifest_normalizes_weights(tmp_path):
     assert sources[1].episode_indices == [3, 4]
 
 
+def test_load_dataset_mixture_manifest_requires_explicit_semantics(tmp_path):
+    path = tmp_path / "mixture.json"
+    path.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {"name": "source_a", "weight": 1.0, "episode_range": [0, 1]},
+                    {
+                        "name": "source_b",
+                        "semantic_type": "handle_press",
+                        "weight": 1.0,
+                        "episode_range": [1, 2],
+                    },
+                ]
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="explicit non-empty semantic_type"):
+        load_dataset_mixture_manifest(path, num_episodes=2)
+
+
 @pytest.mark.parametrize(
     "ranges,match",
     [
@@ -47,8 +69,18 @@ def test_load_dataset_mixture_manifest_requires_exact_partition(tmp_path, ranges
         json.dumps(
             {
                 "sources": [
-                    {"name": "a", "weight": 0.8, "episode_range": ranges[0]},
-                    {"name": "b", "weight": 0.2, "episode_range": ranges[1]},
+                    {
+                        "name": "a",
+                        "semantic_type": "approach",
+                        "weight": 0.8,
+                        "episode_range": ranges[0],
+                    },
+                    {
+                        "name": "b",
+                        "semantic_type": "handle_press",
+                        "weight": 0.2,
+                        "episode_range": ranges[1],
+                    },
                 ]
             }
         )

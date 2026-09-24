@@ -36,9 +36,9 @@ def load_dataset_mixture_manifest(path: str | Path, *, num_episodes: int) -> lis
         if not name or name in names:
             raise ValueError(f"{manifest_path}: every source name must be non-empty and unique")
         names.add(name)
-        semantic_type = str(raw.get("semantic_type", name)).strip()
+        semantic_type = str(raw.get("semantic_type", "")).strip()
         if not semantic_type:
-            raise ValueError(f"{manifest_path}: source {name!r} needs a non-empty semantic_type")
+            raise ValueError(f"{manifest_path}: source {name!r} needs an explicit non-empty semantic_type")
         if re.fullmatch(r"[A-Za-z0-9_.-]+", semantic_type) is None:
             raise ValueError(
                 f"{manifest_path}: source {name!r} semantic_type must contain only letters, "
