@@ -68,6 +68,22 @@ def load_transformed_action_stats(path: str | Path) -> dict[str, Any]:
     return payload
 
 
+def is_task_complete_schema_extension(saved: dict[str, Any], measured: dict[str, Any]) -> bool:
+    """Return whether measured only appends task_complete to the saved action schema."""
+    saved_schema = dict(saved["schema"])
+    measured_schema = dict(measured["schema"])
+    saved_names = list(saved_schema.pop("action_names"))
+    measured_names = list(measured_schema.pop("action_names"))
+    saved_task_complete = bool(saved_schema.pop("include_task_complete", False))
+    measured_task_complete = bool(measured_schema.pop("include_task_complete", False))
+    return (
+        not saved_task_complete
+        and measured_task_complete
+        and measured_names == [*saved_names, TASK_COMPLETE_NAME]
+        and saved_schema == measured_schema
+    )
+
+
 def validate_transformed_action_stats(payload: dict[str, Any], dataset, config) -> None:
     dataset_record = payload["dataset"]
     expected_dataset = {

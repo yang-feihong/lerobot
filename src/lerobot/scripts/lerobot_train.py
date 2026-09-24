@@ -68,6 +68,7 @@ from lerobot.policies.pi05.transformed_action_stats import (
     PI05_TRANSFORMED_ACTION_STATS_NAME,
     assert_transformed_action_stats_equal,
     compute_transformed_action_stats,
+    is_task_complete_schema_extension,
     load_transformed_action_stats,
     save_transformed_action_stats,
     transformed_action_stats_ee_valid_count,
@@ -1043,9 +1044,21 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     )
                 saved_action_stats_payload = load_transformed_action_stats(resume_stats_path)
                 if cfg.resume_with_updated_dataset:
-                    if saved_action_stats_payload["schema"] != measured_action_stats_payload["schema"]:
+                    schema_matches = (
+                        saved_action_stats_payload["schema"]
+                        == measured_action_stats_payload["schema"]
+                    )
+                    task_complete_extension = is_task_complete_schema_extension(
+                        saved_action_stats_payload, measured_action_stats_payload
+                    )
+                    if not schema_matches and not task_complete_extension:
                         raise ValueError(
                             "Cannot resume with an updated dataset when the transformed-action schema changed"
+                        )
+                    if task_complete_extension:
+                        logging.info(
+                            "Extending the resumed action schema with task_complete while preserving the "
+                            "checkpoint model and optimizer state"
                         )
                     logging.warning(
                         "Resuming with an explicitly updated dataset: replacing checkpoint transformed-action "

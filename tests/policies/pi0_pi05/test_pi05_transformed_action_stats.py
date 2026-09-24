@@ -16,6 +16,7 @@ from lerobot.policies.pi05.b2_action_transform import (
 from lerobot.policies.pi05.transformed_action_stats import (
     assert_transformed_action_stats_equal,
     compute_transformed_action_stats,
+    is_task_complete_schema_extension,
     load_transformed_action_stats,
     save_transformed_action_stats,
     transformed_action_stats_ee_valid_count,
@@ -112,6 +113,31 @@ def test_transformed_stats_follow_episode_deltas_and_active_endpoint_mask(tmp_pa
 
 def test_transformed_stats_valid_count_supports_all_transition_schema() -> None:
     assert transformed_action_stats_ee_valid_count({"counts": {"ee_all_transitions": 17}}) == 17
+
+
+def test_task_complete_schema_extension_only_allows_appended_completion() -> None:
+    base_schema = {
+        "include_task_complete": False,
+        "action_names": ["b2_vx", "gripper_target"],
+        "control_frequency_hz": 50.0,
+    }
+    extended_schema = {
+        **base_schema,
+        "include_task_complete": True,
+        "action_names": ["b2_vx", "gripper_target", "task_complete"],
+    }
+
+    assert is_task_complete_schema_extension(
+        {"schema": base_schema}, {"schema": extended_schema}
+    )
+    assert not is_task_complete_schema_extension(
+        {"schema": base_schema},
+        {"schema": {**extended_schema, "control_frequency_hz": 25.0}},
+    )
+    assert not is_task_complete_schema_extension(
+        {"schema": base_schema},
+        {"schema": {**extended_schema, "action_names": ["task_complete", "b2_vx", "gripper_target"]}},
+    )
 
 
 @pytest.mark.parametrize("b2_representation", ["velocity", "pose_delta"])
