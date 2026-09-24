@@ -55,7 +55,7 @@ def is_task_complete_deployment_metadata_extension(saved: dict[str, Any], curren
         return False
     if current_predict.get("task_complete") is not True:
         return False
-    if current_names != [*saved_names, "task_complete"]:
+    if current_names not in (saved_names, [*saved_names, "task_complete"]):
         return False
     expected_completion_contract = {
         "task_complete_deployment_behavior": (

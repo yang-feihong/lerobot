@@ -23,6 +23,10 @@ def test_task_complete_metadata_extension_only_allows_appended_completion() -> N
 
     assert is_task_complete_deployment_metadata_extension(saved, extended)
 
+    unresolved = deepcopy(extended)
+    unresolved["action"]["model_names"] = list(saved["action"]["model_names"])
+    assert is_task_complete_deployment_metadata_extension(saved, unresolved)
+
     reordered = deepcopy(extended)
     reordered["action"]["model_names"] = ["task_complete", "b2_vx", "gripper_target"]
     assert not is_task_complete_deployment_metadata_extension(saved, reordered)
