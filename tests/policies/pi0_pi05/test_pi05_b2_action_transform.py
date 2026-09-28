@@ -360,6 +360,30 @@ def test_processor_uses_new_schema_without_mutating_raw_transition():
     assert step.get_config()["include_task_complete"] is True
 
 
+def test_processor_appends_instruction_relative_task_blocked_channel():
+    action = torch.zeros(1, 3, 16)
+    action[..., 5] = 1.0
+    action[..., 9] = 1.0
+    blocked = torch.tensor([[0.0, 1.0, 1.0]])
+    transition = {
+        TransitionKey.OBSERVATION: {OBS_STATE: torch.zeros(1, 49)},
+        TransitionKey.ACTION: _stored_control_action(action),
+        TransitionKey.COMPLEMENTARY_DATA: {
+            f"{ACTION}_is_pad": torch.zeros(1, 3, dtype=torch.bool),
+            "action_task_blocked": blocked,
+        },
+    }
+    step = Pi05ActionRepresentationProcessorStep(
+        dt=0.1,
+        representation="velocity",
+        z1_representation="ee_delta",
+        include_task_blocked=True,
+    )
+    transformed = step(transition)[TransitionKey.ACTION]
+    assert transformed.shape == (1, 2, 17)
+    torch.testing.assert_close(transformed[..., -1], blocked[..., :-1])
+
+
 def test_action_multiplicity_can_cap_chunk_start_frames():
     assert action_label_multiplicity(5, [0, 1, 2], num_start_frames=4).tolist() == [1, 2, 3, 3, 2]
 

@@ -172,6 +172,46 @@ def test_boolean_priors_support_control_extended_dataset_actions():
     }
 
 
+def test_semantic_resume_defers_comparison_until_status_priors_are_recomputed():
+    actions = np.zeros((5, len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)), dtype=np.float32)
+    actions[:, 3] = [1, 1, 0, 0, 0]
+    actions[:, 4] = [0, 0, 1, 0, 0]
+    policy_cfg = SimpleNamespace(
+        type="pi05",
+        action_predict_arm_teleop_inactive=True,
+        action_predict_arm_reset=True,
+        action_predict_gripper=True,
+        action_predict_task_complete=True,
+        gripper_target_representation="continuous_position",
+        action_gripper_target_true_side="negative",
+        action_bool_loss_weight=4.0,
+        action_bool_true_fractions={
+            "arm_teleop_inactive": 0.25,
+            "arm_reset": 0.25,
+            "task_complete": 0.2,
+            "task_blocked": 0.1,
+        },
+        chunk_size=3,
+        control_frequency_hz=10,
+    )
+
+    stats = configure_action_bool_balance(
+        SimpleNamespace(
+            trainable_config=policy_cfg,
+            resume=True,
+            resume_with_updated_dataset=False,
+        ),
+        _fake_dataset(actions, CONTROL_EXTENDED_DATASET_ACTION_NAMES),
+        exclude_task_status=True,
+    )
+
+    assert stats is not None
+    assert policy_cfg.action_bool_true_fractions == {
+        "arm_teleop_inactive": pytest.approx(0.25),
+        "arm_reset": pytest.approx(0.25),
+    }
+
+
 def test_resume_rejects_changed_boolean_priors_without_updated_dataset_opt_in():
     actions = np.zeros((5, len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)), dtype=np.float32)
     actions[:, 3] = [1, 1, 0, 0, 0]

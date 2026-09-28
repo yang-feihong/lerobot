@@ -76,6 +76,57 @@ def is_task_complete_deployment_metadata_extension(saved: dict[str, Any], curren
     return saved == current
 
 
+def is_task_status_deployment_metadata_extension(saved: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Return whether current only appends optional flow-matched task status channels."""
+    saved = json.loads(json.dumps(saved))
+    current = json.loads(json.dumps(current))
+    try:
+        saved_action = saved["action"]
+        current_action = current["action"]
+        saved_predict = saved_action["predict"]
+        current_predict = current_action["predict"]
+        saved_names = list(saved_action["model_names"])
+        current_names = list(current_action["model_names"])
+    except (KeyError, TypeError):
+        return False
+    appended: list[str] = []
+    contracts = {
+        "task_complete": {
+            "task_complete_semantics": "explicit_true_in_the_terminal_stage_hold",
+            "task_complete_deployment_behavior": "stop_before_executing_later_chunk_elements_at_first_true",
+        },
+        "task_blocked": {
+            "task_blocked_semantics": "instruction_precondition_is_not_satisfied_in_the_current_state",
+        },
+    }
+    for name, expected_contract in contracts.items():
+        old = bool(saved_predict.get(name, False))
+        new = bool(current_predict.get(name, False))
+        if old and not new:
+            return False
+        if new and not old:
+            appended.append(name)
+        saved_predict[name] = new
+        for key, enabled_value in expected_contract.items():
+            if current_action.get(key) != (enabled_value if new else None):
+                return False
+            saved_action[key] = current_action.get(key)
+    if not appended or current_names != [*saved_names, *appended]:
+        return False
+    saved_action["model_names"] = current_names
+    # New checkpoints explicitly serialize blocked decoding even when disabled.
+    for container in ("boolean_decoding",):
+        saved_container = saved_action.get(container)
+        current_container = current_action.get(container)
+        if isinstance(saved_container, dict) and isinstance(current_container, dict):
+            for child in ("true_side", "output_values"):
+                if isinstance(saved_container.get(child), dict) and isinstance(
+                    current_container.get(child), dict
+                ):
+                    saved_container[child]["task_blocked"] = current_container[child].get("task_blocked")
+    return saved == current
+
+
 @dataclass
 class MotionBalancedSamplingConfig:
     enabled: bool = False
@@ -344,13 +395,13 @@ class TrainPipelineConfig(HubMixin):
                     saved_metadata = json.load(f)
                 current_metadata = deployment_metadata()
                 metadata_matches = saved_metadata == current_metadata
-                task_complete_extension = (
+                task_status_extension = (
                     self.resume_with_updated_dataset
-                    and is_task_complete_deployment_metadata_extension(
+                    and is_task_status_deployment_metadata_extension(
                         saved_metadata, current_metadata
                     )
                 )
-                if not metadata_matches and not task_complete_extension:
+                if not metadata_matches and not task_status_extension:
                     raise ValueError("Resume checkpoint deployment metadata disagrees with policy config")
         if self.reward_model is not None:
             self.reward_model.pretrained_path = str(policy_dir)

@@ -31,6 +31,7 @@ predict_arm_reset="true"
 predict_ee_pose="true"
 predict_gripper="true"
 predict_task_complete="false"
+predict_task_blocked="false"
 discrete_action_training_mode="continuous_flow" # "continuous_flow" or "structured_temporal"
 ee_target_dataset_semantics="joint_control_inactive_interpolated"
 ee_supervision_source="control_action"
@@ -110,6 +111,18 @@ interior_static_weight="0.0"
 terminal_static_weight="1.0" # increase above 1.0 to strengthen terminal holds
 dataset_mixture_sampling="false"
 dataset_mixture_manifest=""
+# Optional instruction-relative semantic views. The physical sample is chosen
+# first; one semantic view and then one language realization are selected.
+semantic_views_path=""
+random_semantic_view="true"
+# JSON object, for example: {"primary":1.0,"composite":1.0,"counterfactual":0.5}
+semantic_view_kind_weights="{}"
+# Physical frame ranges selected from complete episodes.  Example:
+# semantic_phases='["approach","handle_press"]'
+# Equal phase weights are used when semantic_phase_weights is empty.
+semantic_phases="[]"
+semantic_phase_weights="{}"
+semantic_source_weights="{}"
 # A mixture manifest describes source membership in a losslessly merged dataset:
 # {"sources":[
 #   {"name":"stage1_stage2","weight":0.8,"episode_range":[0,1085]},
@@ -203,6 +216,13 @@ training_rtc_explicit="false"
 training_rtc_simulated_delay_explicit="false"
 training_rtc_delay_distribution_explicit="false"
 predict_task_complete_explicit="false"
+predict_task_blocked_explicit="false"
+semantic_views_path_explicit="false"
+random_semantic_view_explicit="false"
+semantic_view_kind_weights_explicit="false"
+semantic_phases_explicit="false"
+semantic_phase_weights_explicit="false"
+semantic_source_weights_explicit="false"
 for argument in "$@"; do
   if [[ "$argument" == --action-semantics-profile=* ]]; then
     action_semantics_profile="${argument#*=}"
@@ -286,6 +306,10 @@ while (( $# > 0 )); do
       predict_task_complete="${1#*=}"
       predict_task_complete_explicit="true"
       ;;
+    --predict-task-blocked=*)
+      predict_task_blocked="${1#*=}"
+      predict_task_blocked_explicit="true"
+      ;;
     --new-module-optimizer-lr-multiplier=*) new_module_optimizer_lr_multiplier="${1#*=}" ;;
     --structured-action-crf-initial-stay-bias=*) structured_action_crf_initial_stay_bias="${1#*=}" ;;
     --batch-size-per-gpu=*) batch_size_per_gpu="${1#*=}" ;;
@@ -301,6 +325,12 @@ while (( $# > 0 )); do
     --terminal-static-weight=*) terminal_static_weight="${1#*=}"; terminal_static_weight_explicit="true" ;;
     --dataset-mixture-sampling=*) dataset_mixture_sampling="${1#*=}"; dataset_mixture_sampling_explicit="true" ;;
     --dataset-mixture-manifest=*) dataset_mixture_manifest="${1#*=}"; dataset_mixture_manifest_explicit="true" ;;
+    --semantic-views-path=*) semantic_views_path="${1#*=}"; semantic_views_path_explicit="true" ;;
+    --random-semantic-view=*) random_semantic_view="${1#*=}"; random_semantic_view_explicit="true" ;;
+    --semantic-view-kind-weights=*) semantic_view_kind_weights="${1#*=}"; semantic_view_kind_weights_explicit="true" ;;
+    --semantic-phases=*) semantic_phases="${1#*=}"; semantic_phases_explicit="true" ;;
+    --semantic-phase-weights=*) semantic_phase_weights="${1#*=}"; semantic_phase_weights_explicit="true" ;;
+    --semantic-source-weights=*) semantic_source_weights="${1#*=}"; semantic_source_weights_explicit="true" ;;
     --finetune-mode=*) finetune_mode="${1#*=}" ;;
     --dataset-repo-id=*) dataset_repo_id="${1#*=}"; dataset_repo_id_explicit="true" ;;
     --dataset-root=*) dataset_root="${1#*=}"; dataset_root_explicit="true" ;;
@@ -350,6 +380,41 @@ if [[ "$training_rtc" != "true" && "$training_rtc" != "false" ]]; then
   echo "--training-rtc must be true or false." >&2
   exit 2
 fi
+if [[ "$predict_task_blocked" != "true" && "$predict_task_blocked" != "false" ]]; then
+  echo "--predict-task-blocked must be true or false." >&2
+  exit 2
+fi
+if [[ "$random_semantic_view" != "true" && "$random_semantic_view" != "false" ]]; then
+  echo "--random-semantic-view must be true or false." >&2
+  exit 2
+fi
+if [[ -n "$semantic_views_path" && ! -f "$semantic_views_path" ]]; then
+  echo "Semantic-view sidecar not found: $semantic_views_path" >&2
+  exit 2
+fi
+python3 - "$semantic_view_kind_weights" "$semantic_phases" "$semantic_phase_weights" "$semantic_source_weights" <<'PY'
+import json
+import sys
+
+value = json.loads(sys.argv[1])
+if not isinstance(value, dict) or any(not isinstance(k, str) or not isinstance(v, (int, float)) or v < 0 for k, v in value.items()):
+    raise SystemExit("--semantic-view-kind-weights must be a JSON object with non-negative numeric values")
+phases = json.loads(sys.argv[2])
+if not isinstance(phases, list) or any(not isinstance(item, str) or not item for item in phases):
+    raise SystemExit("--semantic-phases must be a JSON array of non-empty strings")
+if len(phases) != len(set(phases)):
+    raise SystemExit("--semantic-phases must not contain duplicates")
+for option, raw in (("--semantic-phase-weights", sys.argv[3]), ("--semantic-source-weights", sys.argv[4])):
+    weights = json.loads(raw)
+    if not isinstance(weights, dict) or any(
+        not isinstance(k, str) or not k or not isinstance(v, (int, float)) or v <= 0
+        for k, v in weights.items()
+    ):
+        raise SystemExit(f"{option} must be a JSON object with positive numeric values")
+phase_weights = json.loads(sys.argv[3])
+if phase_weights and set(phase_weights) != set(phases):
+    raise SystemExit("--semantic-phase-weights keys must exactly match --semantic-phases")
+PY
 if [[ ! "$training_rtc_simulated_delay" =~ ^[1-9][0-9]*$ ]]; then
   echo "--training-rtc-simulated-delay must be a positive integer (exclusive upper bound)." >&2
   exit 2
@@ -513,6 +578,10 @@ if [[ -n "$resume_checkpoint" ]]; then
       exit 1
     fi
     resume_args+=(--wandb.resume_training_run=false)
+  else
+    # An in-place resume continues the same experiment and therefore the same
+    # W&B run, even when the source checkpoint was originally created by a fork.
+    resume_args+=(--wandb.resume_training_run=true)
   fi
   policy_source_args=()
   log_file="$log_dir/${job_name}_resume_${timestamp}.log"
@@ -584,6 +653,7 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.action_predict_ee_pose="$predict_ee_pose"
     --policy.action_predict_gripper="$predict_gripper"
     --policy.action_predict_task_complete="$predict_task_complete"
+    --policy.action_predict_task_blocked="$predict_task_blocked"
     --policy.discrete_action_training_mode="$discrete_action_training_mode"
     --policy.ee_target_dataset_semantics="$ee_target_dataset_semantics"
     --policy.ee_supervision_source="$ee_supervision_source"
@@ -597,44 +667,49 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.n_action_steps="$action_steps_to_execute"
     --policy.control_frequency_hz="$control_frequency_hz"
   )
-elif [[ "$predict_task_complete_explicit" == "true" ]]; then
+elif [[ "$predict_task_complete_explicit" == "true" || "$predict_task_blocked_explicit" == "true" ]]; then
   task_complete_config_python="${LEROBOT_RUNTIME_BIN:+$LEROBOT_RUNTIME_BIN/python}"
   task_complete_config_python="${task_complete_config_python:-python3}"
-  "$task_complete_config_python" - "$resume_config" "$predict_task_complete" \
+  "$task_complete_config_python" - "$resume_config" "$predict_task_complete" "$predict_task_blocked" \
+    "$predict_task_complete_explicit" "$predict_task_blocked_explicit" \
     "$resume_with_updated_dataset" "$resume_new_run_name" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1]) as stream:
-    saved = bool(json.load(stream).get("policy", {}).get("action_predict_task_complete", False))
-requested = sys.argv[2] == "true"
-updated_dataset = sys.argv[3] == "true"
-fork_name = sys.argv[4]
-
-if requested == saved:
+    policy = json.load(stream).get("policy", {})
+checks = (
+    ("action_predict_task_complete", bool(policy.get("action_predict_task_complete", False)), sys.argv[2] == "true", sys.argv[4] == "true"),
+    ("action_predict_task_blocked", bool(policy.get("action_predict_task_blocked", False)), sys.argv[3] == "true", sys.argv[5] == "true"),
+)
+updated_dataset = sys.argv[6] == "true"
+fork_name = sys.argv[7]
+extensions = []
+for name, saved, requested, explicit in checks:
+    if not explicit or requested == saved:
+        continue
+    if saved or not requested:
+        print(f"Resume only supports the schema extension {name}=false -> true; checkpoint={saved}, requested={requested}.", file=sys.stderr)
+        raise SystemExit(2)
+    extensions.append(name)
+if not extensions:
     raise SystemExit(0)
-if saved or not requested:
-    print(
-        "Resume only supports the schema extension action_predict_task_complete=false -> true; "
-        f"checkpoint={saved}, requested={requested}.",
-        file=sys.stderr,
-    )
-    raise SystemExit(2)
 if not updated_dataset:
     print(
-        "Enabling task_complete on resume requires --resume-with-updated-dataset=true.",
+        "Extending task-status outputs on resume requires --resume-with-updated-dataset=true.",
         file=sys.stderr,
     )
     raise SystemExit(2)
 if not fork_name:
     print(
-        "Enabling task_complete on resume requires --resume-new-run-name=<new-run>; "
+        "Extending task-status outputs on resume requires --resume-new-run-name=<new-run>; "
         "the source run cannot be mutated in place.",
         file=sys.stderr,
     )
     raise SystemExit(2)
 PY
-  policy_io_args+=(--policy.action_predict_task_complete=true)
+  [[ "$predict_task_complete_explicit" == "false" ]] || policy_io_args+=(--policy.action_predict_task_complete="$predict_task_complete")
+  [[ "$predict_task_blocked_explicit" == "false" ]] || policy_io_args+=(--policy.action_predict_task_blocked="$predict_task_blocked")
 fi
 
 policy_mem_args=()
@@ -689,6 +764,16 @@ if [[ -z "$resume_checkpoint" ]]; then
       --dataset.sim_image_root="$sim_image_root"
     )
   fi
+  if [[ -n "$semantic_views_path" ]]; then
+    dataset_args+=(
+      --dataset.semantic_views_path="$semantic_views_path"
+      --dataset.random_semantic_view="$random_semantic_view"
+      --dataset.semantic_view_kind_weights="$semantic_view_kind_weights"
+      --dataset.semantic_phases="$semantic_phases"
+      --dataset.semantic_phase_weights="$semantic_phase_weights"
+      --dataset.semantic_source_weights="$semantic_source_weights"
+    )
+  fi
 else
   [[ "$dataset_repo_id_explicit" == "false" ]] || dataset_args+=(--dataset.repo_id="$dataset_repo_id")
   [[ "$dataset_root_explicit" == "false" ]] || dataset_args+=(--dataset.root="$dataset_root")
@@ -696,6 +781,12 @@ else
   [[ "$sim_image_manifest_explicit" == "false" ]] || dataset_args+=(--dataset.sim_image_manifest="$sim_image_manifest")
   [[ "$sim_image_root_explicit" == "false" ]] || dataset_args+=(--dataset.sim_image_root="$sim_image_root")
   [[ "$mixed_sim_probability_explicit" == "false" ]] || dataset_args+=(--dataset.mixed_sim_probability="$mixed_sim_probability")
+  [[ "$semantic_views_path_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_views_path="$semantic_views_path")
+  [[ "$random_semantic_view_explicit" == "false" ]] || dataset_args+=(--dataset.random_semantic_view="$random_semantic_view")
+  [[ "$semantic_view_kind_weights_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_view_kind_weights="$semantic_view_kind_weights")
+  [[ "$semantic_phases_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_phases="$semantic_phases")
+  [[ "$semantic_phase_weights_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_phase_weights="$semantic_phase_weights")
+  [[ "$semantic_source_weights_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_source_weights="$semantic_source_weights")
 fi
 if [[ -n "$video_backend" ]]; then
   dataset_args+=(--dataset.video_backend="$video_backend")
@@ -939,6 +1030,9 @@ fi
 if [[ -z "$resume_checkpoint" ]]; then
   echo "Dataset:          $dataset_root"
   echo "Image source:     $image_source (sim probability=$mixed_sim_probability)"
+  echo "Semantic views:   ${semantic_views_path:-none} (random=$random_semantic_view, kind_weights=$semantic_view_kind_weights)"
+  echo "Semantic sampling: phases=$semantic_phases, phase_weights=$semantic_phase_weights, source_weights=$semantic_source_weights"
+  echo "Task status:      complete=$predict_task_complete, blocked=$predict_task_blocked"
 else
   echo "Dataset:          restored from checkpoint unless explicitly overridden"
   echo "Image source:     restored from checkpoint unless explicitly overridden"

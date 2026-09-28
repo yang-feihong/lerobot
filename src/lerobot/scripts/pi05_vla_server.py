@@ -82,6 +82,7 @@ EE_STATE_NAMES = tuple(
 EXECUTION_ACTION_SUFFIX_NAMES = (
     "gripper_target",
     "task_complete",
+    "task_blocked",
 )
 B2_EXECUTION_VELOCITY_NAMES = ("b2_vx", "b2_vy", "b2_omega_z")
 B2_OBSERVED_VELOCITY_NAMES = ("b2_body_vx", "b2_body_vy", "b2_body_wz")
@@ -290,7 +291,13 @@ def _to_execution_actions(
         rot6d = _matrix_to_rot6d(_rotvec_to_matrix(rotvec))
         for index, name in enumerate(EE_DELTA_ACTION_NAMES[:6]):
             columns[name] = rot6d[:, index]
-    required = set(output_names) - {"b2_active", "arm_active", "arm_reset", "task_complete"}
+    required = set(output_names) - {
+        "b2_active",
+        "arm_active",
+        "arm_reset",
+        "task_complete",
+        "task_blocked",
+    }
     missing = sorted(required - columns.keys())
     if missing:
         raise ValueError(f"Checkpoint postprocessor is missing executable actions: {missing}")
@@ -303,6 +310,7 @@ def _to_execution_actions(
     columns.setdefault("b2_active", torch.ones_like(actions[:, 0]))
     columns.setdefault("arm_reset", torch.zeros_like(actions[:, 0]))
     columns.setdefault("task_complete", torch.zeros_like(actions[:, 0]))
+    columns.setdefault("task_blocked", torch.zeros_like(actions[:, 0]))
     return torch.stack([columns[name] for name in output_names], dim=-1)
 
 
@@ -363,10 +371,28 @@ def _decode_discrete_actions(
             decoded.new_tensor(gripper_negative_value),
             decoded.new_tensor(gripper_nonnegative_value),
         )
-    if "task_complete" in indices:
+    if {"task_complete", "task_blocked"}.issubset(indices):
+        status_indices = [indices["task_complete"], indices["task_blocked"]]
+        normalized_status = normalized_actions[:, status_indices]
+        prototypes = normalized_status.new_tensor(((-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0)))
+        state_indices = torch.argmin(
+            torch.sum((normalized_status[:, None, :] - prototypes[None, :, :]) ** 2, dim=-1),
+            dim=-1,
+        )
+        terminal = state_indices != 0
+        if bool(terminal.any()):
+            first = int(torch.nonzero(terminal, as_tuple=False)[0, 0])
+            state_indices[first:] = state_indices[first]
+        physical_states = decoded.new_tensor(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)))
+        decoded[:, status_indices] = physical_states[state_indices]
+    elif "task_complete" in indices:
         index = indices["task_complete"]
         complete = torch.cummax(normalized_actions[:, index] > 0, dim=0).values
         decoded[:, index] = complete.to(decoded.dtype)
+    elif "task_blocked" in indices:
+        index = indices["task_blocked"]
+        blocked = torch.cummax(normalized_actions[:, index] > 0, dim=0).values
+        decoded[:, index] = blocked.to(decoded.dtype)
     if mode == "structured_temporal" and {"arm_teleop_inactive", "arm_reset"}.issubset(indices):
         inactive = decoded[:, indices["arm_teleop_inactive"]] > 0.5
         reset = decoded[:, indices["arm_reset"]] > 0.5
@@ -554,6 +580,21 @@ def _load_checkpoint_contract(
     expected = config.deployment_metadata()
     if "arm_mode_encoding" not in action:
         expected["action"].pop("arm_mode_encoding", None)
+    saved_predict = action.get("predict", {})
+    expected_predict = expected["action"].get("predict", {})
+    if (
+        isinstance(saved_predict, dict)
+        and "task_blocked" not in saved_predict
+        and expected_predict.get("task_blocked") is False
+    ):
+        expected_predict.pop("task_blocked", None)
+        expected["action"].get("boolean_decoding", {}).get("true_side", {}).pop(
+            "task_blocked", None
+        )
+        expected["action"].get("boolean_decoding", {}).get("output_values", {}).pop(
+            "task_blocked", None
+        )
+        expected["action"].pop("task_blocked_semantics", None)
     if saved != expected:
         raise ValueError("pi05_deployment_metadata.json disagrees with checkpoint config.json")
     discrete_mode = str(action.get("discrete_training_mode", "continuous_flow"))
@@ -661,7 +702,14 @@ def _resolve_policy_path(path: str | Path) -> Path:
 
 
 def _checkpoint_hot_swap_signature(policy_path: Path) -> str:
-    """Return a conservative signature for in-process PEFT weight replacement."""
+    """Return the inference-compatibility signature for PEFT weight replacement.
+
+    Checkpoints trained from the same inference architecture may legitimately
+    contain different training priors or newer explicit copies of old default
+    values.  Those values must not force a full model reconstruction.  The
+    pre/post processors are rebuilt on every hot swap, so their training-only
+    masking options are likewise outside the compatibility contract.
+    """
     documents = {}
     for name in (
         "config.json",
@@ -675,15 +723,30 @@ def _checkpoint_hot_swap_signature(policy_path: Path) -> str:
             raise FileNotFoundError(f"Checkpoint is missing hot-swap metadata: {path}")
         documents[name] = json.loads(path.read_text(encoding="utf-8"))
     config = documents["config.json"]
-    for runtime_override in (
+    for non_structural_field in (
         "pretrained_path",
         "pretrained_revision",
         "device",
         "compile_model",
         "compile_mode",
         "num_inference_steps",
+        # Dataset priors used only to balance training losses.
+        "action_bool_true_fractions",
+        # Controls which padded targets contribute to the training loss.
+        "action_supervise_terminal_static_padding",
+        # Training-time MEM history augmentation.  Deployment history timing is
+        # described separately by the fixed inference contract.
+        "mem_vit_random_interval_sampling",
+        "mem_vit_global_interval_std_seconds",
+        "mem_vit_local_interval_std_seconds",
+        "mem_vit_min_interval_seconds",
+        "mem_vit_max_interval_seconds",
     ):
-        config.pop(runtime_override, None)
+        config.pop(non_structural_field, None)
+
+    for processor_name in ("policy_preprocessor.json", "policy_postprocessor.json"):
+        for step in documents[processor_name].get("steps", ()):
+            step.get("config", {}).pop("supervise_terminal_static_padding", None)
     canonical = json.dumps(documents, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(canonical).hexdigest()
 
@@ -1168,6 +1231,7 @@ class AsyncRTCPolicy:
                     "representation",
                     "z1_representation",
                     "ee_delta_rotation_representation",
+                    "include_task_blocked",
                 }
             }
         )

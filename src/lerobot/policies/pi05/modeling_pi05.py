@@ -2378,6 +2378,13 @@ class PI05Policy(PreTrainedPolicy):
         completion_target = None
         if "task_complete" in name_to_dim:
             completion_target = self._normalized_bool_mask(actions, name_to_dim["task_complete"])
+        blocked_target = None
+        if "task_blocked" in name_to_dim:
+            blocked_target = self._normalized_bool_mask(actions, name_to_dim["task_blocked"])
+        if completion_target is not None and blocked_target is not None:
+            overlap = completion_target & blocked_target & valid_mask
+            if bool(overlap.any()):
+                raise ValueError("task_complete and task_blocked cannot both be true")
         # Completion is an additional prediction target, not an action-validity
         # mask.  The terminal hold remains valid supervision for every other
         # action channel after task_complete becomes true.
@@ -2503,6 +2510,26 @@ class PI05Policy(PreTrainedPolicy):
                     bool_dim_stats["gate_weight/task_complete_false"] = float(
                         bool_weight * 0.5 / (1.0 - global_true_fraction)
                     )
+
+        if blocked_target is not None:
+            blocked_dim = name_to_dim["task_blocked"]
+            blocked_valid = valid_mask
+            blocked_weights = (
+                self._global_bool_weights("task_blocked", blocked_target, blocked_valid) * bool_weight
+            )
+            blocked_losses = losses[:, :, blocked_dim]
+            weighted_parts.append(blocked_losses * blocked_weights)
+            weight_parts.append(blocked_weights)
+            loss_part_names.append("task_blocked")
+            bool_dim_stats["gate_true_frac/task_blocked"] = float(
+                blocked_target[blocked_valid].float().mean().detach().cpu().item()
+            )
+            bool_dim_stats["gate_loss/task_blocked"] = float(
+                ((blocked_losses * blocked_weights).sum() / blocked_weights.sum().clamp_min(1e-6))
+                .detach()
+                .cpu()
+                .item()
+            )
 
         weighted = torch.cat([part.reshape(losses.shape[0], -1) for part in weighted_parts], dim=1)
         weights = torch.cat([part.reshape(losses.shape[0], -1) for part in weight_parts], dim=1)

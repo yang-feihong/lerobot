@@ -58,6 +58,12 @@ from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
 from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.datasets.mixture_sampling import load_dataset_mixture_manifest
 from lerobot.datasets.motion_balanced_sampling import build_motion_priority_pool
+from lerobot.datasets.semantic_views import (
+    apply_semantic_views_to_batch,
+    load_semantic_views,
+    semantic_phase_sampling_groups,
+    semantic_status_priors,
+)
 from lerobot.datasets.static_horizon_sampling import build_static_horizon_pool
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
@@ -68,9 +74,10 @@ from lerobot.policies.pi05.transformed_action_stats import (
     PI05_TRANSFORMED_ACTION_STATS_NAME,
     assert_transformed_action_stats_equal,
     compute_transformed_action_stats,
-    is_task_complete_schema_extension,
+    is_task_status_schema_extension,
     load_transformed_action_stats,
     save_transformed_action_stats,
+    transformed_action_schemas_equal,
     transformed_action_stats_ee_valid_count,
     validate_transformed_action_stats,
 )
@@ -217,6 +224,20 @@ def _is_eval_policy_metric(key: str, value: object) -> bool:
     )
 
 
+def _record_train_loss_contributions(
+    train_metrics: MetricsTracker, output_dict: dict[str, Any] | None
+) -> None:
+    """Route policy contributions, including slash-qualified semantic names, into meters."""
+    if output_dict is None:
+        return
+    for output_key, value in output_dict.items():
+        if not output_key.startswith("loss_contribution/"):
+            continue
+        meter_key = f"loss_contribution/train/{output_key.removeprefix('loss_contribution/')}"
+        if meter_key in train_metrics.metrics and isinstance(value, int | float):
+            setattr(train_metrics, meter_key, float(value))
+
+
 def _wandb_eval_metrics(
     eval_loss: float,
     eval_batches: int,
@@ -318,12 +339,7 @@ def update_policy(
             else:
                 loss, output_dict = policy.forward(batch)
 
-            if output_dict is not None:
-                for output_key, value in output_dict.items():
-                    if output_key.startswith("loss_contribution/") and output_key.count("/") == 2:
-                        meter_key = f"loss_contribution/train/{output_key.removeprefix('loss_contribution/')}"
-                        if meter_key in train_metrics.metrics and isinstance(value, int | float):
-                            setattr(train_metrics, meter_key, float(value))
+            _record_train_loss_contributions(train_metrics, output_dict)
 
             # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
@@ -578,6 +594,19 @@ def attach_loss_semantics(
     batch["loss_semantic_names"] = semantic_names
 
 
+def attach_semantic_view_loss_semantics(batch: dict[str, Any], semantic_names: tuple[str, ...]) -> None:
+    selected = batch.get("semantic_view_name")
+    if not isinstance(selected, (list, tuple)):
+        raise ValueError("semantic-view training batch lost semantic_view_name")
+    name_to_id = {name: index for index, name in enumerate(semantic_names)}
+    try:
+        ids = [name_to_id[str(name)] for name in selected]
+    except KeyError as exc:
+        raise ValueError(f"unknown semantic view in batch: {exc.args[0]}") from exc
+    batch["loss_semantic_id"] = torch.tensor(ids, dtype=torch.long)
+    batch["loss_semantic_names"] = semantic_names
+
+
 def select_balanced_eval_indices(
     task_indices: np.ndarray,
     max_samples: int,
@@ -699,7 +728,11 @@ def resolve_task_complete_sampling(dataset, policy_cfg) -> tuple[list[int], dict
 
 
 def configure_action_bool_balance(
-    cfg: TrainPipelineConfig, dataset, start_counts: dict[int, int] | None = None
+    cfg: TrainPipelineConfig,
+    dataset,
+    start_counts: dict[int, int] | None = None,
+    *,
+    exclude_task_status: bool = False,
 ) -> dict[str, dict[str, int | float]] | None:
     """Resolve fixed class priors for every enabled boolean action from the train split."""
     policy_cfg = cfg.trainable_config
@@ -716,7 +749,7 @@ def configure_action_bool_balance(
         "arm_reset": policy_cfg.action_predict_arm_reset,
         "gripper_target": policy_cfg.action_predict_gripper
         and policy_cfg.gripper_target_representation == "binary_position",
-        "task_complete": policy_cfg.action_predict_task_complete,
+        "task_complete": policy_cfg.action_predict_task_complete and not exclude_task_status,
     }
     enabled_names = [name for name, is_enabled in enabled.items() if is_enabled]
     if not enabled_names:
@@ -809,7 +842,8 @@ def configure_action_bool_balance(
 
     saved_fractions = dict(policy_cfg.action_bool_true_fractions)
     if (
-        cfg.resume
+        not exclude_task_status
+        and cfg.resume
         and not cfg.resume_with_updated_dataset
         and saved_fractions
         and saved_fractions != true_fractions
@@ -818,7 +852,12 @@ def configure_action_bool_balance(
             "Resume train-split boolean priors disagree with the checkpoint: "
             f"checkpoint={saved_fractions}, current={true_fractions}"
         )
-    if cfg.resume and cfg.resume_with_updated_dataset and saved_fractions != true_fractions:
+    if (
+        not exclude_task_status
+        and cfg.resume
+        and cfg.resume_with_updated_dataset
+        and saved_fractions != true_fractions
+    ):
         logging.warning(
             "Resuming with an explicitly updated dataset: replacing checkpoint boolean priors "
             "(%s) with freshly measured train-split priors (%s)",
@@ -856,6 +895,40 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     from accelerate.utils import DistributedDataParallelKwargs, DistributedType
 
     cfg.validate()
+
+    semantic_views = (
+        load_semantic_views(cfg.dataset.semantic_views_path)
+        if cfg.dataset.semantic_views_path is not None
+        else None
+    )
+    if semantic_views is not None:
+        if cfg.dataset.task_variants_path is not None:
+            raise ValueError("semantic_views_path supersedes task_variants_path; configure only one")
+        if semantic_views.selected_episodes is not None:
+            requested = None if cfg.dataset.episodes is None else set(cfg.dataset.episodes)
+            selected = set(semantic_views.selected_episodes)
+            if requested is None:
+                cfg.dataset.episodes = list(semantic_views.selected_episodes)
+            elif not requested.issubset(selected):
+                raise ValueError(
+                    "dataset.episodes contains episodes excluded by the semantic-view sidecar: "
+                    f"{sorted(requested - selected)[:10]}"
+                )
+        if cfg.trainable_config.type != "pi05":
+            raise ValueError("semantic views currently require PI0.5")
+        saved_manifest_hash = cfg.trainable_config.semantic_view_manifest_sha256
+        if (
+            cfg.resume
+            and saved_manifest_hash != semantic_views.sha256
+            and not cfg.resume_with_updated_dataset
+        ):
+            raise ValueError(
+                "Resume semantic-view provenance differs from the checkpoint; pass "
+                "resume_with_updated_dataset=true and fork a new run to use the new sidecar"
+            )
+        cfg.trainable_config.semantic_view_manifest_sha256 = semantic_views.sha256
+        cfg.trainable_config.semantic_view_manifest_version = 1
+        cfg.trainable_config.semantic_view_kind_weights = dict(cfg.dataset.semantic_view_kind_weights)
 
     if isinstance(cfg.policy, PI05Config) and (
         cfg.policy.mem_vit_enabled
@@ -940,8 +1013,33 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info("Creating env")
         eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
-    task_variants = load_task_variants(dataset.root, cfg.dataset.task_variants_path)
-    completion_sampling = resolve_task_complete_sampling(dataset, cfg.trainable_config)
+    task_variants = (
+        {} if semantic_views is not None else load_task_variants(dataset.root, cfg.dataset.task_variants_path)
+    )
+    if semantic_views is not None:
+        expected_episodes = set(dataset.episodes or range(dataset.meta.total_episodes))
+        missing = expected_episodes - set(semantic_views.episodes)
+        if missing:
+            raise ValueError(f"semantic-view sidecar is missing selected episodes: {sorted(missing)[:10]}")
+        if is_main_process:
+            cfg.output_dir.mkdir(parents=True, exist_ok=True)
+            semantic_record = {
+                "path": str(semantic_views.path),
+                "sha256": semantic_views.sha256,
+                "version": 1,
+                "selected_episodes": sorted(expected_episodes),
+                "view_kind_weights": cfg.dataset.semantic_view_kind_weights,
+                "phases": cfg.dataset.semantic_phases,
+                "phase_weights": cfg.dataset.semantic_phase_weights,
+                "source_weights": cfg.dataset.semantic_source_weights,
+            }
+            (cfg.output_dir / "semantic_view_runtime.json").write_text(
+                json.dumps(semantic_record, indent=2), encoding="utf-8"
+            )
+            (cfg.output_dir / "semantic_views.json").write_bytes(semantic_views.path.read_bytes())
+    completion_sampling = (
+        None if semantic_views is not None else resolve_task_complete_sampling(dataset, cfg.trainable_config)
+    )
     capped_train_to = completion_sampling[0] if completion_sampling is not None else None
     train_start_counts = completion_sampling[1] if completion_sampling is not None else None
     if is_main_process and train_start_counts is not None:
@@ -953,7 +1051,50 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             len(train_start_counts),
             cfg.trainable_config.task_complete_sample_tail_seconds,
         )
-    action_bool_balance = configure_action_bool_balance(cfg, dataset, train_start_counts)
+    saved_action_bool_priors = dict(cfg.trainable_config.action_bool_true_fractions)
+    action_bool_balance = configure_action_bool_balance(
+        cfg, dataset, train_start_counts, exclude_task_status=semantic_views is not None
+    )
+    if semantic_views is not None:
+        selected_episodes = dataset.episodes or list(range(dataset.meta.total_episodes))
+        episode_lengths = {
+            episode: int(dataset.meta.episodes[episode]["dataset_to_index"])
+            - int(dataset.meta.episodes[episode]["dataset_from_index"])
+            for episode in selected_episodes
+        }
+        status_priors = semantic_status_priors(
+            semantic_views,
+            episode_lengths,
+            action_horizon=cfg.trainable_config.chunk_size,
+            view_kind_weights=cfg.dataset.semantic_view_kind_weights,
+            phases=cfg.dataset.semantic_phases,
+            phase_weights=cfg.dataset.semantic_phase_weights,
+            source_weights=cfg.dataset.semantic_source_weights,
+        )
+        cfg.trainable_config.action_bool_true_fractions.update(status_priors)
+        current_action_bool_priors = dict(cfg.trainable_config.action_bool_true_fractions)
+        if (
+            cfg.resume
+            and not cfg.resume_with_updated_dataset
+            and saved_action_bool_priors
+            and saved_action_bool_priors != current_action_bool_priors
+        ):
+            raise ValueError(
+                "Resume train-split boolean priors disagree with the checkpoint: "
+                f"checkpoint={saved_action_bool_priors}, current={current_action_bool_priors}"
+            )
+        if (
+            cfg.resume
+            and cfg.resume_with_updated_dataset
+            and saved_action_bool_priors != current_action_bool_priors
+        ):
+            logging.warning(
+                "Resuming with an explicitly updated semantic dataset: replacing checkpoint "
+                "boolean priors (%s) with freshly measured priors (%s)",
+                saved_action_bool_priors,
+                current_action_bool_priors,
+            )
+        logging.info("Semantic-view status priors: %s", status_priors)
     if is_main_process and action_bool_balance is not None:
         for name, balance in action_bool_balance.items():
             logging.info(
@@ -1044,11 +1185,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     )
                 saved_action_stats_payload = load_transformed_action_stats(resume_stats_path)
                 if cfg.resume_with_updated_dataset:
-                    schema_matches = (
-                        saved_action_stats_payload["schema"]
-                        == measured_action_stats_payload["schema"]
+                    schema_matches = transformed_action_schemas_equal(
+                        saved_action_stats_payload, measured_action_stats_payload
                     )
-                    task_complete_extension = is_task_complete_schema_extension(
+                    task_complete_extension = is_task_status_schema_extension(
                         saved_action_stats_payload, measured_action_stats_payload
                     )
                     if not schema_matches and not task_complete_extension:
@@ -1057,7 +1197,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         )
                     if task_complete_extension:
                         logging.info(
-                            "Extending the resumed action schema with task_complete while preserving the "
+                            "Extending the resumed action schema with task status outputs while preserving the "
                             "checkpoint model and optimizer state"
                         )
                     logging.warning(
@@ -1386,6 +1526,39 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # same permutation. accelerate then shards it disjointly across ranks via BatchSamplerShard
         # without needing a `generator` attribute to synchronize an RNG, and resume is sample-exact.
         shuffle = False
+        semantic_eligible_frames = None
+        semantic_frame_groups = None
+        semantic_group_weights = None
+        if semantic_views is not None and cfg.dataset.semantic_phases:
+            if cfg.dataset_mixture_sampling.enabled:
+                raise ValueError(
+                    "semantic phase sampling supersedes dataset-mixture sampling; encode physical "
+                    "source_group in semantic segments and use dataset.semantic_source_weights"
+                )
+            (
+                semantic_eligible_frames,
+                semantic_frame_groups,
+                semantic_group_weights,
+                semantic_group_names,
+            ) = semantic_phase_sampling_groups(
+                semantic_views,
+                list(dataset.meta.episodes["dataset_from_index"]),
+                list(dataset.episodes or range(dataset.meta.total_episodes)),
+                phases=cfg.dataset.semantic_phases,
+                phase_weights=cfg.dataset.semantic_phase_weights,
+                source_weights=cfg.dataset.semantic_source_weights,
+            )
+            if is_main_process:
+                logging.info(
+                    "Semantic phase sampling: frames=%d groups=%s",
+                    len(semantic_eligible_frames),
+                    ", ".join(
+                        f"{name}={weight:.1%}"
+                        for name, weight in zip(
+                            semantic_group_names, semantic_group_weights, strict=True
+                        )
+                    ),
+                )
         if cfg.dataset_mixture_sampling.enabled:
             mixture_sources = load_dataset_mixture_manifest(
                 cfg.dataset_mixture_sampling.manifest_path,
@@ -1417,6 +1590,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 [source.episode_indices for source in mixture_sources] if mixture_sources else None
             ),
             source_weights=([source.weight for source in mixture_sources] if mixture_sources else None),
+            eligible_frame_indices=semantic_eligible_frames,
+            sampling_group_frame_indices=semantic_frame_groups,
+            sampling_group_weights=semantic_group_weights,
         )
         if cfg.resume and step > 0:
             # The resume offset depends on the (num_processes, batch_size) that produced `step`, so
@@ -1462,7 +1638,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 num_episodes=dataset.meta.total_episodes,
             )
     semantic_metadata = build_episode_semantic_lookup(dataset, semantic_sources)
-    if semantic_metadata is None:
+    if semantic_views is not None:
+        episode_semantic_lookup, semantic_names = None, semantic_views.semantic_names
+    elif semantic_metadata is None:
         episode_semantic_lookup, semantic_names = None, ()
     else:
         episode_semantic_lookup, semantic_names = semantic_metadata
@@ -1488,9 +1666,29 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     eval_dataloader = None
     if eval_dataset is not None:
         eval_ds = eval_dataset
-        eval_completion_sampling = resolve_task_complete_sampling(eval_dataset, cfg.trainable_config)
+        eval_completion_sampling = (
+            None
+            if semantic_views is not None
+            else resolve_task_complete_sampling(eval_dataset, cfg.trainable_config)
+        )
         eligible_eval_indices = None
-        if eval_completion_sampling is not None:
+        if semantic_views is not None and cfg.dataset.semantic_phases:
+            semantic_eval_frames, _, _, _ = semantic_phase_sampling_groups(
+                semantic_views,
+                list(eval_dataset.meta.episodes["dataset_from_index"]),
+                list(eval_dataset.episodes or range(eval_dataset.meta.total_episodes)),
+                phases=cfg.dataset.semantic_phases,
+                phase_weights=cfg.dataset.semantic_phase_weights,
+                source_weights=cfg.dataset.semantic_source_weights,
+            )
+            eligible_eval_indices = EpisodeAwareSampler(
+                eval_dataset.meta.episodes["dataset_from_index"],
+                eval_dataset.meta.episodes["dataset_to_index"],
+                episode_indices_to_use=eval_dataset.episodes,
+                absolute_to_relative_idx=eval_dataset.absolute_to_relative_idx,
+                eligible_frame_indices=semantic_eval_frames,
+            ).indices
+        elif eval_completion_sampling is not None:
             eligible_eval_indices = EpisodeAwareSampler(
                 eval_dataset.meta.episodes["dataset_from_index"],
                 eval_completion_sampling[0],
@@ -1575,7 +1773,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # max() because headroom is gated by the worst-case rank.
         train_metrics["gpu_mem_gb"] = AverageMeter("mem_gb", ":.2f", reduction="max")
     semantic_loss_logging_enabled = (
-        episode_semantic_lookup is not None
+        (episode_semantic_lookup is not None or semantic_views is not None)
         and isinstance(active_cfg, PI05Config)
         and active_cfg.discrete_action_training_mode == "continuous_flow"
         and active_cfg.action_loss_schema not in {"off", "uniform_valid"}
@@ -1626,8 +1824,21 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 seed=cfg.seed,
                 randomize=cfg.dataset.random_task_variant,
             )
+            if semantic_views is not None:
+                semantic_counts = apply_semantic_views_to_batch(
+                    batch,
+                    semantic_views,
+                    step=step * cfg.gradient_accumulation_steps + accum_idx,
+                    seed=cfg.seed if cfg.seed is not None else 0,
+                    randomize=cfg.dataset.random_semantic_view,
+                    view_kind_weights=cfg.dataset.semantic_view_kind_weights,
+                )
+                train_tracker.task_variant_applied = sum(semantic_counts.values()) - semantic_counts["hold"]
             batch = preprocessor(batch)
-            attach_loss_semantics(batch, episode_semantic_lookup, semantic_names)
+            if semantic_views is not None:
+                attach_semantic_view_loss_semantics(batch, semantic_views.semantic_names)
+            else:
+                attach_loss_semantics(batch, episode_semantic_lookup, semantic_names)
             train_tracker.dataloading_s = time.perf_counter() - start_time
 
             train_tracker, output_dict = update_policy(
@@ -1700,8 +1911,22 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                             seed=cfg.seed,
                             randomize=False,
                         )
+                    if semantic_views is not None:
+                        apply_semantic_views_to_batch(
+                            eval_batch,
+                            semantic_views,
+                            # Validation uses a stable hash of the physical sample,
+                            # covering every enabled intent without changing across eval steps.
+                            step=0,
+                            seed=cfg.seed if cfg.seed is not None else 0,
+                            randomize=True,
+                            view_kind_weights=cfg.dataset.semantic_view_kind_weights,
+                        )
                     eval_batch = preprocessor(eval_batch)
-                    attach_loss_semantics(eval_batch, episode_semantic_lookup, semantic_names)
+                    if semantic_views is not None:
+                        attach_semantic_view_loss_semantics(eval_batch, semantic_views.semantic_names)
+                    else:
+                        attach_loss_semantics(eval_batch, episode_semantic_lookup, semantic_names)
                     loss, eval_output = policy.forward(eval_batch)
                     eval_loss_sum += loss.item()
                     n_eval_batches += 1
@@ -1790,6 +2015,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     save_transformed_action_stats(
                         transformed_action_stats_payload,
                         checkpoint_dir / PRETRAINED_MODEL_DIR / PI05_TRANSFORMED_ACTION_STATS_NAME,
+                    )
+                if semantic_views is not None:
+                    (checkpoint_dir / PRETRAINED_MODEL_DIR / "semantic_views.json").write_bytes(
+                        semantic_views.path.read_bytes()
                     )
                 update_last_checkpoint(checkpoint_dir)
                 if cfg.save_checkpoint_to_hub:

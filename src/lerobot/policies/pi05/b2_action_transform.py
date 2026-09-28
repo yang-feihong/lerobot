@@ -42,6 +42,8 @@ DATASET_B2_TWIST_SLICE = slice(0, 3)
 B2_POSE_DELTA_NAMES = ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")
 ARM_TELEOP_INACTIVE_NAME = "arm_teleop_inactive"
 TASK_COMPLETE_NAME = "task_complete"
+TASK_BLOCKED_NAME = "task_blocked"
+TASK_BLOCKED_KEY = f"{ACTION}_task_blocked"
 EE_DELTA_VALID_KEY = f"{ACTION}_ee_delta_is_valid"
 EE_DELTA_ROTVEC_NAMES = (
     "height_invariant_ee_delta_rotvec_x",
@@ -83,6 +85,7 @@ def action_schema_kwargs(config: Any) -> dict[str, bool | str]:
         "predict_ee_pose": config.action_predict_ee_pose,
         "predict_gripper": config.action_predict_gripper,
         "include_task_complete": config.action_predict_task_complete,
+        "include_task_blocked": config.action_predict_task_blocked,
     }
 
 
@@ -481,6 +484,8 @@ def encode_b2_action_chunk(
     predict_ee_pose: bool = True,
     predict_gripper: bool = True,
     include_task_complete: bool = True,
+    include_task_blocked: bool = False,
+    task_blocked: Tensor | None = None,
 ) -> Tensor:
     """Convert raw velocity/EE-target controls into the configured model action."""
     if action.ndim < 2 or action.shape[-1] != DATASET_ACTION_DIM:
@@ -547,6 +552,20 @@ def encode_b2_action_chunk(
             result = torch.cat((result[..., :first], ee_delta, result[..., last:]), dim=-1)
         else:
             result[..., ee_output_indices] = ee_delta
+    if include_task_blocked:
+        blocked = (
+            torch.zeros(action.shape[:-1], dtype=result.dtype, device=result.device)
+            if task_blocked is None
+            else torch.as_tensor(task_blocked, dtype=result.dtype, device=result.device)
+        )
+        if z1_representation == "ee_delta":
+            blocked = blocked[..., :-1]
+        if blocked.shape != result.shape[:-1]:
+            raise ValueError(
+                f"task_blocked shape {tuple(blocked.shape)} does not match action time shape "
+                f"{tuple(result.shape[:-1])}"
+            )
+        result = torch.cat((result, blocked.unsqueeze(-1)), dim=-1)
     return result
 
 
@@ -578,6 +597,7 @@ def b2_execution_action_names(
     predict_ee_pose: bool = True,
     predict_gripper: bool = True,
     include_task_complete: bool = True,
+    include_task_blocked: bool = False,
 ) -> list[str] | None:
     del representation
     if dataset_names is None:
@@ -625,6 +645,8 @@ def b2_execution_action_names(
             raise ValueError(
                 f"Unknown EE delta rotation representation: {ee_delta_rotation_representation!r}"
             )
+    if include_task_blocked:
+        names.append(TASK_BLOCKED_NAME)
     return names
 
 
@@ -650,6 +672,7 @@ def make_pi05_action_stats(
     predict_ee_pose: bool = True,
     predict_gripper: bool = True,
     include_task_complete: bool = True,
+    include_task_blocked: bool = False,
     state_indices: tuple[int, ...] | None = None,
 ) -> dict[str, dict[str, Any]] | None:
     """Install exact statistics measured after the configured temporal transform."""
@@ -677,6 +700,7 @@ def make_pi05_action_stats(
         predict_ee_pose=predict_ee_pose,
         predict_gripper=predict_gripper,
         include_task_complete=include_task_complete,
+        include_task_blocked=include_task_blocked,
     )
     if representation == "velocity":
         expected_names = b2_execution_action_names(
@@ -689,6 +713,7 @@ def make_pi05_action_stats(
             predict_ee_pose=predict_ee_pose,
             predict_gripper=predict_gripper,
             include_task_complete=include_task_complete,
+            include_task_blocked=include_task_blocked,
         )
     q01_exact = torch.as_tensor(transformed_action_stats["q01"]).reshape(-1)
     if expected_names is None or q01_exact.numel() != len(expected_names):

@@ -135,6 +135,56 @@ def test_checkpoint_hot_swap_signature_requires_identical_runtime_schema(tmp_pat
     assert _checkpoint_hot_swap_signature(first) != _checkpoint_hot_swap_signature(second)
 
 
+def test_checkpoint_hot_swap_signature_ignores_training_only_fields(tmp_path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    processor = {
+        "steps": [
+            {
+                "registry_name": "pi05_action_representation_processor",
+                "config": {"representation": "pose_delta"},
+            }
+        ]
+    }
+    for directory in (first, second):
+        directory.mkdir()
+        (directory / "adapter_config.json").write_text(json.dumps({"r": 16}))
+        (directory / "pi05_deployment_metadata.json").write_text(
+            json.dumps({"action": {"model_names": ["b2_delta_x"]}})
+        )
+        for name in ("policy_preprocessor.json", "policy_postprocessor.json"):
+            (directory / name).write_text(json.dumps(processor))
+
+    (first / "config.json").write_text(
+        json.dumps(
+            {
+                "architecture": "pi05",
+                "action_bool_true_fractions": {"arm_reset": 0.01},
+                "action_supervise_terminal_static_padding": True,
+                "mem_vit_random_interval_sampling": False,
+                "mem_vit_global_interval_std_seconds": 0.15,
+                "mem_vit_local_interval_std_seconds": 0.05,
+                "mem_vit_min_interval_seconds": 0.25,
+                "mem_vit_max_interval_seconds": 1.0,
+            }
+        )
+    )
+    (second / "config.json").write_text(
+        json.dumps(
+            {
+                "architecture": "pi05",
+                "action_bool_true_fractions": {"arm_reset": 0.25},
+            }
+        )
+    )
+    for name in ("policy_preprocessor.json", "policy_postprocessor.json"):
+        document = json.loads((first / name).read_text())
+        document["steps"][0]["config"]["supervise_terminal_static_padding"] = True
+        (first / name).write_text(json.dumps(document))
+
+    assert _checkpoint_hot_swap_signature(first) == _checkpoint_hot_swap_signature(second)
+
+
 def test_action_packet_contains_replayable_model_and_execution_outputs() -> None:
     record = ActionRecord(
         sequence=3,
@@ -547,6 +597,17 @@ def test_server_loads_current_contract_for_all_representation_pairs(
     metadata_path.write_text(json.dumps(legacy_metadata), encoding="utf-8")
     legacy_contract = _load_checkpoint_contract(tmp_path, config, 50.0)
     assert legacy_contract.arm_mode_encoding is None
+
+    pre_task_blocked_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    pre_task_blocked_metadata["action"]["predict"].pop("task_blocked")
+    pre_task_blocked_metadata["action"]["boolean_decoding"]["true_side"].pop("task_blocked")
+    pre_task_blocked_metadata["action"]["boolean_decoding"]["output_values"].pop(
+        "task_blocked"
+    )
+    pre_task_blocked_metadata["action"].pop("task_blocked_semantics")
+    metadata_path.write_text(json.dumps(pre_task_blocked_metadata), encoding="utf-8")
+    pre_task_blocked_contract = _load_checkpoint_contract(tmp_path, config, 50.0)
+    assert pre_task_blocked_contract.arm_mode_encoding is None
 
 
 def _schema_v2_names() -> tuple[str, ...]:

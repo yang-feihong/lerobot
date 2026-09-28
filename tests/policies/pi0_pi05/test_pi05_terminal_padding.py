@@ -25,3 +25,21 @@ def test_non_trailing_padding_is_never_unmasked():
     padding = torch.tensor([[False, True, False, True]])
     result = Pi05ActionRepresentationProcessorStep._terminal_static_padding_mask(actions, padding)
     assert torch.equal(result, padding)
+
+
+def test_semantic_completion_materializes_inactive_padding():
+    actions = torch.zeros(1, 5, 25)
+    actions[:, :, 3] = 0.0
+    actions[:, :, 15] = 0.0
+    actions[0, 1, 15] = 1.0
+    actions[0, 1, 14] = 0.0
+    padding = torch.tensor([[False, False, True, True, True]])
+
+    rewritten, rewritten_padding = (
+        Pi05ActionRepresentationProcessorStep._terminal_static_padding(actions, padding)
+    )
+
+    assert not rewritten_padding.any()
+    assert rewritten[0, 2:, 3].tolist() == [1.0, 1.0, 1.0]
+    assert rewritten[0, 2:, 4].tolist() == [0.0, 0.0, 0.0]
+    assert rewritten[0, 2:, 15].tolist() == [1.0, 1.0, 1.0]

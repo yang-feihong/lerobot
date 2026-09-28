@@ -94,6 +94,35 @@ def test_gate_loss_rejects_overlapping_arm_modes():
         )
 
 
+def test_gate_loss_rejects_complete_and_blocked_at_the_same_time():
+    policy = PI05Policy.__new__(PI05Policy)
+    torch.nn.Module.__init__(policy)
+    names = ["b2_delta_x", "b2_delta_y", "b2_delta_yaw", *DATASET_ACTION_NAMES[3:], "task_blocked"]
+    policy.config = SimpleNamespace(
+        action_bool_loss_weight=4.0,
+        action_continuous_loss_weight=1.0,
+        action_masked_continuous_min_weight=0.0,
+        action_bool_balance_eps=1e-3,
+        action_bool_true_fractions={"task_complete": 0.2, "task_blocked": 0.2},
+        action_gripper_target_true_side="negative",
+        io_schema_resolved=True,
+        b2_action_representation="pose_delta",
+        z1_action_representation="ee_delta",
+        action_feature_names=names,
+        training_rtc_config=None,
+    )
+    actions = -torch.ones(1, 2, len(names))
+    actions[0, 0, names.index("task_complete")] = 1.0
+    actions[0, 0, names.index("task_blocked")] = 1.0
+    with pytest.raises(ValueError, match="task_complete and task_blocked"):
+        policy._b2_z1_gate_action_loss(
+            torch.ones_like(actions),
+            actions,
+            "mean",
+            ee_delta_is_valid=torch.ones(1, 2, dtype=torch.bool),
+        )
+
+
 def test_disabling_inactive_prediction_removes_its_output_and_ee_mask():
     policy = PI05Policy.__new__(PI05Policy)
     torch.nn.Module.__init__(policy)

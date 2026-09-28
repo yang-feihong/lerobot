@@ -6,12 +6,37 @@ import torch
 from lerobot.datasets.mixture_sampling import DatasetMixtureSource
 from lerobot.scripts.lerobot_train import (
     _is_eval_policy_metric,
+    _record_train_loss_contributions,
     _wandb_eval_metrics,
     _wandb_train_metrics,
     attach_loss_semantics,
     build_episode_semantic_lookup,
     select_balanced_eval_indices,
 )
+
+
+class _FakeTracker:
+    def __init__(self, keys: list[str]) -> None:
+        object.__setattr__(self, "metrics", dict.fromkeys(keys))
+        object.__setattr__(self, "recorded", {})
+
+    def __setattr__(self, key: str, value: float) -> None:
+        self.recorded[key] = value
+
+
+def test_train_contribution_router_accepts_slash_qualified_semantic_names() -> None:
+    target = "loss_contribution/train/goal_open/active/z1"
+    tracker = _FakeTracker([target])
+
+    _record_train_loss_contributions(
+        tracker,
+        {
+            "loss_contribution/goal_open/active/z1": 0.125,
+            "loss_contribution/z1": 0.5,
+        },
+    )
+
+    assert tracker.recorded == {target: 0.125}
 
 
 def test_train_metrics_are_grouped_and_action_dimensions_use_names() -> None:

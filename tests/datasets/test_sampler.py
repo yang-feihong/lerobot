@@ -255,6 +255,40 @@ def test_dataset_mixture_sampling_requires_episode_partition():
         )
 
 
+def test_semantic_frame_groups_select_ranges_and_preserve_exact_weights():
+    kwargs = {
+        "dataset_from_indices": [0, 10],
+        "dataset_to_indices": [10, 20],
+        "episode_indices_to_use": [0, 1],
+        "eligible_frame_indices": [1, 2, 3, 7, 8, 12, 13, 14],
+        "sampling_group_frame_indices": [[1, 2, 3], [7, 8], [12, 13, 14]],
+        "sampling_group_weights": [0.5, 0.25, 0.25],
+        "shuffle": True,
+        "seed": 23,
+    }
+    sampler = EpisodeAwareSampler(**kwargs)
+    epoch = list(sampler)
+    assert len(epoch) == 8
+    assert set(epoch) <= {1, 2, 3, 7, 8, 12, 13, 14}
+    assert sum(index in {1, 2, 3} for index in epoch) == 4
+    assert sum(index in {7, 8} for index in epoch) == 2
+    assert sum(index in {12, 13, 14} for index in epoch) == 2
+    assert list(EpisodeAwareSampler(**kwargs)) == epoch
+
+
+def test_semantic_frame_groups_intersect_episode_subset():
+    sampler = EpisodeAwareSampler(
+        [0, 10],
+        [10, 20],
+        episode_indices_to_use=[1],
+        eligible_frame_indices=[1, 2, 12, 13],
+        sampling_group_frame_indices=[[12, 13]],
+        sampling_group_weights=[1.0],
+        shuffle=True,
+    )
+    assert sorted(sampler.indices) == [12, 13]
+
+
 def test_negative_drop_first_frames_raises():
     with pytest.raises(ValueError, match="drop_n_first_frames must be >= 0"):
         EpisodeAwareSampler([0], [10], drop_n_first_frames=-1)

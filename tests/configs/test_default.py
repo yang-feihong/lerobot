@@ -36,3 +36,26 @@ def test_dataset_config_none_episodes_ok():
 
 def test_dataset_config_empty_episodes_ok():
     DatasetConfig(repo_id="user/repo", episodes=[])
+
+
+def test_dataset_config_semantic_phase_weights_are_explicit_and_consistent():
+    DatasetConfig(
+        repo_id="user/repo",
+        semantic_views_path="/data/semantic_views.json",
+        semantic_phases=["approach", "handle_press"],
+        semantic_phase_weights={"approach": 1.0, "handle_press": 1.0},
+        semantic_source_weights={"full_episode": 1.0},
+    )
+    with pytest.raises(ValueError, match="exactly match"):
+        DatasetConfig(
+            repo_id="user/repo",
+            semantic_views_path="/data/semantic_views.json",
+            semantic_phases=["approach", "handle_press"],
+            semantic_phase_weights={"approach": 1.0},
+        )
+    with pytest.raises(ValueError, match="requires dataset.semantic_phases"):
+        DatasetConfig(
+            repo_id="user/repo",
+            semantic_views_path="/data/semantic_views.json",
+            semantic_source_weights={"full_episode": 1.0},
+        )

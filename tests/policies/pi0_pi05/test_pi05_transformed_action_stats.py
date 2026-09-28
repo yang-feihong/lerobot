@@ -17,8 +17,10 @@ from lerobot.policies.pi05.transformed_action_stats import (
     assert_transformed_action_stats_equal,
     compute_transformed_action_stats,
     is_task_complete_schema_extension,
+    is_task_status_schema_extension,
     load_transformed_action_stats,
     save_transformed_action_stats,
+    transformed_action_schemas_equal,
     transformed_action_stats_ee_valid_count,
     validate_transformed_action_stats,
 )
@@ -67,6 +69,7 @@ def test_transformed_stats_follow_episode_deltas_and_active_endpoint_mask(tmp_pa
         action_predict_ee_pose=True,
         action_predict_gripper=True,
         action_predict_task_complete=True,
+        action_predict_task_blocked=False,
         dataset_action_feature_names=list(CONTROL_EXTENDED_DATASET_ACTION_NAMES),
         b2_global_pose_state_indices=None,
         ee_supervision_source="control_action",
@@ -140,6 +143,47 @@ def test_task_complete_schema_extension_only_allows_appended_completion() -> Non
     )
 
 
+def test_task_status_schema_extension_supports_complete_and_blocked_channels() -> None:
+    base = {
+        "include_task_complete": False,
+        "include_task_blocked": False,
+        "action_names": ["b2_vx", "gripper_target"],
+        "control_frequency_hz": 50.0,
+    }
+    both = {
+        **base,
+        "include_task_complete": True,
+        "include_task_blocked": True,
+        "action_names": ["b2_vx", "gripper_target", "task_complete", "task_blocked"],
+    }
+    complete_only = {
+        **base,
+        "include_task_complete": True,
+        "action_names": ["b2_vx", "gripper_target", "task_complete"],
+    }
+    add_blocked = {
+        **complete_only,
+        "include_task_blocked": True,
+        "action_names": ["b2_vx", "gripper_target", "task_complete", "task_blocked"],
+    }
+
+    assert is_task_status_schema_extension({"schema": base}, {"schema": both})
+    assert is_task_status_schema_extension({"schema": complete_only}, {"schema": add_blocked})
+    assert not is_task_status_schema_extension({"schema": both}, {"schema": complete_only})
+
+
+def test_missing_blocked_schema_flag_is_backward_compatible_with_false() -> None:
+    old = {"schema": {"include_task_complete": True, "action_names": ["task_complete"]}}
+    current = {
+        "schema": {
+            "include_task_complete": True,
+            "include_task_blocked": False,
+            "action_names": ["task_complete"],
+        }
+    }
+    assert transformed_action_schemas_equal(old, current)
+
+
 @pytest.mark.parametrize("b2_representation", ["velocity", "pose_delta"])
 @pytest.mark.parametrize("z1_representation", ["ee_delta", "ee_state_delta"])
 def test_transformed_stats_support_all_formal_representation_pairs(
@@ -192,6 +236,7 @@ def test_transformed_stats_support_all_formal_representation_pairs(
         action_predict_ee_pose=True,
         action_predict_gripper=True,
         action_predict_task_complete=True,
+        action_predict_task_blocked=False,
         dataset_action_feature_names=list(CONTROL_EXTENDED_DATASET_ACTION_NAMES),
         ee_supervision_source="control_action",
         ee_state_anchor_indices=list(range(9)),

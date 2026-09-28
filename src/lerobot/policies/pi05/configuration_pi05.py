@@ -93,6 +93,13 @@ class PI05Config(PreTrainedConfig):
     action_predict_ee_pose: bool = True
     action_predict_gripper: bool = True
     action_predict_task_complete: bool = True
+    # Instruction-relative "cannot execute from the current state" signal.
+    # Together with task_complete this encodes active=(0,0), complete=(1,0),
+    # blocked=(0,1). It is intentionally trained by the normal flow objective.
+    action_predict_task_blocked: bool = False
+    semantic_view_manifest_sha256: str | None = None
+    semantic_view_manifest_version: int | None = None
+    semantic_view_kind_weights: dict[str, float] = field(default_factory=dict)
     discrete_action_training_mode: str = "continuous_flow"
     ee_target_dataset_semantics: str = "joint_control_inactive_interpolated"
     ee_supervision_source: str = "control_action"
@@ -278,6 +285,8 @@ class PI05Config(PreTrainedConfig):
                 "discrete_action_training_mode must be 'continuous_flow' or "
                 f"'structured_temporal', got {self.discrete_action_training_mode!r}"
             )
+        if self.action_predict_task_blocked and self.discrete_action_training_mode != "continuous_flow":
+            raise ValueError("task_blocked is a flow-matching output and requires continuous_flow")
         if self.action_predict_arm_teleop_inactive != self.action_predict_arm_reset:
             raise ValueError(
                 "arm_teleop_inactive and arm_reset jointly encode the mutually exclusive "
@@ -683,6 +692,7 @@ class PI05Config(PreTrainedConfig):
                     "ee_pose": self.action_predict_ee_pose,
                     "gripper": self.action_predict_gripper,
                     "task_complete": self.action_predict_task_complete,
+                    "task_blocked": self.action_predict_task_blocked,
                 },
                 "boolean_decoding": {
                     "threshold": 0.0,
@@ -693,6 +703,7 @@ class PI05Config(PreTrainedConfig):
                         "arm_reset": "positive",
                         "gripper_target": self.action_gripper_target_true_side,
                         "task_complete": "positive",
+                        "task_blocked": "positive",
                     },
                     "output_values": {
                         "arm_teleop_inactive": {"false": 0.0, "true": 1.0},
@@ -702,11 +713,17 @@ class PI05Config(PreTrainedConfig):
                             "normalized_nonnegative": self.action_gripper_nonnegative_value,
                         },
                         "task_complete": {"false": 0.0, "true": 1.0},
+                        "task_blocked": {"false": 0.0, "true": 1.0},
                     },
                 },
                 "task_complete_semantics": (
                     "explicit_true_in_the_terminal_stage_hold"
                     if self.action_predict_task_complete
+                    else None
+                ),
+                "task_blocked_semantics": (
+                    "instruction_precondition_is_not_satisfied_in_the_current_state"
+                    if self.action_predict_task_blocked
                     else None
                 ),
                 "task_complete_deployment_behavior": (

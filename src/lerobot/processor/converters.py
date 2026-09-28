@@ -164,6 +164,8 @@ _COMPLEMENTARY_KEYS = (
     "messages",
     "message_streams",
     "target_message_indices",
+    "action_task_blocked",
+    "semantic_view_name",
 )
 
 

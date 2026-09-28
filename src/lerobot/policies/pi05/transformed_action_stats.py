@@ -13,6 +13,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .b2_action_transform import (
     ARM_TELEOP_INACTIVE_NAME,
+    TASK_BLOCKED_NAME,
     TASK_COMPLETE_NAME,
     action_schema_kwargs,
     b2_execution_action_names,
@@ -84,6 +85,35 @@ def is_task_complete_schema_extension(saved: dict[str, Any], measured: dict[str,
     )
 
 
+def transformed_action_schemas_equal(saved: dict[str, Any], measured: dict[str, Any]) -> bool:
+    """Compare schemas after the explicit pre-task-blocked metadata migration."""
+    saved_schema = dict(saved["schema"])
+    measured_schema = dict(measured["schema"])
+    saved_schema.setdefault("include_task_blocked", False)
+    measured_schema.setdefault("include_task_blocked", False)
+    return saved_schema == measured_schema
+
+
+def is_task_status_schema_extension(saved: dict[str, Any], measured: dict[str, Any]) -> bool:
+    """Allow resume to append complete and/or blocked flow channels only."""
+    saved_schema = dict(saved["schema"])
+    measured_schema = dict(measured["schema"])
+    saved_names = list(saved_schema.pop("action_names"))
+    measured_names = list(measured_schema.pop("action_names"))
+    appended: list[str] = []
+    for key, name in (
+        ("include_task_complete", TASK_COMPLETE_NAME),
+        ("include_task_blocked", TASK_BLOCKED_NAME),
+    ):
+        old = bool(saved_schema.pop(key, False))
+        new = bool(measured_schema.pop(key, False))
+        if old and not new:
+            return False
+        if new and not old:
+            appended.append(name)
+    return bool(appended) and measured_names == [*saved_names, *appended] and saved_schema == measured_schema
+
+
 def validate_transformed_action_stats(payload: dict[str, Any], dataset, config) -> None:
     dataset_record = payload["dataset"]
     expected_dataset = {
@@ -99,7 +129,8 @@ def validate_transformed_action_stats(payload: dict[str, Any], dataset, config) 
             )
     saved_schema = payload["schema"]
     for key, expected in action_schema_kwargs(config).items():
-        if saved_schema.get(key) != expected:
+        actual = saved_schema.get(key, False) if key == "include_task_blocked" else saved_schema.get(key)
+        if actual != expected:
             raise ValueError(
                 f"Transformed-action statistics schema mismatch for {key}: "
                 f"saved={saved_schema.get(key)!r}, current={expected!r}"
@@ -123,7 +154,9 @@ def validate_transformed_action_stats(payload: dict[str, Any], dataset, config) 
 
 
 def assert_transformed_action_stats_equal(saved: dict[str, Any], measured: dict[str, Any]) -> None:
-    if saved["schema"] != measured["schema"] or saved["counts"] != _jsonable(measured["counts"]):
+    if not transformed_action_schemas_equal(saved, measured) or saved["counts"] != _jsonable(
+        measured["counts"]
+    ):
         raise ValueError("Checkpoint transformed-action statistics provenance does not match the dataset")
     saved_stats = saved["stats"][ACTION]
     measured_stats = measured["stats"][ACTION]
@@ -307,7 +340,7 @@ def compute_transformed_action_stats(dataset, config) -> dict[str, Any]:
     for quantile, name in ((0.01, "q01"), (0.10, "q10"), (0.50, "q50"), (0.90, "q90"), (0.99, "q99")):
         stats[name] = np.asarray([np.quantile(array, quantile) for array in arrays], dtype=np.float32)
 
-    categorical_names = {ARM_TELEOP_INACTIVE_NAME, "arm_reset", TASK_COMPLETE_NAME}
+    categorical_names = {ARM_TELEOP_INACTIVE_NAME, "arm_reset", TASK_COMPLETE_NAME, TASK_BLOCKED_NAME}
     for index, name in enumerate(action_names):
         if name in categorical_names:
             for key in ("min", "q01", "q10"):

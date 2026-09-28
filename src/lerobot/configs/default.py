@@ -58,6 +58,17 @@ class DatasetConfig:
     random_task_variant: bool = True
     # Keep eval deterministic by default; set True to apply task variants during eval loss too.
     eval_task_variant: bool = False
+    # Optional instruction-relative views over the same physical samples.
+    # This supersedes task_variants_path when present without rewriting data.
+    semantic_views_path: str | None = None
+    random_semantic_view: bool = True
+    semantic_view_kind_weights: dict[str, float] = field(default_factory=dict)
+    # Optional physical phase selection over complete episodes.  The sidecar
+    # owns the per-episode frame boundaries; these fields only select and
+    # weight them for the current training run.
+    semantic_phases: list[str] = field(default_factory=list)
+    semantic_phase_weights: dict[str, float] = field(default_factory=dict)
+    semantic_source_weights: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.image_source not in ("real", "sim", "mixed"):
@@ -77,6 +88,24 @@ class DatasetConfig:
             )
         if not (0.0 <= self.eval_split < 1.0):
             raise ValueError(f"eval_split must be in [0.0, 1.0), got {self.eval_split}")
+        if len(self.semantic_phases) != len(set(self.semantic_phases)):
+            raise ValueError("dataset.semantic_phases contains duplicates")
+        if self.semantic_phase_weights and set(self.semantic_phase_weights) != set(
+            self.semantic_phases
+        ):
+            raise ValueError(
+                "dataset.semantic_phase_weights must exactly match dataset.semantic_phases"
+            )
+        for name, weights in (
+            ("semantic_phase_weights", self.semantic_phase_weights),
+            ("semantic_source_weights", self.semantic_source_weights),
+        ):
+            if any(not key or value <= 0.0 for key, value in weights.items()):
+                raise ValueError(f"dataset.{name} requires non-empty keys and positive weights")
+        if self.semantic_phases and self.semantic_views_path is None:
+            raise ValueError("dataset.semantic_phases requires dataset.semantic_views_path")
+        if self.semantic_source_weights and not self.semantic_phases:
+            raise ValueError("dataset.semantic_source_weights requires dataset.semantic_phases")
         if self.episodes is not None:
             if any(ep < 0 for ep in self.episodes):
                 raise ValueError(

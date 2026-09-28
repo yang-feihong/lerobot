@@ -132,3 +132,68 @@ def test_resume_task_complete_extension_requires_fork_and_updated_dataset(tmp_pa
 
         assert result.returncode == 2
         assert expected_error in result.stderr
+
+
+def test_resume_restores_semantic_sampling_and_can_explicitly_replace_it(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "old_run/checkpoints/050000"
+    pretrained = checkpoint / "pretrained_model"
+    pretrained.mkdir(parents=True)
+    saved_dataset = {
+        "semantic_views_path": "/data/staff1/meta/semantic_views.json",
+        "semantic_phases": ["approach", "handle_press", "traversal"],
+        "semantic_phase_weights": {"approach": 1.0, "handle_press": 1.0, "traversal": 1.0},
+        "semantic_source_weights": {"full_episode": 1.0, "independent_stage2": 1.0},
+    }
+    (pretrained / "train_config.json").write_text(
+        json.dumps({"policy": {}, "dataset": saved_dataset})
+    )
+
+    restored = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT),
+            "--dry-run=true",
+            f"--resume-checkpoint={checkpoint}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert restored.returncode == 0, restored.stderr
+    restored_flags = dict(
+        arg.split("=", 1) for arg in shlex.split(restored.stdout) if arg.startswith("--")
+    )
+    assert restored_flags["--config_path"] == str(pretrained / "train_config.json")
+    assert "--dataset.semantic_phases" not in restored_flags
+    assert "--dataset.semantic_source_weights" not in restored_flags
+
+    replacement_root = tmp_path / "replacement"
+    replacement_sidecar = replacement_root / "meta/semantic_views.json"
+    replacement_sidecar.parent.mkdir(parents=True)
+    replacement_sidecar.write_text("{}")
+    replaced = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT),
+            "--dry-run=true",
+            f"--output-root={tmp_path / 'outputs'}",
+            f"--resume-checkpoint={checkpoint}",
+            "--resume-new-run-name=approach_only",
+            "--resume-with-updated-dataset=true",
+            f"--dataset-root={replacement_root}",
+            f"--semantic-views-path={replacement_sidecar}",
+            '--semantic-phases=["approach"]',
+            '--semantic-phase-weights={"approach":1.0}',
+            "--semantic-source-weights={}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert replaced.returncode == 0, replaced.stderr
+    replaced_flags = dict(
+        arg.split("=", 1) for arg in shlex.split(replaced.stdout) if arg.startswith("--")
+    )
+    assert json.loads(replaced_flags["--dataset.semantic_phases"]) == ["approach"]
+    assert json.loads(replaced_flags["--dataset.semantic_phase_weights"]) == {"approach": 1.0}
+    assert json.loads(replaced_flags["--dataset.semantic_source_weights"]) == {}

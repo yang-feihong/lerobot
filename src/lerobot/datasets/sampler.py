@@ -62,6 +62,9 @@ class EpisodeAwareSampler:
         terminal_static_weight: float = 1.0,
         source_episode_indices: list[list[int]] | None = None,
         source_weights: list[float] | None = None,
+        eligible_frame_indices: list[int] | np.ndarray | None = None,
+        sampling_group_frame_indices: list[list[int] | np.ndarray] | None = None,
+        sampling_group_weights: list[float] | None = None,
     ):
         """
         Args:
@@ -129,7 +132,26 @@ class EpisodeAwareSampler:
         self._starts = starts[used]
         self._cum_lengths = np.cumsum(lengths[used])
         self._used_episode_indices = np.flatnonzero(used)
-        self._num_frames = int(self._cum_lengths[-1])
+        self._explicit_indices = None
+        if eligible_frame_indices is not None:
+            eligible = np.unique(np.asarray(eligible_frame_indices, dtype=np.int64))
+            if eligible.ndim != 1:
+                raise ValueError("eligible_frame_indices must be one-dimensional")
+            episode = np.searchsorted(from_indices, eligible, side="right") - 1
+            valid_episode = episode >= 0
+            safe_episode = np.maximum(episode, 0)
+            valid = (
+                valid_episode
+                & used[safe_episode]
+                & (eligible >= starts[safe_episode])
+                & (eligible < (to_indices - drop_n_last_frames)[safe_episode])
+            )
+            self._explicit_indices = eligible[valid]
+            if len(self._explicit_indices) == 0:
+                raise ValueError("No eligible semantic frames remain in the sampler")
+            self._num_frames = len(self._explicit_indices)
+        else:
+            self._num_frames = int(self._cum_lengths[-1])
         self.shuffle = shuffle
         self.seed = seed
         self._epoch = 0
@@ -152,7 +174,44 @@ class EpisodeAwareSampler:
             if not np.any(weights > 0.0):
                 raise ValueError("static-horizon weights remove every eligible frame")
             self._sampling_weights = weights
+        if sampling_group_frame_indices is not None and source_episode_indices is not None:
+            raise ValueError(
+                "semantic frame-group sampling and episode-source sampling cannot be combined"
+            )
+        if sampling_group_frame_indices is not None and priority_fraction > 0.0:
+            raise ValueError(
+                "semantic frame-group sampling and motion-priority sampling cannot be combined"
+            )
         self._source_positions = self._resolve_source_positions(source_episode_indices, source_weights)
+        self._sampling_group_positions = self._resolve_sampling_group_positions(
+            sampling_group_frame_indices, sampling_group_weights
+        )
+
+    def _resolve_sampling_group_positions(
+        self,
+        frame_groups: list[list[int] | np.ndarray] | None,
+        weights: list[float] | None,
+    ) -> list[np.ndarray] | None:
+        if frame_groups is None and weights is None:
+            self.sampling_group_weights = None
+            return None
+        if frame_groups is None or weights is None:
+            raise ValueError("sampling frame groups and weights must be provided together")
+        if len(frame_groups) != len(weights) or not frame_groups:
+            raise ValueError("sampling frame groups and weights must have the same nonzero length")
+        parsed_weights = np.asarray(weights, dtype=np.float64)
+        if np.any(parsed_weights <= 0.0) or not np.all(np.isfinite(parsed_weights)):
+            raise ValueError("sampling_group_weights must be finite and strictly positive")
+        self.sampling_group_weights = parsed_weights / parsed_weights.sum()
+        positions = [self._resolve_priority_positions(group) for group in frame_groups]
+        if any(len(group) == 0 for group in positions):
+            raise ValueError("every semantic sampling group must contain at least one eligible frame")
+        claimed = np.concatenate(positions)
+        if len(np.unique(claimed)) != len(claimed):
+            raise ValueError("semantic sampling frame groups overlap")
+        if len(claimed) != self._num_frames:
+            raise ValueError("semantic sampling frame groups must partition every eligible frame")
+        return positions
 
     def _resolve_source_positions(
         self,
@@ -162,6 +221,10 @@ class EpisodeAwareSampler:
         if source_episode_indices is None and source_weights is None:
             self.source_weights = None
             return None
+        if self._explicit_indices is not None:
+            raise ValueError(
+                "episode-source sampling cannot be combined with explicit eligible frame indices"
+            )
         if source_episode_indices is None or source_weights is None:
             raise ValueError("source_episode_indices and source_weights must be provided together")
         if len(source_episode_indices) != len(source_weights) or len(source_weights) < 2:
@@ -257,6 +320,24 @@ class EpisodeAwareSampler:
         combined = torch.cat(source_parts)
         return combined[torch.randperm(len(combined), generator=generator)]
 
+    def _sampling_group_order(self, generator: torch.Generator) -> torch.Tensor:
+        counts = self._weighted_counts(self._num_frames, self.sampling_group_weights)
+        parts = []
+        for pool, count in zip(self._sampling_group_positions, counts, strict=True):
+            tensor_pool = torch.from_numpy(pool)
+            if self._sampling_weights is None:
+                parts.append(self._draw_from_pool(tensor_pool, int(count), generator))
+                continue
+            selected = torch.multinomial(
+                torch.from_numpy(self._sampling_weights[pool]),
+                int(count),
+                replacement=True,
+                generator=generator,
+            )
+            parts.append(tensor_pool[selected])
+        combined = torch.cat(parts)
+        return combined[torch.randperm(len(combined), generator=generator)]
+
     def _resolve_priority_positions(
         self, priority_frame_indices: list[int] | np.ndarray | None
     ) -> np.ndarray:
@@ -265,6 +346,12 @@ class EpisodeAwareSampler:
         absolute = np.unique(np.asarray(priority_frame_indices, dtype=np.int64))
         if absolute.ndim != 1:
             raise ValueError("priority_frame_indices must be one-dimensional")
+        if self._explicit_indices is not None:
+            positions = np.searchsorted(self._explicit_indices, absolute)
+            valid = positions < len(self._explicit_indices)
+            safe = np.minimum(positions, len(self._explicit_indices) - 1)
+            valid &= self._explicit_indices[safe] == absolute
+            return positions[valid].astype(np.int64, copy=False)
         episode_lengths = np.diff(np.concatenate(([0], self._cum_lengths)))
         episode_ends = self._starts + episode_lengths
         episode = np.searchsorted(self._starts, absolute, side="right") - 1
@@ -298,6 +385,11 @@ class EpisodeAwareSampler:
         return torch.Generator().manual_seed(epoch_seed)
 
     def _frame_index(self, position: int) -> int:
+        if self._explicit_indices is not None:
+            absolute_idx = int(self._explicit_indices[position])
+            if self._absolute_to_relative is not None:
+                return self._absolute_to_relative[absolute_idx]
+            return absolute_idx
         episode = int(np.searchsorted(self._cum_lengths, position, side="right"))
         position_in_episode = position - (int(self._cum_lengths[episode - 1]) if episode > 0 else 0)
         absolute_idx = int(self._starts[episode]) + position_in_episode
@@ -315,7 +407,9 @@ class EpisodeAwareSampler:
     def _iter_epoch(self, epoch: int, start: int) -> Iterator[int]:
         if self.shuffle:
             generator = self._epoch_generator(epoch)
-            if self._source_positions is not None:
+            if self._sampling_group_positions is not None:
+                order = self._sampling_group_order(generator)
+            elif self._source_positions is not None:
                 order = self._mixture_order(generator)
             elif self._sampling_weights is not None:
                 order = torch.multinomial(

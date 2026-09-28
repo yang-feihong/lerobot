@@ -29,10 +29,33 @@ from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
 from .mixture_sampling import load_dataset_mixture_manifest
 from .multi_dataset import MultiLeRobotDataset
+from .semantic_views import SemanticViewCatalog, load_semantic_views
 from .streaming_dataset import StreamingLeRobotDataset
 from .temporal_history import RandomHistorySamplingConfig
 
 HEIGHT_INVARIANT_EE_STATE_KEY = "observation.height_invariant_ee_state"
+
+
+def semantic_source_split_keys(
+    catalog: SemanticViewCatalog, episode_indices: list[int]
+) -> dict[int, str]:
+    """Return the single physical semantic source represented by each episode."""
+    source_by_episode: dict[int, str] = {}
+    for episode_index in episode_indices:
+        source_groups = {
+            segment.source_group for segment in catalog.segments.get(episode_index, ())
+        }
+        if not source_groups:
+            raise ValueError(
+                f"semantic-view sidecar has no phase segment for episode {episode_index}"
+            )
+        if len(source_groups) != 1:
+            raise ValueError(
+                "semantic train/eval splitting requires one physical source group per episode: "
+                f"episode={episode_index}, source_groups={sorted(source_groups)}"
+            )
+        source_by_episode[episode_index] = next(iter(source_groups))
+    return source_by_episode
 
 
 def resolve_delta_timestamps(
@@ -271,7 +294,9 @@ def make_train_eval_datasets(
 ) -> tuple[LeRobotDataset | MultiLeRobotDataset, LeRobotDataset | None]:
     """Create train and optional eval datasets by splitting episodes based on eval_split.
 
-    The last ceil(n_episodes * eval_split) episodes per task are held out for evaluation.
+    The last ceil(n_episodes * eval_split) episodes per stratum are held out for evaluation.
+    Ordinary datasets use task/source strata; semantic-view datasets use physical
+    source groups because their task text is materialized dynamically.
     If eval_split == 0.0, returns (full_dataset, None).
     """
     full_dataset = make_dataset(cfg)
@@ -284,7 +309,7 @@ def make_train_eval_datasets(
     )
 
     episode_tasks = full_dataset.meta.episodes["tasks"]
-    task_to_episodes: dict[str, list[int]] = {}
+    stratum_to_episodes: dict[str, list[int]] = {}
     mixture_source_by_episode: dict[int, str] = {}
     if cfg.dataset_mixture_sampling.enabled:
         sources = load_dataset_mixture_manifest(
@@ -297,13 +322,24 @@ def make_train_eval_datasets(
             mixture_source_by_episode.update(
                 (episode_index, source.name) for episode_index in source.episode_indices
             )
+    semantic_source_by_episode: dict[int, str] = {}
+    if cfg.dataset.semantic_views_path is not None:
+        catalog = load_semantic_views(cfg.dataset.semantic_views_path)
+        semantic_source_by_episode = semantic_source_split_keys(catalog, base_episodes)
     for ep_idx in base_episodes:
-        task_key = episode_tasks[ep_idx][0] if episode_tasks[ep_idx] else ""
-        split_key = f"{mixture_source_by_episode.get(ep_idx, '')}\0{task_key}"
-        task_to_episodes.setdefault(split_key, []).append(ep_idx)
+        if semantic_source_by_episode:
+            # Semantic-view training replaces the dataset's historical task text at
+            # materialization time.  Split by physical source instead, so every
+            # source (and therefore its available phases) is represented in both
+            # train and eval rather than letting append order dominate the holdout.
+            split_key = semantic_source_by_episode[ep_idx]
+        else:
+            task_key = episode_tasks[ep_idx][0] if episode_tasks[ep_idx] else ""
+            split_key = f"{mixture_source_by_episode.get(ep_idx, '')}\0{task_key}"
+        stratum_to_episodes.setdefault(split_key, []).append(ep_idx)
 
     train_episodes, eval_episodes = [], []
-    for eps in task_to_episodes.values():
+    for eps in stratum_to_episodes.values():
         n_eval = math.ceil(len(eps) * cfg.dataset.eval_split)
         train_episodes.extend(eps[: len(eps) - n_eval])
         eval_episodes.extend(eps[len(eps) - n_eval :])
@@ -315,7 +351,7 @@ def make_train_eval_datasets(
 
     logging.info(
         f"Train/eval split: {len(train_episodes)} train, {len(eval_episodes)} eval "
-        f"(eval_split={cfg.dataset.eval_split}, {len(task_to_episodes)} tasks)"
+        f"(eval_split={cfg.dataset.eval_split}, {len(stratum_to_episodes)} strata)"
     )
 
     delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, full_dataset.meta)
