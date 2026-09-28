@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+vla_storage_root="${VLA_STORAGE_ROOT:-/data}"
+
 # Always resolve relative paths from the repository root.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$repo_root"
@@ -16,7 +18,7 @@ IFS=',' read -r -a gpu_array <<< "$gpu_devices"
 nproc_per_node="${#gpu_array[@]}"
 
 log_dir="$repo_root/logs"
-output_root="/data/mem_vit_distill_outputs"
+output_root="$vla_storage_root/models/trained/mem_vit"
 log_file="$log_dir/train_mem_vit_distill_${timestamp}.log"
 pid_file="$log_dir/train_mem_vit_distill_${timestamp}.pid"
 resume_from_checkpoint="${1:-}"
@@ -50,12 +52,12 @@ setsid env \
     --standalone \
     --nproc-per-node="$nproc_per_node" \
     -m lerobot.scripts.train_mem_vit_distill \
-    --pretrained-path /data/checkpoints/lerobot_pi05_base \
+    --pretrained-path "$vla_storage_root/models/base/lerobot_pi05_base" \
     --local-files-only \
     --dataset-repo-id local/vlnce_smooth_memvit \
     --dataset-root /data/VLNCE_smooth_lerobot_final \
     --test-dataset-repo-id local/vlnce_smooth_memvit \
-    --test-dataset-root /data/mem_vit_drone_test \
+    --test-dataset-root "$vla_storage_root/datasets/other/mem_vit_drone_test" \
     --image-key observation.images.rgb \
     --output-dir "$output_dir" \
     "${resume_args[@]}" \

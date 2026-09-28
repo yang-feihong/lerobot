@@ -665,7 +665,10 @@ def _resolve_mem_vit_checkpoint(checkpoint_path: str | Path) -> Path:
             )
         return override_path
 
-    search_roots_value = os.environ.get("LEROBOT_MEM_VIT_SEARCH_ROOTS", "/data/mem_vit_distill_outputs")
+    search_roots_value = os.environ.get(
+        "LEROBOT_MEM_VIT_SEARCH_ROOTS",
+        str(Path(os.environ.get("VLA_STORAGE_ROOT", "/data")) / "models/trained/mem_vit"),
+    )
     search_roots = [Path(value).expanduser() for value in search_roots_value.split(os.pathsep) if value]
     candidates: list[Path] = []
     for root in search_roots:

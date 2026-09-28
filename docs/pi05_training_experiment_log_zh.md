@@ -465,7 +465,7 @@ step 1,500/2,000。step 5,000 由独立 watcher 在 `checkpoints/last=005000` �
 SHA-256 对比，验证通过后才删除远程备份。
 
 step 5,000 的上述流程已实际完成：本地 checkpoint 位于
-`/data01/yangfeihong/MEM_videos/b2_z1_vla_pi05_outputs/20260818_155704_pi05_b2_z1_vla_continuous_ee_v1_existingdata/checkpoints/005000`，
+`/data01/yangfeihong/MEM_videos/models/trained/pi05/20260818_155704_pi05_b2_z1_vla_continuous_ee_v1_existingdata/checkpoints/005000`，
 远程 hardlink 备份在逐文件 SHA-256 一致后删除，远程训练未暂停并继续向 step 10,000
 推进。本地固定条件闭环为
 `20260819_041217_continuous_ee_v1_005000_r01`，完整运行 1,500 个 50 Hz step、120 次 VLA

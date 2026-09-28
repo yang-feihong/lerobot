@@ -5,6 +5,7 @@ set -euo pipefail
 # Always resolve relative paths from the repository root.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$repo_root"
+vla_storage_root="${VLA_STORAGE_ROOT:-/data}"
 
 # =========================
 # User configuration
@@ -15,7 +16,7 @@ cd "$repo_root"
 #   2) a checkpoint step dir, e.g. .../checkpoints/012000
 #   3) a pretrained_model dir, e.g. .../checkpoints/012000/pretrained_model
 # If this is a run dir, the latest numeric checkpoint is used automatically.
-policy_path="/data/b2_z1_vla_pi05_outputs/pi05_b2_z1_vla_20260806_131138/checkpoints/004500"
+policy_path="$vla_storage_root/models/trained/pi05/pi05_b2_z1_vla_20260806_131138/checkpoints/004500"
 
 # full | approach | handle_press | door_traversal | custom
 eval_stage="full"
@@ -81,19 +82,19 @@ done
 case "$eval_stage" in
   full)
     stage_dataset_repo_id="local/b2_z1_vla_staff1_command_clean"
-    stage_dataset_root="/data/b2_z1_vla_lerobot_staff1_command_clean"
+    stage_dataset_root="$vla_storage_root/datasets/b2_z1/cleaned/staff1"
     ;;
   approach)
     stage_dataset_repo_id="local/b2_z1_vla_staff1_command_clean_b2_approach"
-    stage_dataset_root="/data/b2_z1_vla_lerobot_staff1_command_clean_b2_approach"
+    stage_dataset_root="$vla_storage_root/archive/trash/unified_semantic_migration_20260928/b2_z1_vla_lerobot_staff1_command_clean_b2_approach"
     ;;
   handle_press)
     stage_dataset_repo_id="local/b2_z1_vla_stage2_handle_press_with_randomized_pose"
-    stage_dataset_root="/data/b2_z1_vla_lerobot_stage2_handle_press_with_randomized_pose"
+    stage_dataset_root="$vla_storage_root/datasets/b2_z1/converted/independent_handle_press_legacy"
     ;;
   door_traversal)
     stage_dataset_repo_id="local/b2_z1_vla_staff1_command_clean_door_traversal"
-    stage_dataset_root="/data/b2_z1_vla_lerobot_staff1_command_clean_door_traversal"
+    stage_dataset_root="$vla_storage_root/archive/trash/unified_semantic_migration_20260928/b2_z1_vla_lerobot_staff1_command_clean_door_traversal"
     ;;
   custom)
     stage_dataset_repo_id=""
@@ -117,7 +118,7 @@ if [[ -z "$dataset_repo_id" || -z "$dataset_root" ]]; then
 fi
 if [[ "$output_root_overridden" == false ]]; then
   policy_label="$(basename "${policy_path%/pretrained_model}")"
-  output_root="/data/b2_z1_vla_openloop_eval/${eval_stage}_${policy_label}"
+  output_root="$vla_storage_root/evaluations/open_loop/b2_z1/${eval_stage}_${policy_label}"
 fi
 
 case "$eval_splits" in

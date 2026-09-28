@@ -39,7 +39,12 @@ def parse_args() -> argparse.Namespace:
         default=Path("/data/VLNCE_smooth_lerobot_final"),
         help="Existing MEM-ViT LeRobot dataset used only as schema/template.",
     )
-    parser.add_argument("--output-root", type=Path, default=Path("/data/mem_vit_drone_test"))
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path(os.environ.get("VLA_STORAGE_ROOT", "/data"))
+        / "datasets/other/mem_vit_drone_test",
+    )
     parser.add_argument("--repo-id", default="local/vlnce_smooth_memvit")
     parser.add_argument("--drone-root", type=Path, default=Path("/data/drone_videos"))
     parser.add_argument("--image-key", default="observation.images.rgb")

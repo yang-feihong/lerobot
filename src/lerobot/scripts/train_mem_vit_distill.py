@@ -1646,7 +1646,7 @@ if __name__ == "__main__":
 
 # HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0,1,2 uv run torchrun \
 #   --standalone --nproc-per-node=3 -m lerobot.scripts.train_mem_vit_distill \
-#   --pretrained-path /data/checkpoints/lerobot_pi05_base \
+#   --pretrained-path /data/models/base/lerobot_pi05_base \
 #   --local-files-only \
 #   --dataset-repo-id local/vlnce_smooth_memvit \
 #   --dataset-root /data/VLNCE_smooth_lerobot_final \

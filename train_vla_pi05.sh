@@ -5,6 +5,7 @@ set -euo pipefail
 # Always resolve relative paths from the repository root.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$repo_root"
+vla_storage_root="${VLA_STORAGE_ROOT:-/data}"
 
 # =========================
 # User configuration
@@ -62,7 +63,7 @@ main_process_port="29500"
 finetune_mode="lora"
 
 dataset_repo_id="local/b2_z1_vla"
-dataset_root="/data/b2_z1_vla_lerobot"
+dataset_root="$vla_storage_root/datasets/b2_z1/converted/staff1_staff2_legacy_aggregate"
 # PyAV is the deployment image's supported and reproducible video decoder.
 # Override explicitly only when validating another installed backend.
 video_backend="pyav"
@@ -72,7 +73,7 @@ image_source="real" # "real", "sim", or "mixed"
 sim_image_manifest=""
 sim_image_root=""
 mixed_sim_probability="0.5"
-base_policy="/data/checkpoints/lerobot_pi05_base_local_tokenizer"
+base_policy="$vla_storage_root/models/base/lerobot_pi05_base_local_tokenizer"
 max_state_dim="32"
 
 steps="20000"
@@ -141,7 +142,7 @@ keep_checkpoint_every_n_steps="10000"
 wandb_project="b2-z1-vla"
 wandb_enable="true"
 
-output_root="/data/b2_z1_vla_pi05_outputs"
+output_root="$vla_storage_root/models/trained/pi05"
 
 # Leave empty for a new run. To resume in place, point this at a complete
 # numeric checkpoint directory or its `last` symlink. The checkpoint's saved
@@ -162,7 +163,7 @@ lora_alpha="32"
 freeze_vision_encoder="false"
 
 # MEM-only configuration. Used only when enable_mem="true".
-mem_vit_checkpoint="/data/mem_vit_distill_outputs/mem_vit_distill_20260716_142702/mem_vit_distill_latest.pt"
+mem_vit_checkpoint="$vla_storage_root/models/trained/mem_vit/mem_vit_distill_20260716_142702/mem_vit_distill_latest.pt"
 # auto selects lora with finetune_mode=lora, otherwise full (legacy behavior).
 # Explicit CLI modes are full, lora, frozen. Resume restores the saved strategy.
 mem_vit_finetune_mode="auto"
@@ -527,7 +528,7 @@ log_dir="$repo_root/logs"
 job_prefix="pi05_b2_z1_vla"
 if [[ "$enable_mem" == "true" ]]; then
   job_prefix="mem_pi05_b2_z1_vla"
-  output_root="/data/b2_z1_vla_mem_outputs"
+  output_root="$vla_storage_root/models/trained/pi05"
 fi
 if [[ "$image_source" != "real" ]]; then
   job_prefix="${job_prefix}_${image_source}_images"

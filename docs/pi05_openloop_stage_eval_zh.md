@@ -17,6 +17,6 @@ B2/Z1 表示以及 anchor 画法始终从 checkpoint metadata 读取。
 ```bash
 ./openloop_vla_eval.sh \
   --stage=handle_press \
-  --policy-path=/data/b2_z1_vla_pi05_outputs/<run>/checkpoints/050000/pretrained_model \
-  --output-root=/data/b2_z1_vla_openloop_eval/<name>
+  --policy-path=/data/models/trained/pi05/<run>/checkpoints/050000/pretrained_model \
+  --output-root=/data/evaluations/open_loop/b2_z1/<name>
 ```

@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import multiprocessing
+import os
 from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
@@ -928,7 +929,13 @@ def main() -> None:
         "--policy-path", required=True, help="Run dir, checkpoint dir, or pretrained_model dir."
     )
     parser.add_argument("--dataset-repo-id", default="local/b2_z1_vla")
-    parser.add_argument("--dataset-root", default="/data/b2_z1_vla_lerobot")
+    parser.add_argument(
+        "--dataset-root",
+        default=str(
+            Path(os.environ.get("VLA_STORAGE_ROOT", "/data"))
+            / "datasets/b2_z1/converted/staff1_staff2_legacy_aggregate"
+        ),
+    )
     parser.add_argument(
         "--image-source",
         choices=["checkpoint", "real", "sim", "mixed"],
