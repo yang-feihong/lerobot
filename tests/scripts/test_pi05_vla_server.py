@@ -1,7 +1,7 @@
 import json
 import time
 from io import BytesIO
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, get_ident
 from types import SimpleNamespace
 
 import numpy as np
@@ -51,9 +51,41 @@ from lerobot.scripts.pi05_vla_server import (
 EXECUTION_ACTION_NAMES = execution_action_names("ee_delta")
 
 
+def test_start_runs_compile_warmup_on_the_inference_worker() -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy._stop = Event()
+    policy._warmup_requested = Event()
+    policy._warmup_finished = Event()
+    policy._warmup_error = None
+    policy._mailbox_condition = __import__("threading").Condition()
+    policy._mailbox = None
+    policy._mailbox_version = 0
+    policy._last_inferred_version = 0
+    policy._model_lock = Lock()
+    warmup_thread_ids: list[int] = []
+
+    def warmup() -> None:
+        warmup_thread_ids.append(get_ident())
+        policy._stop.set()
+
+    policy._warmup = warmup
+    policy._worker = Thread(target=policy._run)
+    caller_thread_id = get_ident()
+
+    policy.start()
+    policy._worker.join(timeout=1.0)
+
+    assert warmup_thread_ids
+    assert warmup_thread_ids == [policy._worker.ident]
+    assert warmup_thread_ids[0] != caller_thread_id
+
+
 def test_inference_worker_immediately_consumes_an_observation_waiting_in_the_mailbox() -> None:
     policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
     policy._stop = Event()
+    policy._warmup_requested = Event()
+    policy._warmup_finished = Event()
+    policy._warmup_error = None
     policy._mailbox_condition = __import__("threading").Condition()
     policy._mailbox = None
     policy._mailbox_version = 0
@@ -63,6 +95,7 @@ def test_inference_worker_immediately_consumes_an_observation_waiting_in_the_mai
     policy._latest_record = None
     policy._inference_count = 0
     policy._last_error = None
+    policy._last_error_traceback = None
     policy.recorder = SimpleNamespace(action=lambda _: None)
     first_started = Event()
     release_first = Event()

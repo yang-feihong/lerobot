@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from lerobot.datasets.semantic_views import SemanticViewCatalog, apply_semantic_views_to_batch
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .b2_action_transform import (
@@ -216,7 +217,31 @@ def _episode_arrays(dataset):
         )
 
 
-def compute_transformed_action_stats(dataset, config) -> dict[str, Any]:
+def _semantic_start_frames(
+    catalog: SemanticViewCatalog,
+    episode_index: int,
+    episode_length: int,
+    phases: list[str],
+) -> np.ndarray:
+    selected = [segment for segment in catalog.segments.get(episode_index, ()) if segment.phase in phases]
+    if not selected:
+        return np.empty(0, dtype=np.int64)
+    starts = np.concatenate(
+        [np.arange(segment.frame_start, min(segment.frame_stop, episode_length), dtype=np.int64) for segment in selected]
+    )
+    if len(starts) != len(np.unique(starts)):
+        raise ValueError(f"semantic phase segments overlap for episode {episode_index}")
+    return starts
+
+
+def compute_transformed_action_stats(
+    dataset,
+    config,
+    *,
+    semantic_views: SemanticViewCatalog | None = None,
+    semantic_phases: list[str] | None = None,
+    semantic_view_kind_weights: dict[str, float] | None = None,
+) -> dict[str, Any]:
     """Traverse continuous episodes and measure statistics after the configured action transform."""
     if not config.io_schema_resolved:
         raise ValueError("Transformed B2+Z1 statistics require a resolved PI0.5 I/O schema")
@@ -245,6 +270,42 @@ def compute_transformed_action_stats(dataset, config) -> dict[str, Any]:
     total_transitions = 0
     ee_valid_transitions = 0
     ee_indices = [i for i, name in enumerate(action_names) if name.startswith("height_invariant_ee_")]
+
+    if semantic_views is not None:
+        if not semantic_phases:
+            raise ValueError("semantic transformed-action statistics require selected phases")
+        enabled_kinds = {
+            name for name, weight in (semantic_view_kind_weights or {}).items() if weight > 0
+        }
+        if enabled_kinds != {"primary"}:
+            raise ValueError(
+                "Exact transformed-action statistics currently require only the primary semantic view"
+            )
+
+    def apply_semantics(
+        raw: torch.Tensor,
+        episode_index: int,
+        start_frames: np.ndarray,
+    ) -> torch.Tensor:
+        if semantic_views is None:
+            return raw
+        batch = {
+            ACTION: raw,
+            "episode_index": torch.full((len(raw),), episode_index, dtype=torch.long),
+            "frame_index": torch.from_numpy(start_frames),
+            "index": torch.from_numpy(start_frames),
+            "task": [""] * len(raw),
+        }
+        apply_semantic_views_to_batch(
+            batch,
+            semantic_views,
+            step=0,
+            seed=0,
+            randomize=False,
+            view_kind_weights=semantic_view_kind_weights,
+        )
+        return batch[ACTION]
+
     def accumulate(transformed: torch.Tensor, ee_valid: torch.Tensor) -> None:
         nonlocal total_transitions, ee_valid_transitions
         transformed_np = transformed.reshape(-1, transformed.shape[-1]).numpy()
@@ -275,10 +336,18 @@ def compute_transformed_action_stats(dataset, config) -> dict[str, Any]:
             num_starts = len(actions_np) - last_offset
             if num_starts <= 0:
                 continue
+            eligible_starts = (
+                _semantic_start_frames(semantic_views, episode_index, num_starts, semantic_phases or [])
+                if semantic_views is not None
+                else np.arange(num_starts, dtype=np.int64)
+            )
+            if not len(eligible_starts):
+                continue
             offsets = np.arange(action_count, dtype=np.int64) * stride
-            for batch_start in range(0, num_starts, 2048):
-                starts = np.arange(batch_start, min(batch_start + 2048, num_starts), dtype=np.int64)
+            for batch_start in range(0, len(eligible_starts), 2048):
+                starts = eligible_starts[batch_start : batch_start + 2048]
                 raw = torch.from_numpy(actions_np[starts[:, None] + offsets[None, :]])
+                raw = apply_semantics(raw, episode_index, starts)
                 raw = select_dataset_action_supervision(raw, source=config.ee_supervision_source)
                 ee_state_anchor = None
                 if config.z1_action_representation == "ee_state_delta":
@@ -304,6 +373,14 @@ def compute_transformed_action_stats(dataset, config) -> dict[str, Any]:
         source = torch.from_numpy(actions_np[:-stride])
         target = torch.from_numpy(actions_np[stride:])
         pairs = torch.stack((source, target), dim=1)
+        if semantic_views is not None:
+            starts = _semantic_start_frames(
+                semantic_views, episode_index, len(pairs), semantic_phases or []
+            )
+            if not len(starts):
+                continue
+            pairs = pairs[torch.from_numpy(starts)]
+            pairs = apply_semantics(pairs, episode_index, starts)
         pairs = select_dataset_action_supervision(
             pairs,
             source=config.ee_supervision_source,
@@ -370,6 +447,9 @@ def compute_transformed_action_stats(dataset, config) -> dict[str, Any]:
             "num_frames": int(dataset.num_frames),
             "num_episodes": int(dataset.num_episodes),
             "fps": dataset_fps,
+            "semantic_view_sha256": semantic_views.sha256 if semantic_views is not None else None,
+            "semantic_phases": list(semantic_phases or []),
+            "semantic_view_kind_weights": dict(semantic_view_kind_weights or {}),
         },
         "schema": {
             **schema,

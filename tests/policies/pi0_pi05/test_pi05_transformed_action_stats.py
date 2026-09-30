@@ -1,9 +1,11 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from datasets import Dataset
 
+from lerobot.datasets.semantic_views import SemanticSegment, SemanticView, SemanticViewCatalog
 from lerobot.policies.pi05.b2_action_transform import (
     CONTROL_EXTENDED_DATASET_ACTION_NAMES,
     DATASET_ACTION_NAMES,
@@ -116,6 +118,85 @@ def test_transformed_stats_follow_episode_deltas_and_active_endpoint_mask(tmp_pa
 
 def test_transformed_stats_valid_count_supports_all_transition_schema() -> None:
     assert transformed_action_stats_ee_valid_count({"counts": {"ee_all_transitions": 17}}) == 17
+
+
+def test_transformed_stats_only_traverse_selected_semantic_phase(tmp_path) -> None:
+    actions = np.zeros((8, 25), dtype=np.float32)
+    actions[:, 3] = 1.0
+    actions[:, 5] = 0.1
+    actions[:, 9] = 1.0
+    actions[:, 14] = np.tile([-1.0471976, 0.0], 4)
+    actions[:, 16:25] = actions[:, 5:14]
+    dataset = SimpleNamespace(
+        hf_dataset=Dataset.from_dict(
+            {
+                ACTION: actions.tolist(),
+                "episode_index": [0] * 8,
+                "frame_index": list(range(8)),
+            }
+        ),
+        meta=SimpleNamespace(
+            fps=50.0,
+            features={ACTION: {"names": list(CONTROL_EXTENDED_DATASET_ACTION_NAMES)}},
+        ),
+        root=tmp_path,
+        repo_id="local/semantic",
+        num_frames=8,
+        num_episodes=1,
+    )
+    config = SimpleNamespace(
+        io_schema_resolved=True,
+        action_dt_seconds=0.02,
+        control_frequency_hz=50.0,
+        b2_action_representation="velocity",
+        z1_action_representation="ee_delta",
+        ee_delta_rotation_representation="rotvec",
+        action_predict_arm_teleop_inactive=True,
+        action_predict_arm_reset=True,
+        action_predict_ee_pose=True,
+        action_predict_gripper=True,
+        action_predict_task_complete=False,
+        action_predict_task_blocked=False,
+        dataset_action_feature_names=list(CONTROL_EXTENDED_DATASET_ACTION_NAMES),
+        ee_supervision_source="control_action",
+        ee_target_dataset_semantics="joint_control_inactive_interpolated",
+        ee_delta_supervision_mode="all",
+        gripper_target_representation="binary_position",
+    )
+    config.action_feature_names = b2_execution_action_names(
+        list(DATASET_ACTION_NAMES), **action_schema_kwargs(config)
+    )
+    primary = SemanticView(
+        intent_id="open",
+        canonical_intent="open",
+        instructions=("Open the door.",),
+        status="active",
+        action_supervision="demonstrated",
+        frame_start=2,
+        frame_stop=6,
+        view_kind="primary",
+    )
+    catalog = SemanticViewCatalog(
+        Path("semantic_views.json"),
+        {0: (primary,)},
+        "test-sha",
+        1,
+        ("open/active",),
+        (0,),
+        {0: (SemanticSegment("handle_press", 2, 6, "full_episode"),)},
+    )
+
+    payload = compute_transformed_action_stats(
+        dataset,
+        config,
+        semantic_views=catalog,
+        semantic_phases=["handle_press"],
+        semantic_view_kind_weights={"primary": 1.0, "compatible": 0.0},
+    )
+
+    assert payload["counts"]["all_transitions"] == 4
+    assert payload["dataset"]["semantic_view_sha256"] == "test-sha"
+    assert payload["dataset"]["semantic_phases"] == ["handle_press"]
 
 
 def test_task_complete_schema_extension_only_allows_appended_completion() -> None:

@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import time
+import traceback
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -1257,8 +1258,12 @@ class AsyncRTCPolicy:
         self._control_epoch: int | None = None
         self._task_complete_latched = False
         self._stop = Event()
+        self._warmup_requested = Event()
+        self._warmup_finished = Event()
+        self._warmup_error: BaseException | None = None
         self._worker = Thread(target=self._run, name="pi05-rtc-worker", daemon=True)
         self._last_error: str | None = None
+        self._last_error_traceback: str | None = None
         self._inference_count = 0
         self._warmup_inferences = int(args.warmup_inferences)
         self._b2_controller = SE2TrajectoryController(self.low_level_hz)
@@ -1359,6 +1364,7 @@ class AsyncRTCPolicy:
         self._control_epoch = None
         self._task_complete_latched = False
         self._last_error = None
+        self._last_error_traceback = None
 
     def hot_swap_checkpoint(self, value: str | Path) -> dict[str, object]:
         """Replace compatible PEFT weights without reconstructing the base model."""
@@ -1416,7 +1422,7 @@ class AsyncRTCPolicy:
             self.policy_path = policy_path
             b2_rtc_reanchor, ee_rtc_reanchor, _, _ = self._rtc_reanchor_status()
             self._reset_runtime_after_model_switch()
-            self._warmup()
+        self._request_worker_warmup()
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         self.recorder.event(
             "vla_checkpoint_hot_swapped",
@@ -1436,8 +1442,23 @@ class AsyncRTCPolicy:
         }
 
     def start(self) -> None:
-        self._warmup()
+        self._warmup_requested.set()
         self._worker.start()
+        self._wait_for_worker_warmup()
+
+    def _request_worker_warmup(self) -> None:
+        self._warmup_error = None
+        self._warmup_finished.clear()
+        self._warmup_requested.set()
+        with self._mailbox_condition:
+            self._mailbox_condition.notify_all()
+        self._wait_for_worker_warmup()
+
+    def _wait_for_worker_warmup(self) -> None:
+        if not self._warmup_finished.wait(timeout=600.0):
+            raise TimeoutError("Timed out waiting for VLA warmup on the inference worker")
+        if self._warmup_error is not None:
+            raise RuntimeError("VLA warmup failed on the inference worker") from self._warmup_error
 
     def _warmup_batch(self) -> dict[str, object]:
         batch: dict[str, object] = {
@@ -1469,6 +1490,7 @@ class AsyncRTCPolicy:
             return
         started = time.perf_counter()
         rtc_prefix = None
+        completed = 0
         for warmup_index in range(self._warmup_inferences):
             batch = self.preprocessor(self._warmup_batch())
             with torch.inference_mode():
@@ -1491,15 +1513,52 @@ class AsyncRTCPolicy:
                     # outputs, then exercise RTC guidance before the service reports ready.
                     rtc_prefix = actions.detach().cpu().clone().to(self.device)
                 self.postprocessor(actions).detach().cpu()
+                completed += 1
+        if self.rtc_config.mode in {"inference", "training"} and not self.rtc_config.enabled:
+            self.rtc_config.enabled = True
+            try:
+                batch = self.preprocessor(self._warmup_batch())
+                with torch.inference_mode():
+                    actions = self.policy.predict_action_chunk(
+                        batch,
+                        inference_delay=0,
+                        prev_chunk_left_over=None,
+                    )
+                    self.postprocessor(actions).detach().cpu()
+                    prefix = actions.detach().cpu().clone().to(self.device)
+                    actions = self.policy.predict_action_chunk(
+                        batch,
+                        inference_delay=(
+                            min(1, self.training_rtc_max_delay)
+                            if self.rtc_config.mode == "training"
+                            else 0
+                        ),
+                        prev_chunk_left_over=prefix,
+                    )
+                    self.postprocessor(actions).detach().cpu()
+                    completed += 2
+            finally:
+                self.rtc_config.enabled = False
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         elapsed = time.perf_counter() - started
         self.recorder.event(
             "vla_warmup_finished",
-            inference_count=self._warmup_inferences,
+            inference_count=completed,
             elapsed_ms=elapsed * 1000.0,
         )
-        LOG.info("Completed %d VLA warmup inference(s) in %.3fs", self._warmup_inferences, elapsed)
+        LOG.info("Completed %d VLA warmup inference(s) in %.3fs", completed, elapsed)
+
+    def _run_worker_warmup(self) -> None:
+        try:
+            with self._model_lock:
+                self._warmup()
+            self._warmup_error = None
+        except BaseException as exc:
+            self._warmup_error = exc
+        finally:
+            self._warmup_requested.clear()
+            self._warmup_finished.set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -1623,6 +1682,7 @@ class AsyncRTCPolicy:
             "rtc_mode": self.rtc_config.mode,
             "training_rtc_max_delay": self.training_rtc_max_delay,
             "last_error": self._last_error,
+            "last_error_traceback": self._last_error_traceback,
         }
 
     def set_chunk_scheduling_mode(self, mode: str) -> dict[str, object]:
@@ -2088,10 +2148,16 @@ class AsyncRTCPolicy:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            if self._warmup_requested.is_set():
+                self._run_worker_warmup()
+                if self._warmup_error is not None:
+                    return
+                continue
             with self._mailbox_condition:
                 self._mailbox_condition.wait_for(
                     lambda: (
                         self._stop.is_set()
+                        or self._warmup_requested.is_set()
                         or (
                             self._mailbox is not None and self._mailbox_version != self._last_inferred_version
                         )
@@ -2100,6 +2166,8 @@ class AsyncRTCPolicy:
                 )
                 if self._stop.is_set():
                     return
+                if self._warmup_requested.is_set():
+                    continue
                 packet = self._mailbox
                 version = self._mailbox_version
             if packet is None or version == self._last_inferred_version:
@@ -2114,6 +2182,7 @@ class AsyncRTCPolicy:
                 self._last_inferred_version = version
                 self._inference_count += 1
                 self._last_error = None
+                self._last_error_traceback = None
                 self.recorder.action(record)
                 LOG.info(
                     "chunk=%d obs_step=%d latency=%.3fs delay=%d actions=%s",
@@ -2125,8 +2194,19 @@ class AsyncRTCPolicy:
                 )
             except Exception as exc:  # keep the server observable, but stop retry storms
                 self._last_error = f"{type(exc).__name__}: {exc}"
+                self._last_error_traceback = traceback.format_exc()
                 self._last_inferred_version = version
-                LOG.exception("Inference failed for sim_step=%d", packet.sim_step)
+                self.recorder.event(
+                    "inference_failed",
+                    sim_step=packet.sim_step,
+                    error=self._last_error,
+                    traceback=self._last_error_traceback,
+                )
+                LOG.error(
+                    "Inference failed for sim_step=%d\n%s",
+                    packet.sim_step,
+                    self._last_error_traceback,
+                )
                 if self._stop.wait(0.5):
                     return
 

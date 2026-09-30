@@ -2236,12 +2236,13 @@ class PI05Policy(PreTrainedPolicy):
         schema = self.config.action_loss_schema
         if schema in {"off", "uniform_valid"}:
             return False
-        if schema == "always":
+        if schema in {"always", "group_balanced"}:
             return True
         if schema != "auto":
             raise ValueError(
                 "Unsupported action_loss_schema="
-                f"{schema!r}. Expected one of: 'auto', 'always', 'off', 'uniform_valid'."
+                f"{schema!r}. Expected one of: 'auto', 'always', 'group_balanced', "
+                "'off', 'uniform_valid'."
             )
         return self.config.io_schema_resolved and action_dim == len(self.config.action_feature_names or [])
 
@@ -2534,35 +2535,56 @@ class PI05Policy(PreTrainedPolicy):
                 .item()
             )
 
-        weighted = torch.cat([part.reshape(losses.shape[0], -1) for part in weighted_parts], dim=1)
-        weights = torch.cat([part.reshape(losses.shape[0], -1) for part in weight_parts], dim=1)
-        total_weight_per_sample = weights.sum(dim=1).clamp_min(1e-6)
-        per_sample_loss = weighted.sum(dim=1) / total_weight_per_sample
+        part_numerators = {
+            name: part.reshape(losses.shape[0], -1).sum(dim=1)
+            for name, part in zip(loss_part_names, weighted_parts, strict=True)
+        }
+        part_weights = {
+            name: part.reshape(losses.shape[0], -1).sum(dim=1)
+            for name, part in zip(loss_part_names, weight_parts, strict=True)
+        }
+        group_balanced = self.config.action_loss_schema == "group_balanced"
+        part_contributions: dict[str, Tensor] = {}
+        part_weight_fractions: dict[str, Tensor] = {}
+        if group_balanced:
+            continuous_names = [name for name in ("b2", "ee") if name in part_numerators]
+            discrete_names = [name for name in loss_part_names if name not in continuous_names]
+            per_sample_loss = losses.new_zeros(losses.shape[0])
+            for group_names in (continuous_names, discrete_names):
+                if not group_names:
+                    continue
+                group_weight = sum(part_weights[name] for name in group_names)
+                group_valid = group_weight > 0
+                safe_group_weight = group_weight.clamp_min(1e-6)
+                group_loss = sum(part_numerators[name] for name in group_names) / safe_group_weight
+                per_sample_loss = per_sample_loss + torch.where(
+                    group_valid, group_loss, torch.zeros_like(group_loss)
+                )
+                for name in group_names:
+                    part_contributions[name] = part_numerators[name] / safe_group_weight
+                    part_weight_fractions[name] = part_weights[name] / safe_group_weight
+        else:
+            total_weight_per_sample = sum(part_weights.values()).clamp_min(1e-6)
+            per_sample_loss = sum(part_numerators.values()) / total_weight_per_sample
+            for name in loss_part_names:
+                part_contributions[name] = part_numerators[name] / total_weight_per_sample
+                part_weight_fractions[name] = part_weights[name] / total_weight_per_sample
 
         loss_dict: dict[str, float] = {
             "gate_aware_action_loss": 1.0,
+            "group_balanced_action_loss": float(group_balanced),
             f"continuous_mask_frac/b2_{self.config.b2_action_representation}": float(
                 b2_continuous_mask.float().mean().detach().cpu().item()
             ),
             "continuous_mask_frac/ee_pose": float(ee_continuous_mask.float().mean().detach().cpu().item()),
         }
-        for part_name, weighted_part, weight_part in zip(
-            loss_part_names, weighted_parts, weight_parts, strict=True
-        ):
-            part_numerator = weighted_part.reshape(losses.shape[0], -1).sum(dim=1)
-            part_weight = weight_part.reshape(losses.shape[0], -1).sum(dim=1)
+        for part_name in loss_part_names:
             loss_dict[f"loss_contribution/{part_name}"] = float(
-                (part_numerator / total_weight_per_sample).mean().detach().cpu().item()
+                part_contributions[part_name].mean().detach().cpu().item()
             )
             loss_dict[f"loss_weight_fraction/{part_name}"] = float(
-                (part_weight / total_weight_per_sample).mean().detach().cpu().item()
+                part_weight_fractions[part_name].mean().detach().cpu().item()
             )
-        per_sample_b2 = (
-            weighted_parts[loss_part_names.index("b2")].reshape(losses.shape[0], -1).sum(dim=1)
-            / total_weight_per_sample
-        )
-        per_sample_z1 = per_sample_loss - per_sample_b2
-        loss_dict["loss_contribution/z1"] = float(per_sample_z1.mean().detach().cpu().item())
         if (loss_semantic_ids is None) != (loss_semantic_names is None):
             raise ValueError("loss_semantic_id and loss_semantic_names must be provided together")
         if loss_semantic_ids is not None and loss_semantic_names is not None:
@@ -2578,15 +2600,18 @@ class PI05Policy(PreTrainedPolicy):
                 raise ValueError("loss_semantic_id contains an ID absent from loss_semantic_names")
             for semantic_id, semantic_name in enumerate(loss_semantic_names):
                 semantic_mask = loss_semantic_ids == semantic_id
+                semantic_count = semantic_mask.sum().clamp_min(1)
                 loss_dict[f"loss_semantic_fraction/{semantic_name}"] = float(
                     semantic_mask.float().mean().detach().cpu().item()
                 )
-                loss_dict[f"loss_contribution/{semantic_name}/b2"] = float(
-                    (per_sample_b2 * semantic_mask).mean().detach().cpu().item()
-                )
-                loss_dict[f"loss_contribution/{semantic_name}/z1"] = float(
-                    (per_sample_z1 * semantic_mask).mean().detach().cpu().item()
-                )
+                for part_name in loss_part_names:
+                    semantic_part = part_contributions[part_name] * semantic_mask
+                    loss_dict[f"loss_contribution/{semantic_name}/{part_name}"] = float(
+                        semantic_part.mean().detach().cpu().item()
+                    )
+                    loss_dict[f"loss_mean/{semantic_name}/{part_name}"] = float(
+                        (semantic_part.sum() / semantic_count).detach().cpu().item()
+                    )
         loss_dict.update(bool_dim_stats)
         if completion_target is not None:
             loss_dict["gate_true_frac/task_complete"] = bool_dim_stats["gate_true_frac/task_complete"]

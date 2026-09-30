@@ -30,6 +30,7 @@ def test_gate_loss_uses_arm_modes_but_completion_does_not_mask_actions():
         b2_action_representation="pose_delta",
         z1_action_representation="ee_delta",
         action_feature_names=names,
+        action_loss_schema="auto",
         training_rtc_config=None,
     )
     actions = -torch.ones(1, 5, 16)
@@ -49,14 +50,14 @@ def test_gate_loss_uses_arm_modes_but_completion_does_not_mask_actions():
     assert info["continuous_mask_frac/ee_pose"] == pytest.approx(0.6)
     assert info["gate_true_frac/task_complete"] == pytest.approx(0.4)
     assert "gate_loss/arm_teleop_inactive" in info
-    contribution_keys = ["loss_contribution/b2", "loss_contribution/z1"]
+    contribution_keys = [f"loss_contribution/{name}" for name in ("b2", "ee", "arm_teleop_inactive", "arm_reset", "gripper_target", "task_complete")]
     weight_keys = [key for key in info if key.startswith("loss_weight_fraction/")]
     assert sum(info[key] for key in contribution_keys) == pytest.approx(loss.item())
     assert sum(info[key] for key in weight_keys) == pytest.approx(1.0)
     semantic_contribution_keys = [
         f"loss_contribution/{semantic}/{domain}"
         for semantic in ("approach", "handle_press", "traversal")
-        for domain in ("b2", "z1")
+        for domain in ("b2", "ee", "arm_teleop_inactive", "arm_reset", "gripper_target", "task_complete")
     ]
     assert sum(info[key] for key in semantic_contribution_keys) == pytest.approx(loss.item())
     assert info["loss_semantic_fraction/approach"] == pytest.approx(1.0)
@@ -79,6 +80,7 @@ def test_gate_loss_rejects_overlapping_arm_modes():
         b2_action_representation="pose_delta",
         z1_action_representation="ee_delta",
         action_feature_names=names,
+        action_loss_schema="auto",
         training_rtc_config=None,
     )
     actions = -torch.ones(1, 2, len(names))
@@ -92,6 +94,59 @@ def test_gate_loss_rejects_overlapping_arm_modes():
             "mean",
             ee_delta_is_valid=torch.ones(1, 2, dtype=torch.bool),
         )
+
+
+def test_group_balanced_gate_loss_does_not_dilute_b2_with_discrete_targets():
+    policy = PI05Policy.__new__(PI05Policy)
+    torch.nn.Module.__init__(policy)
+    names = ["b2_delta_x", "b2_delta_y", "b2_delta_yaw", *DATASET_ACTION_NAMES[3:]]
+    policy.config = SimpleNamespace(
+        action_bool_loss_weight=4.0,
+        action_continuous_loss_weight=1.0,
+        action_masked_continuous_min_weight=0.0,
+        action_bool_balance_eps=1e-3,
+        action_bool_true_fractions=dict.fromkeys(
+            ("arm_teleop_inactive", "arm_reset", "gripper_target", "task_complete"), 0.5
+        ),
+        action_gripper_target_true_side="negative",
+        io_schema_resolved=True,
+        b2_action_representation="pose_delta",
+        z1_action_representation="ee_delta",
+        action_feature_names=names,
+        action_loss_schema="group_balanced",
+        training_rtc_config=None,
+    )
+    actions = -torch.ones(1, 4, len(names))
+    actions[:, :, names.index("arm_teleop_inactive")] = 1.0
+    actions[:, :, names.index("arm_reset")] = -1.0
+    base_losses = torch.ones_like(actions)
+    changed_losses = base_losses.clone()
+    for name in ("arm_teleop_inactive", "arm_reset", "gripper_target", "task_complete"):
+        changed_losses[:, :, names.index(name)] = 100.0
+
+    _, base_info = policy._b2_z1_gate_action_loss(
+        base_losses,
+        actions,
+        "mean",
+        ee_delta_is_valid=torch.ones(1, 4, dtype=torch.bool),
+        loss_semantic_ids=torch.tensor([0]),
+        loss_semantic_names=("approach",),
+    )
+    changed_loss, changed_info = policy._b2_z1_gate_action_loss(
+        changed_losses,
+        actions,
+        "mean",
+        ee_delta_is_valid=torch.ones(1, 4, dtype=torch.bool),
+        loss_semantic_ids=torch.tensor([0]),
+        loss_semantic_names=("approach",),
+    )
+
+    assert changed_info["group_balanced_action_loss"] == 1.0
+    assert changed_info["loss_contribution/b2"] == pytest.approx(base_info["loss_contribution/b2"])
+    assert changed_info["loss_contribution/ee"] == pytest.approx(0.0)
+    assert changed_info["loss_mean/approach/b2"] == pytest.approx(1.0)
+    assert changed_info["loss_mean/approach/ee"] == pytest.approx(0.0)
+    assert changed_loss.item() == pytest.approx(101.0)
 
 
 def test_gate_loss_rejects_complete_and_blocked_at_the_same_time():
@@ -109,6 +164,7 @@ def test_gate_loss_rejects_complete_and_blocked_at_the_same_time():
         b2_action_representation="pose_delta",
         z1_action_representation="ee_delta",
         action_feature_names=names,
+        action_loss_schema="auto",
         training_rtc_config=None,
     )
     actions = -torch.ones(1, 2, len(names))
@@ -138,6 +194,7 @@ def test_disabling_inactive_prediction_removes_its_output_and_ee_mask():
         b2_action_representation="pose_delta",
         z1_action_representation="ee_delta",
         action_feature_names=names,
+        action_loss_schema="auto",
         training_rtc_config=None,
     )
     actions = -torch.ones(1, 3, 15)

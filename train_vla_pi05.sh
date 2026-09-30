@@ -38,7 +38,7 @@ ee_target_dataset_semantics="joint_control_inactive_interpolated"
 ee_supervision_source="control_action"
 ee_delta_supervision_mode="all" # "active_only" or "all"
 gripper_target_representation="continuous_position"
-action_loss_schema="auto"
+action_loss_schema="group_balanced"
 task_complete_sample_tail_seconds="2.0"
 new_module_optimizer_lr_multiplier="40.0"
 structured_action_crf_initial_stay_bias="4.0"
@@ -134,6 +134,9 @@ semantic_source_weights="{}"
 eval_split="0.1"
 eval_steps="500"
 max_eval_samples="512"
+# Full denoising + checkpoint unnormalization on a fixed, phase-balanced validation subset.
+# These are the cross-checkpoint-comparable metrics logged under physical_validation/* in W&B.
+physical_eval_samples="96"
 
 log_freq="10"
 save_freq="500"
@@ -254,7 +257,7 @@ case "$action_semantics_profile" in
     ee_supervision_source="control_action"
     ee_delta_supervision_mode="all"
     gripper_target_representation="continuous_position"
-    action_loss_schema="auto"
+    action_loss_schema="group_balanced"
     ;;
   custom) ;;
   *)
@@ -357,6 +360,7 @@ while (( $# > 0 )); do
     --log-freq=*) log_freq="${1#*=}" ;;
     --eval-steps=*) eval_steps="${1#*=}" ;;
     --max-eval-samples=*) max_eval_samples="${1#*=}" ;;
+    --physical-eval-samples=*) physical_eval_samples="${1#*=}" ;;
     --save-freq=*) save_freq="${1#*=}" ;;
     --keep-last-checkpoints=*) keep_last_checkpoints="${1#*=}" ;;
     --keep-checkpoint-every-n-steps=*) keep_checkpoint_every_n_steps="${1#*=}" ;;
@@ -494,7 +498,7 @@ case "$action_semantics_profile" in
     expected_semantics=(false false true true continuous_flow joint_control_inactive_interpolated control_action all continuous_position uniform_valid)
     ;;
   joint_control_arm_mode_v2)
-    expected_semantics=(true true true true continuous_flow joint_control_inactive_interpolated control_action all continuous_position auto)
+    expected_semantics=(true true true true continuous_flow joint_control_inactive_interpolated control_action all continuous_position group_balanced)
     ;;
   custom)
     expected_semantics=()
@@ -935,6 +939,7 @@ train_args=(
   --log_freq="$log_freq" \
   --eval_steps="$eval_steps" \
   --max_eval_samples="$max_eval_samples" \
+  --physical_eval_samples="$physical_eval_samples" \
   --env_eval_freq=0 \
   --save_checkpoint=true \
   --save_freq="$save_freq" \

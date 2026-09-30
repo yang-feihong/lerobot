@@ -1,8 +1,10 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from lerobot.datasets.semantic_views import SemanticSegment, SemanticView, SemanticViewCatalog
 from lerobot.policies.pi05.b2_action_transform import (
     CONTROL_EXTENDED_DATASET_ACTION_NAMES,
     DATASET_ACTION_NAMES,
@@ -297,6 +299,58 @@ def test_stage_dataset_without_reset_positive_keeps_the_flow_channel():
     assert stats["arm_reset"]["true_weight"] == 4.0
     assert stats["arm_reset"]["false_weight"] == 4.0
     assert policy_cfg.action_bool_true_fractions["arm_reset"] == 0.0
+
+
+def test_semantic_phase_boolean_priors_clip_at_completion_and_add_hold_tail():
+    actions = np.zeros((5, len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)), dtype=np.float32)
+    actions[3:, 4] = 1.0
+    policy_cfg = SimpleNamespace(
+        type="pi05",
+        action_predict_arm_teleop_inactive=True,
+        action_predict_arm_reset=True,
+        action_predict_gripper=True,
+        action_predict_task_complete=False,
+        gripper_target_representation="continuous_position",
+        action_gripper_target_true_side="negative",
+        action_bool_loss_weight=4.0,
+        action_bool_true_fractions={},
+        chunk_size=3,
+        control_frequency_hz=10,
+    )
+    primary = SemanticView(
+        intent_id="press",
+        canonical_intent="skill_press_handle",
+        instructions=("Press the handle.",),
+        status="active",
+        action_supervision="demonstrated",
+        frame_start=0,
+        frame_stop=3,
+        completion_frame=3,
+        view_kind="primary",
+    )
+    catalog = SemanticViewCatalog(
+        path=Path("semantic_views.json"),
+        episodes={0: (primary,)},
+        sha256="test",
+        action_stride_dataset_frames=1,
+        semantic_names=("skill_press_handle/active",),
+        selected_episodes=(0,),
+        segments={0: (SemanticSegment("handle_press", 0, 3, "full_episode"),)},
+    )
+
+    stats = configure_action_bool_balance(
+        SimpleNamespace(trainable_config=policy_cfg, resume=False),
+        _fake_dataset(actions, CONTROL_EXTENDED_DATASET_ACTION_NAMES),
+        exclude_task_status=True,
+        semantic_views=catalog,
+        semantic_phases=["handle_press"],
+        semantic_view_kind_weights={"primary": 1.0},
+    )
+
+    assert stats["arm_teleop_inactive"]["positive_labels"] == 3
+    assert stats["arm_teleop_inactive"]["negative_labels"] == 6
+    assert stats["arm_reset"]["positive_labels"] == 0
+    assert stats["arm_reset"]["negative_labels"] == 9
 
 
 def test_arm_mode_overlap_is_rejected_during_dataset_preflight():

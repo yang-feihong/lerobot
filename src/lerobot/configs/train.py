@@ -274,6 +274,9 @@ class TrainPipelineConfig(HubMixin):
     eval_steps: int = 0
     # Cap on total eval samples, split uniformly across tasks (0 = use all held-out data).
     max_eval_samples: int = 0
+    # Run full action sampling and report unnormalized physical trajectory metrics on at most this
+    # many validation observations (0 = disabled). Samples are divided evenly across phases/ranks.
+    physical_eval_samples: int = 0
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
@@ -455,6 +458,12 @@ class TrainPipelineConfig(HubMixin):
 
         if self.eval_steps > 0 and self.dataset.eval_split == 0.0:
             raise ValueError("eval_steps > 0 requires dataset.eval_split > 0.0 to hold out eval data.")
+        if self.physical_eval_samples < 0:
+            raise ValueError(
+                f"physical_eval_samples must be non-negative, got {self.physical_eval_samples}"
+            )
+        if self.physical_eval_samples > 0 and self.eval_steps <= 0:
+            raise ValueError("physical_eval_samples > 0 requires eval_steps > 0")
         if self.gradient_accumulation_steps < 1:
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"

@@ -169,9 +169,12 @@ class PI05Config(PreTrainedConfig):
     #            after quantile normalization. Override action_gripper_target_true_side
     #            if a future dataset stores gripper differently.
     #
-    # "auto" applies this to a resolved B2+Z1 schema; "always"
-    # forces it; "off" restores the original unweighted mean.
-    action_loss_schema: str = "auto"  # "auto", "always", "off", or "uniform_valid"
+    # "group_balanced" independently normalizes continuous motion targets and
+    # discrete control targets before adding them. This prevents sparse,
+    # class-balanced bool targets from changing the gradient scale of B2/EE.
+    # "auto" and "always" retain the historical shared-denominator behavior
+    # so saved training configurations remain reproducible.
+    action_loss_schema: str = "group_balanced"
     action_bool_loss_weight: float = 4.0
     action_continuous_loss_weight: float = 1.0
     action_masked_continuous_min_weight: float = 0.0
@@ -275,10 +278,17 @@ class PI05Config(PreTrainedConfig):
                 "lr_scheduler_type must be constant_with_warmup or cosine_decay_with_warmup, "
                 f"got {self.lr_scheduler_type}"
             )
-        if self.action_loss_schema not in ["auto", "always", "off", "uniform_valid"]:
+        if self.action_loss_schema not in [
+            "auto",
+            "always",
+            "group_balanced",
+            "off",
+            "uniform_valid",
+        ]:
             raise ValueError(
                 "Invalid action_loss_schema: "
-                f"{self.action_loss_schema}. Expected 'auto', 'always', 'off', or 'uniform_valid'."
+                f"{self.action_loss_schema}. Expected 'auto', 'always', 'group_balanced', "
+                "'off', or 'uniform_valid'."
             )
         if self.discrete_action_training_mode not in ["continuous_flow", "structured_temporal"]:
             raise ValueError(

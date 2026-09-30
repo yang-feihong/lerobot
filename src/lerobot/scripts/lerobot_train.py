@@ -69,7 +69,12 @@ from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
+from lerobot.policies.pi05.b2_action_transform import EE_DELTA_VALID_KEY
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.pi05.physical_validation import (
+    physical_action_metric_sums,
+    physical_metric_names,
+)
 from lerobot.policies.pi05.transformed_action_stats import (
     PI05_TRANSFORMED_ACTION_STATS_NAME,
     assert_transformed_action_stats_equal,
@@ -116,6 +121,140 @@ def _configure_quantile_fallback_for_training(
                 step.quantile_fallback_to_min_max = True
 
 
+def _unnormalize_physical_action(
+    normalized: torch.Tensor, postprocessor: PolicyProcessorPipeline
+) -> torch.Tensor:
+    """Undo action normalization without applying deployment-side representation conversion."""
+    transition = postprocessor.to_transition(normalized)
+    found = False
+    for processor_step in postprocessor.steps:
+        transition = processor_step(transition)
+        if isinstance(processor_step, UnnormalizerProcessorStep):
+            found = True
+            break
+    if not found:
+        raise ValueError("Physical validation requires an action unnormalizer")
+    action = postprocessor.to_output(transition)
+    if not isinstance(action, torch.Tensor):
+        raise ValueError("Action unnormalizer did not return a tensor")
+    if action.ndim == 2:
+        action = action.unsqueeze(1)
+    if action.ndim != 3:
+        raise ValueError(f"Expected unnormalized [B, H, A] actions, got {tuple(action.shape)}")
+    return action.to(dtype=torch.float32)
+
+
+def _slice_physical_eval_batch(batch: dict[str, Any], indices: list[int]) -> dict[str, Any]:
+    """Select batch rows while preserving processor metadata that is not batch-shaped."""
+    selected: dict[str, Any] = {}
+    batch_size = len(batch.get("task", []))
+    if not batch_size:
+        episode_index = batch.get("episode_index")
+        if not isinstance(episode_index, torch.Tensor):
+            raise ValueError("Physical validation batch has no batch-shaped task or episode_index")
+        batch_size = int(episode_index.shape[0])
+    index = torch.as_tensor(indices, dtype=torch.long)
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
+            selected[key] = value.index_select(0, index.to(value.device))
+        elif isinstance(value, list) and len(value) == batch_size:
+            selected[key] = [value[i] for i in indices]
+        elif isinstance(value, tuple) and len(value) == batch_size and key != "loss_semantic_names":
+            selected[key] = tuple(value[i] for i in indices)
+        else:
+            selected[key] = value
+    return selected
+
+
+def _physical_eval_groups(
+    batch: dict[str, Any],
+    *,
+    semantic_views,
+    episode_semantic_lookup: torch.Tensor | None,
+    semantic_names: tuple[str, ...],
+) -> list[str]:
+    """Resolve stable physical-stage labels independently of natural-language intent/status."""
+    episode_indices = torch.as_tensor(batch["episode_index"]).reshape(-1).tolist()
+    frame_indices = torch.as_tensor(batch["frame_index"]).reshape(-1).tolist()
+    if semantic_views is not None:
+        labels = []
+        for episode, frame in zip(episode_indices, frame_indices, strict=True):
+            matches = [
+                segment.phase
+                for segment in semantic_views.segments.get(int(episode), ())
+                if segment.frame_start <= int(frame) < segment.frame_stop
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    "Physical validation requires exactly one stage per frame: "
+                    f"episode={episode}, frame={frame}, matches={matches}"
+                )
+            labels.append(matches[0])
+        return labels
+    if episode_semantic_lookup is None:
+        return ["all"] * len(episode_indices)
+    ids = episode_semantic_lookup[torch.as_tensor(episode_indices, dtype=torch.long)].tolist()
+    return [semantic_names[int(index)] for index in ids]
+
+
+def _select_physical_eval_indices(
+    eval_dataset,
+    eval_ds,
+    *,
+    max_samples: int,
+    semantic_views,
+    episode_semantic_lookup: torch.Tensor | None,
+    semantic_names: tuple[str, ...],
+) -> set[int]:
+    """Select a deterministic, time-spread and stage-balanced physical validation subset."""
+    if max_samples <= 0:
+        return set()
+    relative_indices = (
+        [int(index) for index in eval_ds.indices]
+        if isinstance(eval_ds, torch.utils.data.Subset)
+        else list(range(len(eval_dataset)))
+    )
+    columns = eval_dataset.hf_dataset.select(relative_indices).select_columns(
+        ["index", "episode_index", "frame_index"]
+    )
+    batch = columns[:]
+    labels = _physical_eval_groups(
+        batch,
+        semantic_views=semantic_views,
+        episode_semantic_lookup=episode_semantic_lookup,
+        semantic_names=semantic_names,
+    )
+    groups: dict[str, list[int]] = {}
+    for absolute_index, label in zip(batch["index"], labels, strict=True):
+        groups.setdefault(label, []).append(int(absolute_index))
+    if not groups:
+        return set()
+    group_names = sorted(groups)
+    exact_quota = max_samples / len(group_names)
+    quotas = dict.fromkeys(group_names, int(np.floor(exact_quota)))
+    for name in group_names[: max_samples - sum(quotas.values())]:
+        quotas[name] += 1
+    selected: set[int] = set()
+    for name in group_names:
+        candidates = groups[name]
+        quota = min(quotas[name], len(candidates))
+        if quota:
+            positions = np.linspace(0, len(candidates) - 1, num=quota, dtype=np.int64)
+            selected.update(candidates[position] for position in positions.tolist())
+    return selected
+
+
+def _merge_physical_metric_sums(
+    target: dict[str, dict[str, list[float]]],
+    group: str,
+    values: dict[str, tuple[float, int]],
+) -> None:
+    group_values = target[group]
+    for name, (metric_sum, count) in values.items():
+        group_values[name][0] += metric_sum
+        group_values[name][1] += count
+
+
 def _wandb_train_metrics(
     tracker_metrics: dict[str, int | float],
     policy_metrics: dict[str, Any] | None,
@@ -157,6 +296,7 @@ def _wandb_train_metrics(
         "gate_global_true_frac/": "discrete_action/global_target_fraction/",
         "gate_weight/": "discrete_action/class_weight/",
         "loss_contribution/": "loss_contribution/train/",
+        "loss_mean/": "loss_mean/train/",
         "loss_weight_fraction/": "loss_weight_fraction/train/",
         "loss_semantic_fraction/": "loss_semantic_fraction/train/",
         "sample_weight_": "sample_weighting/",
@@ -216,6 +356,7 @@ def _is_eval_policy_metric(key: str, value: object) -> bool:
                 "discrete_loss/",
                 "discrete_accuracy/",
                 "loss_contribution/",
+                "loss_mean/",
                 "loss_weight_fraction/",
                 "loss_semantic_fraction/",
             )
@@ -231,11 +372,13 @@ def _record_train_loss_contributions(
     if output_dict is None:
         return
     for output_key, value in output_dict.items():
-        if not output_key.startswith("loss_contribution/"):
-            continue
-        meter_key = f"loss_contribution/train/{output_key.removeprefix('loss_contribution/')}"
-        if meter_key in train_metrics.metrics and isinstance(value, int | float):
-            setattr(train_metrics, meter_key, float(value))
+        for prefix in ("loss_contribution/", "loss_mean/"):
+            if not output_key.startswith(prefix):
+                continue
+            meter_key = f"{prefix.removesuffix('/')}/train/{output_key.removeprefix(prefix)}"
+            if meter_key in train_metrics.metrics and isinstance(value, int | float):
+                setattr(train_metrics, meter_key, float(value))
+            break
 
 
 def _wandb_eval_metrics(
@@ -259,6 +402,8 @@ def _wandb_eval_metrics(
             grouped["continuous_action/val_loss"] = mean
         elif key.startswith("loss_contribution/"):
             grouped[f"loss_contribution/val/{key.removeprefix('loss_contribution/')}"] = mean
+        elif key.startswith("loss_mean/"):
+            grouped[f"loss_mean/val/{key.removeprefix('loss_mean/')}"] = mean
         elif key.startswith("loss_weight_fraction/"):
             grouped[f"loss_weight_fraction/val/{key.removeprefix('loss_weight_fraction/')}"] = mean
         elif key.startswith("loss_semantic_fraction/"):
@@ -733,6 +878,9 @@ def configure_action_bool_balance(
     start_counts: dict[int, int] | None = None,
     *,
     exclude_task_status: bool = False,
+    semantic_views=None,
+    semantic_phases: list[str] | None = None,
+    semantic_view_kind_weights: dict[str, float] | None = None,
 ) -> dict[str, dict[str, int | float]] | None:
     """Resolve fixed class priors for every enabled boolean action from the train split."""
     policy_cfg = cfg.trainable_config
@@ -774,14 +922,65 @@ def configure_action_bool_balance(
         float(dataset.meta.fps),
         control_frequency_hz,
     )
-    episode_multiplicities = {
-        episode_index: action_label_multiplicity(
-            length,
-            offsets,
-            num_start_frames=None if start_counts is None else start_counts[episode_index],
-        ).numpy()
-        for episode_index, length in zip(episode_indices, lengths, strict=True)
-    }
+    forced_semantic_holds = 0
+    use_phase_multiplicity = semantic_views is not None and bool(semantic_phases)
+    if use_phase_multiplicity:
+        positive_view_kinds = {
+            name for name, weight in (semantic_view_kind_weights or {}).items() if weight > 0
+        }
+        if positive_view_kinds != {"primary"}:
+            raise ValueError(
+                "Exact arm-mode balancing for semantic phase sampling currently requires "
+                "semantic_view_kind_weights to enable only the primary view"
+            )
+        episode_multiplicities = {}
+        for episode_index, length in zip(episode_indices, lengths, strict=True):
+            multiplicity = np.zeros(length, dtype=np.int64)
+            for segment in semantic_views.segments.get(episode_index, ()):
+                if segment.phase not in semantic_phases:
+                    continue
+                matching_views = [
+                    view
+                    for view in semantic_views.episodes.get(episode_index, ())
+                    if view.view_kind == "primary"
+                    and (view.frame_start is None or view.frame_start <= segment.frame_start)
+                    and (view.frame_stop is None or view.frame_stop >= segment.frame_stop)
+                ]
+                if len(matching_views) != 1:
+                    raise ValueError(
+                        "Every selected semantic segment must have exactly one covering primary view: "
+                        f"episode={episode_index}, phase={segment.phase}, matches={len(matching_views)}"
+                    )
+                view = matching_views[0]
+                if (
+                    view.status != "active"
+                    or view.action_supervision != "demonstrated"
+                    or view.completion_frame != segment.frame_stop
+                ):
+                    raise ValueError(
+                        "Selected primary semantic views must supervise the demonstrated action and "
+                        "complete at the segment boundary for exact arm-mode balancing: "
+                        f"episode={episode_index}, phase={segment.phase}"
+                    )
+                segment_length = segment.frame_stop - segment.frame_start
+                for offset in offsets:
+                    offset = int(offset)
+                    if offset < 0:
+                        raise ValueError("Action sample offsets must be nonnegative")
+                    first_target = segment.frame_start + offset
+                    if first_target < segment.frame_stop:
+                        multiplicity[first_target : segment.frame_stop] += 1
+                    forced_semantic_holds += min(offset, segment_length)
+            episode_multiplicities[episode_index] = multiplicity
+    else:
+        episode_multiplicities = {
+            episode_index: action_label_multiplicity(
+                length,
+                offsets,
+                num_start_frames=None if start_counts is None else start_counts[episode_index],
+            ).numpy()
+            for episode_index, length in zip(episode_indices, lengths, strict=True)
+        }
     counts: dict[str, list[int]] = {name: [0, 0] for name in enabled_names}
     if counts:
         missing_names = [name for name in counts if name not in action_names]
@@ -821,6 +1020,11 @@ def configure_action_bool_balance(
                 positive = int(label_multiplicity[target_true].sum())
                 counts[name][0] += positive
                 counts[name][1] += int(label_multiplicity.sum()) - positive
+        if use_phase_multiplicity:
+            if "arm_teleop_inactive" in counts:
+                counts["arm_teleop_inactive"][0] += forced_semantic_holds
+            if "arm_reset" in counts:
+                counts["arm_reset"][1] += forced_semantic_holds
 
     stats: dict[str, dict[str, int | float]] = {}
     true_fractions: dict[str, float] = {}
@@ -1053,7 +1257,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         )
     saved_action_bool_priors = dict(cfg.trainable_config.action_bool_true_fractions)
     action_bool_balance = configure_action_bool_balance(
-        cfg, dataset, train_start_counts, exclude_task_status=semantic_views is not None
+        cfg,
+        dataset,
+        train_start_counts,
+        exclude_task_status=semantic_views is not None,
+        semantic_views=semantic_views,
+        semantic_phases=cfg.dataset.semantic_phases,
+        semantic_view_kind_weights=cfg.dataset.semantic_view_kind_weights,
     )
     if semantic_views is not None:
         selected_episodes = dataset.episodes or list(range(dataset.meta.total_episodes))
@@ -1171,7 +1381,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         output_stats_path = cfg.output_dir / PI05_TRANSFORMED_ACTION_STATS_NAME
         if is_main_process:
             logging.info("Traversing continuous episodes for exact transformed-action statistics")
-            measured_action_stats_payload = compute_transformed_action_stats(dataset, policy.config)
+            measured_action_stats_payload = compute_transformed_action_stats(
+                dataset,
+                policy.config,
+                semantic_views=semantic_views,
+                semantic_phases=cfg.dataset.semantic_phases,
+                semantic_view_kind_weights=cfg.dataset.semantic_view_kind_weights,
+            )
             resume_stats_path = (
                 cfg.checkpoint_path / PRETRAINED_MODEL_DIR / PI05_TRANSFORMED_ACTION_STATS_NAME
                 if cfg.resume
@@ -1645,6 +1861,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     else:
         episode_semantic_lookup, semantic_names = semantic_metadata
 
+    physical_eval_group_names: tuple[str, ...]
+    if semantic_views is not None:
+        physical_eval_group_names = tuple(cfg.dataset.semantic_phases) or tuple(
+            dict.fromkeys(
+                segment.phase
+                for segments in semantic_views.segments.values()
+                for segment in segments
+            )
+        )
+    else:
+        physical_eval_group_names = semantic_names or ("all",)
+
     # Only swap in the language-aware collate when the dataset actually
     # declares language columns; otherwise stay on PyTorch's default
     # collate so non-language training runs are unaffected.
@@ -1664,6 +1892,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     # Build eval dataloader if a held-out split exists
     eval_dataloader = None
+    physical_eval_selected_indices: set[int] = set()
     if eval_dataset is not None:
         eval_ds = eval_dataset
         eval_completion_sampling = (
@@ -1720,6 +1949,25 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             eval_ds = torch.utils.data.Subset(eval_dataset, selected)
         elif eligible_eval_indices is not None:
             eval_ds = torch.utils.data.Subset(eval_dataset, eligible_eval_indices)
+
+        if (
+            cfg.physical_eval_samples > 0
+            and isinstance(active_cfg, PI05Config)
+            and active_cfg.io_schema_resolved
+        ):
+            physical_eval_selected_indices = _select_physical_eval_indices(
+                eval_dataset,
+                eval_ds,
+                max_samples=cfg.physical_eval_samples,
+                semantic_views=semantic_views,
+                episode_semantic_lookup=episode_semantic_lookup,
+                semantic_names=semantic_names,
+            )
+            if is_main_process:
+                logging.info(
+                    "Physical validation: selected %d fixed, stage-balanced observations",
+                    len(physical_eval_selected_indices),
+                )
 
         eval_collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
         eval_dataloader = torch.utils.data.DataLoader(
@@ -1779,10 +2027,26 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         and active_cfg.action_loss_schema not in {"off", "uniform_valid"}
     )
     if semantic_loss_logging_enabled:
+        action_names = set(active_cfg.action_feature_names or [])
+        loss_parts = ["b2"]
+        if any(name.startswith("height_invariant_ee_") for name in action_names):
+            loss_parts.append("ee")
+        loss_parts.extend(
+            name
+            for name in (
+                "arm_teleop_inactive",
+                "arm_reset",
+                "gripper_target",
+                "task_complete",
+                "task_blocked",
+            )
+            if name in action_names
+        )
         for semantic_name in semantic_names:
-            for domain in ("b2", "z1"):
-                key = f"loss_contribution/train/{semantic_name}/{domain}"
-                train_metrics[key] = AverageMeter(key, ":.4f", reduction="mean")
+            for part_name in loss_parts:
+                for metric_prefix in ("loss_contribution", "loss_mean"):
+                    key = f"{metric_prefix}/train/{semantic_name}/{part_name}"
+                    train_metrics[key] = AverageMeter(key, ":.4f", reduction="mean")
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
     effective_batch_size = cfg.batch_size * cfg.gradient_accumulation_steps * accelerator.num_processes
@@ -1898,6 +2162,22 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             n_eval_batches = 0
             eval_policy_metric_sums: dict[str, float] = {}
             eval_action_dimension_sums: torch.Tensor | None = None
+            physical_eval_enabled = (
+                cfg.physical_eval_samples > 0
+                and isinstance(active_cfg, PI05Config)
+                and active_cfg.io_schema_resolved
+            )
+            physical_names = (
+                physical_metric_names(active_cfg.action_feature_names or [])
+                if physical_eval_enabled
+                else ()
+            )
+            physical_sums: dict[str, dict[str, list[float]]] = {
+                group: {name: [0.0, 0.0] for name in physical_names}
+                for group in physical_eval_group_names
+            }
+            physical_sample_counts = dict.fromkeys(physical_eval_group_names, 0)
+            physical_batch_index = 0
             with torch.no_grad(), accelerator.autocast():
                 for eval_batch in eval_dataloader:
                     for cam_key in dataset.meta.camera_keys:
@@ -1922,6 +2202,21 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                             randomize=True,
                             view_kind_weights=cfg.dataset.semantic_view_kind_weights,
                         )
+                    physical_groups = (
+                        _physical_eval_groups(
+                            eval_batch,
+                            semantic_views=semantic_views,
+                            episode_semantic_lookup=episode_semantic_lookup,
+                            semantic_names=semantic_names,
+                        )
+                        if physical_eval_enabled
+                        else []
+                    )
+                    physical_absolute_indices = (
+                        torch.as_tensor(eval_batch["index"]).reshape(-1).tolist()
+                        if physical_eval_enabled
+                        else []
+                    )
                     eval_batch = preprocessor(eval_batch)
                     if semantic_views is not None:
                         attach_semantic_view_loss_semantics(eval_batch, semantic_views.semantic_names)
@@ -1942,6 +2237,92 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         if eval_action_dimension_sums is None:
                             eval_action_dimension_sums = torch.zeros_like(numeric_per_dim)
                         eval_action_dimension_sums += numeric_per_dim
+
+                    if physical_eval_enabled:
+                        selected_indices: list[int] = []
+                        selected_groups: list[str] = []
+                        for row, (group, absolute_index) in enumerate(
+                            zip(physical_groups, physical_absolute_indices, strict=True)
+                        ):
+                            if group not in physical_sample_counts:
+                                raise ValueError(f"Unexpected physical validation stage: {group!r}")
+                            if int(absolute_index) not in physical_eval_selected_indices:
+                                continue
+                            physical_sample_counts[group] += 1
+                            selected_indices.append(row)
+                            selected_groups.append(group)
+                        if selected_indices:
+                            physical_batch = _slice_physical_eval_batch(eval_batch, selected_indices)
+                            normalized_expert = physical_batch.get(ACTION)
+                            if not isinstance(normalized_expert, torch.Tensor):
+                                raise ValueError("Physical validation batch has no normalized action tensor")
+                            inference_policy = accelerator.unwrap_model(policy)
+                            generator = torch.Generator(device=device)
+                            generator.manual_seed(
+                                int(cfg.seed or 0)
+                                + accelerator.process_index * 1_000_003
+                                + physical_batch_index
+                            )
+                            noise = torch.randn(
+                                len(selected_indices),
+                                active_cfg.chunk_size,
+                                active_cfg.max_action_dim,
+                                dtype=torch.float32,
+                                device=device,
+                                generator=generator,
+                            )
+                            noise = inference_policy.model._zero_structured_discrete_channels(noise)
+                            normalized_predicted = inference_policy.predict_action_chunk(
+                                physical_batch,
+                                noise=noise,
+                            )
+                            expert_physical = _unnormalize_physical_action(
+                                normalized_expert, postprocessor
+                            )
+                            predicted_physical = _unnormalize_physical_action(
+                                normalized_predicted, postprocessor
+                            )
+                            action_is_pad = physical_batch.get(f"{ACTION}_is_pad")
+                            valid = (
+                                torch.ones(
+                                    expert_physical.shape[:2],
+                                    dtype=torch.bool,
+                                    device=expert_physical.device,
+                                )
+                                if action_is_pad is None
+                                else ~torch.as_tensor(
+                                    action_is_pad,
+                                    dtype=torch.bool,
+                                    device=expert_physical.device,
+                                )
+                            )
+                            ee_valid = physical_batch.get(EE_DELTA_VALID_KEY)
+                            for group in set(selected_groups):
+                                rows = [
+                                    index
+                                    for index, selected_group in enumerate(selected_groups)
+                                    if selected_group == group
+                                ]
+                                row_index = torch.as_tensor(rows, dtype=torch.long, device=device)
+                                values = physical_action_metric_sums(
+                                    expert_physical.index_select(0, row_index),
+                                    predicted_physical.index_select(0, row_index),
+                                    valid.index_select(0, row_index),
+                                    action_names=active_cfg.action_feature_names or [],
+                                    b2_representation=active_cfg.b2_action_representation,
+                                    z1_representation=active_cfg.z1_action_representation,
+                                    ee_rotation_representation=active_cfg.ee_delta_rotation_representation,
+                                    action_dt_seconds=float(active_cfg.action_dt_seconds),
+                                    ee_valid=(
+                                        None
+                                        if ee_valid is None
+                                        else torch.as_tensor(ee_valid, device=device).index_select(
+                                            0, row_index
+                                        )
+                                    ),
+                                )
+                                _merge_physical_metric_sums(physical_sums, group, values)
+                            physical_batch_index += 1
             eval_loss = eval_loss_sum / max(n_eval_batches, 1)
             eval_loss = torch.tensor(eval_loss, device=device)
             eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
@@ -1972,18 +2353,52 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 }
             policy.train()
 
+            physical_eval_metrics: dict[str, float | int] = {}
+            if physical_eval_enabled:
+                flat_names = [
+                    (group, name)
+                    for group in physical_eval_group_names
+                    for name in physical_names
+                ]
+                flat_values = [
+                    value
+                    for group, name in flat_names
+                    for value in physical_sums[group][name]
+                ]
+                reduced = accelerator.reduce(
+                    torch.tensor(flat_values, dtype=torch.float64, device=device), reduction="sum"
+                ).cpu()
+                for index, (group, name) in enumerate(flat_names):
+                    metric_sum = float(reduced[index * 2])
+                    count = int(reduced[index * 2 + 1])
+                    if count:
+                        physical_eval_metrics[f"physical_validation/{group}/{name}"] = (
+                            metric_sum / count
+                        )
+                sample_values = accelerator.reduce(
+                    torch.tensor(
+                        [physical_sample_counts[group] for group in physical_eval_group_names],
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                    reduction="sum",
+                ).cpu()
+                for group, count in zip(
+                    physical_eval_group_names, sample_values.tolist(), strict=True
+                ):
+                    physical_eval_metrics[f"physical_validation/{group}/sample_count"] = int(count)
+
             if is_main_process:
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
                 if wandb_logger:
-                    wandb_logger.log_grouped_dict(
-                        _wandb_eval_metrics(
-                            eval_loss,
-                            n_eval_batches,
-                            eval_metric_means,
-                            eval_action_dimension_means,
-                        ),
-                        step,
+                    wandb_eval_metrics = _wandb_eval_metrics(
+                        eval_loss,
+                        n_eval_batches,
+                        eval_metric_means,
+                        eval_action_dimension_means,
                     )
+                    wandb_eval_metrics.update(physical_eval_metrics)
+                    wandb_logger.log_grouped_dict(wandb_eval_metrics, step)
 
         if cfg.save_checkpoint and is_saving_step:
             # Under FSDP, gathering the full model + optimizer state dicts is a cross-rank collective,
