@@ -2271,7 +2271,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                                 device=device,
                                 generator=generator,
                             )
-                            noise = inference_policy.model._zero_structured_discrete_channels(noise)
                             normalized_predicted = inference_policy.predict_action_chunk(
                                 physical_batch,
                                 noise=noise,
