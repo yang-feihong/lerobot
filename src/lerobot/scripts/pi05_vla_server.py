@@ -1368,8 +1368,13 @@ class AsyncRTCPolicy:
 
     def hot_swap_checkpoint(self, value: str | Path) -> dict[str, object]:
         """Replace compatible PEFT weights without reconstructing the base model."""
+        from lerobot.policies.base_artifacts import resolve_checkpoint_bases
+
         started = time.perf_counter()
         policy_path = _resolve_policy_path(value)
+        # A hot swap reuses the already-loaded bases, so first prove that the
+        # requested adapter declares the exact artifacts available locally.
+        resolve_checkpoint_bases(policy_path)
         signature = _checkpoint_hot_swap_signature(policy_path)
         if signature != self._hot_swap_signature:
             return {

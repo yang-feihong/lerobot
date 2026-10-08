@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import logging
 import shutil
 from contextlib import contextmanager
@@ -31,6 +32,7 @@ from lerobot.optim import (
     save_scheduler_state,
 )
 from lerobot.policies import PreTrainedPolicy
+from lerobot.policies.base_artifacts import artifact_uri, write_manifest
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import (
@@ -112,6 +114,46 @@ def _append_peft_base_weights(
     save_file(adapter_state, temporary_path, metadata={"format": "pt"})
     temporary_path.replace(adapter_path)
     return len(extra_state)
+
+
+def _replace_saved_artifact_paths(pretrained_dir: Path, policy_cfg: PI05Config) -> None:
+    """Remove host-specific base paths from newly written checkpoint metadata."""
+    policy_uri = artifact_uri(policy_cfg.policy_base_artifact_id)
+    mem_vit_uri = (
+        artifact_uri(policy_cfg.mem_vit_artifact_id)
+        if policy_cfg.mem_vit_artifact_id is not None
+        else None
+    )
+
+    def replace_named_paths(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in {"base_model_name_or_path", "pretrained_path"}:
+                    value[key] = policy_uri
+                elif key == "mem_vit_checkpoint" and mem_vit_uri is not None:
+                    value[key] = mem_vit_uri
+                else:
+                    replace_named_paths(item)
+        elif isinstance(value, list):
+            for item in value:
+                replace_named_paths(item)
+
+    for filename in ("adapter_config.json", "config.json", "train_config.json"):
+        path = pretrained_dir / filename
+        if not path.is_file():
+            continue
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        replace_named_paths(parsed)
+        path.write_text(json.dumps(parsed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    processor_path = pretrained_dir / "policy_preprocessor.json"
+    if processor_path.is_file() and policy_cfg.policy_tokenizer_artifact_id is not None:
+        payload = json.loads(processor_path.read_text(encoding="utf-8"))
+        tokenizer_uri = artifact_uri(policy_cfg.policy_tokenizer_artifact_id)
+        for step in payload.get("steps", []):
+            step_config = step.get("config", {})
+            if step.get("registry_name") == "tokenizer_processor" and step_config.get("tokenizer_name"):
+                step_config["tokenizer_name"] = tokenizer_uri
+        processor_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def get_step_identifier(step: int, total_steps: int) -> str:
@@ -244,8 +286,16 @@ def save_checkpoint(
     """
     pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
     policy_cfg = policy.config
+    portable_artifacts = (
+        cfg.peft is not None
+        and isinstance(policy_cfg, PI05Config)
+        and policy_cfg.policy_base_artifact_id is not None
+    )
     embed_mem_vit_base = (
-        cfg.peft is not None and isinstance(policy_cfg, PI05Config) and policy_cfg.mem_vit_enabled
+        cfg.peft is not None
+        and isinstance(policy_cfg, PI05Config)
+        and policy_cfg.mem_vit_enabled
+        and (not portable_artifacts or policy_cfg.mem_vit_finetune_mode == "full")
     )
     if cfg.peft is not None and model_state_dict is not None:
         with _peft_modules_to_save_from_state_dict(policy):
@@ -271,10 +321,35 @@ def save_checkpoint(
         # When using PEFT, policy.save_pretrained will only write the adapter weights + config, not the
         # policy config which we need for loading the model. In this case we'll write it ourselves.
         policy.config.save_pretrained(pretrained_dir)
+    if portable_artifacts:
+        if policy_cfg.policy_tokenizer_artifact_id is None:
+            raise ValueError("Portable PI0.5 checkpoint export requires a tokenizer artifact identity")
+        if policy_cfg.mem_vit_enabled and policy_cfg.mem_vit_artifact_id is None:
+            raise ValueError("Portable MEM checkpoint export requires a MEM-ViT artifact identity")
+        if policy_cfg.mem_vit_finetune_mode != "full":
+            policy_cfg.mem_vit_base_weights_embedded = False
+            policy_cfg.mem_vit_embedded_tensor_count = 0
+            if isinstance(cfg.policy, PI05Config):
+                cfg.policy.mem_vit_base_weights_embedded = False
+                cfg.policy.mem_vit_embedded_tensor_count = 0
+        # Re-save after finalizing the portable representation.
+        cfg.save_pretrained(pretrained_dir)
+        policy_cfg.save_pretrained(pretrained_dir)
+        write_manifest(
+            pretrained_dir,
+            policy_artifact_id=policy_cfg.policy_base_artifact_id,
+            policy_sha256=policy_cfg.policy_base_sha256,
+            mem_vit_artifact_id=policy_cfg.mem_vit_artifact_id,
+            mem_vit_sha256=policy_cfg.mem_vit_sha256,
+            tokenizer_artifact_id=policy_cfg.policy_tokenizer_artifact_id,
+            tokenizer_sha256=policy_cfg.policy_tokenizer_sha256,
+        )
     if preprocessor is not None:
         preprocessor.save_pretrained(pretrained_dir)
     if postprocessor is not None:
         postprocessor.save_pretrained(pretrained_dir)
+    if portable_artifacts:
+        _replace_saved_artifact_paths(pretrained_dir, policy_cfg)
     save_training_state(
         checkpoint_dir,
         step,

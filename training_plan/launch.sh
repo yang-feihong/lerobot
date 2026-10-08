@@ -4,14 +4,23 @@ set -euo pipefail
 plan_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${plan_dir}/.." && pwd)"
 env_file="${ENV_FILE:-${plan_dir}/.env}"
+semantic_presets_file="${SEMANTIC_TRAINING_PRESETS:-${plan_dir}/semantic_training_presets.json}"
+training_jobs_file="${TRAINING_JOBS_FILE:-${plan_dir}/training_jobs.json}"
+artifacts_lock="${ARTIFACTS_LOCK_FILE:-${plan_dir}/artifacts.lock}"
 [[ -f "${env_file}" ]] || { echo "Missing ${env_file}" >&2; exit 1; }
+[[ -f "${semantic_presets_file}" ]] || { echo "Missing ${semantic_presets_file}" >&2; exit 1; }
+[[ -f "${training_jobs_file}" ]] || { echo "Missing ${training_jobs_file}" >&2; exit 1; }
+[[ -f "${artifacts_lock}" ]] || { echo "Missing ${artifacts_lock}" >&2; exit 1; }
 set -a
 # shellcheck disable=SC1090
 source "${env_file}"
+# shellcheck disable=SC1090
+source "${artifacts_lock}"
 set +a
+export LEROBOT_ARTIFACT_REGISTRY="${LEROBOT_ARTIFACT_REGISTRY:-${plan_dir}/base_artifact_registry.json}"
 
 required=(
-  VLA_STORAGE_ROOT STAFF1_DATASET_ROOT ALL_SCENES_DATASET_ROOT BASE_POLICY
+  VLA_STORAGE_ROOT BASE_POLICY
   MEM_VIT_CHECKPOINT OUTPUT_ROOT WANDB_PROJECT TRAIN_STEPS GLOBAL_BATCH_SIZE
   BATCH_SIZE_PER_GPU EVAL_STEPS PHYSICAL_EVAL_SAMPLES SAVE_FREQ
   KEEP_LAST_CHECKPOINTS KEEP_CHECKPOINT_EVERY_N_STEPS
@@ -22,11 +31,11 @@ for name in "${required[@]}"; do
   [[ -n "${!name:-}" ]] || { echo "Missing ${name} in ${env_file}" >&2; exit 2; }
 done
 [[ "${ACTION_SEMANTICS_PROFILE}" == "joint_control_arm_mode_v2" ]] || {
-  echo "Plan 16 requires joint_control_arm_mode_v2 (mechanical-arm three-state output)." >&2
+  echo "This training plan requires joint_control_arm_mode_v2 (mechanical-arm three-state output)." >&2
   exit 2
 }
 [[ "${PREDICT_TASK_COMPLETE}" == "true" ]] || {
-  echo "Plan 16 requires PREDICT_TASK_COMPLETE=true." >&2
+  echo "This training plan requires PREDICT_TASK_COMPLETE=true." >&2
   exit 2
 }
 
@@ -36,56 +45,49 @@ Usage:
   training_plan/launch.sh describe TASK_ID
   training_plan/launch.sh start TASK_ID GPU_ID [PORT]
   training_plan/launch.sh dry-run TASK_ID GPU_ID [PORT]
+  training_plan/launch.sh resume TASK_ID GPU_ID CHECKPOINT [PORT]
+  training_plan/launch.sh resume-dry-run TASK_ID GPU_ID CHECKPOINT [PORT]
 
-TASK_ID values:
-  staff1_stage1_standard       staff1_stage2_standard
-  staff1_stage3_standard       staff1_stage1_mem_vit
-  staff1_stage2_mem_vit        staff1_stage3_mem_vit
-  staff1_stage1_full_mem       staff1_stage2_full_mem
-  staff1_stage3_full_mem       staff1_joint_standard
-  staff1_joint_mem_vit         staff1_joint_full_mem
-  all_scenes_stage1_standard   all_scenes_stage2_standard
-  all_scenes_stage3_standard   all_scenes_joint_standard
+TASK_ID values are defined in training_plan/training_jobs.json:
 EOF
+  python3 "${plan_dir}/semantic_plan.py" \
+    --presets "${semantic_presets_file}" --jobs "${training_jobs_file}" list | sed 's/^/  /'
 }
 
 task_id="${2:-}"
-dataset_family=""
-phase=""
-memory_mode=""
-case "${task_id}" in
-  staff1_stage1_standard) dataset_family=staff1; phase=approach; memory_mode=standard ;;
-  staff1_stage2_standard) dataset_family=staff1; phase=handle_press; memory_mode=standard ;;
-  staff1_stage3_standard) dataset_family=staff1; phase=traversal; memory_mode=standard ;;
-  staff1_stage1_mem_vit) dataset_family=staff1; phase=approach; memory_mode=mem_vit ;;
-  staff1_stage2_mem_vit) dataset_family=staff1; phase=handle_press; memory_mode=mem_vit ;;
-  staff1_stage3_mem_vit) dataset_family=staff1; phase=traversal; memory_mode=mem_vit ;;
-  staff1_stage1_full_mem) dataset_family=staff1; phase=approach; memory_mode=full_mem ;;
-  staff1_stage2_full_mem) dataset_family=staff1; phase=handle_press; memory_mode=full_mem ;;
-  staff1_stage3_full_mem) dataset_family=staff1; phase=traversal; memory_mode=full_mem ;;
-  staff1_joint_standard) dataset_family=staff1; phase=joint; memory_mode=standard ;;
-  staff1_joint_mem_vit) dataset_family=staff1; phase=joint; memory_mode=mem_vit ;;
-  staff1_joint_full_mem) dataset_family=staff1; phase=joint; memory_mode=full_mem ;;
-  all_scenes_stage1_standard) dataset_family=all_scenes; phase=approach; memory_mode=standard ;;
-  all_scenes_stage2_standard) dataset_family=all_scenes; phase=handle_press; memory_mode=standard ;;
-  all_scenes_stage3_standard) dataset_family=all_scenes; phase=traversal; memory_mode=standard ;;
-  all_scenes_joint_standard) dataset_family=all_scenes; phase=joint; memory_mode=standard ;;
-  *) usage >&2; exit 2 ;;
-esac
+[[ -n "${task_id}" ]] || { usage >&2; exit 2; }
+mapfile -t semantic_task_spec < <(
+  python3 "${plan_dir}/semantic_plan.py" \
+    --presets "${semantic_presets_file}" --jobs "${training_jobs_file}" resolve "${task_id}"
+)
+[[ "${#semantic_task_spec[@]}" -eq 8 ]] || {
+  echo "Failed to resolve semantic task ${task_id} from ${training_jobs_file}" >&2
+  exit 2
+}
+dataset_family="${semantic_task_spec[0]}"
+memory_mode="${semantic_task_spec[1]}"
+semantic_phases="${semantic_task_spec[2]}"
+semantic_phase_weights="${semantic_task_spec[3]}"
+semantic_state_instruction_matrix="${semantic_task_spec[4]}"
+configured_node="${semantic_task_spec[5]}"
+configured_gpu_ids="${semantic_task_spec[6]}"
+configured_port="${semantic_task_spec[7]}"
+semantic_source_weights='{}'
 
 if [[ "${dataset_family}" == staff1 ]]; then
+  [[ -n "${STAFF1_DATASET_ROOT:-}" ]] || {
+    echo "Task ${task_id} requires STAFF1_DATASET_ROOT in ${env_file}." >&2
+    exit 2
+  }
   dataset_root="${STAFF1_DATASET_ROOT}"
 else
+  [[ -n "${ALL_SCENES_DATASET_ROOT:-}" ]] || {
+    echo "Task ${task_id} requires ALL_SCENES_DATASET_ROOT in ${env_file}." >&2
+    exit 2
+  }
   dataset_root="${ALL_SCENES_DATASET_ROOT}"
 fi
 semantic_views_path="${dataset_root}/meta/semantic_views.json"
-if [[ "${phase}" == joint ]]; then
-  semantic_phases='["approach","handle_press","traversal"]'
-  semantic_phase_weights='{"approach":1.0,"handle_press":1.0,"traversal":1.0}'
-else
-  semantic_phases="[\"${phase}\"]"
-  semantic_phase_weights='{}'
-fi
 
 memory_args=()
 case "${memory_mode}" in
@@ -114,20 +116,40 @@ case "${memory_mode}" in
     ;;
 esac
 
-gpu_id="${3:-0}"
-port="${4:-$((29500 + gpu_id))}"
+command="${1:-}"
+gpu_id="${3:-${configured_gpu_ids}}"
+if [[ "${command}" == resume || "${command}" == resume-dry-run ]]; then
+  port="${5:-${configured_port}}"
+else
+  port="${4:-${configured_port}}"
+fi
+[[ "${gpu_id}" == "${configured_gpu_ids}" ]] || {
+  echo "Task ${task_id} requires GPUs ${configured_gpu_ids}, got ${gpu_id}." >&2
+  exit 2
+}
+[[ "${port}" == "${configured_port}" ]] || {
+  echo "Task ${task_id} requires DDP port ${configured_port}, got ${port}." >&2
+  exit 2
+}
 common_args=(
   --gpu-id="${gpu_id}" --main-process-port="${port}"
-  --job-suffix="plan16_${task_id}_arm_mode_complete"
+  --job-suffix="training_job_${task_id}_arm_mode_complete"
   --dataset-root="${dataset_root}"
   --dataset-repo-id="local/b2_z1_vla_${dataset_family}_training"
   --semantic-views-path="${semantic_views_path}"
-  --semantic-view-kind-weights='{"primary":1.0}'
+  --semantic-state-instruction-matrix="${semantic_state_instruction_matrix}"
   --semantic-phases="${semantic_phases}"
   --semantic-phase-weights="${semantic_phase_weights}"
+  --semantic-source-weights="${semantic_source_weights}"
   --random-semantic-view=true
   --base-policy="${BASE_POLICY}"
   --mem-vit-checkpoint="${MEM_VIT_CHECKPOINT}"
+  --policy-base-artifact-id="${BASE_POLICY_ARTIFACT_ID}"
+  --policy-base-sha256="${BASE_POLICY_SHA256}"
+  --mem-vit-artifact-id="${MEM_VIT_ARTIFACT_ID}"
+  --mem-vit-sha256="${MEM_VIT_SHA256}"
+  --policy-tokenizer-artifact-id="${POLICY_TOKENIZER_ARTIFACT_ID}"
+  --policy-tokenizer-sha256="${POLICY_TOKENIZER_SHA256}"
   --steps="${TRAIN_STEPS}"
   --batch-size-per-gpu="${BATCH_SIZE_PER_GPU}"
   --global-batch-size="${GLOBAL_BATCH_SIZE}"
@@ -152,12 +174,42 @@ common_args=(
 )
 
 describe() {
-  printf 'task_id=%s\ndataset=%s\nphase=%s\nmemory=%s\narm_mode=true\ntask_complete=%s\ntask_blocked=%s\ngpu=%s\n' \
-    "${task_id}" "${dataset_root}" "${phase}" "${memory_mode}" \
-    "${PREDICT_TASK_COMPLETE}" "${PREDICT_TASK_BLOCKED}" "${gpu_id}"
+  printf 'task_id=%s\ndataset=%s\nmemory=%s\nnode=%s\narm_mode=true\ntask_complete=%s\ntask_blocked=%s\ngpus=%s\n' \
+    "${task_id}" "${dataset_root}" "${memory_mode}" \
+    "${configured_node}" "${PREDICT_TASK_COMPLETE}" "${PREDICT_TASK_BLOCKED}" "${gpu_id}"
+  semantic_describe_args=(
+    --presets "${semantic_presets_file}" --jobs "${training_jobs_file}" describe "${task_id}"
+  )
+  if [[ -f "${semantic_views_path}" ]]; then
+    semantic_describe_args+=(--sidecar "${semantic_views_path}")
+  fi
+  python3 "${plan_dir}/semantic_plan.py" "${semantic_describe_args[@]}"
 }
 
-case "${1:-}" in
+validate_resume_checkpoint() {
+  local checkpoint="$1" relative
+  local required=(
+    pretrained_model/train_config.json
+    pretrained_model/config.json
+    training_state/optimizer_state.safetensors
+    training_state/optimizer_param_groups.json
+    training_state/rng_state.safetensors
+    training_state/scheduler_state.json
+    training_state/training_step.json
+  )
+  for relative in "${required[@]}"; do
+    [[ -s "${checkpoint}/${relative}" ]] || {
+      echo "Incomplete resume checkpoint (missing or empty ${checkpoint}/${relative})." >&2
+      return 1
+    }
+  done
+  if [[ ! -s "${checkpoint}/pretrained_model/model.safetensors" && ! -s "${checkpoint}/pretrained_model/adapter_model.safetensors" ]]; then
+    echo "Incomplete resume checkpoint (no policy weight file under ${checkpoint}/pretrained_model)." >&2
+    return 1
+  fi
+}
+
+case "${command}" in
   describe) describe ;;
   dry-run)
     describe
@@ -172,6 +224,65 @@ case "${1:-}" in
     fi
     describe
     exec bash "${repo_root}/train_vla_pi05.sh" "${common_args[@]}"
+    ;;
+  resume|resume-dry-run)
+    checkpoint="${4:-}"
+    [[ -n "${checkpoint}" ]] || { echo "Missing checkpoint path." >&2; exit 2; }
+    checkpoint="$(readlink -f "${checkpoint}")"
+    validate_resume_checkpoint "${checkpoint}"
+    resume_config="${checkpoint}/pretrained_model/train_config.json"
+    if ! python3 - "${resume_config}" "${dataset_root}" "${semantic_phases}" "${semantic_phase_weights}" \
+      "${semantic_state_instruction_matrix}" "${memory_mode}" \
+      "${B2_ACTION_REPRESENTATION}" "${Z1_ACTION_REPRESENTATION}" \
+      "${PREDICT_TASK_COMPLETE}" "${PREDICT_TASK_BLOCKED}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    config = json.load(stream)
+run_id = config.get("wandb", {}).get("run_id")
+dataset = config.get("dataset", {})
+policy = config.get("policy", {})
+expected_phases = json.loads(sys.argv[3])
+expected_phase_weights = json.loads(sys.argv[4])
+expected_state_instruction_matrix = json.loads(sys.argv[5])
+expected_encoding = "continuous" if sys.argv[6] == "full_mem" else "text"
+expected = {
+    "wandb.run_id": isinstance(run_id, str) and bool(run_id.strip()),
+    "dataset.root": dataset.get("root") == sys.argv[2],
+    "dataset.semantic_phases": dataset.get("semantic_phases") == expected_phases,
+    "dataset.semantic_phase_weights": dataset.get("semantic_phase_weights") == expected_phase_weights,
+    "dataset.semantic_state_instruction_matrix": dataset.get("semantic_state_instruction_matrix") == expected_state_instruction_matrix,
+    "policy.state_action_encoding": policy.get("state_action_encoding") == expected_encoding,
+    "policy.b2_action_representation": policy.get("b2_action_representation") == sys.argv[7],
+    "policy.z1_action_representation": policy.get("z1_action_representation") == sys.argv[8],
+    "policy.action_predict_arm_teleop_inactive": policy.get("action_predict_arm_teleop_inactive") is True,
+    "policy.action_predict_arm_reset": policy.get("action_predict_arm_reset") is True,
+    "policy.action_predict_task_complete": policy.get("action_predict_task_complete") is (sys.argv[9] == "true"),
+    "policy.action_predict_task_blocked": policy.get("action_predict_task_blocked") is (sys.argv[10] == "true"),
+}
+failed = [name for name, valid in expected.items() if not valid]
+if failed:
+    print("checkpoint configuration mismatch: " + ", ".join(failed), file=sys.stderr)
+    raise SystemExit(1)
+PY
+    then
+      echo "Resume checkpoint does not match task ${task_id}: ${resume_config}" >&2
+      exit 1
+    fi
+    describe
+    resume_args=(
+      --gpu-id="${gpu_id}"
+      --main-process-port="${port}"
+      --resume-checkpoint="${checkpoint}"
+      --resume-with-updated-dataset=false
+    )
+    if [[ "${command}" == resume-dry-run ]]; then
+      resume_args+=(--dry-run=true)
+    fi
+    # No --resume-new-run-name is passed: train_vla_pi05.sh therefore restores
+    # wandb.run_id and uses resume="must" for the original W&B run.
+    exec bash "${repo_root}/train_vla_pi05.sh" "${resume_args[@]}"
     ;;
   *) usage >&2; exit 2 ;;
 esac

@@ -63,6 +63,7 @@ from lerobot.datasets.semantic_views import (
     load_semantic_views,
     semantic_phase_sampling_groups,
     semantic_status_priors,
+    semantic_view_matches_relation,
 )
 from lerobot.datasets.static_horizon_sampling import build_static_horizon_pool
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
@@ -881,6 +882,7 @@ def configure_action_bool_balance(
     semantic_views=None,
     semantic_phases: list[str] | None = None,
     semantic_view_kind_weights: dict[str, float] | None = None,
+    semantic_state_instruction_matrix: dict[str, dict[str, dict[str, str]]] | None = None,
 ) -> dict[str, dict[str, int | float]] | None:
     """Resolve fixed class priors for every enabled boolean action from the train split."""
     policy_cfg = cfg.trainable_config
@@ -925,14 +927,15 @@ def configure_action_bool_balance(
     forced_semantic_holds = 0
     use_phase_multiplicity = semantic_views is not None and bool(semantic_phases)
     if use_phase_multiplicity:
-        positive_view_kinds = {
-            name for name, weight in (semantic_view_kind_weights or {}).items() if weight > 0
-        }
-        if positive_view_kinds != {"primary"}:
-            raise ValueError(
-                "Exact arm-mode balancing for semantic phase sampling currently requires "
-                "semantic_view_kind_weights to enable only the primary view"
-            )
+        if not semantic_state_instruction_matrix:
+            positive_view_kinds = {
+                name for name, weight in (semantic_view_kind_weights or {}).items() if weight > 0
+            }
+            if positive_view_kinds != {"primary"}:
+                raise ValueError(
+                    "Exact arm-mode balancing for legacy semantic phase sampling requires "
+                    "semantic_view_kind_weights to enable only the primary view"
+                )
         episode_multiplicities = {}
         for episode_index, length in zip(episode_indices, lengths, strict=True):
             multiplicity = np.zeros(length, dtype=np.int64)
@@ -942,13 +945,21 @@ def configure_action_bool_balance(
                 matching_views = [
                     view
                     for view in semantic_views.episodes.get(episode_index, ())
-                    if view.view_kind == "primary"
-                    and (view.frame_start is None or view.frame_start <= segment.frame_start)
+                    if (view.frame_start is None or view.frame_start <= segment.frame_start)
                     and (view.frame_stop is None or view.frame_stop >= segment.frame_stop)
+                    and (
+                        semantic_view_matches_relation(
+                            view,
+                            segment,
+                            semantic_state_instruction_matrix,
+                        )
+                        if semantic_state_instruction_matrix
+                        else view.view_kind == "primary"
+                    )
                 ]
                 if len(matching_views) != 1:
                     raise ValueError(
-                        "Every selected semantic segment must have exactly one covering primary view: "
+                        "Every selected semantic segment must have exactly one configured covering view: "
                         f"episode={episode_index}, phase={segment.phase}, matches={len(matching_views)}"
                     )
                 view = matching_views[0]
@@ -958,7 +969,7 @@ def configure_action_bool_balance(
                     or view.completion_frame != segment.frame_stop
                 ):
                     raise ValueError(
-                        "Selected primary semantic views must supervise the demonstrated action and "
+                        "Selected semantic views must supervise the demonstrated action and "
                         "complete at the segment boundary for exact arm-mode balancing: "
                         f"episode={episode_index}, phase={segment.phase}"
                     )
@@ -1132,6 +1143,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             )
         cfg.trainable_config.semantic_view_manifest_sha256 = semantic_views.sha256
         cfg.trainable_config.semantic_view_manifest_version = 1
+        cfg.trainable_config.semantic_state_instruction_matrix = dict(
+            cfg.dataset.semantic_state_instruction_matrix
+        )
         cfg.trainable_config.semantic_view_kind_weights = dict(cfg.dataset.semantic_view_kind_weights)
 
     if isinstance(cfg.policy, PI05Config) and (
@@ -1233,6 +1247,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "version": 1,
                 "selected_episodes": sorted(expected_episodes),
                 "view_kind_weights": cfg.dataset.semantic_view_kind_weights,
+                "state_instruction_matrix": cfg.dataset.semantic_state_instruction_matrix,
                 "phases": cfg.dataset.semantic_phases,
                 "phase_weights": cfg.dataset.semantic_phase_weights,
                 "source_weights": cfg.dataset.semantic_source_weights,
@@ -1264,6 +1279,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         semantic_views=semantic_views,
         semantic_phases=cfg.dataset.semantic_phases,
         semantic_view_kind_weights=cfg.dataset.semantic_view_kind_weights,
+        semantic_state_instruction_matrix=cfg.dataset.semantic_state_instruction_matrix,
     )
     if semantic_views is not None:
         selected_episodes = dataset.episodes or list(range(dataset.meta.total_episodes))
@@ -1277,6 +1293,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             episode_lengths,
             action_horizon=cfg.trainable_config.chunk_size,
             view_kind_weights=cfg.dataset.semantic_view_kind_weights,
+            state_instruction_matrix=cfg.dataset.semantic_state_instruction_matrix,
             phases=cfg.dataset.semantic_phases,
             phase_weights=cfg.dataset.semantic_phase_weights,
             source_weights=cfg.dataset.semantic_source_weights,
@@ -1387,6 +1404,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 semantic_views=semantic_views,
                 semantic_phases=cfg.dataset.semantic_phases,
                 semantic_view_kind_weights=cfg.dataset.semantic_view_kind_weights,
+                semantic_state_instruction_matrix=cfg.dataset.semantic_state_instruction_matrix,
             )
             resume_stats_path = (
                 cfg.checkpoint_path / PRETRAINED_MODEL_DIR / PI05_TRANSFORMED_ACTION_STATS_NAME
@@ -2096,6 +2114,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     seed=cfg.seed if cfg.seed is not None else 0,
                     randomize=cfg.dataset.random_semantic_view,
                     view_kind_weights=cfg.dataset.semantic_view_kind_weights,
+                    state_instruction_matrix=cfg.dataset.semantic_state_instruction_matrix,
                 )
                 train_tracker.task_variant_applied = sum(semantic_counts.values()) - semantic_counts["hold"]
             batch = preprocessor(batch)
@@ -2201,6 +2220,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                             seed=cfg.seed if cfg.seed is not None else 0,
                             randomize=True,
                             view_kind_weights=cfg.dataset.semantic_view_kind_weights,
+                            state_instruction_matrix=cfg.dataset.semantic_state_instruction_matrix,
                         )
                     physical_groups = (
                         _physical_eval_groups(
@@ -2411,6 +2431,22 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
                 checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                # Saving a checkpoint temporarily needs room for both the previous
+                # rolling checkpoint and the new one. Prune only checkpoints that
+                # would become obsolete after a successful save, while retaining
+                # the latest complete recovery point and every configured milestone.
+                pre_save_removed = []
+                if cfg.keep_last_checkpoints > 0:
+                    pre_save_removed = prune_checkpoints(
+                        checkpoint_dir.parent,
+                        keep_last=max(cfg.keep_last_checkpoints - 1, 1),
+                        keep_every_n_steps=cfg.keep_checkpoint_every_n_steps,
+                    )
+                if pre_save_removed:
+                    logging.info(
+                        "Removed obsolete checkpoints before save: %s",
+                        ", ".join(path.name for path in pre_save_removed),
+                    )
                 save_checkpoint(
                     checkpoint_dir=checkpoint_dir,
                     step=step,

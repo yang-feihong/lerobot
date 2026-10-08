@@ -99,6 +99,9 @@ class PI05Config(PreTrainedConfig):
     action_predict_task_blocked: bool = False
     semantic_view_manifest_sha256: str | None = None
     semantic_view_manifest_version: int | None = None
+    semantic_state_instruction_matrix: dict[str, dict[str, dict[str, str]]] = field(
+        default_factory=dict
+    )
     semantic_view_kind_weights: dict[str, float] = field(default_factory=dict)
     discrete_action_training_mode: str = "continuous_flow"
     ee_target_dataset_semantics: str = "joint_control_inactive_interpolated"
@@ -199,6 +202,14 @@ class PI05Config(PreTrainedConfig):
     # MEM-ViT settings. Passing mem_vit_checkpoint also enables MEM-ViT.
     mem_vit_enabled: bool = False
     mem_vit_checkpoint: str | None = None
+    # Portable identities for immutable base artifacts. Filesystem paths are
+    # runtime locations only; checkpoints bind to these ids and content hashes.
+    policy_base_artifact_id: str | None = None
+    policy_base_sha256: str | None = None
+    mem_vit_artifact_id: str | None = None
+    mem_vit_sha256: str | None = None
+    policy_tokenizer_artifact_id: str | None = None
+    policy_tokenizer_sha256: str | None = None
     # Set when a PEFT checkpoint contains the complete MEM-ViT base tensors.
     # Historical checkpoints leave this false and need the distillation asset.
     mem_vit_base_weights_embedded: bool = False
@@ -405,6 +416,18 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(f"dataset_frequency_hz must be positive, got {self.dataset_frequency_hz}")
         if self.mem_vit_checkpoint is not None:
             self.mem_vit_enabled = True
+        for name in ("policy_base_sha256", "mem_vit_sha256", "policy_tokenizer_sha256"):
+            digest = getattr(self, name)
+            if digest is not None and (len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)):
+                raise ValueError(f"{name} must be a lowercase 64-character SHA256 digest")
+        if (self.policy_base_artifact_id is None) != (self.policy_base_sha256 is None):
+            raise ValueError("policy base artifact id and SHA256 must be configured together")
+        if (self.mem_vit_artifact_id is None) != (self.mem_vit_sha256 is None):
+            raise ValueError("MEM-ViT artifact id and SHA256 must be configured together")
+        if (self.policy_tokenizer_artifact_id is None) != (self.policy_tokenizer_sha256 is None):
+            raise ValueError("policy tokenizer artifact id and SHA256 must be configured together")
+        if self.mem_vit_artifact_id is not None and not self.mem_vit_enabled:
+            raise ValueError("MEM-ViT artifact identity requires mem_vit_enabled=true")
         if self.mem_vit_embedded_tensor_count < 0:
             raise ValueError("mem_vit_embedded_tensor_count must be non-negative")
         if self.mem_vit_base_weights_embedded != (self.mem_vit_embedded_tensor_count > 0):

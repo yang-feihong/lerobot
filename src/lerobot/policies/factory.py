@@ -47,6 +47,7 @@ from lerobot.utils.constants import (
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 from .act.configuration_act import ACTConfig
+from .base_artifacts import resolve_checkpoint_bases
 from .diffusion.configuration_diffusion import DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config
 from .evo1.configuration_evo1 import Evo1Config
@@ -811,6 +812,16 @@ def make_policy(
 
         peft_pretrained_path = str(cfg.pretrained_path)
         peft_config = PeftConfig.from_pretrained(peft_pretrained_path)
+        resolved_bases = resolve_checkpoint_bases(peft_pretrained_path)
+        if resolved_bases:
+            peft_config.base_model_name_or_path = str(resolved_bases["policy_base"])
+            if isinstance(cfg, PI05Config):
+                mem_vit_base = resolved_bases.get("mem_vit_base")
+                cfg.mem_vit_checkpoint = str(mem_vit_base) if mem_vit_base is not None else None
+            logging.info(
+                "Resolved checkpoint base artifacts from local registry: %s",
+                {role: str(path) for role, path in resolved_bases.items()},
+            )
         if isinstance(cfg, PI05Config):
             _validate_embedded_mem_vit_weights(peft_pretrained_path, cfg)
 

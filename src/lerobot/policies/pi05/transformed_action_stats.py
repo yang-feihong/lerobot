@@ -241,6 +241,7 @@ def compute_transformed_action_stats(
     semantic_views: SemanticViewCatalog | None = None,
     semantic_phases: list[str] | None = None,
     semantic_view_kind_weights: dict[str, float] | None = None,
+    semantic_state_instruction_matrix: dict[str, dict[str, dict[str, str]]] | None = None,
 ) -> dict[str, Any]:
     """Traverse continuous episodes and measure statistics after the configured action transform."""
     if not config.io_schema_resolved:
@@ -274,13 +275,14 @@ def compute_transformed_action_stats(
     if semantic_views is not None:
         if not semantic_phases:
             raise ValueError("semantic transformed-action statistics require selected phases")
-        enabled_kinds = {
-            name for name, weight in (semantic_view_kind_weights or {}).items() if weight > 0
-        }
-        if enabled_kinds != {"primary"}:
-            raise ValueError(
-                "Exact transformed-action statistics currently require only the primary semantic view"
-            )
+        if not semantic_state_instruction_matrix:
+            enabled_kinds = {
+                name for name, weight in (semantic_view_kind_weights or {}).items() if weight > 0
+            }
+            if enabled_kinds != {"primary"}:
+                raise ValueError(
+                    "Exact transformed-action statistics for legacy filtering require only the primary view"
+                )
 
     def apply_semantics(
         raw: torch.Tensor,
@@ -303,6 +305,7 @@ def compute_transformed_action_stats(
             seed=0,
             randomize=False,
             view_kind_weights=semantic_view_kind_weights,
+            state_instruction_matrix=semantic_state_instruction_matrix,
         )
         return batch[ACTION]
 
@@ -450,6 +453,7 @@ def compute_transformed_action_stats(
             "semantic_view_sha256": semantic_views.sha256 if semantic_views is not None else None,
             "semantic_phases": list(semantic_phases or []),
             "semantic_view_kind_weights": dict(semantic_view_kind_weights or {}),
+            "semantic_state_instruction_matrix": dict(semantic_state_instruction_matrix or {}),
         },
         "schema": {
             **schema,

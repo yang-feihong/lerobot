@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -291,6 +292,91 @@ def test_save_checkpoint_embeds_mem_base_weights(tmp_path, gathered, mode):
         policy.state_dict.assert_called_once_with()
     else:
         policy.state_dict.assert_not_called()
+
+
+def test_save_checkpoint_uses_portable_artifacts_without_embedding_mem_base(tmp_path):
+    from lerobot.policies.pi05.configuration_pi05 import PI05Config
+
+    pretrained_dir = tmp_path / "pretrained_model"
+    policy_config = PI05Config(
+        device="cpu",
+        pretrained_path="/remote/base-policy",
+        mem_vit_enabled=True,
+        mem_vit_checkpoint="/remote/mem.pt",
+        mem_vit_finetune_mode="lora",
+        policy_base_artifact_id="policy-v1",
+        policy_base_sha256="1" * 64,
+        mem_vit_artifact_id="mem-v1",
+        mem_vit_sha256="2" * 64,
+        policy_tokenizer_artifact_id="tokenizer-v1",
+        policy_tokenizer_sha256="3" * 64,
+    )
+    policy = Mock(config=policy_config)
+
+    def save_policy(path, state_dict=None):
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": "/remote/base-policy"}), encoding="utf-8"
+        )
+
+    policy.save_pretrained.side_effect = save_policy
+    original_config_save = policy_config.save_pretrained
+
+    def save_policy_config(path):
+        original_config_save(path)
+
+    policy_config.save_pretrained = save_policy_config
+
+    def save_train_config(path):
+        (path / "train_config.json").write_text(
+            json.dumps(
+                {
+                    "policy": {
+                        "pretrained_path": "/remote/base-policy",
+                        "mem_vit_checkpoint": "/remote/mem.pt",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    cfg = SimpleNamespace(peft=object(), policy=policy_config, save_pretrained=save_train_config)
+    preprocessor = Mock()
+
+    def save_preprocessor(path):
+        (path / "policy_preprocessor.json").write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "registry_name": "tokenizer_processor",
+                            "config": {"tokenizer_name": "/remote/tokenizer"},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    preprocessor.save_pretrained.side_effect = save_preprocessor
+    with (
+        patch("lerobot.common.train_utils._append_peft_base_weights") as append,
+        patch("lerobot.common.train_utils.save_training_state"),
+    ):
+        save_checkpoint(tmp_path, 1, cfg, policy, optimizer=None, preprocessor=preprocessor)
+
+    append.assert_not_called()
+    adapter = json.loads((pretrained_dir / "adapter_config.json").read_text(encoding="utf-8"))
+    assert adapter["base_model_name_or_path"] == "artifact://policy-v1"
+    config = json.loads((pretrained_dir / "config.json").read_text(encoding="utf-8"))
+    assert config["mem_vit_checkpoint"] == "artifact://mem-v1"
+    assert config["mem_vit_base_weights_embedded"] is False
+    preprocessor_config = json.loads(
+        (pretrained_dir / "policy_preprocessor.json").read_text(encoding="utf-8")
+    )
+    assert preprocessor_config["steps"][0]["config"]["tokenizer_name"] == "artifact://tokenizer-v1"
+    manifest = json.loads((pretrained_dir / "base_artifacts.json").read_text(encoding="utf-8"))
+    assert set(manifest["requirements"]) == {"policy_base", "mem_vit_base", "policy_tokenizer"}
 
 
 def test_save_training_state(tmp_path, optimizer, scheduler):

@@ -62,6 +62,12 @@ class DatasetConfig:
     # This supersedes task_variants_path when present without rewriting data.
     semantic_views_path: str | None = None
     random_semantic_view: bool = True
+    # Exact physical-state x canonical-instruction relations enabled for this
+    # run.  This is the preferred interface; view-kind weights are retained
+    # only for loading historical training configurations.
+    semantic_state_instruction_matrix: dict[str, dict[str, dict[str, str]]] = field(
+        default_factory=dict
+    )
     semantic_view_kind_weights: dict[str, float] = field(default_factory=dict)
     # Optional physical phase selection over complete episodes.  The sidecar
     # owns the per-episode frame boundaries; these fields only select and
@@ -90,6 +96,41 @@ class DatasetConfig:
             raise ValueError(f"eval_split must be in [0.0, 1.0), got {self.eval_split}")
         if len(self.semantic_phases) != len(set(self.semantic_phases)):
             raise ValueError("dataset.semantic_phases contains duplicates")
+        if self.semantic_view_kind_weights:
+            if any(
+                not key or not isinstance(value, (int, float)) or value < 0.0
+                for key, value in self.semantic_view_kind_weights.items()
+            ):
+                raise ValueError(
+                    "dataset.semantic_view_kind_weights requires non-empty keys and non-negative weights"
+                )
+            if not any(value > 0.0 for value in self.semantic_view_kind_weights.values()):
+                raise ValueError("dataset.semantic_view_kind_weights must enable at least one view kind")
+        if self.semantic_state_instruction_matrix and self.semantic_view_kind_weights:
+            raise ValueError(
+                "dataset.semantic_state_instruction_matrix and semantic_view_kind_weights are mutually exclusive"
+            )
+        for state, instructions in self.semantic_state_instruction_matrix.items():
+            if not state or not isinstance(instructions, dict) or not instructions:
+                raise ValueError(
+                    "dataset.semantic_state_instruction_matrix requires non-empty states and instructions"
+                )
+            for intent, relation in instructions.items():
+                if not intent or not isinstance(relation, dict):
+                    raise ValueError(
+                        "dataset.semantic_state_instruction_matrix has an invalid instruction relation"
+                    )
+                if set(relation) != {"status", "action_supervision", "completion_boundary"}:
+                    raise ValueError(
+                        "dataset.semantic_state_instruction_matrix relations require status, "
+                        "action_supervision and completion_boundary"
+                    )
+                if relation["status"] not in {"active", "complete", "blocked"}:
+                    raise ValueError("semantic instruction relation has an invalid status")
+                if relation["action_supervision"] not in {"demonstrated", "hold"}:
+                    raise ValueError("semantic instruction relation has invalid action_supervision")
+                if relation["completion_boundary"] not in {"none", "state_end"}:
+                    raise ValueError("semantic instruction relation has invalid completion_boundary")
         if self.semantic_phase_weights and set(self.semantic_phase_weights) != set(
             self.semantic_phases
         ):
@@ -104,6 +145,18 @@ class DatasetConfig:
                 raise ValueError(f"dataset.{name} requires non-empty keys and positive weights")
         if self.semantic_phases and self.semantic_views_path is None:
             raise ValueError("dataset.semantic_phases requires dataset.semantic_views_path")
+        if self.semantic_view_kind_weights and self.semantic_views_path is None:
+            raise ValueError("dataset.semantic_view_kind_weights requires dataset.semantic_views_path")
+        if self.semantic_state_instruction_matrix and self.semantic_views_path is None:
+            raise ValueError(
+                "dataset.semantic_state_instruction_matrix requires dataset.semantic_views_path"
+            )
+        if self.semantic_state_instruction_matrix and set(self.semantic_state_instruction_matrix) != set(
+            self.semantic_phases
+        ):
+            raise ValueError(
+                "dataset.semantic_state_instruction_matrix keys must exactly match dataset.semantic_phases"
+            )
         if self.semantic_source_weights and not self.semantic_phases:
             raise ValueError("dataset.semantic_source_weights requires dataset.semantic_phases")
         if self.episodes is not None:
@@ -130,6 +183,13 @@ class WandBConfig:
     resume_training_run: bool = True
     mode: str | None = None  # Allowed values: 'online', 'offline' 'disabled'. Defaults to 'online'
     add_tags: bool = True  # If True, save configuration as tags in the WandB run.
+    # Optional user-maintained tags. Automatically derived comparability tags
+    # (stages, memory, action schema, image source) are added separately.
+    tags: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(tag, str) or not tag.strip() for tag in self.tags):
+            raise ValueError("wandb.tags must contain only non-empty strings")
 
 
 @dataclass

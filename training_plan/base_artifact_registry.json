@@ -1,0 +1,15 @@
+{
+  "format": "lerobot.base_artifact_registry",
+  "version": 1,
+  "artifacts": {
+    "lerobot_pi05_base_local_tokenizer_v1": {
+      "path": "/data/checkpoints/lerobot_pi05_base_local_tokenizer"
+    },
+    "mem_vit_distill_20260716_142702": {
+      "path": "/data/checkpoints/mem_vit_distill_20260716_142702/mem_vit_distill_latest.pt"
+    },
+    "google_paligemma_3b_pt_224_tokenizer_v1": {
+      "path": "/data/checkpoints/google_paligemma-3b-pt-224"
+    }
+  }
+}

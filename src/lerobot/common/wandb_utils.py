@@ -58,6 +58,61 @@ def cfg_to_group(
     return lst if return_list else "-".join(lst)
 
 
+_SEMANTIC_PHASE_STAGE_TAGS = {
+    "approach": "stage1",
+    "handle_press": "stage2",
+    "traversal": "stage3",
+}
+
+
+def cfg_to_wandb_tags(cfg: TrainPipelineConfig, max_tag_length: int = 64) -> list[str]:
+    """Build stable tags for filtering runs with genuinely comparable semantics."""
+    tags = list(cfg_to_group(cfg, return_list=True))
+    if cfg.dataset is not None:
+        phases = list(cfg.dataset.semantic_phases)
+        stages_present = {
+            _SEMANTIC_PHASE_STAGE_TAGS[phase]
+            for phase in phases
+            if phase in _SEMANTIC_PHASE_STAGE_TAGS
+        }
+        stages = [stage for stage in ("stage1", "stage2", "stage3") if stage in stages_present]
+        tags.extend(f"phase:{phase}" for phase in phases)
+        tags.append(f"phase-set:{'+'.join(sorted(phases))}" if phases else "phase-set:unspecified")
+        tags.extend(f"stage:{stage}" for stage in stages)
+        tags.append(f"stage-set:{'+'.join(stages)}" if stages else "stage-set:unspecified")
+        tags.append(f"image-source:{cfg.dataset.image_source}")
+        if cfg.dataset.semantic_state_instruction_matrix:
+            tags.append("semantic-conditioning:state-instruction-matrix")
+        elif cfg.dataset.semantic_view_kind_weights:
+            tags.append("semantic-conditioning:legacy-view-kinds")
+        else:
+            tags.append("semantic-conditioning:none")
+
+    if not cfg.is_reward_model_training:
+        policy = cfg.policy
+        tags.extend(
+            [
+                f"memory:{'mem-vit' if getattr(policy, 'mem_vit_enabled', False) else 'standard'}",
+                f"state-encoding:{getattr(policy, 'state_action_encoding', 'none')}",
+                f"b2-output:{getattr(policy, 'b2_action_representation', 'unspecified')}",
+                f"z1-output:{getattr(policy, 'z1_action_representation', 'unspecified')}",
+                f"arm-mode-output:{str(bool(getattr(policy, 'action_predict_arm_teleop_inactive', False) and getattr(policy, 'action_predict_arm_reset', False))).lower()}",
+                f"task-complete-output:{str(bool(getattr(policy, 'action_predict_task_complete', False))).lower()}",
+                f"task-blocked-output:{str(bool(getattr(policy, 'action_predict_task_blocked', False))).lower()}",
+            ]
+        )
+    tags.extend(cfg.wandb.tags)
+
+    deduplicated = []
+    seen = set()
+    for tag in tags:
+        tag = tag[:max_tag_length]
+        if tag not in seen:
+            seen.add(tag)
+            deduplicated.append(tag)
+    return deduplicated
+
+
 def get_wandb_run_id_from_filesystem(log_dir: Path) -> str:
     # Get the WandB run ID.
     paths = glob(str(log_dir / "wandb/latest-run/run-*"))
@@ -97,13 +152,14 @@ class WandBLogger:
             if resume_training_run
             else None
         )
+        automatic_tags = cfg_to_wandb_tags(cfg) if self.cfg.add_tags else None
         wandb.init(
             id=wandb_run_id,
             project=self.cfg.project,
             entity=self.cfg.entity,
             name=self.job_name,
             notes=self.cfg.notes,
-            tags=cfg_to_group(cfg, return_list=True, truncate_tags=True) if self.cfg.add_tags else None,
+            tags=automatic_tags,
             dir=self.log_dir,
             config=cfg.to_dict(),
             # TODO(rcadene): try set to True
@@ -121,6 +177,11 @@ class WandBLogger:
                 x_save_requirements=False,
             ),
         )
+        if automatic_tags is not None:
+            # W&B may retain the old tag set when resuming an existing run.
+            # Preserve tags edited in the UI while ensuring current semantic
+            # comparability tags are present on the resumed run as well.
+            wandb.run.tags = tuple(dict.fromkeys([*(wandb.run.tags or ()), *automatic_tags]))
         run_id = wandb.run.id
         # NOTE: We will override the cfg.wandb.run_id with the wandb run id.
         # This is because we want to be able to resume the run from the wandb run id.
@@ -130,6 +191,7 @@ class WandBLogger:
         self._wandb = wandb
         self._define_default_metrics()
         logging.info(colored("Logs will be synced with wandb.", "blue", attrs=["bold"]))
+        logging.info("W&B tags: %s", list(wandb.run.tags or ()))
         logging.info(f"Track this run --> {colored(wandb.run.get_url(), 'yellow', attrs=['bold'])}")
 
     def _define_default_metrics(self) -> None:

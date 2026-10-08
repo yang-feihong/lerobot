@@ -344,7 +344,15 @@ def test_semantic_phase_boolean_priors_clip_at_completion_and_add_hold_tail():
         exclude_task_status=True,
         semantic_views=catalog,
         semantic_phases=["handle_press"],
-        semantic_view_kind_weights={"primary": 1.0},
+        semantic_state_instruction_matrix={
+            "handle_press": {
+                "skill_press_handle": {
+                    "status": "active",
+                    "action_supervision": "demonstrated",
+                    "completion_boundary": "state_end",
+                }
+            }
+        },
     )
 
     assert stats["arm_teleop_inactive"]["positive_labels"] == 3

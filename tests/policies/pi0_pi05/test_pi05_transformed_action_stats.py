@@ -191,12 +191,29 @@ def test_transformed_stats_only_traverse_selected_semantic_phase(tmp_path) -> No
         config,
         semantic_views=catalog,
         semantic_phases=["handle_press"],
-        semantic_view_kind_weights={"primary": 1.0, "compatible": 0.0},
+        semantic_state_instruction_matrix={
+            "handle_press": {
+                "open": {
+                    "status": "active",
+                    "action_supervision": "demonstrated",
+                    "completion_boundary": "none",
+                }
+            }
+        },
     )
 
     assert payload["counts"]["all_transitions"] == 4
     assert payload["dataset"]["semantic_view_sha256"] == "test-sha"
     assert payload["dataset"]["semantic_phases"] == ["handle_press"]
+    assert payload["dataset"]["semantic_state_instruction_matrix"] == {
+        "handle_press": {
+            "open": {
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "completion_boundary": "none",
+            }
+        }
+    }
 
 
 def test_task_complete_schema_extension_only_allows_appended_completion() -> None:

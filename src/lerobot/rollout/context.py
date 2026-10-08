@@ -190,8 +190,20 @@ def build_rollout_context(
     if policy_config.use_peft:
         from peft import PeftConfig, PeftModel
 
+        from lerobot.policies.base_artifacts import resolve_checkpoint_bases
+
         peft_path = policy_config.pretrained_path
         peft_config = PeftConfig.from_pretrained(peft_path)
+        resolved_bases = resolve_checkpoint_bases(peft_path)
+        if resolved_bases:
+            peft_config.base_model_name_or_path = str(resolved_bases["policy_base"])
+            if hasattr(policy_config, "mem_vit_checkpoint"):
+                mem_vit_base = resolved_bases.get("mem_vit_base")
+                policy_config.mem_vit_checkpoint = str(mem_vit_base) if mem_vit_base is not None else None
+            logger.info(
+                "Resolved checkpoint base artifacts from local registry: %s",
+                {role: str(path) for role, path in resolved_bases.items()},
+            )
         policy = policy_class.from_pretrained(
             pretrained_name_or_path=peft_config.base_model_name_or_path, config=policy_config
         )

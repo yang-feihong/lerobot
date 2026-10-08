@@ -108,6 +108,10 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         elif self.tokenizer_name is not None:
             if AutoTokenizer is None:
                 raise ImportError("AutoTokenizer is not available")
+            if str(self.tokenizer_name).startswith("artifact://"):
+                from lerobot.policies.base_artifacts import resolve_artifact_uri
+
+                self.tokenizer_name = str(resolve_artifact_uri(self.tokenizer_name))
             self.input_tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
         else:
             raise ValueError(

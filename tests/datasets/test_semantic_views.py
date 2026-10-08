@@ -1,10 +1,12 @@
 import json
+from dataclasses import replace
 
 import pytest
 import torch
 
 from lerobot.datasets.factory import semantic_source_split_keys
 from lerobot.datasets.semantic_views import (
+    SemanticSegment,
     apply_semantic_views_to_batch,
     load_semantic_views,
     semantic_phase_sampling_groups,
@@ -247,6 +249,93 @@ def test_status_priors_follow_view_probability_not_language_count(tmp_path):
         "task_complete": 0.0,
         "task_blocked": 0.75,
     }
+
+
+def test_explicit_view_kind_mapping_is_an_allowlist(tmp_path):
+    catalog = _catalog(
+        tmp_path,
+        [
+            {
+                "intent_id": "pass",
+                "status": "blocked",
+                "action_supervision": "hold",
+                "view_kind": "blocked_counterfactual",
+            },
+            {
+                "intent_id": "go",
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "completion_source": "recorded",
+                "view_kind": "primary",
+            },
+        ],
+    )
+    batch = _batch()
+    expected = batch[ACTION].clone()
+    counts = apply_semantic_views_to_batch(
+        batch,
+        catalog,
+        step=0,
+        seed=0,
+        randomize=False,
+        view_kind_weights={"primary": 1.0},
+    )
+    assert counts == {"active": 1, "complete": 0, "blocked": 0, "hold": 0}
+    assert batch["task"] == ["Open the door."]
+    assert torch.equal(batch[ACTION], expected)
+    assert semantic_status_priors(
+        catalog,
+        {0: 5},
+        view_kind_weights={"primary": 1.0},
+    ) == {"task_complete": 0.0, "task_blocked": 0.0}
+
+
+def test_state_instruction_matrix_selects_exact_relation_not_view_kind(tmp_path):
+    catalog = _catalog(
+        tmp_path,
+        [
+            {
+                "intent_id": "go",
+                "status": "blocked",
+                "action_supervision": "hold",
+                "view_kind": "primary",
+            },
+            {
+                "intent_id": "pass",
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "completion_frame": 10,
+                "view_kind": "compatible_goal",
+            },
+        ],
+    )
+    catalog = replace(
+        catalog,
+        segments={0: (SemanticSegment("approach", 0, 10, "full_episode"),)},
+    )
+    matrix = {
+        "approach": {
+            "pass": {
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "completion_boundary": "state_end",
+            }
+        }
+    }
+    batch = _batch()
+    expected = batch[ACTION].clone()
+    counts = apply_semantic_views_to_batch(
+        batch,
+        catalog,
+        step=0,
+        seed=0,
+        randomize=True,
+        state_instruction_matrix=matrix,
+    )
+    assert counts == {"active": 1, "complete": 0, "blocked": 0, "hold": 0}
+    assert batch["task"] == ["Enter the room."]
+    assert torch.equal(batch[ACTION][0, :3], expected[0, :3])
+    assert batch[ACTION][0, :, 15].tolist() == [0.0, 0.0, 0.0, 1.0]
 
 
 def test_status_priors_include_active_view_completion_suffix(tmp_path):

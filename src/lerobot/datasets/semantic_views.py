@@ -261,6 +261,57 @@ def _choice_index(weights: list[float], token: bytes) -> int:
     return len(weights) - 1
 
 
+def _view_kind_weight(view_kind_weights: dict[str, float] | None, view_kind: str) -> float:
+    """Resolve one view-kind weight without silently enabling omitted kinds.
+
+    An empty mapping means that no filtering was requested and preserves the
+    catalog weights.  Once a mapping is supplied, it is an allowlist: omitted
+    kinds are disabled.  This makes a configuration such as {"primary": 1.0}
+    mean exactly primary-only.
+    """
+    if not view_kind_weights:
+        return 1.0
+    return float(view_kind_weights.get(view_kind, 0.0))
+
+
+def semantic_state_for_frame(
+    catalog: SemanticViewCatalog,
+    episode: int,
+    frame: int,
+    state_instruction_matrix: dict[str, dict[str, dict[str, str]]],
+) -> SemanticSegment:
+    """Return the unique configured physical state containing one frame."""
+    matches = [
+        segment
+        for segment in catalog.segments.get(episode, ())
+        if segment.phase in state_instruction_matrix
+        and segment.frame_start <= frame < segment.frame_stop
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "semantic state-instruction matrix requires exactly one configured state at "
+            f"episode={episode}, frame={frame}; matches={[item.phase for item in matches]}"
+        )
+    return matches[0]
+
+
+def semantic_view_matches_relation(
+    view: SemanticView,
+    state: SemanticSegment,
+    state_instruction_matrix: dict[str, dict[str, dict[str, str]]],
+) -> bool:
+    """Match a concrete view against an explicit state-instruction cell."""
+    relation = state_instruction_matrix[state.phase].get(view.canonical_intent)
+    if relation is None:
+        return False
+    completion_boundary = "state_end" if view.completion_frame == state.frame_stop else "none"
+    return (
+        view.status == relation["status"]
+        and view.action_supervision == relation["action_supervision"]
+        and completion_boundary == relation["completion_boundary"]
+    )
+
+
 def _hold_action(action: torch.Tensor) -> torch.Tensor:
     if action.ndim != 2 or action.shape[-1] != 25:
         raise ValueError(f"semantic hold expects one 25D action chunk, got {tuple(action.shape)}")
@@ -298,6 +349,7 @@ def apply_semantic_views_to_batch(
     seed: int,
     randomize: bool,
     view_kind_weights: dict[str, float] | None = None,
+    state_instruction_matrix: dict[str, dict[str, dict[str, str]]] | None = None,
 ) -> dict[str, int]:
     """Materialize one deterministic semantic view for each physical sample."""
     episode_values = torch.as_tensor(batch["episode_index"]).reshape(-1).tolist()
@@ -319,12 +371,36 @@ def apply_semantic_views_to_batch(
             for view in episode_views or ()
             if view.frame_start is None or view.frame_start <= int(frame) < view.frame_stop
         )
+        if state_instruction_matrix:
+            state = semantic_state_for_frame(
+                catalog,
+                int(episode),
+                int(frame),
+                state_instruction_matrix,
+            )
+            views = tuple(
+                view
+                for view in views
+                if semantic_view_matches_relation(view, state, state_instruction_matrix)
+            )
+            if len(views) != 1:
+                raise ValueError(
+                    "semantic state-instruction matrix requires exactly one view at "
+                    f"episode={int(episode)}, frame={int(frame)}; matches={len(views)}"
+                )
         if not views:
-            raise ValueError(f"semantic-view sidecar has no entry for episode {int(episode)}")
+            raise ValueError(
+                "semantic-view sidecar has no enabled state-instruction relation for "
+                f"episode={int(episode)}, frame={int(frame)}"
+            )
         digest = hashlib.blake2b(
             f"{seed}:{step}:{int(sample)}:{int(episode)}".encode(), digest_size=16
         ).digest()
-        weights = [view.weight * (view_kind_weights or {}).get(view.view_kind, 1.0) for view in views]
+        weights = (
+            [view.weight for view in views]
+            if state_instruction_matrix
+            else [view.weight * _view_kind_weight(view_kind_weights, view.view_kind) for view in views]
+        )
         if any(weight < 0 for weight in weights) or not any(weight > 0 for weight in weights):
             raise ValueError(f"semantic view weights disable every view for episode={episode} frame={frame}")
         view_index = (
@@ -368,6 +444,7 @@ def semantic_status_priors(
     *,
     action_horizon: int = 1,
     view_kind_weights: dict[str, float] | None = None,
+    state_instruction_matrix: dict[str, dict[str, dict[str, str]]] | None = None,
     phases: list[str] | None = None,
     phase_weights: dict[str, float] | None = None,
     source_weights: dict[str, float] | None = None,
@@ -397,7 +474,29 @@ def semantic_status_priors(
                 for view in catalog.episodes.get(episode, ())
                 if view.frame_start is None or view.frame_start <= frame < view.frame_stop
             ]
-            weights = [view.weight * (view_kind_weights or {}).get(view.view_kind, 1.0) for view in views]
+            if state_instruction_matrix:
+                state = semantic_state_for_frame(
+                    catalog,
+                    episode,
+                    frame,
+                    state_instruction_matrix,
+                )
+                views = [
+                    view
+                    for view in views
+                    if semantic_view_matches_relation(view, state, state_instruction_matrix)
+                ]
+                if len(views) != 1:
+                    raise ValueError(
+                        "semantic state-instruction matrix requires exactly one view at "
+                        f"episode={episode}, frame={frame}; matches={len(views)}"
+                    )
+                weights = [view.weight for view in views]
+            else:
+                weights = [
+                    view.weight * _view_kind_weight(view_kind_weights, view.view_kind)
+                    for view in views
+                ]
             total = sum(weights)
             if total <= 0:
                 raise ValueError(f"no enabled semantic view for episode={episode} frame={frame}")

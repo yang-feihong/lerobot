@@ -59,3 +59,51 @@ def test_dataset_config_semantic_phase_weights_are_explicit_and_consistent():
             semantic_views_path="/data/semantic_views.json",
             semantic_source_weights={"full_episode": 1.0},
         )
+
+
+def test_dataset_config_semantic_view_kind_weights_are_an_explicit_allowlist():
+    config = DatasetConfig(
+        repo_id="user/repo",
+        semantic_views_path="/data/semantic_views.json",
+        semantic_view_kind_weights={
+            "primary": 1.0,
+            "compatible_goal": 0.0,
+            "completed_counterfactual": 0.0,
+            "blocked_counterfactual": 0.0,
+        },
+    )
+    assert config.semantic_view_kind_weights["primary"] == 1.0
+    with pytest.raises(ValueError, match="must enable at least one"):
+        DatasetConfig(
+            repo_id="user/repo",
+            semantic_views_path="/data/semantic_views.json",
+            semantic_view_kind_weights={"primary": 0.0},
+        )
+
+
+def test_dataset_config_accepts_exact_state_instruction_matrix():
+    matrix = {
+        "approach": {
+            "goal_approach": {
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "completion_boundary": "state_end",
+            }
+        }
+    }
+    config = DatasetConfig(
+        repo_id="user/repo",
+        semantic_views_path="/data/semantic_views.json",
+        semantic_phases=["approach"],
+        semantic_phase_weights={"approach": 1.0},
+        semantic_state_instruction_matrix=matrix,
+    )
+    assert config.semantic_state_instruction_matrix == matrix
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        DatasetConfig(
+            repo_id="user/repo",
+            semantic_views_path="/data/semantic_views.json",
+            semantic_phases=["approach"],
+            semantic_state_instruction_matrix=matrix,
+            semantic_view_kind_weights={"primary": 1.0},
+        )

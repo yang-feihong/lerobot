@@ -77,6 +77,7 @@ base_policy="$vla_storage_root/models/base/lerobot_pi05_base_local_tokenizer"
 max_state_dim="32"
 
 steps="20000"
+steps_explicit="false"
 seed="1000"
 optimizer_lr="2.5e-5"
 lr_scheduler_type="constant_with_warmup" # warmup, then hold optimizer_lr
@@ -116,7 +117,9 @@ dataset_mixture_manifest=""
 # first; one semantic view and then one language realization are selected.
 semantic_views_path=""
 random_semantic_view="true"
-# JSON object, for example: {"primary":1.0,"composite":1.0,"counterfactual":0.5}
+# Preferred exact physical-state x canonical-instruction relation matrix.
+semantic_state_instruction_matrix="{}"
+# Historical view-kind filtering; mutually exclusive with the exact matrix.
 semantic_view_kind_weights="{}"
 # Physical frame ranges selected from complete episodes.  Example:
 # semantic_phases='["approach","handle_press"]'
@@ -167,6 +170,12 @@ freeze_vision_encoder="false"
 
 # MEM-only configuration. Used only when enable_mem="true".
 mem_vit_checkpoint="$vla_storage_root/models/trained/mem_vit/mem_vit_distill_20260716_142702/mem_vit_distill_latest.pt"
+policy_base_artifact_id=""
+policy_base_sha256=""
+mem_vit_artifact_id=""
+mem_vit_sha256=""
+policy_tokenizer_artifact_id=""
+policy_tokenizer_sha256=""
 # auto selects lora with finetune_mode=lora, otherwise full (legacy behavior).
 # Explicit CLI modes are full, lora, frozen. Resume restores the saved strategy.
 mem_vit_finetune_mode="auto"
@@ -224,6 +233,7 @@ predict_task_blocked_explicit="false"
 semantic_views_path_explicit="false"
 random_semantic_view_explicit="false"
 semantic_view_kind_weights_explicit="false"
+semantic_state_instruction_matrix_explicit="false"
 semantic_phases_explicit="false"
 semantic_phase_weights_explicit="false"
 semantic_source_weights_explicit="false"
@@ -279,6 +289,12 @@ while (( $# > 0 )); do
       ;;
     --freeze-vision-encoder=*) freeze_vision_encoder="${1#*=}" ;;
     --mem-vit-checkpoint=*) mem_vit_checkpoint="${1#*=}" ;;
+    --policy-base-artifact-id=*) policy_base_artifact_id="${1#*=}" ;;
+    --policy-base-sha256=*) policy_base_sha256="${1#*=}" ;;
+    --mem-vit-artifact-id=*) mem_vit_artifact_id="${1#*=}" ;;
+    --mem-vit-sha256=*) mem_vit_sha256="${1#*=}" ;;
+    --policy-tokenizer-artifact-id=*) policy_tokenizer_artifact_id="${1#*=}" ;;
+    --policy-tokenizer-sha256=*) policy_tokenizer_sha256="${1#*=}" ;;
     --mem-random-min-num-frames=*) mem_random_min_num_frames="${1#*=}" ;;
     --mem-random-max-num-frames=*) mem_random_max_num_frames="${1#*=}" ;;
     --mem-frame-interval-seconds=*) mem_frame_interval_seconds="${1#*=}" ;;
@@ -332,6 +348,7 @@ while (( $# > 0 )); do
     --semantic-views-path=*) semantic_views_path="${1#*=}"; semantic_views_path_explicit="true" ;;
     --random-semantic-view=*) random_semantic_view="${1#*=}"; random_semantic_view_explicit="true" ;;
     --semantic-view-kind-weights=*) semantic_view_kind_weights="${1#*=}"; semantic_view_kind_weights_explicit="true" ;;
+    --semantic-state-instruction-matrix=*) semantic_state_instruction_matrix="${1#*=}"; semantic_state_instruction_matrix_explicit="true" ;;
     --semantic-phases=*) semantic_phases="${1#*=}"; semantic_phases_explicit="true" ;;
     --semantic-phase-weights=*) semantic_phase_weights="${1#*=}"; semantic_phase_weights_explicit="true" ;;
     --semantic-source-weights=*) semantic_source_weights="${1#*=}"; semantic_source_weights_explicit="true" ;;
@@ -351,7 +368,7 @@ while (( $# > 0 )); do
     --sim-image-root=*) sim_image_root="${1#*=}"; sim_image_root_explicit="true" ;;
     --mixed-sim-probability=*) mixed_sim_probability="${1#*=}"; mixed_sim_probability_explicit="true" ;;
     --gpu-ids=*) gpu_ids="${1#*=}" ;;
-    --steps=*) steps="${1#*=}" ;;
+    --steps=*) steps="${1#*=}"; steps_explicit="true" ;;
     --optimizer-lr=*) optimizer_lr="${1#*=}" ;;
     --lr-scheduler-type=*) lr_scheduler_type="${1#*=}" ;;
     --scheduler-warmup-steps=*) scheduler_warmup_steps="${1#*=}" ;;
@@ -397,26 +414,42 @@ if [[ -n "$semantic_views_path" && ! -f "$semantic_views_path" ]]; then
   echo "Semantic-view sidecar not found: $semantic_views_path" >&2
   exit 2
 fi
-python3 - "$semantic_view_kind_weights" "$semantic_phases" "$semantic_phase_weights" "$semantic_source_weights" <<'PY'
+python3 - "$semantic_view_kind_weights" "$semantic_state_instruction_matrix" "$semantic_phases" "$semantic_phase_weights" "$semantic_source_weights" <<'PY'
 import json
 import sys
 
 value = json.loads(sys.argv[1])
 if not isinstance(value, dict) or any(not isinstance(k, str) or not isinstance(v, (int, float)) or v < 0 for k, v in value.items()):
     raise SystemExit("--semantic-view-kind-weights must be a JSON object with non-negative numeric values")
-phases = json.loads(sys.argv[2])
+if value and not any(v > 0 for v in value.values()):
+    raise SystemExit("--semantic-view-kind-weights must enable at least one view kind")
+matrix = json.loads(sys.argv[2])
+if not isinstance(matrix, dict):
+    raise SystemExit("--semantic-state-instruction-matrix must be a JSON object")
+if matrix and value:
+    raise SystemExit("--semantic-state-instruction-matrix and --semantic-view-kind-weights are mutually exclusive")
+required_relation_keys = {"status", "action_supervision", "completion_boundary"}
+for state, instructions in matrix.items():
+    if not isinstance(state, str) or not state or not isinstance(instructions, dict) or not instructions:
+        raise SystemExit("--semantic-state-instruction-matrix requires non-empty states and instructions")
+    for intent, relation in instructions.items():
+        if not isinstance(intent, str) or not intent or not isinstance(relation, dict) or set(relation) != required_relation_keys:
+            raise SystemExit("every state-instruction relation requires status, action_supervision and completion_boundary")
+phases = json.loads(sys.argv[3])
 if not isinstance(phases, list) or any(not isinstance(item, str) or not item for item in phases):
     raise SystemExit("--semantic-phases must be a JSON array of non-empty strings")
 if len(phases) != len(set(phases)):
     raise SystemExit("--semantic-phases must not contain duplicates")
-for option, raw in (("--semantic-phase-weights", sys.argv[3]), ("--semantic-source-weights", sys.argv[4])):
+if matrix and set(matrix) != set(phases):
+    raise SystemExit("--semantic-state-instruction-matrix keys must exactly match --semantic-phases")
+for option, raw in (("--semantic-phase-weights", sys.argv[4]), ("--semantic-source-weights", sys.argv[5])):
     weights = json.loads(raw)
     if not isinstance(weights, dict) or any(
         not isinstance(k, str) or not k or not isinstance(v, (int, float)) or v <= 0
         for k, v in weights.items()
     ):
         raise SystemExit(f"{option} must be a JSON object with positive numeric values")
-phase_weights = json.loads(sys.argv[3])
+phase_weights = json.loads(sys.argv[4])
 if phase_weights and set(phase_weights) != set(phases):
     raise SystemExit("--semantic-phase-weights keys must exactly match --semantic-phases")
 PY
@@ -553,6 +586,26 @@ fi
 
 resume_args=()
 policy_source_args=(--policy.path="$base_policy")
+if [[ -n "$policy_base_artifact_id" || -n "$policy_base_sha256" ]]; then
+  if [[ -z "$policy_base_artifact_id" || -z "$policy_base_sha256" ]]; then
+    echo "--policy-base-artifact-id and --policy-base-sha256 must be set together." >&2
+    exit 2
+  fi
+  policy_source_args+=(
+    --policy.policy_base_artifact_id="$policy_base_artifact_id"
+    --policy.policy_base_sha256="$policy_base_sha256"
+  )
+fi
+if [[ -n "$policy_tokenizer_artifact_id" || -n "$policy_tokenizer_sha256" ]]; then
+  if [[ -z "$policy_tokenizer_artifact_id" || -z "$policy_tokenizer_sha256" ]]; then
+    echo "--policy-tokenizer-artifact-id and --policy-tokenizer-sha256 must be set together." >&2
+    exit 2
+  fi
+  policy_source_args+=(
+    --policy.policy_tokenizer_artifact_id="$policy_tokenizer_artifact_id"
+    --policy.policy_tokenizer_sha256="$policy_tokenizer_sha256"
+  )
+fi
 if [[ -n "$resume_checkpoint" ]]; then
   resume_checkpoint="$(readlink -f "$resume_checkpoint")"
   resume_config="$resume_checkpoint/pretrained_model/train_config.json"
@@ -719,11 +772,19 @@ fi
 
 policy_mem_args=()
 if [[ "$enable_mem" == "true" && -z "$resume_checkpoint" ]]; then
-  if [[ ! -f "$mem_vit_checkpoint" ]]; then
+  if [[ "$dry_run" != "true" && ! -f "$mem_vit_checkpoint" ]]; then
     echo "MEM ViT checkpoint not found: $mem_vit_checkpoint" >&2
     exit 1
   fi
   policy_mem_args+=(--policy.mem_vit_checkpoint="$mem_vit_checkpoint")
+  if [[ -n "$mem_vit_artifact_id" || -n "$mem_vit_sha256" ]]; then
+    if [[ -z "$mem_vit_artifact_id" || -z "$mem_vit_sha256" ]]; then
+      echo "--mem-vit-artifact-id and --mem-vit-sha256 must be set together." >&2
+      exit 2
+    fi
+    policy_mem_args+=(--policy.mem_vit_artifact_id="$mem_vit_artifact_id")
+    policy_mem_args+=(--policy.mem_vit_sha256="$mem_vit_sha256")
+  fi
   policy_mem_args+=(--policy.mem_vit_finetune_mode="$mem_vit_finetune_mode")
   policy_mem_args+=(--policy.mem_vit_frame_interval_seconds="$mem_frame_interval_seconds")
   policy_mem_args+=(--policy.mem_vit_random_interval_sampling="$mem_random_interval_sampling")
@@ -773,11 +834,14 @@ if [[ -z "$resume_checkpoint" ]]; then
     dataset_args+=(
       --dataset.semantic_views_path="$semantic_views_path"
       --dataset.random_semantic_view="$random_semantic_view"
-      --dataset.semantic_view_kind_weights="$semantic_view_kind_weights"
+      --dataset.semantic_state_instruction_matrix="$semantic_state_instruction_matrix"
       --dataset.semantic_phases="$semantic_phases"
       --dataset.semantic_phase_weights="$semantic_phase_weights"
       --dataset.semantic_source_weights="$semantic_source_weights"
     )
+    if [[ -n "$semantic_view_kind_weights" && "$semantic_view_kind_weights" != "{}" ]]; then
+      dataset_args+=(--dataset.semantic_view_kind_weights="$semantic_view_kind_weights")
+    fi
   fi
 else
   [[ "$dataset_repo_id_explicit" == "false" ]] || dataset_args+=(--dataset.repo_id="$dataset_repo_id")
@@ -788,6 +852,7 @@ else
   [[ "$mixed_sim_probability_explicit" == "false" ]] || dataset_args+=(--dataset.mixed_sim_probability="$mixed_sim_probability")
   [[ "$semantic_views_path_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_views_path="$semantic_views_path")
   [[ "$random_semantic_view_explicit" == "false" ]] || dataset_args+=(--dataset.random_semantic_view="$random_semantic_view")
+  [[ "$semantic_state_instruction_matrix_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_state_instruction_matrix="$semantic_state_instruction_matrix")
   [[ "$semantic_view_kind_weights_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_view_kind_weights="$semantic_view_kind_weights")
   [[ "$semantic_phases_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_phases="$semantic_phases")
   [[ "$semantic_phase_weights_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_phase_weights="$semantic_phase_weights")
@@ -930,7 +995,6 @@ train_args=(
   "${peft_args[@]}" \
   --output_dir="$output_dir" \
   --job_name="$job_name" \
-  --steps="$steps" \
   --seed="$seed" \
   --batch_size="$batch_size_per_gpu" \
   --gradient_accumulation_steps="$gradient_accumulation_steps" \
@@ -949,6 +1013,13 @@ train_args=(
   --wandb.project="$wandb_project" \
   --wandb.disable_artifact=true
 )
+
+# An in-place resume restores its training horizon from train_config.json.
+# Only an explicit --steps argument may extend or shorten that horizon; the
+# script's start-mode default must never silently replace the saved value.
+if [[ -z "$resume_checkpoint" || "$steps_explicit" == "true" ]]; then
+  train_args+=(--steps="$steps")
+fi
 
 if [[ "$dry_run" == "true" ]]; then
   printf 'CUDA_VISIBLE_DEVICES=%q lerobot_train' "$gpu_ids"
@@ -1036,7 +1107,11 @@ fi
 if [[ -z "$resume_checkpoint" ]]; then
   echo "Dataset:          $dataset_root"
   echo "Image source:     $image_source (sim probability=$mixed_sim_probability)"
-  echo "Semantic views:   ${semantic_views_path:-none} (random=$random_semantic_view, kind_weights=$semantic_view_kind_weights)"
+  echo "Semantic views:   ${semantic_views_path:-none} (random=$random_semantic_view)"
+  echo "Semantic matrix:  $semantic_state_instruction_matrix"
+  if [[ -n "$semantic_view_kind_weights" && "$semantic_view_kind_weights" != "{}" ]]; then
+    echo "Legacy semantic filter: $semantic_view_kind_weights"
+  fi
   echo "Semantic sampling: phases=$semantic_phases, phase_weights=$semantic_phase_weights, source_weights=$semantic_source_weights"
   echo "Task status:      complete=$predict_task_complete, blocked=$predict_task_blocked"
 else
@@ -1056,7 +1131,11 @@ else
   echo "Action timing:    restored from checkpoint deployment metadata"
 fi
 echo "Train/eval split: eval_split=$eval_split"
-echo "Steps:            $steps optimizer updates"
+if [[ -n "$resume_checkpoint" && "$steps_explicit" != "true" ]]; then
+  echo "Steps:            restored from checkpoint"
+else
+  echo "Steps:            $steps optimizer updates"
+fi
 echo "Checkpoints:      every $save_freq steps; keep latest $keep_last_checkpoints and every ${keep_checkpoint_every_n_steps}-step milestone"
 if [[ -z "$resume_checkpoint" ]]; then
   echo "Action semantics: $action_semantics_profile ($ee_target_dataset_semantics, EE source=$ee_supervision_source, mask=$ee_delta_supervision_mode, gripper=$gripper_target_representation, loss=$action_loss_schema)"
@@ -1070,3 +1149,22 @@ echo "Global batch:     $batch_size_per_gpu x $num_gpus GPU(s) x $gradient_accum
 echo "Log:              $log_file"
 echo "Output:           $output_dir"
 echo "Watch:            tail -f '$log_file'"
+
+if [[ "${LEROBOT_TRAIN_FOREGROUND:-false}" == "true" ]]; then
+  terminate_training() {
+    trap - TERM INT HUP
+    kill -TERM -- "-${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+    exit 143
+  }
+  trap terminate_training TERM INT HUP
+  set +e
+  wait "${pid}"
+  training_status=$?
+  set -e
+  trap - TERM INT HUP
+  exit "${training_status}"
+elif [[ "${LEROBOT_TRAIN_FOREGROUND:-false}" != "false" ]]; then
+  echo "LEROBOT_TRAIN_FOREGROUND must be true or false, got ${LEROBOT_TRAIN_FOREGROUND}." >&2
+  exit 2
+fi

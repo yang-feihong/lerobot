@@ -6,6 +6,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$repo_root"
 vla_storage_root="${VLA_STORAGE_ROOT:-/data}"
+export LEROBOT_ARTIFACT_REGISTRY="${LEROBOT_ARTIFACT_REGISTRY:-${repo_root}/deployment/base_artifact_registry.json}"
 
 # =========================
 # User configuration
