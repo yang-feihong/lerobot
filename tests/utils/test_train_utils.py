@@ -136,6 +136,12 @@ def test_prune_checkpoints_keep_last_zero_disables_pruning(tmp_path):
     assert {path.name for path in tmp_path.iterdir()} == {"000500", "001000", "001500"}
 
 
+def test_prune_checkpoints_accepts_missing_directory(tmp_path):
+    checkpoints_dir = tmp_path / "checkpoints"
+    assert prune_checkpoints(checkpoints_dir, keep_last=2, keep_every_n_steps=10_000) == []
+    assert not checkpoints_dir.exists()
+
+
 @patch("lerobot.common.train_utils.save_training_state")
 def test_save_checkpoint(mock_save_training_state, tmp_path, optimizer):
     policy = Mock()

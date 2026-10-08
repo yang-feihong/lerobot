@@ -19,9 +19,11 @@ required=(
   CLUSTER_LOCAL_CHECKPOINT_ROOT CLUSTER_F_MIN_FREE_GIB CLUSTER_F_TARGET_FREE_GIB
   CLUSTER_CU124_IMAGE CLUSTER_CU124_IMAGE_ID
   CLUSTER_CU124_IMAGE_ARCHIVE CLUSTER_F_IMAGE CLUSTER_F_IMAGE_ID
-  CLUSTER_F_IMAGE_ARCHIVE BASE_POLICY_SHA256 MEM_VIT_SHA256
+  CLUSTER_F_IMAGE_ARCHIVE BASE_POLICY_SHA256 MEM_VIT_SHA256 POLICY_TOKENIZER_SHA256
   STAFF1_EPISODES STAFF1_VIDEOS STAFF1_INFO_SHA256 STAFF1_SEMANTIC_SHA256
   STAFF1_BOUNDARIES_SHA256
+  ALL_SCENES_EPISODES ALL_SCENES_VIDEOS ALL_SCENES_INFO_SHA256
+  ALL_SCENES_SEMANTIC_SHA256 ALL_SCENES_BOUNDARIES_SHA256
   CLUSTER_F_SSH_HOST CLUSTER_F_DATA_ROOT CLUSTER_F_SOURCE_ROOT CLUSTER_F_GPU_COUNT CLUSTER_F_CONTAINER_USER
   CLUSTER_WB2_SSH_HOST CLUSTER_WB2_DATA_ROOT CLUSTER_WB2_SOURCE_ROOT CLUSTER_WB2_GPU_COUNT CLUSTER_WB2_CONTAINER_USER
   CLUSTER_WB3_SSH_HOST CLUSTER_WB3_DATA_ROOT CLUSTER_WB3_SOURCE_ROOT CLUSTER_WB3_GPU_COUNT CLUSTER_WB3_CONTAINER_USER
@@ -79,10 +81,30 @@ plan_nodes() {
   "${semantic_plan_args[@]}" assignments | awk -F '\t' '!seen[$2]++ {print $2}'
 }
 
+selected_plan_nodes() {
+  local selected="${1:-all}"
+  if [[ "${selected}" == all ]]; then
+    plan_nodes
+    return
+  fi
+  node_profile "${selected}" >/dev/null
+  [[ -n "$(node_tasks "${selected}")" ]] || {
+    echo "Node ${selected} has no task in the current plan." >&2
+    return 1
+  }
+  printf '%s\n' "${selected}"
+}
+
 task_resources() {
   local wanted="$1"
   "${semantic_plan_args[@]}" assignments | \
     awk -F '\t' -v task="${wanted}" '$1 == task {print $3, $4; found=1} END {exit !found}'
+}
+
+task_node() {
+  local wanted="$1"
+  "${semantic_plan_args[@]}" assignments | \
+    awk -F '\t' -v task="${wanted}" '$1 == task {print $2; found=1} END {exit !found}'
 }
 
 validate_plan_resources() {
@@ -91,8 +113,8 @@ validate_plan_resources() {
   while IFS=$'\t' read -r task node gpu_csv port; do
     node_profile "${node}"
     IFS=',' read -r -a gpu_ids <<<"${gpu_csv}"
-    [[ "${#gpu_ids[@]}" -eq 4 ]] || {
-      echo "${task}: expected exactly four GPUs, got ${gpu_csv}" >&2
+    [[ "${#gpu_ids[@]}" -ge 1 ]] || {
+      echo "${task}: expected at least one GPU, got ${gpu_csv}" >&2
       return 1
     }
     for gpu in "${gpu_ids[@]}"; do
@@ -157,9 +179,11 @@ Usage:
   training_plan/cluster.sh check [all|f|wb2|wb3|wb4|wb5]
   training_plan/cluster.sh sync-code [all|f|wb2|wb3|wb4|wb5]
   training_plan/cluster.sh prepare [all|f|wb2|wb3|wb4|wb5]
-  training_plan/cluster.sh dry-run-plan
+  training_plan/cluster.sh dry-run-plan [all|f|wb2|wb3|wb4|wb5]
+  training_plan/cluster.sh dry-run-task TASK_ID
   training_plan/cluster.sh resume-dry-run-plan
-  training_plan/cluster.sh start-plan
+  training_plan/cluster.sh start-plan [all|f|wb2|wb3|wb4|wb5]
+  training_plan/cluster.sh start-task TASK_ID
   training_plan/cluster.sh resume-plan
   training_plan/cluster.sh status
   training_plan/cluster.sh archive-f-checkpoints
@@ -266,6 +290,54 @@ verify_large_file() {
   return 1
 }
 
+verify_directory_tree() {
+  local node="$1" path="$2" expected="$3" actual
+  actual="$(ssh_node "${node}" "python3 - '${path}' <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+if not root.is_dir():
+    raise SystemExit(f'missing directory: {root}')
+digest = hashlib.sha256()
+for candidate in sorted(path for path in root.rglob('*') if path.is_file()):
+    digest.update(candidate.relative_to(root).as_posix().encode())
+    digest.update(b'\0')
+    digest.update(str(candidate.stat().st_size).encode())
+    digest.update(b'\0')
+    with candidate.open('rb') as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+            digest.update(block)
+print(digest.hexdigest())
+PY")"
+  [[ "${actual}" == "${expected}" ]] || {
+    echo "${node}: directory artifact mismatch for ${path}: ${actual}, expected ${expected}" >&2
+    return 1
+  }
+}
+
+verify_dataset_readable() {
+  local node="$1" dataset_root="$2" label="$3" uid gid
+  node_profile "${node}"
+  [[ "${container_user}" == *:* ]] || return 0
+  uid="${container_user%%:*}"
+  gid="${container_user##*:}"
+  ssh_node "${node}" "set -e
+    data_file=\$(find '${dataset_root}/data' -type f -name '*.parquet' -print -quit)
+    video_file=\$(find '${dataset_root}/videos' -type f -name '*.mp4' -print -quit)
+    test -n \"\$data_file\" && test -n \"\$video_file\"
+    for path in '${dataset_root}/meta/info.json' '${dataset_root}/meta/semantic_views.json' '${dataset_root}/meta/stage_boundaries.json' \"\$data_file\" \"\$video_file\"; do
+      setpriv --reuid '${uid}' --regid '${gid}' --clear-groups test -r \"\$path\" || {
+        echo '${label}: container user ${container_user} cannot read' \"\$path\" >&2
+        exit 1
+      }
+    done" || {
+      echo "${node}: ${label} dataset is not readable by container user ${container_user}" >&2
+      return 1
+    }
+}
+
 probe_gpu_container() {
   local node="$1" probe_name output
   node_profile "${node}"
@@ -277,7 +349,7 @@ probe_gpu_container() {
 
 check_node() {
   local node="$1" commit code_dir actual_image actual_gpus
-  local staff1_episodes staff1_videos
+  local staff1_episodes staff1_videos all_scenes_episodes all_scenes_videos
   node_profile "${node}"
   commit="$(code_commit)"
   code_dir="${host_source}/lerobot_main_${commit}"
@@ -288,11 +360,12 @@ check_node() {
   ssh_node "${node}" "test -f '${code_dir}/.source_commit' && test \"\$(cat '${code_dir}/.source_commit')\" = '${commit}' && cd '${code_dir}' && sha256sum -c .source_manifest.sha256 >/dev/null 2>&1" || {
     echo "${node}: code snapshot mismatch" >&2; return 1;
   }
-  ssh_node "${node}" "test -f '${host_data}/datasets/b2_z1/training/staff1/meta/info.json' && test -f '${host_data}/checkpoints/lerobot_pi05_base_local_tokenizer/model.safetensors' && test -f '${host_data}/checkpoints/mem_vit_distill_20260716_142702/mem_vit_distill_latest.pt'" || {
+  ssh_node "${node}" "test -f '${host_data}/datasets/b2_z1/training/staff1/meta/info.json' && test -f '${host_data}/checkpoints/lerobot_pi05_base_local_tokenizer/model.safetensors' && test -f '${host_data}/checkpoints/mem_vit_distill_20260716_142702/mem_vit_distill_latest.pt' && test -d '${host_data}/checkpoints/google_paligemma-3b-pt-224'" || {
     echo "${node}: dataset or model missing" >&2; return 1;
   }
   verify_large_file "${node}" "${host_data}/checkpoints/lerobot_pi05_base_local_tokenizer/model.safetensors" "${BASE_POLICY_SHA256}"
   verify_large_file "${node}" "${host_data}/checkpoints/mem_vit_distill_20260716_142702/mem_vit_distill_latest.pt" "${MEM_VIT_SHA256}"
+  verify_directory_tree "${node}" "${host_data}/checkpoints/google_paligemma-3b-pt-224" "${POLICY_TOKENIZER_SHA256}"
   read -r staff1_episodes staff1_videos < <(ssh_node "${node}" "printf '%s %s\\n' \"\$(find '${host_data}/datasets/b2_z1/training/staff1/data' -type f -name '*.parquet' | wc -l)\" \"\$(find '${host_data}/datasets/b2_z1/training/staff1/videos' -type f -name '*.mp4' | wc -l)\"")
   [[ "${staff1_episodes}" == "${STAFF1_EPISODES}" && "${staff1_videos}" == "${STAFF1_VIDEOS}" ]] || {
     echo "${node}: dataset file-count mismatch" >&2; return 1;
@@ -300,6 +373,22 @@ check_node() {
   ssh_node "${node}" "{ echo '${STAFF1_INFO_SHA256}  ${host_data}/datasets/b2_z1/training/staff1/meta/info.json'; echo '${STAFF1_SEMANTIC_SHA256}  ${host_data}/datasets/b2_z1/training/staff1/meta/semantic_views.json'; echo '${STAFF1_BOUNDARIES_SHA256}  ${host_data}/datasets/b2_z1/training/staff1/meta/stage_boundaries.json'; } | sha256sum -c - >/dev/null" || {
     echo "${node}: dataset metadata checksum mismatch" >&2; return 1;
   }
+  verify_dataset_readable "${node}" "${host_data}/datasets/b2_z1/training/staff1" staff1
+  if node_tasks "${node}" | while read -r task; do
+    "${semantic_plan_args[@]}" resolve "${task}" | head -1
+  done | grep -qx all_scenes; then
+    ssh_node "${node}" "test -f '${host_data}/datasets/b2_z1/training/all_scenes/meta/info.json'" || {
+      echo "${node}: all-scenes dataset missing" >&2; return 1;
+    }
+    read -r all_scenes_episodes all_scenes_videos < <(ssh_node "${node}" "printf '%s %s\\n' \"\$(find '${host_data}/datasets/b2_z1/training/all_scenes/data' -type f -name '*.parquet' | wc -l)\" \"\$(find '${host_data}/datasets/b2_z1/training/all_scenes/videos' -type f -name '*.mp4' | wc -l)\"")
+    [[ "${all_scenes_episodes}" == "${ALL_SCENES_EPISODES}" && "${all_scenes_videos}" == "${ALL_SCENES_VIDEOS}" ]] || {
+      echo "${node}: all-scenes dataset file-count mismatch" >&2; return 1;
+    }
+    ssh_node "${node}" "{ echo '${ALL_SCENES_INFO_SHA256}  ${host_data}/datasets/b2_z1/training/all_scenes/meta/info.json'; echo '${ALL_SCENES_SEMANTIC_SHA256}  ${host_data}/datasets/b2_z1/training/all_scenes/meta/semantic_views.json'; echo '${ALL_SCENES_BOUNDARIES_SHA256}  ${host_data}/datasets/b2_z1/training/all_scenes/meta/stage_boundaries.json'; } | sha256sum -c - >/dev/null" || {
+      echo "${node}: all-scenes dataset metadata checksum mismatch" >&2; return 1;
+    }
+    verify_dataset_readable "${node}" "${host_data}/datasets/b2_z1/training/all_scenes" all-scenes
+  fi
   echo "${node}: OK image=${actual_image} gpus=${actual_gpus} code=${commit}"
 }
 
@@ -472,10 +561,10 @@ node_needs_resume() {
 }
 
 plan_action() {
-  local action="$1" node task
+  local action="$1" selected="${2:-all}" node task
   local -a task_list
   if [[ "${action}" == start ]]; then
-    while IFS= read -r node; do prepare_node "${node}"; done < <(plan_nodes)
+    while IFS= read -r node; do prepare_node "${node}"; done < <(selected_plan_nodes "${selected}")
   else
     # A resume happens while sibling tasks may still occupy every GPU. Reuse the
     # environment proven by the initial prepare; never inject a CUDA probe into
@@ -485,18 +574,18 @@ plan_action() {
         sync_code "${node}"
         check_node "${node}"
       fi
-    done < <(plan_nodes)
+    done < <(selected_plan_nodes "${selected}")
   fi
   while IFS= read -r node; do
     mapfile -t task_list < <(node_tasks "${node}")
     for task in "${task_list[@]}"; do
       "${action}_task" "${node}" "${task}"
     done
-  done < <(plan_nodes)
+  done < <(selected_plan_nodes "${selected}")
 }
 
 dry_run_plan() {
-  local mode="$1" node task gpu port run_dir step checkpoint
+  local mode="$1" selected="${2:-all}" node task gpu port run_dir step checkpoint
   local -a task_list
   while IFS= read -r node; do
     mapfile -t task_list < <(node_tasks "${node}")
@@ -512,7 +601,24 @@ dry_run_plan() {
       fi
       run_task_dry_run "${node}" "${task}" "${mode}" "${gpu}" "${port}" "${checkpoint}"
     done
-  done < <(plan_nodes)
+  done < <(selected_plan_nodes "${selected}")
+}
+
+start_one_task() {
+  local task="$1" node
+  node="$(task_node "${task}")" || { echo "Unknown task: ${task}" >&2; return 2; }
+  sync_code "${node}"
+  check_node "${node}"
+  start_task "${node}" "${task}"
+}
+
+dry_run_one_task() {
+  local task="$1" node gpu port
+  node="$(task_node "${task}")" || { echo "Unknown task: ${task}" >&2; return 2; }
+  sync_code "${node}"
+  check_node "${node}"
+  read -r gpu port < <(task_resources "${task}")
+  run_task_dry_run "${node}" "${task}" start "${gpu}" "${port}" ""
 }
 
 status() {
@@ -560,9 +666,11 @@ case "${1:-}" in
   prepare)
     while IFS= read -r node; do prepare_node "${node}"; done < <(select_nodes "${2:-all}")
     ;;
-  dry-run-plan) dry_run_plan start ;;
+  dry-run-plan) dry_run_plan start "${2:-all}" ;;
+  dry-run-task) dry_run_one_task "${2:?TASK_ID is required}" ;;
   resume-dry-run-plan) dry_run_plan resume ;;
-  start-plan) plan_action start ;;
+  start-plan) plan_action start "${2:-all}" ;;
+  start-task) start_one_task "${2:?TASK_ID is required}" ;;
   resume-plan) plan_action resume ;;
   status) status ;;
   archive-f-checkpoints) exec bash "${plan_dir}/storage_guard.sh" archive ;;

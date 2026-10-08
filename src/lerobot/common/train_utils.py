@@ -217,6 +217,8 @@ def prune_checkpoints(
         raise ValueError(f"keep_every_n_steps must be non-negative, got {keep_every_n_steps}")
     if keep_last == 0:
         return []
+    if not checkpoints_dir.exists():
+        return []
 
     numbered = sorted(
         (path for path in checkpoints_dir.iterdir() if path.is_dir() and path.name.isdigit()),

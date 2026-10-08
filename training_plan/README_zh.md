@@ -85,18 +85,20 @@ sidecar，要求所选状态每一帧恰好对应一个矩阵允许的语言关�
 bash training_plan/launch.sh describe staff1_stage1_full_mem
 ```
 
-当前4路计划直接配置三条关系：`approach × goal_approach`、
+当前6路计划直接配置三条关系：`approach × goal_approach`、
 `handle_press × goal_open`、`traversal × goal_enter`。即使这些语言视图在不同 episode
 的 sidecar 中来自不同历史分类，训练选择也只取决于这里明示的状态—指令关系。
 
-四个任务全部使用 Staff1 统一数据集和完整 MEM 输入，每个任务占用4张GPU：Stage1、
-Stage2、Stage3 单模型，以及三阶段分阶段联合模型。统一数据集同时包含完整 Staff1
-episode 与单独采集的 Stage2 episode。
+其中四个4卡任务使用 Staff1 统一数据集和完整 MEM 输入：Stage1、Stage2、Stage3
+单模型，以及三阶段分阶段联合模型。另外两个2卡任务使用所有场景统一数据集和完整
+MEM 输入，分别训练 Stage1 与 Stage2。入口按任务的 `gpu_ids` 数量自动计算梯度累积，
+六个任务保持相同的全局 batch size。Staff1 统一数据集同时包含完整 Staff1 episode 与
+单独采集的 Stage2 episode。
 
 ## 一键流程
 
 ```bash
-# 查看机器、GPU 与本轮4个任务的固定分配
+# 查看机器、GPU 与本轮6个任务的固定分配
 bash training_plan/cluster.sh describe
 
 # 校验镜像、代码快照、数据集、基础模型和 MEM 权重
@@ -105,7 +107,7 @@ bash training_plan/cluster.sh prepare all
 # 训练运行期间只发布新代码快照，不执行GPU探针或大文件哈希
 bash training_plan/cluster.sh sync-code all
 
-# 首次启动本轮4个任务
+# 首次启动本轮6个任务
 bash training_plan/cluster.sh dry-run-plan
 bash training_plan/cluster.sh start-plan
 
@@ -127,7 +129,7 @@ bash training_plan/cluster.sh status
 续训不创建新 run，而是使用 `wandb resume="must"` 接回原 run。续训校验复用首次
 `prepare` 已验证的CUDA环境，不会在其他任务运行期间额外启动GPU探针。
 
-两个 `dry-run` 命令使用一次性、无 GPU 的容器，逐项覆盖本轮全部4个任务。它们复用
+两个 `dry-run` 命令使用一次性、无 GPU 的容器，逐项覆盖本轮全部6个任务。它们复用
 正式镜像、挂载点、代码快照、任务映射和入口参数，但不会载入模型或启动训练。
 `resume-dry-run-plan` 还会逐项读取真实的最新完整 checkpoint，验证优化器状态、原
 W&B `run_id`、`resume="must"` 参数，以及续训时不会被入口默认值改写训练总步数。

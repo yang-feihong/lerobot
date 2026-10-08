@@ -84,11 +84,11 @@ def _validate_resources(task_id: str, resources: Any) -> None:
     gpu_ids = resources["gpu_ids"]
     if (
         not isinstance(gpu_ids, list)
-        or len(gpu_ids) != 4
+        or not gpu_ids
         or any(not isinstance(gpu_id, int) or gpu_id < 0 for gpu_id in gpu_ids)
         or len(set(gpu_ids)) != len(gpu_ids)
     ):
-        raise ValueError(f"task {task_id!r} must request exactly four distinct GPU IDs")
+        raise ValueError(f"task {task_id!r} must request one or more distinct GPU IDs")
     port = resources["main_process_port"]
     if not isinstance(port, int) or not 1024 <= port <= 65535:
         raise ValueError(f"task {task_id!r} has invalid main_process_port")

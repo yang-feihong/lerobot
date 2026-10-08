@@ -159,3 +159,13 @@ def test_task_cannot_mix_preset_and_inline_matrix(tmp_path):
     )
     with pytest.raises(ValueError, match="exactly one semantic configuration form"):
         semantic_plan.load_plan(PRESETS_PATH, invalid_path)
+
+
+def test_two_gpu_task_is_valid():
+    plan = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
+    task = semantic_plan.resolve_task(plan, "all_scenes_stage1_full_mem")
+    assert task["resources"] == {
+        "node": "wb3",
+        "gpu_ids": [0, 1],
+        "main_process_port": 29500,
+    }
