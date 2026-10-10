@@ -12,15 +12,92 @@ from lerobot.processor.converters import policy_action_to_transition, transition
 from lerobot.scripts.openloop_vla_eval import (
     _compute_metrics,
     _current_state_slice,
+    _deterministic_flow_noise,
     _episode_anchor_plot_names,
     _episode_b2_command_anchors,
     _manipulation_onset_windows,
     _openloop_model_action_names,
+    _physical_metric_means,
+    _report_common_output_metric_sums,
     _reanchor_episode_plot_actions,
     _resolve_image_source,
     _unnormalize_model_action,
     _world_trajectory_plot_limits,
 )
+
+
+def test_physical_metric_means_preserve_empty_supervision_as_none():
+    assert _physical_metric_means(
+        {
+            "b2_xy_ade_m": (3.0, 2),
+            "ee_translation_ade_m": (0.0, 0),
+        }
+    ) == {
+        "b2_xy_ade_m": 1.5,
+        "ee_translation_ade_m": None,
+    }
+
+
+def test_report_common_output_metrics_use_all_valid_frames_without_arm_gate_mask():
+    names = [
+        "arm_teleop_inactive",
+        "height_invariant_ee_delta_rotvec_x",
+        "height_invariant_ee_delta_rotvec_y",
+        "height_invariant_ee_delta_rotvec_z",
+        "height_invariant_ee_delta_x",
+        "height_invariant_ee_delta_y",
+        "height_invariant_ee_delta_z",
+        "gripper_target",
+    ]
+    expert = torch.zeros(1, 2, len(names))
+    expert[..., 0] = 1.0
+    predicted = expert.clone()
+    predicted[..., 1] = torch.tensor([3.0, 0.0])
+    predicted[..., 4] = torch.tensor([0.0, 4.0])
+    predicted[..., 7] = torch.tensor([0.25, 0.5])
+    sums = _report_common_output_metric_sums(
+        expert,
+        predicted,
+        torch.ones(1, 2, dtype=torch.bool),
+        names,
+    )
+
+    assert sums["ee_rotation_ade_rad"] == (3.0, 2)
+    assert sums["ee_translation_ade_m"] == (4.0, 2)
+    assert sums["ee_translation_fde_m"] == (4.0, 1)
+    assert sums["gripper_mae_rad"] == (0.75, 2)
+
+
+def test_deterministic_flow_noise_is_invariant_to_batch_partition():
+    kwargs = {
+        "base_seed": 1000,
+        "chunk_size": 5,
+        "max_action_dim": 7,
+        "device": "cpu",
+    }
+    together = _deterministic_flow_noise(
+        episode_indices=[3, 3, 4],
+        frame_indices=[20, 40, 0],
+        **kwargs,
+    )
+    partitioned = torch.cat(
+        [
+            _deterministic_flow_noise(
+                episode_indices=[3],
+                frame_indices=[20],
+                **kwargs,
+            ),
+            _deterministic_flow_noise(
+                episode_indices=[3, 4],
+                frame_indices=[40, 0],
+                **kwargs,
+            ),
+        ],
+        dim=0,
+    )
+
+    torch.testing.assert_close(together, partitioned, rtol=0, atol=0)
+    assert not torch.equal(together[0], together[1])
 
 
 def test_openloop_image_source_reproduces_checkpoint_sim_pairing(tmp_path):

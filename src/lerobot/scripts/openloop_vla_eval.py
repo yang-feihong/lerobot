@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import hashlib
 import json
 import logging
 import math
@@ -45,6 +46,7 @@ from lerobot.policies.pi05.manipulation_metrics import (
     aggregate_manipulation_metrics,
     compute_manipulation_onset_metrics,
 )
+from lerobot.policies.pi05.physical_validation import physical_action_metric_sums
 from lerobot.policies.pi05.transformed_action_stats import (
     PI05_TRANSFORMED_ACTION_STATS_NAME,
     load_transformed_action_stats,
@@ -57,6 +59,185 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.utils import init_logging
 
 _B2_WORLD_TRAJECTORY_NAMES = ["b2_world_x", "b2_world_y", "b2_world_yaw"]
+_STANDARD_EVAL_SCHEMA_VERSION = 2
+_DETERMINISTIC_FLOW_NOISE_SCHEME = "blake2b_seed_per_episode_frame_v1"
+
+
+def _deterministic_flow_noise(
+    *,
+    episode_indices: list[int],
+    frame_indices: list[int],
+    base_seed: int,
+    chunk_size: int,
+    max_action_dim: int,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Build flow noise that is invariant to batching and evaluation host.
+
+    Each observation owns an independent CPU RNG stream derived only from the
+    evaluation seed and its stable dataset identity.  Generating on CPU avoids
+    CUDA-generator differences between GPU models; moving the finished tensor
+    to the policy device leaves only ordinary floating-point kernel tolerance.
+    """
+    if len(episode_indices) != len(frame_indices):
+        raise ValueError("episode_indices and frame_indices must have equal length")
+    samples = []
+    for episode_index, frame_index in zip(episode_indices, frame_indices, strict=True):
+        identity = f"{int(base_seed)}:{int(episode_index)}:{int(frame_index)}".encode()
+        sample_seed = int.from_bytes(hashlib.blake2b(identity, digest_size=8).digest(), "little")
+        sample_seed &= (1 << 63) - 1
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(sample_seed)
+        samples.append(
+            torch.randn(
+                (int(chunk_size), int(max_action_dim)),
+                generator=generator,
+                dtype=torch.float32,
+                device="cpu",
+            )
+        )
+    return torch.stack(samples, dim=0).to(device=device)
+
+
+def _update_array_hash(digest: Any, value: np.ndarray) -> None:
+    """Hash an ndarray without depending on platform-native byte order."""
+    array = np.ascontiguousarray(np.asarray(value).astype(np.dtype(value.dtype).newbyteorder("<")))
+    digest.update(str(array.shape).encode())
+    digest.update(str(array.dtype).encode())
+    digest.update(array.tobytes())
+
+
+def _sample_input_fingerprint(
+    batch: dict[str, Any],
+    sample_index: int,
+    *,
+    task: str,
+    batch_size: int,
+) -> str:
+    """Hash the actual observation fields consumed by one policy inference.
+
+    The digest deliberately excludes supervision/action fields.  Tensor names,
+    dtypes and shapes are included so that equal raw bytes with a different
+    interpretation cannot compare equal.  Sorting keys makes the result
+    independent of dictionary insertion order and DataLoader batching.
+    """
+    digest = hashlib.sha256()
+    digest.update(b"openloop_policy_input_v1\0")
+    digest.update(task.encode("utf-8"))
+    digest.update(b"\0")
+    for key in sorted(batch):
+        if not key.startswith("observation."):
+            continue
+        value = batch[key]
+        if not isinstance(value, torch.Tensor) or value.shape[:1] != (batch_size,):
+            continue
+        digest.update(key.encode("utf-8"))
+        digest.update(b"\0")
+        _update_array_hash(digest, value[sample_index].detach().cpu().numpy())
+    return digest.hexdigest()
+
+
+def _update_sample_fingerprint_hash(
+    digest: Any,
+    *,
+    episode_index: int,
+    frame_index: int,
+    sample_fingerprint: str,
+) -> None:
+    digest.update(f"{episode_index}:{frame_index}:".encode("ascii"))
+    digest.update(sample_fingerprint.encode("ascii"))
+    digest.update(b"\n")
+
+
+def _reduce_metric_sums(
+    totals: dict[str, tuple[float, int]],
+    values: dict[str, tuple[float, int]],
+) -> None:
+    for name, (value_sum, count) in values.items():
+        previous_sum, previous_count = totals.get(name, (0.0, 0))
+        totals[name] = (previous_sum + value_sum, previous_count + count)
+
+
+def _standard_b2_metrics(metric_sums: dict[str, tuple[float, int]]) -> dict[str, float]:
+    """Return the one canonical seven-column B2 trajectory metric set in SI units."""
+    def mean(name: str) -> float:
+        value_sum, count = metric_sums[name]
+        if count <= 0:
+            raise ValueError(f"Standard metric {name!r} has no valid samples")
+        return value_sum / count
+
+    return {
+        "x_mae_m": mean("b2_x_mae_m"),
+        "y_mae_m": mean("b2_y_mae_m"),
+        "yaw_mae_rad": mean("b2_yaw_mae_rad"),
+        "xy_ade_m": mean("b2_xy_ade_m"),
+        "xy_fde_m": mean("b2_xy_fde_m"),
+        # Yaw ADE is the full-horizon per-step yaw MAE by definition.
+        "yaw_ade_rad": mean("b2_yaw_mae_rad"),
+        "yaw_fde_rad": mean("b2_yaw_fde_rad"),
+    }
+
+
+def _physical_metric_means(
+    metric_sums: dict[str, tuple[float, int]],
+) -> dict[str, float | None]:
+    """Materialize every physical metric from the same additive reduction.
+
+    ``None`` is retained for a metric whose supervision mask has no valid
+    elements (for example, EE motion in an all-inactive Stage1 dataset).  This
+    is materially different from reporting a misleading numerical zero.
+    """
+    return {
+        name: (value_sum / count if count > 0 else None)
+        for name, (value_sum, count) in sorted(metric_sums.items())
+    }
+
+
+def _report_common_output_metric_sums(
+    expert: torch.Tensor,
+    predicted: torch.Tensor,
+    valid: torch.Tensor,
+    action_names: list[str],
+) -> dict[str, tuple[float, int]]:
+    """Metrics used by the historical common-output Stage2/3 report.
+
+    Unlike controller-valid EE metrics, this contract intentionally evaluates
+    every valid horizon frame and measures errors directly in the checkpoint's
+    unnormalized output representation.  Keeping it explicit prevents the
+    report from silently switching between masked/geodesic EE metrics and its
+    established direct rotvec/translation definition.
+    """
+    name_to_dim = {name: index for index, name in enumerate(action_names)}
+
+    def masked(values: torch.Tensor) -> tuple[float, int]:
+        selected = values[valid]
+        return float(selected.sum().detach().cpu()), int(selected.numel())
+
+    def last(values: torch.Tensor) -> tuple[float, int]:
+        lengths = valid.to(dtype=torch.long).sum(dim=1)
+        rows = torch.nonzero(lengths > 0, as_tuple=False).flatten()
+        if not len(rows):
+            return 0.0, 0
+        selected = values[rows, lengths[rows] - 1]
+        return float(selected.sum().detach().cpu()), int(selected.numel())
+
+    result: dict[str, tuple[float, int]] = {}
+    translation_names = [f"height_invariant_ee_delta_{axis}" for axis in "xyz"]
+    rotation_names = [f"height_invariant_ee_delta_rotvec_{axis}" for axis in "xyz"]
+    if all(name in name_to_dim for name in translation_names):
+        indices = [name_to_dim[name] for name in translation_names]
+        error = torch.linalg.vector_norm(predicted[..., indices] - expert[..., indices], dim=-1)
+        result["ee_translation_ade_m"] = masked(error)
+        result["ee_translation_fde_m"] = last(error)
+    if all(name in name_to_dim for name in rotation_names):
+        indices = [name_to_dim[name] for name in rotation_names]
+        error = torch.linalg.vector_norm(predicted[..., indices] - expert[..., indices], dim=-1)
+        result["ee_rotation_ade_rad"] = masked(error)
+        result["ee_rotation_fde_rad"] = last(error)
+    if "gripper_target" in name_to_dim:
+        index = name_to_dim["gripper_target"]
+        result["gripper_mae_rad"] = masked((predicted[..., index] - expert[..., index]).abs())
+    return result
 
 
 def _unnormalize_model_action(normalized: torch.Tensor, postprocessor) -> torch.Tensor:
@@ -1013,12 +1194,37 @@ def main() -> None:
         ),
     )
     parser.add_argument("--seed", type=int, default=1000)
+    parser.add_argument(
+        "--deterministic-flow-noise",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Derive PI0.5 flow noise independently for every episode/frame. "
+            "This makes predictions invariant to DataLoader batch size and host RNG state."
+        ),
+    )
     parser.add_argument("--video-backend", default="torchcodec")
     parser.add_argument(
         "--plot-workers",
         type=int,
         default=1,
         help="Processes used for independent chunk plots. Use more than 1 for large full episodes.",
+    )
+    parser.add_argument(
+        "--write-legacy-metric-aliases",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Also write the old ambiguous metrics.csv/trajectory_metrics.csv filenames. "
+            "Disabled by default so first-step diagnostics cannot be mistaken for the "
+            "canonical full-horizon benchmark."
+        ),
+    )
+    parser.add_argument(
+        "--write-plots",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Render episode and action-chunk diagnostic plots.",
     )
     args = parser.parse_args()
 
@@ -1042,11 +1248,12 @@ def main() -> None:
         root_name = Path(args.dataset_root).name.lower()
         dataset_group = "staff1" if "staff1" in root_name else "staff2" if "staff2" in root_name else "mixed"
     plot_dir = output_dir / "plots"
-    plot_dir.mkdir(parents=True, exist_ok=True)
     chunk_plot_dir = output_dir / "rolling_chunk_plots"
-    chunk_plot_dir.mkdir(parents=True, exist_ok=True)
     single_chunk_plot_dir = output_dir / "single_chunk_plots"
-    single_chunk_plot_dir.mkdir(parents=True, exist_ok=True)
+    if args.write_plots:
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        chunk_plot_dir.mkdir(parents=True, exist_ok=True)
+        single_chunk_plot_dir.mkdir(parents=True, exist_ok=True)
 
     logging.info("Policy path: %s", policy_path)
     logging.info("Output dir: %s", output_dir)
@@ -1284,6 +1491,9 @@ def main() -> None:
     counts: dict[int, int] = defaultdict(int)
     remaining_required_onset_frames = set(required_onset_frames)
     prediction_rows: list[dict[str, Any]] = []
+    raw_input_digest = hashlib.sha256()
+    processed_input_digest = hashlib.sha256()
+    input_fingerprint_rows: list[dict[str, Any]] = []
 
     with torch.inference_mode():
         for step, batch in enumerate(tqdm(dataloader, desc="Open-loop eval", unit="batch")):
@@ -1332,6 +1542,38 @@ def main() -> None:
             if args.task_override is not None:
                 batch["task"] = [args.task_override] * len(keep)
 
+            batch_episode_indices = batch["episode_index"].detach().cpu().view(-1).tolist()
+            batch_frame_indices = batch["frame_index"].detach().cpu().view(-1).tolist()
+            batch_tasks = batch.get("task")
+            if isinstance(batch_tasks, str):
+                input_task_list = [batch_tasks] * len(batch_episode_indices)
+            elif isinstance(batch_tasks, list):
+                input_task_list = [str(task) for task in batch_tasks]
+            else:
+                input_task_list = [""] * len(batch_episode_indices)
+            raw_sample_fingerprints = []
+            for i, (episode_index, frame_index, task) in enumerate(
+                zip(
+                    batch_episode_indices,
+                    batch_frame_indices,
+                    input_task_list,
+                    strict=True,
+                )
+            ):
+                fingerprint = _sample_input_fingerprint(
+                    batch,
+                    i,
+                    task=task,
+                    batch_size=len(batch_episode_indices),
+                )
+                raw_sample_fingerprints.append(fingerprint)
+                _update_sample_fingerprint_hash(
+                    raw_input_digest,
+                    episode_index=int(episode_index),
+                    frame_index=int(frame_index),
+                    sample_fingerprint=fingerprint,
+                )
+
             batch = _batch_to_device_and_float_images(batch, dataset.meta.camera_keys)
             raw_state = batch.get(OBS_STATE)
             if not isinstance(raw_state, torch.Tensor):
@@ -1346,6 +1588,35 @@ def main() -> None:
                 else None
             )
             processed = preprocessor(batch)
+            for i, (episode_index, frame_index, task, raw_fingerprint) in enumerate(
+                zip(
+                    batch_episode_indices,
+                    batch_frame_indices,
+                    input_task_list,
+                    raw_sample_fingerprints,
+                    strict=True,
+                )
+            ):
+                processed_fingerprint = _sample_input_fingerprint(
+                    processed,
+                    i,
+                    task=task,
+                    batch_size=len(batch_episode_indices),
+                )
+                _update_sample_fingerprint_hash(
+                    processed_input_digest,
+                    episode_index=int(episode_index),
+                    frame_index=int(frame_index),
+                    sample_fingerprint=processed_fingerprint,
+                )
+                input_fingerprint_rows.append(
+                    {
+                        "episode_index": int(episode_index),
+                        "frame_index": int(frame_index),
+                        "raw_input_sha256": raw_fingerprint,
+                        "processed_input_sha256": processed_fingerprint,
+                    }
+                )
             normalized_supervision_chunk = processed.get(ACTION)
             if not isinstance(normalized_supervision_chunk, torch.Tensor):
                 raise ValueError("Checkpoint preprocessor did not produce tensor action supervision")
@@ -1353,7 +1624,22 @@ def main() -> None:
                 normalized_supervision_chunk,
                 postprocessor,
             )
-            normalized_pred_chunk = policy.predict_action_chunk(processed)
+            prediction_kwargs: dict[str, Any] = {}
+            if args.deterministic_flow_noise:
+                max_action_dim = getattr(policy_cfg, "max_action_dim", None)
+                if max_action_dim is None:
+                    raise ValueError(
+                        "--deterministic-flow-noise requires a policy with max_action_dim"
+                    )
+                prediction_kwargs["noise"] = _deterministic_flow_noise(
+                    episode_indices=[int(value) for value in batch_episode_indices],
+                    frame_indices=[int(value) for value in batch_frame_indices],
+                    base_seed=args.seed,
+                    chunk_size=int(policy_cfg.chunk_size),
+                    max_action_dim=int(max_action_dim),
+                    device=processed[OBS_STATE].device,
+                )
+            normalized_pred_chunk = policy.predict_action_chunk(processed, **prediction_kwargs)
             pred_model_chunk = _unnormalize_model_action(normalized_pred_chunk, postprocessor)
             if supervision_model_chunk.shape != pred_model_chunk.shape:
                 raise ValueError(
@@ -1438,6 +1724,12 @@ def main() -> None:
     all_expert_chunks, all_pred_chunks = [], []
     all_expert_trajectories, all_pred_trajectories = [], []
     all_expert_trajectory_chunks, all_pred_trajectory_chunks = [], []
+    standard_physical_sums: dict[str, tuple[float, int]] = {}
+    report_common_output_sums: dict[str, tuple[float, int]] = {}
+    sample_digest = hashlib.sha256()
+    b2_target_digest = hashlib.sha256()
+    evaluated_anchor_count = 0
+    evaluated_action_step_count = 0
     npz_payload: dict[str, np.ndarray] = {}
     single_chunk_plot_jobs: list[
         tuple[
@@ -1507,6 +1799,35 @@ def main() -> None:
         valid_pred_chunks = _flatten_valid_chunks(pred_chunks, valid_chunk_lengths)
         valid_expert_trajectory_chunks = _flatten_valid_chunks(expert_trajectory_chunks, valid_chunk_lengths)
         valid_pred_trajectory_chunks = _flatten_valid_chunks(pred_trajectory_chunks, valid_chunk_lengths)
+        valid_mask = np.arange(expert_trajectory_chunks.shape[1])[None, :] < valid_chunk_lengths[:, None]
+        effective_action_dt = float(action_dt) if action_dt is not None else 1.0 / float(meta.fps)
+        physical_sums = physical_action_metric_sums(
+            torch.from_numpy(expert_trajectory_chunks),
+            torch.from_numpy(pred_trajectory_chunks),
+            torch.from_numpy(valid_mask),
+            action_names=trajectory_action_names,
+            b2_representation=policy_cfg.b2_action_representation,
+            z1_representation=policy_cfg.z1_action_representation,
+            ee_rotation_representation=policy_cfg.ee_delta_rotation_representation,
+            action_dt_seconds=effective_action_dt,
+        )
+        _reduce_metric_sums(standard_physical_sums, physical_sums)
+        _reduce_metric_sums(
+            report_common_output_sums,
+            _report_common_output_metric_sums(
+                torch.from_numpy(expert_trajectory_chunks),
+                torch.from_numpy(pred_trajectory_chunks),
+                torch.from_numpy(valid_mask),
+                trajectory_action_names,
+            ),
+        )
+        evaluated_anchor_count += int(len(frame_index))
+        evaluated_action_step_count += int(valid_mask.sum())
+        for frame, task in zip(frame_index.tolist(), item["task"], strict=True):
+            sample_digest.update(f"{ep_idx}:{int(frame)}:{task}\n".encode("utf-8"))
+        b2_target_digest.update(policy_cfg.b2_action_representation.encode("utf-8"))
+        _update_array_hash(b2_target_digest, expert_trajectory_chunks[..., :3])
+        _update_array_hash(b2_target_digest, valid_mask)
         all_expert.append(expert)
         all_pred.append(pred)
         all_expert_chunks.append(valid_expert_chunks)
@@ -1619,42 +1940,43 @@ def main() -> None:
                 strict=True,
             )
         }
-        _plot_episode(
-            plot_dir / f"episode_{ep_idx:06d}.png",
-            ep_idx,
-            frame_index,
-            plot_expert,
-            plot_pred,
-            episode_plot_action_names,
-            episode_plot_y_limits,
-        )
-        _plot_episode_rolling_chunks(
-            chunk_plot_dir / f"episode_{ep_idx:06d}_rolling_chunks.png",
-            ep_idx,
-            frame_index,
-            plot_expert_chunks,
-            plot_pred_chunks,
-            episode_plot_action_names,
-            episode_plot_y_limits,
-            valid_chunk_lengths,
-        )
-        ep_single_dir = single_chunk_plot_dir / f"episode_{ep_idx:06d}"
-        ep_single_dir.mkdir(parents=True, exist_ok=True)
-        single_plot_indices = np.arange(0, len(frame_index), args.chunk_plot_stride)
-        if args.max_chunk_plots_per_episode > 0:
-            single_plot_indices = single_plot_indices[: args.max_chunk_plots_per_episode]
-        for i in single_plot_indices:
-            single_chunk_plot_jobs.append(
-                (
-                    ep_single_dir / f"chunk_start_{int(frame_index[i]):06d}.png",
-                    ep_idx,
-                    int(frame_index[i]),
-                    expert_chunks[i, : valid_chunk_lengths[i]],
-                    pred_chunks[i, : valid_chunk_lengths[i]],
-                    plot_action_names,
-                    plot_y_limits,
-                )
+        if args.write_plots:
+            _plot_episode(
+                plot_dir / f"episode_{ep_idx:06d}.png",
+                ep_idx,
+                frame_index,
+                plot_expert,
+                plot_pred,
+                episode_plot_action_names,
+                episode_plot_y_limits,
             )
+            _plot_episode_rolling_chunks(
+                chunk_plot_dir / f"episode_{ep_idx:06d}_rolling_chunks.png",
+                ep_idx,
+                frame_index,
+                plot_expert_chunks,
+                plot_pred_chunks,
+                episode_plot_action_names,
+                episode_plot_y_limits,
+                valid_chunk_lengths,
+            )
+            ep_single_dir = single_chunk_plot_dir / f"episode_{ep_idx:06d}"
+            ep_single_dir.mkdir(parents=True, exist_ok=True)
+            single_plot_indices = np.arange(0, len(frame_index), args.chunk_plot_stride)
+            if args.max_chunk_plots_per_episode > 0:
+                single_plot_indices = single_plot_indices[: args.max_chunk_plots_per_episode]
+            for i in single_plot_indices:
+                single_chunk_plot_jobs.append(
+                    (
+                        ep_single_dir / f"chunk_start_{int(frame_index[i]):06d}.png",
+                        ep_idx,
+                        int(frame_index[i]),
+                        expert_chunks[i, : valid_chunk_lengths[i]],
+                        pred_chunks[i, : valid_chunk_lengths[i]],
+                        plot_action_names,
+                        plot_y_limits,
+                    )
+                )
         npz_payload[f"episode_{ep_idx:06d}_frame_index"] = frame_index
         npz_payload[f"episode_{ep_idx:06d}_supervision"] = expert
         npz_payload[f"episode_{ep_idx:06d}_pred"] = pred
@@ -1679,7 +2001,9 @@ def main() -> None:
         len(single_chunk_plot_jobs),
         args.plot_workers,
     )
-    if args.plot_workers == 1:
+    if not single_chunk_plot_jobs:
+        pass
+    elif args.plot_workers == 1:
         for job in tqdm(single_chunk_plot_jobs, desc="Chunk plots", unit="plot"):
             _plot_single_chunk_job(job)
     else:
@@ -1767,48 +2091,89 @@ def main() -> None:
         normalized_trajectory_chunk_metrics_rows.insert(0, normalized_chunk_metrics_rows[0].copy())
 
     _write_metrics_csv(
-        output_dir / "metrics.csv", metrics_rows, execution_action_names, discrete_metric_names
+        output_dir / "diagnostic_first_step_action_metrics.csv",
+        metrics_rows,
+        execution_action_names,
+        discrete_metric_names,
     )
     _write_metrics_csv(
-        output_dir / "normalized_metrics.csv",
+        output_dir / "diagnostic_normalized_first_step_action_metrics.csv",
         normalized_metrics_rows,
         execution_action_names,
         discrete_metric_names,
     )
     _write_metrics_csv(
-        output_dir / "chunk_metrics.csv", chunk_metrics_rows, execution_action_names, discrete_metric_names
-    )
-    _write_metrics_csv(
-        output_dir / "normalized_chunk_metrics.csv",
-        normalized_chunk_metrics_rows,
+        output_dir / "full_horizon_action_metrics.csv",
+        chunk_metrics_rows,
         execution_action_names,
         discrete_metric_names,
     )
     _write_metrics_csv(
-        output_dir / "trajectory_metrics.csv",
+        output_dir / "normalized_full_horizon_action_metrics.csv",
+        normalized_chunk_metrics_rows,
+        execution_action_names,
+        discrete_metric_names,
+    )
+    # Explicit diagnostic alias. This file measures only the first action of
+    # each predicted chunk and must never be used as a trajectory benchmark.
+    _write_metrics_csv(
+        output_dir / "diagnostic_first_step_trajectory_metrics.csv",
         trajectory_metrics_rows,
         trajectory_action_names,
         discrete_metric_names,
     )
     _write_metrics_csv(
-        output_dir / "normalized_trajectory_metrics.csv",
+        output_dir / "diagnostic_normalized_first_step_trajectory_metrics.csv",
         normalized_trajectory_metrics_rows,
         trajectory_action_names,
         discrete_metric_names,
     )
+    # This is the only trajectory CSV accepted by the standard reporting path.
     _write_metrics_csv(
-        output_dir / "trajectory_chunk_metrics.csv",
+        output_dir / "standard_full_horizon_trajectory_metrics.csv",
         trajectory_chunk_metrics_rows,
         trajectory_action_names,
         discrete_metric_names,
     )
     _write_metrics_csv(
-        output_dir / "normalized_trajectory_chunk_metrics.csv",
+        output_dir / "normalized_full_horizon_trajectory_metrics.csv",
         normalized_trajectory_chunk_metrics_rows,
         trajectory_action_names,
         discrete_metric_names,
     )
+    if args.write_legacy_metric_aliases:
+        for filename, rows, names in (
+            ("metrics.csv", metrics_rows, execution_action_names),
+            ("normalized_metrics.csv", normalized_metrics_rows, execution_action_names),
+            ("chunk_metrics.csv", chunk_metrics_rows, execution_action_names),
+            ("normalized_chunk_metrics.csv", normalized_chunk_metrics_rows, execution_action_names),
+            ("trajectory_metrics.csv", trajectory_metrics_rows, trajectory_action_names),
+            (
+                "normalized_trajectory_metrics.csv",
+                normalized_trajectory_metrics_rows,
+                trajectory_action_names,
+            ),
+            ("trajectory_chunk_metrics.csv", trajectory_chunk_metrics_rows, trajectory_action_names),
+            (
+                "normalized_trajectory_chunk_metrics.csv",
+                normalized_trajectory_chunk_metrics_rows,
+                trajectory_action_names,
+            ),
+        ):
+            _write_metrics_csv(output_dir / filename, rows, names, discrete_metric_names)
     _write_predictions_csv(output_dir / "predictions.csv", prediction_rows, execution_action_names)
+    with (output_dir / "input_fingerprints.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=(
+                "episode_index",
+                "frame_index",
+                "raw_input_sha256",
+                "processed_input_sha256",
+            ),
+        )
+        writer.writeheader()
+        writer.writerows(input_fingerprint_rows)
     np.savez_compressed(output_dir / "predictions.npz", **npz_payload)
 
     manipulation_metrics = None
@@ -1821,6 +2186,70 @@ def main() -> None:
             ),
             encoding="utf-8",
         )
+
+    standard_metrics = _standard_b2_metrics(standard_physical_sums)
+    standard_evaluation = {
+        "schema_version": _STANDARD_EVAL_SCHEMA_VERSION,
+        "metric_scope": "all_valid_steps_of_every_predicted_action_chunk",
+        "horizon_steps": int(policy_cfg.chunk_size),
+        "first_step_metrics_are_diagnostic_only": True,
+        "primary_metrics_file": "standard_full_horizon_metrics.json",
+        "primary_per_dimension_file": "standard_full_horizon_trajectory_metrics.csv",
+        "diagnostic_first_step_file": "diagnostic_first_step_trajectory_metrics.csv",
+        "metric_definitions": {
+            "x_mae_m": "mean absolute x error over every valid horizon step",
+            "y_mae_m": "mean absolute y error over every valid horizon step",
+            "yaw_mae_rad": "mean wrapped absolute yaw error over every valid horizon step",
+            "xy_ade_m": "mean XY Euclidean error over every valid horizon step",
+            "xy_fde_m": "mean XY Euclidean error at each chunk's last valid step",
+            "yaw_ade_rad": "mean wrapped absolute yaw error over every valid horizon step",
+            "yaw_fde_rad": "mean wrapped absolute yaw error at each chunk's last valid step",
+        },
+        "metrics_si": standard_metrics,
+        "physical_metrics_si": _physical_metric_means(standard_physical_sums),
+        "report_common_output_metrics_si": _physical_metric_means(report_common_output_sums),
+        "comparison_contract": {
+            "dataset_repo_id": args.dataset_repo_id,
+            "split": args.split,
+            "episodes": sorted(per_episode),
+            "frame_stride": int(args.frame_stride),
+            "max_frames_per_episode": int(args.max_frames_per_episode),
+            "include_onset_windows": bool(args.include_onset_windows),
+            "onset_window_seconds": float(args.onset_window_seconds),
+            "task_variant": args.task_variant,
+            "task_override": args.task_override,
+            "sample_fingerprint_sha256": sample_digest.hexdigest(),
+            "b2_target_fingerprint_sha256": b2_target_digest.hexdigest(),
+            "raw_policy_input_fingerprint_sha256": raw_input_digest.hexdigest(),
+            "processed_policy_input_fingerprint_sha256": processed_input_digest.hexdigest(),
+            "input_fingerprints_file": "input_fingerprints.csv",
+            "evaluated_anchor_count": evaluated_anchor_count,
+            "evaluated_action_step_count": evaluated_action_step_count,
+            "inference_batch_size": int(args.batch_size),
+            "dataset_frequency_hz": float(meta.fps),
+            "model_control_frequency_hz": float(
+                getattr(policy_cfg, "control_frequency_hz", None) or meta.fps
+            ),
+            "b2_representation": policy_cfg.b2_action_representation,
+            "flow_noise": {
+                "deterministic": bool(args.deterministic_flow_noise),
+                "scheme": (
+                    _DETERMINISTIC_FLOW_NOISE_SCHEME
+                    if args.deterministic_flow_noise
+                    else "policy_process_rng"
+                ),
+                "base_seed": int(args.seed),
+            },
+        },
+        "provenance": {
+            "policy_path": str(policy_path),
+            "dataset_root": str(Path(args.dataset_root).expanduser()),
+            "seed": int(args.seed),
+        },
+    }
+    (output_dir / "standard_full_horizon_metrics.json").write_text(
+        json.dumps(standard_evaluation, indent=2), encoding="utf-8"
+    )
 
     summary = {
         "policy_path": str(policy_path),
@@ -1848,16 +2277,30 @@ def main() -> None:
             "metrics_and_csv": "checkpoint_training_representation",
         },
         "plot_y_limits_by_episode": episode_plot_y_limits_by_episode,
-        "metrics": metrics_rows[0],
-        "normalized_metrics": normalized_metrics_rows[0],
-        "chunk_metrics": chunk_metrics_rows[0],
-        "normalized_chunk_metrics": normalized_chunk_metrics_rows[0],
-        "trajectory_metrics": trajectory_metrics_rows[0],
-        "normalized_trajectory_metrics": normalized_trajectory_metrics_rows[0],
-        "trajectory_chunk_metrics": trajectory_chunk_metrics_rows[0],
-        "normalized_trajectory_chunk_metrics": normalized_trajectory_chunk_metrics_rows[0],
+        "diagnostic_first_step_action_metrics": metrics_rows[0],
+        "diagnostic_normalized_first_step_action_metrics": normalized_metrics_rows[0],
+        "full_horizon_action_metrics": chunk_metrics_rows[0],
+        "normalized_full_horizon_action_metrics": normalized_chunk_metrics_rows[0],
+        "diagnostic_first_step_trajectory_metrics": trajectory_metrics_rows[0],
+        "diagnostic_normalized_first_step_trajectory_metrics": normalized_trajectory_metrics_rows[0],
+        "full_horizon_trajectory_metrics": trajectory_chunk_metrics_rows[0],
+        "normalized_full_horizon_trajectory_metrics": normalized_trajectory_chunk_metrics_rows[0],
+        "standard_full_horizon_evaluation": standard_evaluation,
         "manipulation_onset_metrics": manipulation_metrics,
     }
+    if args.write_legacy_metric_aliases:
+        summary.update(
+            {
+                "metrics": metrics_rows[0],
+                "normalized_metrics": normalized_metrics_rows[0],
+                "chunk_metrics": chunk_metrics_rows[0],
+                "normalized_chunk_metrics": normalized_chunk_metrics_rows[0],
+                "trajectory_metrics": trajectory_metrics_rows[0],
+                "normalized_trajectory_metrics": normalized_trajectory_metrics_rows[0],
+                "trajectory_chunk_metrics": trajectory_chunk_metrics_rows[0],
+                "normalized_trajectory_chunk_metrics": normalized_trajectory_chunk_metrics_rows[0],
+            }
+        )
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     logging.info("Open-loop eval finished.")
@@ -1874,7 +2317,7 @@ def main() -> None:
             "Normalized trajectory chunk MAE mean: %.6f",
             normalized_trajectory_chunk_metrics_rows[0]["mae_mean"],
         )
-    logging.info("Metrics: %s", output_dir / "metrics.csv")
+    logging.info("Standard metrics: %s", output_dir / "standard_full_horizon_metrics.json")
     logging.info("Plots: %s", plot_dir)
 
 

@@ -61,6 +61,10 @@ main_process_port="29500"
 #            during optimizer-state initialization. Plan for at least 32GB, preferably
 #            40GB/48GB or multi-GPU/ZeRO/FSDP/8-bit optimizer.
 finetune_mode="lora"
+# PEFT normally optimizes only each wrapper's active adapter copy. Historical
+# parity probes may disable this to reproduce checkpoints trained before the
+# active-copy restriction was introduced.
+peft_train_active_modules_only="true"
 
 dataset_repo_id="local/b2_z1_vla"
 dataset_root="$vla_storage_root/datasets/b2_z1/converted/staff1_staff2_legacy_aggregate"
@@ -111,6 +115,10 @@ motion_gripper_change_threshold="0.5"
 static_horizon_sampling="true"
 interior_static_weight="0.0"
 terminal_static_weight="1.0" # increase above 1.0 to strengthen terminal holds
+# Whether right-padding after a legal terminal hold remains part of the action
+# supervision. Disable this only for controlled comparisons with checkpoints
+# trained before terminal-padding supervision was introduced.
+supervise_terminal_static_padding="true"
 dataset_mixture_sampling="false"
 dataset_mixture_manifest=""
 # Optional instruction-relative semantic views. The physical sample is chosen
@@ -164,6 +172,9 @@ resume_new_run_name=""
 # PaliGemma/VLM backbone uses LoRA. In non-MEM mode, unfrozen ViT also uses LoRA.
 lora_rank="16"
 lora_alpha="32"
+# Optional regex override used by controlled compatibility/ablation runs.
+# Empty keeps the policy's versioned default LoRA target set.
+peft_target_modules=""
 # Freezes the entire visual encoder, including MEM when enabled. This takes
 # precedence over mem_vit_finetune_mode; the language model keeps its chosen mode.
 freeze_vision_encoder="false"
@@ -223,6 +234,7 @@ motion_gripper_change_threshold_explicit="false"
 static_horizon_sampling_explicit="false"
 interior_static_weight_explicit="false"
 terminal_static_weight_explicit="false"
+supervise_terminal_static_padding_explicit="false"
 dataset_mixture_sampling_explicit="false"
 dataset_mixture_manifest_explicit="false"
 training_rtc_explicit="false"
@@ -305,6 +317,8 @@ while (( $# > 0 )); do
     --mem-max-interval-seconds=*) mem_max_interval_seconds="${1#*=}" ;;
     --lora-rank=*) lora_rank="${1#*=}" ;;
     --lora-alpha=*) lora_alpha="${1#*=}" ;;
+    --peft-target-modules=*) peft_target_modules="${1#*=}" ;;
+    --peft-train-active-modules-only=*) peft_train_active_modules_only="${1#*=}" ;;
     --base-policy=*) base_policy="${1#*=}" ;;
     --state-action-encoding=*) state_action_encoding="${1#*=}" ;;
     --action-history-enabled=*) action_history_enabled="${1#*=}" ;;
@@ -343,6 +357,7 @@ while (( $# > 0 )); do
     --static-horizon-sampling=*) static_horizon_sampling="${1#*=}"; static_horizon_sampling_explicit="true" ;;
     --interior-static-weight=*) interior_static_weight="${1#*=}"; interior_static_weight_explicit="true" ;;
     --terminal-static-weight=*) terminal_static_weight="${1#*=}"; terminal_static_weight_explicit="true" ;;
+    --supervise-terminal-static-padding=*) supervise_terminal_static_padding="${1#*=}"; supervise_terminal_static_padding_explicit="true" ;;
     --dataset-mixture-sampling=*) dataset_mixture_sampling="${1#*=}"; dataset_mixture_sampling_explicit="true" ;;
     --dataset-mixture-manifest=*) dataset_mixture_manifest="${1#*=}"; dataset_mixture_manifest_explicit="true" ;;
     --semantic-views-path=*) semantic_views_path="${1#*=}"; semantic_views_path_explicit="true" ;;
@@ -718,6 +733,7 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.ee_delta_supervision_mode="$ee_delta_supervision_mode"
     --policy.gripper_target_representation="$gripper_target_representation"
     --policy.action_loss_schema="$action_loss_schema"
+    --policy.action_supervise_terminal_static_padding="$supervise_terminal_static_padding"
     --policy.task_complete_sample_tail_seconds="$task_complete_sample_tail_seconds"
     --policy.new_module_optimizer_lr_multiplier="$new_module_optimizer_lr_multiplier"
     --policy.structured_action_crf_initial_stay_bias="$structured_action_crf_initial_stay_bias"
@@ -906,10 +922,13 @@ if [[ -z "$resume_checkpoint" ]]; then
   case "$finetune_mode" in
     lora)
       train_expert_only="false"
-      policy_runtime_args+=(--policy.peft_train_active_modules_only=true)
+      policy_runtime_args+=(--policy.peft_train_active_modules_only="$peft_train_active_modules_only")
       peft_args+=(--peft.method_type=LORA)
       peft_args+=(--peft.r="$lora_rank")
       peft_args+=(--peft.lora_alpha="$lora_alpha")
+      if [[ -n "$peft_target_modules" ]]; then
+        peft_args+=(--peft.target_modules="$peft_target_modules")
+      fi
       ;;
     expert)
       train_expert_only="true"
@@ -1121,6 +1140,7 @@ fi
 if [[ -z "$resume_checkpoint" ]]; then
   echo "Motion sampling:  legacy enabled=$motion_balanced_sampling"
   echo "Static horizons:  enabled=$static_horizon_sampling, interior_weight=$interior_static_weight, terminal_weight=$terminal_static_weight"
+  echo "Terminal padding: supervise=$supervise_terminal_static_padding"
   echo "Dataset mixture:  enabled=$dataset_mixture_sampling, manifest=${dataset_mixture_manifest:-none}"
 else
   echo "Sampling:         restored from checkpoint unless explicitly overridden"

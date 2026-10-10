@@ -1,0 +1,23 @@
+{
+  "protocol_id": "b2_z1_staff1_stage2_full_horizon_v1",
+  "description": "Canonical Staff1 Stage2 physical trajectory benchmark used for historical and current model comparison.",
+  "dataset_repo_id": "local/staff1_handle_press",
+  "dataset_info_sha256": "6ff7df31cf52e01b33711e8c9850fabc25deda893fce7580d9f470307b93866e",
+  "dataset_total_episodes": 1106,
+  "dataset_total_frames": 915993,
+  "episodes": "0-99",
+  "max_episodes": 100,
+  "max_frames_per_episode": 0,
+  "frame_stride": 20,
+  "include_onset_windows": false,
+  "max_chunk_plots_per_episode": 1,
+  "chunk_plot_stride": 100000,
+  "task": "Open the door.",
+  "task_variant": "first",
+  "seed": 1000,
+  "inference_batch_size": 4,
+  "required_horizon_steps": 50,
+  "expected_selected_anchor_count": 4500,
+  "expected_valid_action_step_count": 218788,
+  "primary_output": "standard_full_horizon_metrics.json"
+}
