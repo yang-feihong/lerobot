@@ -25,7 +25,8 @@ required=(
   BATCH_SIZE_PER_GPU EVAL_STEPS PHYSICAL_EVAL_SAMPLES SAVE_FREQ
   KEEP_LAST_CHECKPOINTS KEEP_CHECKPOINT_EVERY_N_STEPS
   B2_ACTION_REPRESENTATION Z1_ACTION_REPRESENTATION ACTION_SEMANTICS_PROFILE
-  ACTION_LOSS_SCHEMA PREDICT_TASK_COMPLETE PREDICT_TASK_BLOCKED
+  ACTION_LOSS_SCHEMA ACTION_CONTINUOUS_GROUP_WEIGHT ACTION_DISCRETE_GROUP_WEIGHT
+  PREDICT_TASK_COMPLETE PREDICT_TASK_BLOCKED
 )
 for name in "${required[@]}"; do
   [[ -n "${!name:-}" ]] || { echo "Missing ${name} in ${env_file}" >&2; exit 2; }
@@ -162,6 +163,8 @@ common_args=(
   --z1-action-representation="${Z1_ACTION_REPRESENTATION}"
   --action-semantics-profile="${ACTION_SEMANTICS_PROFILE}"
   --action-loss-schema="${ACTION_LOSS_SCHEMA}"
+  --action-continuous-group-weight="${ACTION_CONTINUOUS_GROUP_WEIGHT}"
+  --action-discrete-group-weight="${ACTION_DISCRETE_GROUP_WEIGHT}"
   --predict-task-complete="${PREDICT_TASK_COMPLETE}"
   --predict-task-blocked="${PREDICT_TASK_BLOCKED}"
   --motion-balanced-sampling=false

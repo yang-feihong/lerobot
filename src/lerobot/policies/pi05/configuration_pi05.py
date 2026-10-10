@@ -172,14 +172,19 @@ class PI05Config(PreTrainedConfig):
     #            after quantile normalization. Override action_gripper_target_true_side
     #            if a future dataset stores gripper differently.
     #
-    # "group_balanced" independently normalizes continuous motion targets and
-    # discrete control targets before adding them. This prevents sparse,
-    # class-balanced bool targets from changing the gradient scale of B2/EE.
+    # "group_balanced" is the historical v1 behavior: it independently
+    # normalizes continuous and discrete targets and adds both group means.
+    # "group_balanced_v2" uses an explicitly weighted, normalized mean of the
+    # two group losses. This keeps the total scale stable and makes the group
+    # weights effective. The default 3:1 ratio gives continuous motion 75% and
+    # all discrete controls together 25% of the action objective.
     # "auto" and "always" retain the historical shared-denominator behavior
     # so saved training configurations remain reproducible.
-    action_loss_schema: str = "group_balanced"
+    action_loss_schema: str = "group_balanced_v2"
     action_bool_loss_weight: float = 4.0
     action_continuous_loss_weight: float = 1.0
+    action_continuous_group_weight: float = 3.0
+    action_discrete_group_weight: float = 1.0
     action_masked_continuous_min_weight: float = 0.0
     action_bool_balance_eps: float = 1e-3
     structured_action_crf_initial_stay_bias: float = 4.0
@@ -293,13 +298,14 @@ class PI05Config(PreTrainedConfig):
             "auto",
             "always",
             "group_balanced",
+            "group_balanced_v2",
             "off",
             "uniform_valid",
         ]:
             raise ValueError(
                 "Invalid action_loss_schema: "
                 f"{self.action_loss_schema}. Expected 'auto', 'always', 'group_balanced', "
-                "'off', or 'uniform_valid'."
+                "'group_balanced_v2', 'off', or 'uniform_valid'."
             )
         if self.discrete_action_training_mode not in ["continuous_flow", "structured_temporal"]:
             raise ValueError(
@@ -397,6 +403,16 @@ class PI05Config(PreTrainedConfig):
         if self.action_continuous_loss_weight <= 0:
             raise ValueError(
                 f"action_continuous_loss_weight must be > 0, got {self.action_continuous_loss_weight}"
+            )
+        if self.action_continuous_group_weight <= 0:
+            raise ValueError(
+                "action_continuous_group_weight must be > 0, got "
+                f"{self.action_continuous_group_weight}"
+            )
+        if self.action_discrete_group_weight <= 0:
+            raise ValueError(
+                "action_discrete_group_weight must be > 0, got "
+                f"{self.action_discrete_group_weight}"
             )
         if self.action_masked_continuous_min_weight < 0:
             raise ValueError(

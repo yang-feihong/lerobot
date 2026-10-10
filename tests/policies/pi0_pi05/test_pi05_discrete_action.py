@@ -96,7 +96,7 @@ def test_gate_loss_rejects_overlapping_arm_modes():
         )
 
 
-def test_group_balanced_gate_loss_does_not_dilute_b2_with_discrete_targets():
+def test_group_balanced_v1_gate_loss_preserves_historical_sum_of_group_means():
     policy = PI05Policy.__new__(PI05Policy)
     torch.nn.Module.__init__(policy)
     names = ["b2_delta_x", "b2_delta_y", "b2_delta_yaw", *DATASET_ACTION_NAMES[3:]]
@@ -147,6 +147,56 @@ def test_group_balanced_gate_loss_does_not_dilute_b2_with_discrete_targets():
     assert changed_info["loss_mean/approach/b2"] == pytest.approx(1.0)
     assert changed_info["loss_mean/approach/ee"] == pytest.approx(0.0)
     assert changed_loss.item() == pytest.approx(101.0)
+
+
+@pytest.mark.parametrize(
+    ("continuous_group_weight", "discrete_group_weight", "expected_loss"),
+    [(3.0, 1.0, 2.0), (1.0, 3.0, 4.0)],
+)
+def test_group_balanced_v2_uses_normalized_configurable_group_weights(
+    continuous_group_weight: float,
+    discrete_group_weight: float,
+    expected_loss: float,
+) -> None:
+    policy = PI05Policy.__new__(PI05Policy)
+    torch.nn.Module.__init__(policy)
+    names = ["b2_delta_x", "b2_delta_y", "b2_delta_yaw", *DATASET_ACTION_NAMES[3:]]
+    policy.config = SimpleNamespace(
+        action_bool_loss_weight=4.0,
+        action_continuous_loss_weight=1.0,
+        action_continuous_group_weight=continuous_group_weight,
+        action_discrete_group_weight=discrete_group_weight,
+        action_masked_continuous_min_weight=0.0,
+        action_bool_balance_eps=1e-3,
+        action_bool_true_fractions=dict.fromkeys(
+            ("arm_teleop_inactive", "arm_reset", "gripper_target", "task_complete"), 0.5
+        ),
+        action_gripper_target_true_side="negative",
+        io_schema_resolved=True,
+        b2_action_representation="pose_delta",
+        z1_action_representation="ee_delta",
+        action_feature_names=names,
+        action_loss_schema="group_balanced_v2",
+        training_rtc_config=None,
+    )
+    actions = -torch.ones(1, 4, len(names))
+    losses = torch.ones_like(actions)
+    for name in ("arm_teleop_inactive", "arm_reset", "gripper_target", "task_complete"):
+        losses[:, :, names.index(name)] = 5.0
+
+    loss, info = policy._b2_z1_gate_action_loss(
+        losses,
+        actions,
+        "mean",
+        ee_delta_is_valid=torch.ones(1, 4, dtype=torch.bool),
+    )
+
+    weight_fraction_sum = sum(
+        value for key, value in info.items() if key.startswith("loss_weight_fraction/")
+    )
+    assert loss.item() == pytest.approx(expected_loss)
+    assert weight_fraction_sum == pytest.approx(1.0)
+    assert info["group_balanced_v2_action_loss"] == 1.0
 
 
 def test_gate_loss_rejects_complete_and_blocked_at_the_same_time():

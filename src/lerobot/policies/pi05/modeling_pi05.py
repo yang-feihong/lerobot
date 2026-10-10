@@ -2236,13 +2236,13 @@ class PI05Policy(PreTrainedPolicy):
         schema = self.config.action_loss_schema
         if schema in {"off", "uniform_valid"}:
             return False
-        if schema in {"always", "group_balanced"}:
+        if schema in {"always", "group_balanced", "group_balanced_v2"}:
             return True
         if schema != "auto":
             raise ValueError(
                 "Unsupported action_loss_schema="
                 f"{schema!r}. Expected one of: 'auto', 'always', 'group_balanced', "
-                "'off', 'uniform_valid'."
+                "'group_balanced_v2', 'off', 'uniform_valid'."
             )
         return self.config.io_schema_resolved and action_dim == len(self.config.action_feature_names or [])
 
@@ -2543,10 +2543,11 @@ class PI05Policy(PreTrainedPolicy):
             name: part.reshape(losses.shape[0], -1).sum(dim=1)
             for name, part in zip(loss_part_names, weight_parts, strict=True)
         }
-        group_balanced = self.config.action_loss_schema == "group_balanced"
+        group_balanced_v1 = self.config.action_loss_schema == "group_balanced"
+        group_balanced_v2 = self.config.action_loss_schema == "group_balanced_v2"
         part_contributions: dict[str, Tensor] = {}
         part_weight_fractions: dict[str, Tensor] = {}
-        if group_balanced:
+        if group_balanced_v1:
             continuous_names = [name for name in ("b2", "ee") if name in part_numerators]
             discrete_names = [name for name in loss_part_names if name not in continuous_names]
             per_sample_loss = losses.new_zeros(losses.shape[0])
@@ -2563,6 +2564,38 @@ class PI05Policy(PreTrainedPolicy):
                 for name in group_names:
                     part_contributions[name] = part_numerators[name] / safe_group_weight
                     part_weight_fractions[name] = part_weights[name] / safe_group_weight
+        elif group_balanced_v2:
+            continuous_names = [name for name in ("b2", "ee") if name in part_numerators]
+            discrete_names = [name for name in loss_part_names if name not in continuous_names]
+            group_specs = (
+                (continuous_names, float(self.config.action_continuous_group_weight)),
+                (discrete_names, float(self.config.action_discrete_group_weight)),
+            )
+            group_values: list[tuple[list[str], Tensor, Tensor, Tensor]] = []
+            total_group_weight = losses.new_zeros(losses.shape[0])
+            for group_names, configured_weight in group_specs:
+                if not group_names:
+                    continue
+                element_weight = sum(part_weights[name] for name in group_names)
+                group_valid = element_weight > 0
+                safe_element_weight = element_weight.clamp_min(1e-6)
+                group_loss = sum(part_numerators[name] for name in group_names) / safe_element_weight
+                active_group_weight = group_valid.to(losses.dtype) * configured_weight
+                total_group_weight = total_group_weight + active_group_weight
+                group_values.append(
+                    (group_names, safe_element_weight, group_loss, active_group_weight)
+                )
+            safe_total_group_weight = total_group_weight.clamp_min(1e-6)
+            per_sample_loss = losses.new_zeros(losses.shape[0])
+            for group_names, safe_element_weight, group_loss, active_group_weight in group_values:
+                group_fraction = active_group_weight / safe_total_group_weight
+                per_sample_loss = per_sample_loss + group_fraction * group_loss
+                for name in group_names:
+                    within_group_fraction = part_weights[name] / safe_element_weight
+                    part_contributions[name] = (
+                        group_fraction * part_numerators[name] / safe_element_weight
+                    )
+                    part_weight_fractions[name] = group_fraction * within_group_fraction
         else:
             total_weight_per_sample = sum(part_weights.values()).clamp_min(1e-6)
             per_sample_loss = sum(part_numerators.values()) / total_weight_per_sample
@@ -2572,7 +2605,8 @@ class PI05Policy(PreTrainedPolicy):
 
         loss_dict: dict[str, float] = {
             "gate_aware_action_loss": 1.0,
-            "group_balanced_action_loss": float(group_balanced),
+            "group_balanced_action_loss": float(group_balanced_v1 or group_balanced_v2),
+            "group_balanced_v2_action_loss": float(group_balanced_v2),
             f"continuous_mask_frac/b2_{self.config.b2_action_representation}": float(
                 b2_continuous_mask.float().mean().detach().cpu().item()
             ),

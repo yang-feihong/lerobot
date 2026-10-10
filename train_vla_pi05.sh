@@ -38,7 +38,9 @@ ee_target_dataset_semantics="joint_control_inactive_interpolated"
 ee_supervision_source="control_action"
 ee_delta_supervision_mode="all" # "active_only" or "all"
 gripper_target_representation="continuous_position"
-action_loss_schema="group_balanced"
+action_loss_schema="group_balanced_v2"
+action_continuous_group_weight="3.0"
+action_discrete_group_weight="1.0"
 task_complete_sample_tail_seconds="2.0"
 new_module_optimizer_lr_multiplier="40.0"
 structured_action_crf_initial_stay_bias="4.0"
@@ -279,7 +281,7 @@ case "$action_semantics_profile" in
     ee_supervision_source="control_action"
     ee_delta_supervision_mode="all"
     gripper_target_representation="continuous_position"
-    action_loss_schema="group_balanced"
+    action_loss_schema="group_balanced_v2"
     ;;
   custom) ;;
   *)
@@ -332,6 +334,8 @@ while (( $# > 0 )); do
     --ee-delta-supervision-mode=*) ee_delta_supervision_mode="${1#*=}" ;;
     --gripper-target-representation=*) gripper_target_representation="${1#*=}" ;;
     --action-loss-schema=*) action_loss_schema="${1#*=}" ;;
+    --action-continuous-group-weight=*) action_continuous_group_weight="${1#*=}" ;;
+    --action-discrete-group-weight=*) action_discrete_group_weight="${1#*=}" ;;
     --predict-arm-teleop-inactive=*) predict_arm_teleop_inactive="${1#*=}" ;;
     --predict-arm-reset=*) predict_arm_reset="${1#*=}" ;;
     --predict-ee-pose=*) predict_ee_pose="${1#*=}" ;;
@@ -546,7 +550,7 @@ case "$action_semantics_profile" in
     expected_semantics=(false false true true continuous_flow joint_control_inactive_interpolated control_action all continuous_position uniform_valid)
     ;;
   joint_control_arm_mode_v2)
-    expected_semantics=(true true true true continuous_flow joint_control_inactive_interpolated control_action all continuous_position group_balanced)
+    expected_semantics=(true true true true continuous_flow joint_control_inactive_interpolated control_action all continuous_position group_balanced_v2)
     ;;
   custom)
     expected_semantics=()
@@ -733,6 +737,8 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.ee_delta_supervision_mode="$ee_delta_supervision_mode"
     --policy.gripper_target_representation="$gripper_target_representation"
     --policy.action_loss_schema="$action_loss_schema"
+    --policy.action_continuous_group_weight="$action_continuous_group_weight"
+    --policy.action_discrete_group_weight="$action_discrete_group_weight"
     --policy.action_supervise_terminal_static_padding="$supervise_terminal_static_padding"
     --policy.task_complete_sample_tail_seconds="$task_complete_sample_tail_seconds"
     --policy.new_module_optimizer_lr_multiplier="$new_module_optimizer_lr_multiplier"
@@ -1158,7 +1164,7 @@ else
 fi
 echo "Checkpoints:      every $save_freq steps; keep latest $keep_last_checkpoints and every ${keep_checkpoint_every_n_steps}-step milestone"
 if [[ -z "$resume_checkpoint" ]]; then
-  echo "Action semantics: $action_semantics_profile ($ee_target_dataset_semantics, EE source=$ee_supervision_source, mask=$ee_delta_supervision_mode, gripper=$gripper_target_representation, loss=$action_loss_schema)"
+  echo "Action semantics: $action_semantics_profile ($ee_target_dataset_semantics, EE source=$ee_supervision_source, mask=$ee_delta_supervision_mode, gripper=$gripper_target_representation, loss=$action_loss_schema, groups=${action_continuous_group_weight}:${action_discrete_group_weight})"
 else
   echo "Action semantics: restored from checkpoint"
 fi
