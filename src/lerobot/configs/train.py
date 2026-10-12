@@ -127,6 +127,24 @@ def is_task_status_deployment_metadata_extension(saved: dict[str, Any], current:
     return saved == current
 
 
+def is_training_loss_metadata_update(saved: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Return whether only the training-only flow-loss schema changed.
+
+    The flow-loss schema is recorded for provenance but does not alter the
+    model tensor or deployment I/O contract.  A resume may therefore change it
+    only when the caller explicitly opts into an updated training objective.
+    """
+    saved = json.loads(json.dumps(saved))
+    current = json.loads(json.dumps(current))
+    try:
+        saved_schema = saved["action"].pop("flow_loss_schema")
+        current_schema = current["action"].pop("flow_loss_schema")
+    except (KeyError, TypeError):
+        return False
+    supported = {"auto", "always", "group_balanced", "group_balanced_v2", "off", "uniform_valid"}
+    return saved_schema in supported and current_schema in supported and saved == current
+
+
 @dataclass
 class MotionBalancedSamplingConfig:
     enabled: bool = False
@@ -254,6 +272,10 @@ class TrainPipelineConfig(HubMixin):
     # Resume model/optimizer state while intentionally rebuilding dataset-derived
     # normalization statistics from an explicitly overridden dataset.
     resume_with_updated_dataset: bool = False
+    # Resume model/optimizer state while explicitly changing a training-only
+    # objective such as the flow-loss aggregation schema. This never permits
+    # changes to the model tensor or deployment I/O contract.
+    resume_with_updated_training_objective: bool = False
     # `seed` is used for training (eg: model initialization, dataset shuffling)
     # AND for the evaluation environments.
     seed: int | None = 1000
@@ -404,7 +426,11 @@ class TrainPipelineConfig(HubMixin):
                         saved_metadata, current_metadata
                     )
                 )
-                if not metadata_matches and not task_status_extension:
+                training_loss_update = (
+                    self.resume_with_updated_training_objective
+                    and is_training_loss_metadata_update(saved_metadata, current_metadata)
+                )
+                if not metadata_matches and not task_status_extension and not training_loss_update:
                     raise ValueError("Resume checkpoint deployment metadata disagrees with policy config")
         if self.reward_model is not None:
             self.reward_model.pretrained_path = str(policy_dir)

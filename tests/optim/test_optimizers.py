@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+
 import pytest
 import torch
 
@@ -61,6 +63,38 @@ def test_save_optimizer_state(optimizer, tmp_path):
 def test_save_and_load_optimizer_state(model_params, optimizer, tmp_path):
     save_optimizer_state(optimizer, tmp_path)
     loaded_optimizer = AdamConfig().build(model_params)
+    loaded_optimizer = load_optimizer_state(loaded_optimizer, tmp_path)
+
+    torch.testing.assert_close(optimizer.state_dict(), loaded_optimizer.state_dict())
+
+
+def test_load_optimizer_state_preserves_new_runtime_param_group_defaults(model_params, optimizer, tmp_path):
+    """A checkpoint from an older compatible torch may lack a newly added optimizer option."""
+    save_optimizer_state(optimizer, tmp_path)
+    param_groups_path = tmp_path / OPTIMIZER_PARAM_GROUPS
+    saved_groups = json.loads(param_groups_path.read_text())
+    for group in saved_groups:
+        group.pop("maximize", None)
+    param_groups_path.write_text(json.dumps(saved_groups))
+
+    loaded_optimizer = AdamConfig().build(model_params)
+    expected_default = loaded_optimizer.state_dict()["param_groups"][0]["maximize"]
+    loaded_optimizer = load_optimizer_state(loaded_optimizer, tmp_path)
+
+    assert loaded_optimizer.state_dict()["param_groups"][0]["maximize"] == expected_default
+
+
+def test_load_adamw_state_ignores_newer_torch_decoupled_weight_decay_key(model_params, tmp_path):
+    """A newer torch AdamW checkpoint remains resumable on an older compatible AdamW runtime."""
+    optimizer = AdamWConfig().build(model_params)
+    save_optimizer_state(optimizer, tmp_path)
+    param_groups_path = tmp_path / OPTIMIZER_PARAM_GROUPS
+    saved_groups = json.loads(param_groups_path.read_text())
+    for group in saved_groups:
+        group["decoupled_weight_decay"] = True
+    param_groups_path.write_text(json.dumps(saved_groups))
+
+    loaded_optimizer = AdamWConfig().build(model_params)
     loaded_optimizer = load_optimizer_state(loaded_optimizer, tmp_path)
 
     torch.testing.assert_close(optimizer.state_dict(), loaded_optimizer.state_dict())

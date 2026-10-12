@@ -165,6 +165,7 @@ output_root="$vla_storage_root/models/trained/pi05"
 # optimizer, scheduler, RNG, data-order and W&B run state are restored.
 resume_checkpoint=""
 resume_with_updated_dataset="false"
+resume_with_updated_training_objective="false"
 # Set a basename to fork the saved model/optimizer/scheduler state into a new
 # output directory and a new W&B run. Empty keeps the historical in-place
 # resume behavior.
@@ -244,6 +245,9 @@ training_rtc_simulated_delay_explicit="false"
 training_rtc_delay_distribution_explicit="false"
 predict_task_complete_explicit="false"
 predict_task_blocked_explicit="false"
+action_loss_schema_explicit="false"
+action_continuous_group_weight_explicit="false"
+action_discrete_group_weight_explicit="false"
 semantic_views_path_explicit="false"
 random_semantic_view_explicit="false"
 semantic_view_kind_weights_explicit="false"
@@ -333,9 +337,9 @@ while (( $# > 0 )); do
     --discrete-action-training-mode=*) discrete_action_training_mode="${1#*=}" ;;
     --ee-delta-supervision-mode=*) ee_delta_supervision_mode="${1#*=}" ;;
     --gripper-target-representation=*) gripper_target_representation="${1#*=}" ;;
-    --action-loss-schema=*) action_loss_schema="${1#*=}" ;;
-    --action-continuous-group-weight=*) action_continuous_group_weight="${1#*=}" ;;
-    --action-discrete-group-weight=*) action_discrete_group_weight="${1#*=}" ;;
+    --action-loss-schema=*) action_loss_schema="${1#*=}"; action_loss_schema_explicit="true" ;;
+    --action-continuous-group-weight=*) action_continuous_group_weight="${1#*=}"; action_continuous_group_weight_explicit="true" ;;
+    --action-discrete-group-weight=*) action_discrete_group_weight="${1#*=}"; action_discrete_group_weight_explicit="true" ;;
     --predict-arm-teleop-inactive=*) predict_arm_teleop_inactive="${1#*=}" ;;
     --predict-arm-reset=*) predict_arm_reset="${1#*=}" ;;
     --predict-ee-pose=*) predict_ee_pose="${1#*=}" ;;
@@ -407,6 +411,7 @@ while (( $# > 0 )); do
     --wandb-enable=*) wandb_enable="${1#*=}" ;;
     --resume-checkpoint=*) resume_checkpoint="${1#*=}" ;;
     --resume-with-updated-dataset=*) resume_with_updated_dataset="${1#*=}" ;;
+    --resume-with-updated-training-objective=*) resume_with_updated_training_objective="${1#*=}" ;;
     --resume-new-run-name=*) resume_new_run_name="${1#*=}" ;;
     --dry-run=*) dry_run="${1#*=}" ;;
     *)
@@ -642,6 +647,7 @@ if [[ -n "$resume_checkpoint" ]]; then
     --config_path="$resume_config"
     --resume=true
     --resume_with_updated_dataset="$resume_with_updated_dataset"
+    --resume_with_updated_training_objective="$resume_with_updated_training_objective"
   )
   if [[ -n "$resume_new_run_name" ]]; then
     if [[ "$resume_new_run_name" == */* || ! "$resume_new_run_name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
@@ -791,6 +797,11 @@ PY
   [[ "$predict_task_complete_explicit" == "false" ]] || policy_io_args+=(--policy.action_predict_task_complete="$predict_task_complete")
   [[ "$predict_task_blocked_explicit" == "false" ]] || policy_io_args+=(--policy.action_predict_task_blocked="$predict_task_blocked")
 fi
+if [[ -n "$resume_checkpoint" ]]; then
+  [[ "$action_loss_schema_explicit" == "false" ]] || policy_io_args+=(--policy.action_loss_schema="$action_loss_schema")
+  [[ "$action_continuous_group_weight_explicit" == "false" ]] || policy_io_args+=(--policy.action_continuous_group_weight="$action_continuous_group_weight")
+  [[ "$action_discrete_group_weight_explicit" == "false" ]] || policy_io_args+=(--policy.action_discrete_group_weight="$action_discrete_group_weight")
+fi
 
 policy_mem_args=()
 if [[ "$enable_mem" == "true" && -z "$resume_checkpoint" ]]; then
@@ -866,6 +877,14 @@ if [[ -z "$resume_checkpoint" ]]; then
     fi
   fi
 else
+  # A checkpoint stores the concrete train split in dataset.episodes. When the
+  # semantic sidecar changes, that old split may contain episodes which are no
+  # longer valid. Unless the caller explicitly supplies a replacement list,
+  # clear it so the updated sidecar and the original seed/eval_split rebuild a
+  # valid split deterministically.
+  if [[ "$resume_with_updated_dataset" == "true" && "$dataset_episodes_explicit" == "false" ]]; then
+    dataset_args+=(--dataset.episodes=null)
+  fi
   [[ "$dataset_repo_id_explicit" == "false" ]] || dataset_args+=(--dataset.repo_id="$dataset_repo_id")
   [[ "$dataset_root_explicit" == "false" ]] || dataset_args+=(--dataset.root="$dataset_root")
   [[ "$image_source_explicit" == "false" ]] || dataset_args+=(--dataset.image_source="$image_source")

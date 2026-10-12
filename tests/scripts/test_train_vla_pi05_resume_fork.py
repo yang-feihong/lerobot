@@ -197,3 +197,38 @@ def test_resume_restores_semantic_sampling_and_can_explicitly_replace_it(tmp_pat
     assert json.loads(replaced_flags["--dataset.semantic_phases"]) == ["approach"]
     assert json.loads(replaced_flags["--dataset.semantic_phase_weights"]) == {"approach": 1.0}
     assert json.loads(replaced_flags["--dataset.semantic_source_weights"]) == {}
+
+
+def test_resume_can_explicitly_update_dataset_split_and_training_loss(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "old_run/checkpoints/030000"
+    pretrained = checkpoint / "pretrained_model"
+    pretrained.mkdir(parents=True)
+    (pretrained / "train_config.json").write_text(
+        json.dumps({"policy": {"action_loss_schema": "group_balanced"}})
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT),
+            "--dry-run=true",
+            f"--resume-checkpoint={checkpoint}",
+            "--resume-with-updated-dataset=true",
+            "--resume-with-updated-training-objective=true",
+            "--action-loss-schema=group_balanced_v2",
+            "--action-continuous-group-weight=3.0",
+            "--action-discrete-group-weight=1.0",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    flags = dict(arg.split("=", 1) for arg in shlex.split(result.stdout) if arg.startswith("--"))
+    assert flags["--resume_with_updated_dataset"] == "true"
+    assert flags["--resume_with_updated_training_objective"] == "true"
+    assert flags["--dataset.episodes"] == "null"
+    assert flags["--policy.action_loss_schema"] == "group_balanced_v2"
+    assert flags["--policy.action_continuous_group_weight"] == "3.0"
+    assert flags["--policy.action_discrete_group_weight"] == "1.0"

@@ -25,17 +25,19 @@ required=(
   ALL_SCENES_EPISODES ALL_SCENES_VIDEOS ALL_SCENES_INFO_SHA256
   ALL_SCENES_SEMANTIC_SHA256 ALL_SCENES_BOUNDARIES_SHA256
   CLUSTER_F_SSH_HOST CLUSTER_F_DATA_ROOT CLUSTER_F_SOURCE_ROOT CLUSTER_F_GPU_COUNT CLUSTER_F_CONTAINER_USER
+  CLUSTER_WB1_SSH_HOST CLUSTER_WB1_DATA_ROOT CLUSTER_WB1_SOURCE_ROOT CLUSTER_WB1_GPU_COUNT CLUSTER_WB1_CONTAINER_USER
   CLUSTER_WB2_SSH_HOST CLUSTER_WB2_DATA_ROOT CLUSTER_WB2_SOURCE_ROOT CLUSTER_WB2_GPU_COUNT CLUSTER_WB2_CONTAINER_USER
   CLUSTER_WB3_SSH_HOST CLUSTER_WB3_DATA_ROOT CLUSTER_WB3_SOURCE_ROOT CLUSTER_WB3_GPU_COUNT CLUSTER_WB3_CONTAINER_USER
   CLUSTER_WB4_SSH_HOST CLUSTER_WB4_DATA_ROOT CLUSTER_WB4_SOURCE_ROOT CLUSTER_WB4_GPU_COUNT CLUSTER_WB4_CONTAINER_USER
   CLUSTER_WB5_SSH_HOST CLUSTER_WB5_DATA_ROOT CLUSTER_WB5_SOURCE_ROOT CLUSTER_WB5_GPU_COUNT CLUSTER_WB5_CONTAINER_USER
+  CLUSTER_WB6_SSH_HOST CLUSTER_WB6_DATA_ROOT CLUSTER_WB6_SOURCE_ROOT CLUSTER_WB6_GPU_COUNT CLUSTER_WB6_CONTAINER_USER
 )
 for name in "${required[@]}"; do
   [[ -n "${!name:-}" ]] || { echo "Missing ${name} in ${env_file}" >&2; exit 2; }
 done
 [[ -f "${CLUSTER_SSH_CONFIG}" ]] || { echo "Missing SSH config: ${CLUSTER_SSH_CONFIG}" >&2; exit 1; }
 
-nodes=(f wb2 wb3 wb4 wb5)
+nodes=(f wb1 wb2 wb3 wb4 wb5 wb6)
 semantic_plan_args=(
   python3 "${plan_dir}/semantic_plan.py"
   --presets "${plan_dir}/semantic_training_presets.json"
@@ -55,7 +57,17 @@ node_profile() {
       gpu_count="${CLUSTER_F_GPU_COUNT}"
       container_user="${CLUSTER_F_CONTAINER_USER}"
       ;;
-    wb2|wb3|wb4|wb5)
+    wb6)
+      ssh_host="${CLUSTER_WB6_SSH_HOST}"
+      host_data="${CLUSTER_WB6_DATA_ROOT}"
+      host_source="${CLUSTER_WB6_SOURCE_ROOT}"
+      image="${CLUSTER_F_IMAGE}"
+      image_id="${CLUSTER_F_IMAGE_ID}"
+      image_archive="${CLUSTER_F_IMAGE_ARCHIVE}"
+      gpu_count="${CLUSTER_WB6_GPU_COUNT}"
+      container_user="${CLUSTER_WB6_CONTAINER_USER}"
+      ;;
+    wb1|wb2|wb3|wb4|wb5)
       local prefix="CLUSTER_${node^^}"
       local ssh_var="${prefix}_SSH_HOST" data_var="${prefix}_DATA_ROOT"
       local source_var="${prefix}_SOURCE_ROOT" gpu_var="${prefix}_GPU_COUNT"
@@ -176,15 +188,17 @@ usage() {
   cat <<'EOF'
 Usage:
   training_plan/cluster.sh describe
-  training_plan/cluster.sh check [all|f|wb2|wb3|wb4|wb5]
-  training_plan/cluster.sh sync-code [all|f|wb2|wb3|wb4|wb5]
-  training_plan/cluster.sh prepare [all|f|wb2|wb3|wb4|wb5]
-  training_plan/cluster.sh dry-run-plan [all|f|wb2|wb3|wb4|wb5]
+  training_plan/cluster.sh check [all|f|wb1|wb2|wb3|wb4|wb5|wb6]
+  training_plan/cluster.sh sync-code [all|f|wb1|wb2|wb3|wb4|wb5|wb6]
+  training_plan/cluster.sh prepare [all|f|wb1|wb2|wb3|wb4|wb5|wb6]
+  training_plan/cluster.sh dry-run-plan [all|f|wb1|wb2|wb3|wb4|wb5|wb6]
   training_plan/cluster.sh dry-run-task TASK_ID
   training_plan/cluster.sh resume-dry-run-plan
-  training_plan/cluster.sh start-plan [all|f|wb2|wb3|wb4|wb5]
+  training_plan/cluster.sh resume-dry-run-task TASK_ID
+  training_plan/cluster.sh start-plan [all|f|wb1|wb2|wb3|wb4|wb5|wb6]
   training_plan/cluster.sh start-task TASK_ID
   training_plan/cluster.sh resume-plan
+  training_plan/cluster.sh resume-task TASK_ID
   training_plan/cluster.sh status
   training_plan/cluster.sh archive-f-checkpoints
 
@@ -412,6 +426,32 @@ task_container_name() {
   printf '%s-%s\n' "${CLUSTER_CONTAINER_NAME}" "$2"
 }
 
+prepare_resume_io() {
+  local node="$1" checkpoint="$2"
+  local checkpoint_rel host_checkpoint host_run container_run probe_script probe_q
+  node_profile "${node}"
+  [[ "${checkpoint}" == /data/models/trained/pi05/*/checkpoints/[0-9]* ]] || {
+    echo "${node}: refusing to prepare unexpected resume path: ${checkpoint}" >&2
+    return 1
+  }
+  checkpoint_rel="${checkpoint#/data/}"
+  host_checkpoint="${host_data}/${checkpoint_rel}"
+  host_run="${host_checkpoint%/checkpoints/*}"
+  container_run="/data/${host_run#${host_data}/}"
+
+  # Checkpoints are sometimes copied by root between training nodes, while
+  # wb2--wb5 deliberately run containers as uid 1001.  Normalize ownership
+  # only inside the exact selected run, then prove that the real container
+  # user can both read the checkpoint and write future run metadata.
+  probe_script="set -eu; test -r '${checkpoint}/training_state/training_step.json'; probe=\$(mktemp '${container_run}/.resume-write-probe.XXXXXX'); rm -f \"\${probe}\""
+  printf -v probe_q '%q' "${probe_script}"
+  ssh_node "${node}" "set -eu
+    test -d '${host_checkpoint}'
+    chown -R '${container_user}' '${host_run}'
+    docker run --rm --entrypoint bash --user '${container_user}' -v '${host_data}:/data:rw' '${image}' -lc ${probe_q}"
+  echo "${node}: resume I/O preflight OK (${container_user}, ${checkpoint})"
+}
+
 run_task_container() {
   local node="$1" task="$2" mode="$3" gpu="$4" port="$5" checkpoint="${6:-}"
   local name code command_q existing
@@ -428,6 +468,9 @@ run_task_container() {
     echo "${node}/${task}: existing stopped container ${name}; use resume-plan after preserving its logs" >&2
     return 1
   }
+  if [[ "${mode}" == resume ]]; then
+    prepare_resume_io "${node}" "${checkpoint}"
+  fi
   if [[ "${mode}" == start ]]; then
     printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" start "${task}" "${gpu}" "${port}"
   else
@@ -443,6 +486,9 @@ run_task_dry_run() {
   node_profile "${node}"
   code="$(container_code_dir)"
   dry_name="${CLUSTER_CONTAINER_NAME}-dry-run-${task}"
+  if [[ "${mode}" == resume ]]; then
+    prepare_resume_io "${node}" "${checkpoint}"
+  fi
   if [[ "${mode}" == start ]]; then
     printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" dry-run "${task}" "${gpu}" "${port}"
   else
@@ -613,12 +659,27 @@ start_one_task() {
 }
 
 dry_run_one_task() {
-  local task="$1" node gpu port
+  local task="$1" mode="${2:-start}" node gpu port run_dir step checkpoint=""
   node="$(task_node "${task}")" || { echo "Unknown task: ${task}" >&2; return 2; }
   sync_code "${node}"
   check_node "${node}"
   read -r gpu port < <(task_resources "${task}")
-  run_task_dry_run "${node}" "${task}" start "${gpu}" "${port}" ""
+  if [[ "${mode}" == resume ]]; then
+    run_dir="$(latest_run_dir "${node}" "${task}")"
+    [[ -n "${run_dir}" ]] || { echo "${node}/${task}: no run directory" >&2; return 1; }
+    step="$(latest_complete_checkpoint "${node}" "${run_dir}")"
+    [[ -n "${step}" ]] || { echo "${node}/${task}: no complete checkpoint" >&2; return 1; }
+    checkpoint="/data/models/trained/pi05/$(basename "${run_dir}")/checkpoints/${step}"
+  fi
+  run_task_dry_run "${node}" "${task}" "${mode}" "${gpu}" "${port}" "${checkpoint}"
+}
+
+resume_one_task() {
+  local task="$1" node
+  node="$(task_node "${task}")" || { echo "Unknown task: ${task}" >&2; return 2; }
+  sync_code "${node}"
+  check_node "${node}"
+  resume_task "${node}" "${task}"
 }
 
 status() {
@@ -667,11 +728,13 @@ case "${1:-}" in
     while IFS= read -r node; do prepare_node "${node}"; done < <(select_nodes "${2:-all}")
     ;;
   dry-run-plan) dry_run_plan start "${2:-all}" ;;
-  dry-run-task) dry_run_one_task "${2:?TASK_ID is required}" ;;
+  dry-run-task) dry_run_one_task "${2:?TASK_ID is required}" start ;;
   resume-dry-run-plan) dry_run_plan resume ;;
+  resume-dry-run-task) dry_run_one_task "${2:?TASK_ID is required}" resume ;;
   start-plan) plan_action start "${2:-all}" ;;
   start-task) start_one_task "${2:?TASK_ID is required}" ;;
   resume-plan) plan_action resume ;;
+  resume-task) resume_one_task "${2:?TASK_ID is required}" ;;
   status) status ;;
   archive-f-checkpoints) exec bash "${plan_dir}/storage_guard.sh" archive ;;
   *) usage >&2; exit 2 ;;

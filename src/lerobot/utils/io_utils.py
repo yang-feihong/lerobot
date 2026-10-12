@@ -90,7 +90,13 @@ def write_video(video_path: str | Path, stacked_frames: list, fps: int) -> None:
             container.mux(packet)
 
 
-def deserialize_json_into_object[T: JsonLike](fpath: Path, obj: T) -> T:
+def deserialize_json_into_object[T: JsonLike](
+    fpath: Path,
+    obj: T,
+    *,
+    allow_missing_dict_keys: bool = False,
+    ignored_unknown_dict_keys: frozenset[str] = frozenset(),
+) -> T:
     """
     Loads the JSON data from `fpath` and recursively fills `obj` with the
     corresponding values (strictly matching structure and types).
@@ -112,14 +118,20 @@ def deserialize_json_into_object[T: JsonLike](fpath: Path, obj: T) -> T:
             if not isinstance(source, dict):
                 raise TypeError(f"Type mismatch: expected dict, got {type(source)}")
 
-            # Check that they have exactly the same set of keys.
-            if target.keys() != source.keys():
+            # Check that the serialized object does not contain unknown keys.  Some
+            # callers (notably optimizer resume across compatible PyTorch versions)
+            # may explicitly allow keys newly added to the runtime object to retain
+            # their current defaults.
+            missing_keys = target.keys() - source.keys()
+            unknown_keys = source.keys() - target.keys()
+            if (missing_keys and not allow_missing_dict_keys) or unknown_keys - ignored_unknown_dict_keys:
                 raise ValueError(
                     f"Dictionary keys do not match.\nExpected: {target.keys()}, got: {source.keys()}"
                 )
 
-            # Recursively update each key.
-            for k in target:
+            # Recursively update serialized keys. Runtime-only keys are preserved
+            # when ``allow_missing_dict_keys`` is enabled.
+            for k in source.keys() & target.keys():
                 target[k] = _deserialize(target[k], source[k])
 
             return target

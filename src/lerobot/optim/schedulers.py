@@ -188,6 +188,17 @@ def save_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> None:
 
 
 def load_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> LRScheduler:
-    state_dict = deserialize_json_into_object(save_dir / SCHEDULER_STATE, scheduler.state_dict())
+    state_dict = deserialize_json_into_object(
+        save_dir / SCHEDULER_STATE,
+        scheduler.state_dict(),
+        # Scheduler bookkeeping keys changed in both directions across the
+        # torch versions used by our training nodes. Preserve freshly
+        # constructed runtime defaults when the checkpoint lacks one.
+        allow_missing_dict_keys=True,
+        # ``verbose`` is diagnostic-only; ``_is_initial`` is constructor-time
+        # bookkeeping. Neither affects the resumed LR after ``last_epoch``,
+        # ``_step_count`` and ``_last_lr`` have been restored.
+        ignored_unknown_dict_keys=frozenset({"verbose", "_is_initial"}),
+    )
     scheduler.load_state_dict(state_dict)
     return scheduler

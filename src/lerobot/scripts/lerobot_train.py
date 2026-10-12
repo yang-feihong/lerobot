@@ -25,6 +25,7 @@ import logging
 import sys
 import time
 from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
@@ -1107,7 +1108,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     require_package("accelerate", extra="training")
     from accelerate import Accelerator
-    from accelerate.utils import DistributedDataParallelKwargs, DistributedType
+    from accelerate.utils import DistributedDataParallelKwargs, DistributedType, InitProcessGroupKwargs
 
     cfg.validate()
 
@@ -1163,6 +1164,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        # Computing exact transformed-action statistics is intentionally done on rank 0 only.
+        # Large semantic mixtures can take longer than torch.distributed's 10-minute default,
+        # while the remaining ranks wait at the following barrier.  Keep that legitimate
+        # preprocessing phase from being mistaken for a deadlocked collective.
+        process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=2))
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when the active config's device is set to CPU (works for both policy and reward model training).
         force_cpu = cfg.trainable_config.device == "cpu"
@@ -1172,7 +1178,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
             mixed_precision=mixed_precision,
-            kwargs_handlers=[ddp_kwargs],
+            kwargs_handlers=[ddp_kwargs, process_group_kwargs],
             cpu=force_cpu,
         )
 

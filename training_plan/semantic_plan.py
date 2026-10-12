@@ -16,7 +16,7 @@ VALID_MEMORY_MODES = {"standard", "mem_vit", "full_mem"}
 VALID_STATUSES = {"active", "complete", "blocked"}
 VALID_ACTION_SUPERVISION = {"demonstrated", "hold"}
 VALID_COMPLETION_BOUNDARIES = {"none", "state_end"}
-VALID_NODES = {"f", "wb2", "wb3", "wb4", "wb5"}
+VALID_NODES = {"f", "wb1", "wb2", "wb3", "wb4", "wb5", "wb6"}
 
 
 def _load_json(path: Path) -> dict[str, Any]:

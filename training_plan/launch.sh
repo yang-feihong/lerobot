@@ -278,7 +278,11 @@ PY
       --gpu-id="${gpu_id}"
       --main-process-port="${port}"
       --resume-checkpoint="${checkpoint}"
-      --resume-with-updated-dataset=false
+      --resume-with-updated-dataset=true
+      --resume-with-updated-training-objective=true
+      --action-loss-schema="${ACTION_LOSS_SCHEMA}"
+      --action-continuous-group-weight="${ACTION_CONTINUOUS_GROUP_WEIGHT}"
+      --action-discrete-group-weight="${ACTION_DISCRETE_GROUP_WEIGHT}"
     )
     if [[ "${command}" == resume-dry-run ]]; then
       resume_args+=(--dry-run=true)

@@ -115,6 +115,10 @@ bash training_plan/cluster.sh start-plan
 bash training_plan/cluster.sh resume-dry-run-plan
 bash training_plan/cluster.sh resume-plan
 
+# 只验收并恢复一个任务；用于不同任务独立到达迁移点的场景。
+bash training_plan/cluster.sh resume-dry-run-task TASK_ID
+bash training_plan/cluster.sh resume-task TASK_ID
+
 # 前台检查训练进程、日志错误、checkpoint 和磁盘空间
 bash training_plan/cluster.sh status
 ```

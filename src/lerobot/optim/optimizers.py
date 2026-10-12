@@ -359,7 +359,15 @@ def _load_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Pat
 
     if "param_groups" in current_state_dict:
         param_groups = deserialize_json_into_object(
-            save_dir / OPTIMIZER_PARAM_GROUPS, current_state_dict["param_groups"]
+            save_dir / OPTIMIZER_PARAM_GROUPS,
+            current_state_dict["param_groups"],
+            allow_missing_dict_keys=True,
+            # torch 2.9 serializes this explicit Adam option, whereas older
+            # torch AdamW runtimes encode the same behavior in the optimizer
+            # class and omit the param-group key.  Dropping a saved ``True``
+            # value is therefore a representation compatibility conversion,
+            # not a change to the optimization algorithm.
+            ignored_unknown_dict_keys=frozenset({"decoupled_weight_decay"}),
         )
         loaded_state_dict["param_groups"] = param_groups
 

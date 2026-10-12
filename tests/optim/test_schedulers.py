@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+
 import pytest
 import torch
 from packaging.version import Version
@@ -106,3 +108,46 @@ def test_save_load_scheduler_state(scheduler, tmp_path):
     loaded_scheduler = load_scheduler_state(scheduler, tmp_path)
 
     assert scheduler.state_dict() == loaded_scheduler.state_dict()
+
+
+def test_load_scheduler_state_ignores_removed_verbose_key(scheduler, tmp_path):
+    """PyTorch <2.8 checkpoints may contain the now-removed diagnostic-only ``verbose`` key."""
+    save_scheduler_state(scheduler, tmp_path)
+    state_path = tmp_path / SCHEDULER_STATE
+    saved_state = json.loads(state_path.read_text())
+    saved_state["verbose"] = False
+    saved_state.pop("_is_initial", None)
+    state_path.write_text(json.dumps(saved_state))
+
+    loaded_scheduler = load_scheduler_state(scheduler, tmp_path)
+
+    assert loaded_scheduler.state_dict() == scheduler.state_dict()
+
+
+def test_load_scheduler_state_ignores_newer_is_initial_key(scheduler, tmp_path):
+    """A newer checkpoint can resume on a runtime that still exposes ``verbose`` instead."""
+    save_scheduler_state(scheduler, tmp_path)
+    state_path = tmp_path / SCHEDULER_STATE
+    saved_state = json.loads(state_path.read_text())
+    saved_state["_is_initial"] = False
+    saved_state.pop("verbose", None)
+    state_path.write_text(json.dumps(saved_state))
+
+    class LegacySchedulerState:
+        def __init__(self, state):
+            self.state = dict(state)
+            self.state.pop("_is_initial", None)
+            self.state["verbose"] = False
+
+        def state_dict(self):
+            return dict(self.state)
+
+        def load_state_dict(self, state):
+            self.state = state
+
+    legacy_scheduler = LegacySchedulerState(scheduler.state_dict())
+    loaded_scheduler = load_scheduler_state(legacy_scheduler, tmp_path)
+
+    assert "_is_initial" not in loaded_scheduler.state_dict()
+    assert loaded_scheduler.state_dict()["verbose"] is False
+    assert loaded_scheduler.state_dict()["last_epoch"] == saved_state["last_epoch"]

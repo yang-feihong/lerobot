@@ -1,9 +1,24 @@
 from copy import deepcopy
 
 from lerobot.configs.train import (
+    is_training_loss_metadata_update,
     is_task_complete_deployment_metadata_extension,
     is_task_status_deployment_metadata_extension,
 )
+
+
+def test_training_loss_metadata_update_only_allows_flow_loss_schema() -> None:
+    saved = {
+        "policy": {"type": "pi05"},
+        "action": {"flow_loss_schema": "group_balanced", "model_names": ["b2_vx"]},
+    }
+    current = deepcopy(saved)
+    current["action"]["flow_loss_schema"] = "group_balanced_v2"
+    assert is_training_loss_metadata_update(saved, current)
+
+    changed_io = deepcopy(current)
+    changed_io["action"]["model_names"].append("task_complete")
+    assert not is_training_loss_metadata_update(saved, changed_io)
 
 
 def test_task_complete_metadata_extension_only_allows_appended_completion() -> None:
