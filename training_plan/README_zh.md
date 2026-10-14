@@ -85,14 +85,13 @@ sidecar，要求所选状态每一帧恰好对应一个矩阵允许的语言关�
 bash training_plan/launch.sh describe staff1_stage1_full_mem
 ```
 
-当前6路计划直接配置三条关系：`approach × goal_approach`、
+当前任务计划直接配置三条关系：`approach × goal_approach`、
 `handle_press × goal_open`、`traversal × goal_enter`。即使这些语言视图在不同 episode
 的 sidecar 中来自不同历史分类，训练选择也只取决于这里明示的状态—指令关系。
 
-其中四个4卡任务使用 Staff1 统一数据集和完整 MEM 输入：Stage1、Stage2、Stage3
-单模型，以及三阶段分阶段联合模型。另外两个2卡任务使用所有场景统一数据集和完整
-MEM 输入，分别训练 Stage1 与 Stage2。入口按任务的 `gpu_ids` 数量自动计算梯度累积，
-六个任务保持相同的全局 batch size。Staff1 统一数据集同时包含完整 Staff1 episode 与
+每个任务可在 `training_jobs.json` 里通过 `train_steps` 独立指定训练终点；省略时才使用
+`.env` 的共享默认值。入口按任务的 `gpu_ids` 数量自动计算梯度累积，不同 GPU 数量的
+任务仍保持相同的全局 batch size。Staff1 统一数据集同时包含完整 Staff1 episode 与
 单独采集的 Stage2 episode。
 
 ## 一键流程

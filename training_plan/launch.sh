@@ -61,7 +61,7 @@ mapfile -t semantic_task_spec < <(
   python3 "${plan_dir}/semantic_plan.py" \
     --presets "${semantic_presets_file}" --jobs "${training_jobs_file}" resolve "${task_id}"
 )
-[[ "${#semantic_task_spec[@]}" -eq 8 ]] || {
+[[ "${#semantic_task_spec[@]}" -eq 9 ]] || {
   echo "Failed to resolve semantic task ${task_id} from ${training_jobs_file}" >&2
   exit 2
 }
@@ -73,6 +73,8 @@ semantic_state_instruction_matrix="${semantic_task_spec[4]}"
 configured_node="${semantic_task_spec[5]}"
 configured_gpu_ids="${semantic_task_spec[6]}"
 configured_port="${semantic_task_spec[7]}"
+task_train_steps="${semantic_task_spec[8]}"
+effective_train_steps="${task_train_steps:-${TRAIN_STEPS}}"
 semantic_source_weights='{}'
 
 if [[ "${dataset_family}" == staff1 ]]; then
@@ -151,7 +153,7 @@ common_args=(
   --mem-vit-sha256="${MEM_VIT_SHA256}"
   --policy-tokenizer-artifact-id="${POLICY_TOKENIZER_ARTIFACT_ID}"
   --policy-tokenizer-sha256="${POLICY_TOKENIZER_SHA256}"
-  --steps="${TRAIN_STEPS}"
+  --steps="${effective_train_steps}"
   --batch-size-per-gpu="${BATCH_SIZE_PER_GPU}"
   --global-batch-size="${GLOBAL_BATCH_SIZE}"
   --eval-steps="${EVAL_STEPS}"
@@ -177,9 +179,9 @@ common_args=(
 )
 
 describe() {
-  printf 'task_id=%s\ndataset=%s\nmemory=%s\nnode=%s\narm_mode=true\ntask_complete=%s\ntask_blocked=%s\ngpus=%s\n' \
+  printf 'task_id=%s\ndataset=%s\nmemory=%s\nnode=%s\ntrain_steps=%s\narm_mode=true\ntask_complete=%s\ntask_blocked=%s\ngpus=%s\n' \
     "${task_id}" "${dataset_root}" "${memory_mode}" \
-    "${configured_node}" "${PREDICT_TASK_COMPLETE}" "${PREDICT_TASK_BLOCKED}" "${gpu_id}"
+    "${configured_node}" "${effective_train_steps}" "${PREDICT_TASK_COMPLETE}" "${PREDICT_TASK_BLOCKED}" "${gpu_id}"
   semantic_describe_args=(
     --presets "${semantic_presets_file}" --jobs "${training_jobs_file}" describe "${task_id}"
   )
@@ -250,12 +252,25 @@ expected_phases = json.loads(sys.argv[3])
 expected_phase_weights = json.loads(sys.argv[4])
 expected_state_instruction_matrix = json.loads(sys.argv[5])
 expected_encoding = "continuous" if sys.argv[6] == "full_mem" else "text"
+saved_matrix = dataset.get("semantic_state_instruction_matrix", {})
+
+
+def matrix_topology(matrix):
+    return {
+        state: sorted(instructions)
+        for state, instructions in matrix.items()
+    } if isinstance(matrix, dict) else None
+
+
 expected = {
     "wandb.run_id": isinstance(run_id, str) and bool(run_id.strip()),
     "dataset.root": dataset.get("root") == sys.argv[2],
     "dataset.semantic_phases": dataset.get("semantic_phases") == expected_phases,
     "dataset.semantic_phase_weights": dataset.get("semantic_phase_weights") == expected_phase_weights,
-    "dataset.semantic_state_instruction_matrix": dataset.get("semantic_state_instruction_matrix") == expected_state_instruction_matrix,
+    # An explicit updated-training-objective resume may change relation details
+    # such as state_end -> goal_end, but it must remain the same state/intent task.
+    "dataset.semantic_state_instruction_matrix topology": matrix_topology(saved_matrix)
+    == matrix_topology(expected_state_instruction_matrix),
     "policy.state_action_encoding": policy.get("state_action_encoding") == expected_encoding,
     "policy.b2_action_representation": policy.get("b2_action_representation") == sys.argv[7],
     "policy.z1_action_representation": policy.get("z1_action_representation") == sys.argv[8],
@@ -280,6 +295,14 @@ PY
       --resume-checkpoint="${checkpoint}"
       --resume-with-updated-dataset=true
       --resume-with-updated-training-objective=true
+      --steps="${effective_train_steps}"
+      --dataset-root="${dataset_root}"
+      --semantic-views-path="${semantic_views_path}"
+      --semantic-state-instruction-matrix="${semantic_state_instruction_matrix}"
+      --semantic-phases="${semantic_phases}"
+      --semantic-phase-weights="${semantic_phase_weights}"
+      --semantic-source-weights="${semantic_source_weights}"
+      --random-semantic-view=true
       --action-loss-schema="${ACTION_LOSS_SCHEMA}"
       --action-continuous-group-weight="${ACTION_CONTINUOUS_GROUP_WEIGHT}"
       --action-discrete-group-weight="${ACTION_DISCRETE_GROUP_WEIGHT}"

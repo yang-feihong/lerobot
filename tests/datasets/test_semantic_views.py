@@ -338,6 +338,48 @@ def test_state_instruction_matrix_selects_exact_relation_not_view_kind(tmp_path)
     assert batch[ACTION][0, :, 15].tolist() == [0.0, 0.0, 0.0, 1.0]
 
 
+def test_goal_end_relation_accepts_completion_inside_state_and_holds_completed_chunk(tmp_path):
+    catalog = _catalog(
+        tmp_path,
+        [
+            {
+                "intent_id": "pass",
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "frame_start": 0,
+                "frame_stop": 10,
+                "completion_frame": 6,
+            }
+        ],
+    )
+    catalog = replace(
+        catalog,
+        segments={0: (SemanticSegment("handle_press", 0, 10, "independent_stage2"),)},
+    )
+    matrix = {
+        "handle_press": {
+            "pass": {
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "completion_boundary": "goal_end",
+            }
+        }
+    }
+    batch = _batch()
+    batch["frame_index"] = torch.tensor([7])
+    batch[ACTION][0, :, :3] = 0.4
+    apply_semantic_views_to_batch(
+        batch,
+        catalog,
+        step=0,
+        seed=0,
+        randomize=False,
+        state_instruction_matrix=matrix,
+    )
+    assert batch[ACTION][0, :, 15].tolist() == [1.0, 1.0, 1.0, 1.0]
+    assert torch.equal(batch[ACTION][0, :, :3], torch.zeros_like(batch[ACTION][0, :, :3]))
+
+
 def test_status_priors_include_active_view_completion_suffix(tmp_path):
     catalog = _catalog(
         tmp_path,

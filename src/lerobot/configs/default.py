@@ -129,7 +129,7 @@ class DatasetConfig:
                     raise ValueError("semantic instruction relation has an invalid status")
                 if relation["action_supervision"] not in {"demonstrated", "hold"}:
                     raise ValueError("semantic instruction relation has invalid action_supervision")
-                if relation["completion_boundary"] not in {"none", "state_end"}:
+                if relation["completion_boundary"] not in {"none", "state_end", "goal_end"}:
                     raise ValueError("semantic instruction relation has invalid completion_boundary")
         if self.semantic_phase_weights and set(self.semantic_phase_weights) != set(
             self.semantic_phases

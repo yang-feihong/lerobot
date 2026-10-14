@@ -6,6 +6,7 @@ import torch
 
 from lerobot.datasets.factory import resolve_delta_timestamps, resolve_random_history_sampling
 from lerobot.datasets.temporal_history import RandomHistorySamplingConfig
+from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 from lerobot.policies.pi05.processor_pi05 import (
     OBS_ACTION_HISTORY,
     Pi05SplitActionHistoryProcessorStep,
@@ -130,6 +131,53 @@ def test_action_history_split_keeps_target_and_padding_independent():
     complementary = result[TransitionKey.COMPLEMENTARY_DATA]
     assert torch.equal(complementary[f"{OBS_ACTION_HISTORY}_is_pad"], combined_pad[:, :12])
     assert torch.equal(complementary[f"{ACTION}_is_pad"], combined_pad[:, 12:])
+
+
+def test_deployment_memory_plans_preserve_fixed_shapes_while_masking_startup_padding():
+    policy = PI05Policy.__new__(PI05Policy)
+    policy.config = SimpleNamespace(
+        mem_vit_enabled=True,
+        mem_vit_num_frames=6,
+        mem_vit_min_num_frames=None,
+        image_features={"observation.images.base": object()},
+    )
+    image_key = "observation.images.base"
+    image_pad = torch.tensor([[True, True, True, True, True, False]])
+    batch = {
+        image_key: torch.zeros(1, 6, 3, 8, 8),
+        f"{image_key}_is_pad": image_pad,
+        OBS_STATE: torch.zeros(1, 13, 4),
+        f"{OBS_STATE}_is_pad": torch.tensor([[True] * 12 + [False]]),
+        OBS_ACTION_HISTORY: torch.zeros(1, 12, 3),
+        f"{OBS_ACTION_HISTORY}_is_pad": torch.ones(1, 12, dtype=torch.bool),
+    }
+
+    image_window, image_lengths, image_mask = policy._mem_vit_window_plan(
+        batch, randomize=False, preserve_input_window=True
+    )
+    state_window, state_lengths, state_mask = policy._fixed_memory_window_plan(
+        batch,
+        key=OBS_STATE,
+        max_frames=13,
+        preserve_input_window=True,
+    )
+    action_window, action_lengths, action_mask = policy._fixed_memory_window_plan(
+        batch,
+        key=OBS_ACTION_HISTORY,
+        max_frames=12,
+        allow_empty=True,
+        preserve_input_window=True,
+    )
+
+    assert image_window == 6
+    assert image_lengths.tolist() == [1]
+    assert image_mask.tolist() == [[False, False, False, False, False, True]]
+    assert state_window == 13
+    assert state_lengths.tolist() == [1]
+    assert state_mask.tolist() == [[False] * 12 + [True]]
+    assert action_window == 12
+    assert action_lengths.tolist() == [0]
+    assert action_mask.tolist() == [[False] * 12]
 
 
 def test_continuous_state_and_action_history_do_not_require_mem_vit():

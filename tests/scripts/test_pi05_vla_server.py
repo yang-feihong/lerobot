@@ -30,6 +30,7 @@ from lerobot.scripts.pi05_vla_server import (
     PROTOCOL_VERSION,
     ActionRecord,
     AsyncRTCPolicy,
+    ImagePacket,
     MemoryObservation,
     SE2TrajectoryController,
     _apply_completion_stop,
@@ -44,11 +45,83 @@ from lerobot.scripts.pi05_vla_server import (
     _smooth_b2_execution_velocity,
     _to_execution_actions,
     decode_observation_packet,
+    decode_image_packet,
     encode_action_packet,
     execution_action_names,
 )
 
 EXECUTION_ACTION_NAMES = execution_action_names("ee_delta")
+
+
+def _image_packet(capture_ns: int) -> ImagePacket:
+    encoded = np.asarray([1, 2, 3], dtype=np.uint8)
+    return ImagePacket(
+        base_jpeg=encoded,
+        wrist_jpeg=encoded,
+        base_capture_ns=capture_ns,
+        wrist_capture_ns=capture_ns,
+        capture_ns=capture_ns,
+        encoded_ns=capture_ns,
+        server_received_ns=capture_ns,
+        sim_step=None,
+    )
+
+
+def test_image_history_uses_true_half_second_camera_timestamps() -> None:
+    # The deployment camera clock is 4 Hz with small timestamp jitter,
+    # independent of any inference/chunk schedule. A 0.5 s MEM interval is
+    # therefore every other camera frame.
+    start = 10_000_000_000
+    captures = [start + index * 250_000_000 + (index % 3 - 1) * 5_000_000 for index in range(20)]
+    history = tuple(_image_packet(value) for value in captures)
+    current = captures[-1]
+
+    records, is_pad = AsyncRTCPolicy._sample_image_records(
+        history,
+        current,
+        current_step=99,
+        count=6,
+        interval_ns=500_000_000,
+        stride=25,
+    )
+
+    assert not bool(is_pad.any())
+    selected = np.asarray([record.capture_ns for record in records])
+    intervals = np.diff(selected) / 1e9
+    np.testing.assert_allclose(intervals, np.full(5, 0.5), atol=0.015)
+    assert len(set(selected.tolist())) == 6
+
+
+def test_image_history_pads_only_before_session_history() -> None:
+    history = tuple(_image_packet(1_000_000_000 + index * 100_000_000) for index in range(11))
+    records, is_pad = AsyncRTCPolicy._sample_image_records(
+        history,
+        2_000_000_000,
+        current_step=50,
+        count=6,
+        interval_ns=500_000_000,
+        stride=25,
+    )
+    assert is_pad.tolist() == [[True, True, True, False, False, False]]
+    assert records[-1].capture_ns == 2_000_000_000
+
+
+def test_image_stream_packet_round_trip() -> None:
+    ok, jpeg = __import__("cv2").imencode(".jpg", np.zeros((4, 4, 3), dtype=np.uint8))
+    assert ok
+    body = BytesIO()
+    np.savez(
+        body,
+        protocol_version=np.asarray(PROTOCOL_VERSION),
+        base_capture_ns=np.asarray(123_000_000),
+        wrist_capture_ns=np.asarray(124_000_000),
+        encoded_ns=np.asarray(125_000_000),
+        base_jpeg=jpeg,
+        wrist_jpeg=jpeg,
+    )
+    packet = decode_image_packet(body.getvalue())
+    assert packet.capture_ns == 124_000_000
+    np.testing.assert_array_equal(packet.base_jpeg, jpeg)
 
 
 def test_start_runs_compile_warmup_on_the_inference_worker() -> None:
@@ -199,6 +272,23 @@ def test_checkpoint_hot_swap_signature_ignores_training_only_fields(tmp_path) ->
                 "mem_vit_local_interval_std_seconds": 0.05,
                 "mem_vit_min_interval_seconds": 0.25,
                 "mem_vit_max_interval_seconds": 1.0,
+                "semantic_state_instruction_matrix": {
+                    "approach": {
+                        "goal_approach": {
+                            "status": "active",
+                            "action_supervision": "demonstrated",
+                            "completion_boundary": "goal_end",
+                        }
+                    }
+                },
+                "semantic_view_kind_weights": {"active": 1.0},
+                "semantic_view_manifest_sha256": "first-manifest",
+                "semantic_view_manifest_version": 1,
+                "task_complete_sample_tail_seconds": 2.0,
+                "action_loss_schema": "group_balanced_v2",
+                "action_continuous_group_weight": 3.0,
+                "action_discrete_group_weight": 1.0,
+                "optimizer_lr": 2.5e-5,
             }
         )
     )
@@ -207,6 +297,37 @@ def test_checkpoint_hot_swap_signature_ignores_training_only_fields(tmp_path) ->
             {
                 "architecture": "pi05",
                 "action_bool_true_fractions": {"arm_reset": 0.25},
+                "semantic_state_instruction_matrix": {
+                    "approach": {
+                        "goal_approach": {
+                            "status": "active",
+                            "action_supervision": "demonstrated",
+                            "completion_boundary": "goal_end",
+                        }
+                    },
+                    "handle_press": {
+                        "goal_open": {
+                            "status": "active",
+                            "action_supervision": "demonstrated",
+                            "completion_boundary": "goal_end",
+                        }
+                    },
+                    "traversal": {
+                        "goal_enter": {
+                            "status": "active",
+                            "action_supervision": "demonstrated",
+                            "completion_boundary": "goal_end",
+                        }
+                    },
+                },
+                "semantic_view_kind_weights": {"active": 0.5, "complete": 0.5},
+                "semantic_view_manifest_sha256": "second-manifest",
+                "semantic_view_manifest_version": 2,
+                "task_complete_sample_tail_seconds": 4.0,
+                "action_loss_schema": "uniform_valid",
+                "action_continuous_group_weight": 1.0,
+                "action_discrete_group_weight": 1.0,
+                "optimizer_lr": 1e-5,
             }
         )
     )
@@ -216,6 +337,20 @@ def test_checkpoint_hot_swap_signature_ignores_training_only_fields(tmp_path) ->
         (first / name).write_text(json.dumps(document))
 
     assert _checkpoint_hot_swap_signature(first) == _checkpoint_hot_swap_signature(second)
+
+    # A real inference-structure change must still force a full reload.
+    second_config = json.loads((second / "config.json").read_text())
+    second_config["action_feature_names"] = ["b2_delta_x", "task_complete"]
+    (second / "config.json").write_text(json.dumps(second_config))
+    assert _checkpoint_hot_swap_signature(first) != _checkpoint_hot_swap_signature(second)
+
+    second_config.pop("action_feature_names")
+    second_config["mem_vit_num_frames"] = 5
+    first_config = json.loads((first / "config.json").read_text())
+    first_config["mem_vit_num_frames"] = 6
+    (first / "config.json").write_text(json.dumps(first_config))
+    (second / "config.json").write_text(json.dumps(second_config))
+    assert _checkpoint_hot_swap_signature(first) != _checkpoint_hot_swap_signature(second)
 
 
 def test_action_packet_contains_replayable_model_and_execution_outputs() -> None:
@@ -1097,6 +1232,27 @@ def test_chunk_scheduling_mode_switch_updates_rtc_without_reloading_policy() -> 
     assert policy.rtc_config.enabled
     with pytest.raises(ValueError, match="Unknown chunk scheduling mode"):
         policy.set_chunk_scheduling_mode("invalid")
+
+
+def test_task_complete_termination_switch_updates_worker_without_reloading_policy() -> None:
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.stop_on_model_task_complete = False
+    policy._task_complete_latched = True
+
+    enabled = policy.set_stop_on_model_task_complete(True)
+    assert enabled == {
+        "accepted": True,
+        "previous_enabled": False,
+        "stop_on_model_task_complete": True,
+    }
+    assert policy._task_complete_latched is True
+
+    disabled = policy.set_stop_on_model_task_complete(False)
+    assert disabled["accepted"] is True
+    assert policy.stop_on_model_task_complete is False
+    assert policy._task_complete_latched is False
+    with pytest.raises(ValueError, match="enabled must be a boolean"):
+        policy.set_stop_on_model_task_complete(1)
 
 
 def test_rtc_server_keeps_prefix_and_measured_delay_behavior() -> None:

@@ -304,11 +304,22 @@ def semantic_view_matches_relation(
     relation = state_instruction_matrix[state.phase].get(view.canonical_intent)
     if relation is None:
         return False
-    completion_boundary = "state_end" if view.completion_frame == state.frame_stop else "none"
+    requested_boundary = relation["completion_boundary"]
+    if requested_boundary == "none":
+        completion_matches = view.completion_frame is None
+    elif requested_boundary == "state_end":
+        completion_matches = view.completion_frame == state.frame_stop
+    elif requested_boundary == "goal_end":
+        completion_matches = (
+            view.completion_frame is not None
+            and state.frame_start < view.completion_frame <= state.frame_stop
+        )
+    else:
+        raise ValueError(f"unsupported completion boundary: {requested_boundary}")
     return (
         view.status == relation["status"]
         and view.action_supervision == relation["action_supervision"]
-        and completion_boundary == relation["completion_boundary"]
+        and completion_matches
     )
 
 
@@ -426,7 +437,12 @@ def apply_semantic_views_to_batch(
             actions[row, :, 15] = completion_mask.to(actions.dtype)
             first_complete = torch.nonzero(completion_mask, as_tuple=False)
             if len(first_complete):
-                actions[row] = _hold_action_tail(actions[row], int(first_complete[0]))
+                first_complete_index = int(first_complete[0])
+                actions[row] = (
+                    _hold_action(actions[row])
+                    if first_complete_index == 0
+                    else _hold_action_tail(actions[row], first_complete_index)
+                )
         elif view.completion_source != "recorded":
             actions[row, :, 15] = 0.0
         if view.status == "blocked":

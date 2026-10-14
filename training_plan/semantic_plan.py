@@ -15,7 +15,7 @@ VALID_DATASET_FAMILIES = {"staff1", "all_scenes"}
 VALID_MEMORY_MODES = {"standard", "mem_vit", "full_mem"}
 VALID_STATUSES = {"active", "complete", "blocked"}
 VALID_ACTION_SUPERVISION = {"demonstrated", "hold"}
-VALID_COMPLETION_BOUNDARIES = {"none", "state_end"}
+VALID_COMPLETION_BOUNDARIES = {"none", "state_end", "goal_end"}
 VALID_NODES = {"f", "wb1", "wb2", "wb3", "wb4", "wb5", "wb6"}
 
 
@@ -116,9 +116,11 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
         if not isinstance(task, dict):
             raise ValueError(f"task {task_id!r} must be an object")
         common = {"dataset_family", "memory_mode", "resources"}
+        optional = {"train_steps"}
         preset_keys = common | {"training_preset"}
         inline_keys = common | {"state_weights", "state_instruction_matrix"}
-        if frozenset(task) not in {frozenset(preset_keys), frozenset(inline_keys)}:
+        task_keys = frozenset(task)
+        if task_keys - optional not in {frozenset(preset_keys), frozenset(inline_keys)}:
             raise ValueError(
                 f"task {task_id!r} must use exactly one semantic configuration form: "
                 "training_preset, or inline state_weights plus state_instruction_matrix"
@@ -127,6 +129,10 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
             raise ValueError(f"task {task_id!r} has invalid dataset_family")
         if task["memory_mode"] not in VALID_MEMORY_MODES:
             raise ValueError(f"task {task_id!r} has invalid memory_mode")
+        if "train_steps" in task and (
+            not isinstance(task["train_steps"], int) or task["train_steps"] <= 0
+        ):
+            raise ValueError(f"task {task_id!r} train_steps must be a positive integer")
         _validate_resources(task_id, task["resources"])
         if "training_preset" in task:
             if task["training_preset"] not in presets:
@@ -222,14 +228,29 @@ def validate_sidecar(payload: dict[str, Any], task_id: str, sidecar_path: Path) 
                 definition = intents.get(intent_id)
                 if not isinstance(definition, dict):
                     raise ValueError(f"episode {episode_key} references unknown intent {intent_id!r}")
-                relation = (
+                relation_prefix = (
                     str(definition.get("canonical_intent", intent_id)),
                     str(view.get("status", "")),
                     str(view.get("action_supervision", "")),
-                    "state_end" if view.get("completion_frame") == stop else "none",
                 )
-                if relation not in allowed[state]:
+                completion_frame = view.get("completion_frame")
+                matching_relations = [
+                    relation
+                    for relation in allowed[state]
+                    if relation[:3] == relation_prefix
+                    and (
+                        (relation[3] == "none" and completion_frame is None)
+                        or (relation[3] == "state_end" and completion_frame == stop)
+                        or (
+                            relation[3] == "goal_end"
+                            and completion_frame is not None
+                            and start < int(completion_frame) <= stop
+                        )
+                    )
+                ]
+                if len(matching_relations) != 1:
                     continue
+                relation = matching_relations[0]
                 enabled.append((overlap_start, overlap_stop, relation))
                 boundaries.update((overlap_start, overlap_stop))
                 seen[state].add(relation)
@@ -277,6 +298,7 @@ def command_resolve(args: argparse.Namespace) -> None:
         resources["node"],
         ",".join(str(gpu_id) for gpu_id in resources["gpu_ids"]),
         str(resources["main_process_port"]),
+        str(task.get("train_steps", "")),
     )
     print("\n".join(values))
 

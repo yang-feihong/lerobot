@@ -724,6 +724,12 @@ def _checkpoint_hot_swap_signature(policy_path: Path) -> str:
             raise FileNotFoundError(f"Checkpoint is missing hot-swap metadata: {path}")
         documents[name] = json.loads(path.read_text(encoding="utf-8"))
     config = documents["config.json"]
+    # Only inference structure and runtime contracts belong in this signature.
+    # Dataset semantics, sampling, and optimization settings can differ between
+    # checkpoints that share the exact same deployable network (for example a
+    # Stage1-only model and a three-stage joint model).  Keeping those fields in
+    # the signature needlessly destroys the resident worker and reloads the
+    # multi-billion-parameter base model.
     for non_structural_field in (
         "pretrained_path",
         "pretrained_revision",
@@ -742,6 +748,43 @@ def _checkpoint_hot_swap_signature(policy_path: Path) -> str:
         "mem_vit_local_interval_std_seconds",
         "mem_vit_min_interval_seconds",
         "mem_vit_max_interval_seconds",
+        # Language/state relations and semantic manifests only select training
+        # samples.  The instruction itself is already a normal runtime input.
+        "semantic_state_instruction_matrix",
+        "semantic_view_kind_weights",
+        "semantic_view_manifest_sha256",
+        "semantic_view_manifest_version",
+        "task_complete_sample_tail_seconds",
+        # Loss balancing and optimization never alter inference structure.
+        "action_bool_balance_eps",
+        "action_bool_loss_weight",
+        "action_continuous_group_weight",
+        "action_continuous_loss_weight",
+        "action_discrete_group_weight",
+        "action_loss_schema",
+        "action_masked_continuous_min_weight",
+        "gradient_checkpointing",
+        "lr_scheduler_type",
+        "new_module_optimizer_lr_multiplier",
+        "optimizer_betas",
+        "optimizer_eps",
+        "optimizer_grad_clip_norm",
+        "optimizer_lr",
+        "optimizer_weight_decay",
+        "scheduler_decay_lr",
+        "scheduler_decay_steps",
+        "scheduler_warmup_steps",
+        "time_sampling_beta_alpha",
+        "time_sampling_beta_beta",
+        "time_sampling_offset",
+        "time_sampling_scale",
+        "use_amp",
+        # Repository bookkeeping is unrelated to model execution.
+        "license",
+        "private",
+        "push_to_hub",
+        "repo_id",
+        "tags",
     ):
         config.pop(non_structural_field, None)
 
@@ -757,6 +800,32 @@ def _decode_jpeg(encoded: np.ndarray, name: str) -> np.ndarray:
     if image is None:
         raise ValueError(f"Could not decode {name} JPEG")
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+
+def decode_image_packet(payload: bytes) -> ImagePacket:
+    """Decode one independently streamed semantic base/wrist camera pair."""
+    with np.load(BytesIO(payload), allow_pickle=False) as packet:
+        version = int(packet["protocol_version"].item())
+        if version != PROTOCOL_VERSION:
+            raise ValueError(f"Protocol version {version} != {PROTOCOL_VERSION}")
+        base_jpeg = np.asarray(packet["base_jpeg"], dtype=np.uint8).reshape(-1)
+        wrist_jpeg = np.asarray(packet["wrist_jpeg"], dtype=np.uint8).reshape(-1)
+        if base_jpeg.size == 0 or wrist_jpeg.size == 0:
+            raise ValueError("Image stream packet contains an empty JPEG")
+        base_capture_ns = int(packet["base_capture_ns"].item())
+        wrist_capture_ns = int(packet["wrist_capture_ns"].item())
+        if base_capture_ns <= 0 or wrist_capture_ns <= 0:
+            raise ValueError("Image stream packet has invalid capture timestamps")
+        return ImagePacket(
+            base_jpeg=base_jpeg,
+            wrist_jpeg=wrist_jpeg,
+            base_capture_ns=base_capture_ns,
+            wrist_capture_ns=wrist_capture_ns,
+            capture_ns=max(base_capture_ns, wrist_capture_ns),
+            encoded_ns=int(packet["encoded_ns"].item()) if "encoded_ns" in packet else -1,
+            server_received_ns=time.monotonic_ns(),
+            sim_step=None,
+        )
 
 
 def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> ObservationPacket:
@@ -909,6 +978,18 @@ def encode_action_packet(record: ActionRecord) -> bytes:
         sim_steps_per_wall_second=np.asarray(record.sim_steps_per_wall_second, dtype=np.float64),
     )
     return output.getvalue()
+
+
+@dataclass(frozen=True)
+class ImagePacket:
+    base_jpeg: np.ndarray
+    wrist_jpeg: np.ndarray
+    base_capture_ns: int
+    wrist_capture_ns: int
+    capture_ns: int
+    encoded_ns: int
+    server_received_ns: int
+    sim_step: int | None
 
 
 @dataclass(frozen=True)
@@ -1217,6 +1298,9 @@ class AsyncRTCPolicy:
         self.mem_image_stride = max(
             1, round(float(config.mem_vit_frame_interval_seconds or 0.0) * self.low_level_hz)
         )
+        self.mem_image_interval_ns = max(
+            1, round(float(config.mem_vit_frame_interval_seconds or 0.0) * 1e9)
+        )
         self.continuous_state_enabled = config.state_action_encoding == "continuous"
         self.state_num_frames = int(config.state_num_frames) if self.continuous_state_enabled else 1
         self.state_history_stride = max(
@@ -1241,7 +1325,9 @@ class AsyncRTCPolicy:
             (self.state_num_frames - 1) * self.state_history_stride,
         )
         self._observation_history: deque[MemoryObservation] = deque(maxlen=max_history_steps + 2)
-        self._image_history: deque[ObservationPacket] = deque(maxlen=256)
+        # Camera history is populated independently from inference requests.
+        # At the deployment 4 Hz camera clock, 512 pairs retain >2 minutes.
+        self._image_history: deque[ImagePacket] = deque(maxlen=512)
 
         self._mailbox_condition = Condition()
         self._model_lock = Lock()
@@ -1572,6 +1658,7 @@ class AsyncRTCPolicy:
         self._worker.join(timeout=5.0)
 
     def submit(self, packet: ObservationPacket) -> None:
+        executed_completion = False
         if self.stop_on_model_task_complete and packet.active_sequence >= 0 and packet.active_index > 0:
             with self._records_lock:
                 active_record = self._records.get(packet.active_sequence)
@@ -1579,15 +1666,17 @@ class AsyncRTCPolicy:
                 complete_index = active_record.action_names.index("task_complete")
                 executed_count = min(packet.active_index, len(active_record.processed))
                 if bool((active_record.processed[:executed_count, complete_index] > 0.5).any()):
-                    self._task_complete_latched = True
+                    executed_completion = True
         with self._mailbox_condition:
-            epoch_reset = self._control_epoch is not None and packet.control_epoch != self._control_epoch
+            epoch_reset = self._control_epoch != packet.control_epoch
             if epoch_reset:
                 self._task_complete_latched = False
                 self._mailbox = None
                 self._observation_history.clear()
                 self._image_history.clear()
                 self._previous_observation_clock = None
+            if executed_completion:
+                self._task_complete_latched = True
             self._control_epoch = packet.control_epoch
             if self._mailbox is not None and packet.sim_step < self._mailbox.sim_step:
                 return
@@ -1610,13 +1699,38 @@ class AsyncRTCPolicy:
             self._observation_history.extend(new_records)
             if not self._observation_history or self._observation_history[-1].sim_step != packet.sim_step:
                 raise ValueError(f"Telemetry history did not reach current step {packet.sim_step}")
-            if self._image_history and packet.sim_step <= self._image_history[-1].sim_step:
-                self._image_history.clear()
-            self._image_history.append(packet)
+            # The inference observation is also a guaranteed current camera
+            # sample. This initializes a new episode with one valid frame and
+            # keeps legacy/simulation clients functional when no independent
+            # image stream is available.
+            image_capture_ns = int(getattr(packet, "capture_finished_ns", -1))
+            if image_capture_ns <= 0:
+                image_capture_ns = int(packet.server_received_ns)
+            current_image = ImagePacket(
+                base_jpeg=packet.base_jpeg,
+                wrist_jpeg=packet.wrist_jpeg,
+                base_capture_ns=image_capture_ns,
+                wrist_capture_ns=image_capture_ns,
+                capture_ns=image_capture_ns,
+                encoded_ns=int(getattr(packet, "encoded_ns", -1)),
+                server_received_ns=packet.server_received_ns,
+                sim_step=packet.sim_step,
+            )
+            if not self._image_history or current_image.capture_ns > self._image_history[-1].capture_ns:
+                self._image_history.append(current_image)
             self._mailbox = packet
             self._mailbox_version += 1
             self._mailbox_condition.notify()
         self.recorder.observation(packet)
+
+    def submit_images(self, packet: ImagePacket) -> None:
+        """Append camera frames without triggering model inference."""
+        with self._mailbox_condition:
+            if self._image_history and packet.capture_ns <= self._image_history[-1].capture_ns:
+                # Delayed duplicate/out-of-order image packets are harmless;
+                # dropping them preserves a strictly monotonic camera clock.
+                return
+            self._image_history.append(packet)
 
     def latest_after(self, sequence: int) -> ActionRecord | None:
         with self._records_lock:
@@ -1673,6 +1787,12 @@ class AsyncRTCPolicy:
     def health(self) -> dict[str, object]:
         with self._records_lock:
             latest = self._latest_record
+        with self._mailbox_condition:
+            image_capture_ns = [record.capture_ns for record in self._image_history]
+        recent_image_intervals_s = [
+            (right - left) / 1e9
+            for left, right in zip(image_capture_ns[-9:-1], image_capture_ns[-8:])
+        ]
         return {
             "ok": self._worker.is_alive() and self._last_error is None,
             "protocol_version": PROTOCOL_VERSION,
@@ -1683,11 +1803,15 @@ class AsyncRTCPolicy:
             "latest_sequence": latest.sequence if latest else 0,
             "latest_source_step": latest.source_step if latest else -1,
             "chunk_scheduling_mode": self.chunk_scheduling_mode,
+            "stop_on_model_task_complete": self.stop_on_model_task_complete,
             "b2_execution_mode": self.b2_execution_mode,
             "rtc_mode": self.rtc_config.mode,
             "training_rtc_max_delay": self.training_rtc_max_delay,
             "last_error": self._last_error,
             "last_error_traceback": self._last_error_traceback,
+            "image_history_count": len(image_capture_ns),
+            "image_history_latest_capture_ns": image_capture_ns[-1] if image_capture_ns else None,
+            "image_history_recent_intervals_s": recent_image_intervals_s,
         }
 
     def set_chunk_scheduling_mode(self, mode: str) -> dict[str, object]:
@@ -1704,6 +1828,24 @@ class AsyncRTCPolicy:
             "previous_mode": previous,
             "chunk_scheduling_mode": mode,
             "rtc_enabled": self.rtc_config.enabled,
+        }
+
+    def set_stop_on_model_task_complete(self, enabled: bool) -> dict[str, object]:
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be a boolean")
+        previous = self.stop_on_model_task_complete
+        self.stop_on_model_task_complete = enabled
+        if not enabled:
+            self._task_complete_latched = False
+        LOG.info(
+            "Task-complete termination changed: %s -> %s",
+            previous,
+            enabled,
+        )
+        return {
+            "accepted": previous != enabled,
+            "previous_enabled": previous,
+            "stop_on_model_task_complete": enabled,
         }
 
     @staticmethod
@@ -1891,22 +2033,48 @@ class AsyncRTCPolicy:
 
     @staticmethod
     def _sample_image_records(
-        history: tuple[ObservationPacket, ...], current_step: int, *, count: int, stride: int
-    ) -> tuple[list[ObservationPacket], torch.Tensor]:
+        history: tuple[ImagePacket, ...],
+        current_capture_ns: int,
+        *,
+        current_step: int,
+        count: int,
+        interval_ns: int,
+        stride: int,
+    ) -> tuple[list[ImagePacket], torch.Tensor]:
         if not history:
             raise ValueError("Image observation memory is empty")
-        records: list[ObservationPacket] = []
+        records: list[ImagePacket] = []
         is_pad: list[bool] = []
-        first_step = history[0].sim_step
+        eligible_history = tuple(record for record in history if record.capture_ns <= current_capture_ns)
+        if not eligible_history:
+            raise ValueError("Image observation memory has no frame at or before the inference time")
+        use_capture_clock = any(record.sim_step is None for record in eligible_history)
+        first_ns = eligible_history[0].capture_ns
+        stepped_history = tuple(record for record in eligible_history if record.sim_step is not None)
         for slot in range(count):
-            target_step = current_step - (count - 1 - slot) * stride
-            if target_step < first_step:
-                records.append(history[0])
+            if not use_capture_clock:
+                target_step = current_step - (count - 1 - slot) * stride
+                first_step = int(stepped_history[0].sim_step)
+                if target_step < first_step:
+                    records.append(stepped_history[0])
+                    is_pad.append(True)
+                    continue
+                records.append(
+                    min(stepped_history, key=lambda candidate: abs(int(candidate.sim_step) - target_step))
+                )
+                is_pad.append(False)
+                continue
+            target_ns = current_capture_ns - (count - 1 - slot) * interval_ns
+            if target_ns < first_ns:
+                records.append(eligible_history[0])
                 is_pad.append(True)
                 continue
-            record = next(
-                (candidate for candidate in reversed(history) if candidate.sim_step <= target_step),
-                history[0],
+            # Select the true nearest 4 Hz camera sample. With a nominal 0.5 s
+            # interval this normally chooses every other frame; small camera
+            # scheduling jitter is retained rather than synthesized away.
+            record = min(
+                eligible_history,
+                key=lambda candidate: abs(candidate.capture_ns - target_ns),
             )
             records.append(record)
             is_pad.append(False)
@@ -1970,8 +2138,10 @@ class AsyncRTCPolicy:
 
         image_records, image_pad = self._sample_image_records(
             image_history,
-            packet.sim_step,
+            packet.capture_finished_ns,
+            current_step=packet.sim_step,
             count=self.mem_image_num_frames,
+            interval_ns=self.mem_image_interval_ns,
             stride=self.mem_image_stride,
         )
         encoded_images = {
@@ -2265,6 +2435,37 @@ class VLARequestHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, result)
             except Exception as exc:
                 LOG.warning("Rejected chunk scheduling mode: %s", exc)
+                self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        if path == "/v1/task-complete-termination":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 4096:
+                    raise ValueError(f"Invalid Content-Length: {length}")
+                request_value = json.loads(self.rfile.read(length))
+                if not isinstance(request_value.get("enabled"), bool):
+                    raise ValueError("enabled must be a boolean")
+                result = self.engine.set_stop_on_model_task_complete(
+                    request_value["enabled"]
+                )
+                self._write_json(HTTPStatus.OK, result)
+            except Exception as exc:
+                LOG.warning("Rejected task-complete termination setting: %s", exc)
+                self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        if path == "/v1/images":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > self.max_payload_bytes:
+                    raise ValueError(f"Invalid Content-Length: {length}")
+                packet = decode_image_packet(self.rfile.read(length))
+                self.engine.submit_images(packet)
+                self._write_json(
+                    HTTPStatus.ACCEPTED,
+                    {"accepted_capture_ns": packet.capture_ns},
+                )
+            except Exception as exc:
+                LOG.warning("Rejected image stream packet: %s", exc)
                 self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
         if path == "/v1/b2-control":

@@ -172,6 +172,30 @@ def test_discrete_metrics_expose_all_false_rare_event_predictions():
     assert metrics["discrete_recall/task_complete"] == 0.0
 
 
+def test_physical_discrete_metrics_use_deployment_equivalent_half_threshold():
+    names = ["arm_reset", "task_complete"]
+    expert = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+    # Small positive flow residuals are still physical false values. Treating
+    # them as true made open-loop reports disagree with deployment decoding.
+    pred = np.array([[0.1, 0.2], [0.49, 0.51]], dtype=np.float32)
+
+    physical = _compute_metrics("all", expert, pred, names)
+    normalized = _compute_metrics(
+        "all",
+        expert * 2.0 - 1.0,
+        pred * 2.0 - 1.0,
+        names,
+        discrete_threshold=0.0,
+    )
+
+    assert physical["discrete_pred_true_frac/arm_reset"] == 0.0
+    assert physical["discrete_pred_true_frac/task_complete"] == pytest.approx(0.5)
+    assert physical["discrete_recall/task_complete"] == 1.0
+    assert normalized["discrete_pred_true_frac/arm_reset"] == 0.0
+    assert normalized["discrete_pred_true_frac/task_complete"] == pytest.approx(0.5)
+    assert normalized["discrete_recall/task_complete"] == 1.0
+
+
 def test_openloop_reference_stops_after_checkpoint_unnormalization():
     normalized_supervision = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
     unnormalizer = UnnormalizerProcessorStep(

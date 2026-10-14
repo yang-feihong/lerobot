@@ -926,6 +926,7 @@ def configure_action_bool_balance(
         control_frequency_hz,
     )
     forced_semantic_holds = 0
+    semantic_completed_targets: dict[int, np.ndarray] = {}
     use_phase_multiplicity = semantic_views is not None and bool(semantic_phases)
     if use_phase_multiplicity:
         if not semantic_state_instruction_matrix:
@@ -940,6 +941,7 @@ def configure_action_bool_balance(
         episode_multiplicities = {}
         for episode_index, length in zip(episode_indices, lengths, strict=True):
             multiplicity = np.zeros(length, dtype=np.int64)
+            completed_targets = np.zeros(length, dtype=bool)
             for segment in semantic_views.segments.get(episode_index, ()):
                 if segment.phase not in semantic_phases:
                     continue
@@ -967,14 +969,16 @@ def configure_action_bool_balance(
                 if (
                     view.status != "active"
                     or view.action_supervision != "demonstrated"
-                    or view.completion_frame != segment.frame_stop
+                    or view.completion_frame is None
+                    or not segment.frame_start < view.completion_frame <= segment.frame_stop
                 ):
                     raise ValueError(
                         "Selected semantic views must supervise the demonstrated action and "
-                        "complete at the segment boundary for exact arm-mode balancing: "
+                        "complete inside the selected segment for exact arm-mode balancing: "
                         f"episode={episode_index}, phase={segment.phase}"
                     )
                 segment_length = segment.frame_stop - segment.frame_start
+                completed_targets[view.completion_frame : segment.frame_stop] = True
                 for offset in offsets:
                     offset = int(offset)
                     if offset < 0:
@@ -984,6 +988,7 @@ def configure_action_bool_balance(
                         multiplicity[first_target : segment.frame_stop] += 1
                     forced_semantic_holds += min(offset, segment_length)
             episode_multiplicities[episode_index] = multiplicity
+            semantic_completed_targets[episode_index] = completed_targets
     else:
         episode_multiplicities = {
             episode_index: action_label_multiplicity(
@@ -1029,6 +1034,27 @@ def configure_action_bool_balance(
                     target_true = actions[:, dim] < 0
                 else:
                     target_true = actions[:, dim] > 0
+                if use_phase_multiplicity and name in {
+                    "task_complete",
+                    "arm_teleop_inactive",
+                    "arm_reset",
+                }:
+                    semantically_complete = np.fromiter(
+                        (
+                            semantic_completed_targets[int(episode_index)][int(frame_index)]
+                            for episode_index, frame_index in zip(
+                                batch_episode_indices, frame_indices, strict=True
+                            )
+                        ),
+                        dtype=bool,
+                        count=len(frame_indices),
+                    )
+                    if name == "task_complete":
+                        target_true = semantically_complete
+                    elif name == "arm_teleop_inactive":
+                        target_true = target_true | semantically_complete
+                    else:
+                        target_true = target_true & ~semantically_complete
                 positive = int(label_multiplicity[target_true].sum())
                 counts[name][0] += positive
                 counts[name][1] += int(label_multiplicity.sum()) - positive
@@ -1037,6 +1063,8 @@ def configure_action_bool_balance(
                 counts["arm_teleop_inactive"][0] += forced_semantic_holds
             if "arm_reset" in counts:
                 counts["arm_reset"][1] += forced_semantic_holds
+            if "task_complete" in counts:
+                counts["task_complete"][0] += forced_semantic_holds
 
     stats: dict[str, dict[str, int | float]] = {}
     true_fractions: dict[str, float] = {}

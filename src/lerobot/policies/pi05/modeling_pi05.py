@@ -2021,7 +2021,7 @@ class PI05Policy(PreTrainedPolicy):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
     def _mem_vit_window_plan(
-        self, batch: dict[str, Tensor], *, randomize: bool
+        self, batch: dict[str, Tensor], *, randomize: bool, preserve_input_window: bool = False
     ) -> tuple[int, Tensor, Tensor]:
         if not self.config.mem_vit_enabled:
             device = next(self.parameters()).device
@@ -2053,7 +2053,16 @@ class PI05Policy(PreTrainedPolicy):
                 available_lengths = (~image_pad.to(device=device).bool()).sum(dim=1)
 
         lengths = torch.minimum(target_lengths, available_lengths).clamp_min(1)
-        window_num_frames = int(lengths.max().item())
+        # Deployment batches are already left-padded to the checkpoint's fixed
+        # history shape.  Keep that shape during inference and express startup
+        # history only through the mask.  Shrinking K=6 to K=1,2,... caused
+        # torch.compile to build a new graph on the first live observations even
+        # though model loading had reported READY after a K=6 warmup.
+        window_num_frames = (
+            int(image.shape[1])
+            if preserve_input_window and image.ndim >= 5
+            else int(lengths.max().item())
+        )
         positions = torch.arange(window_num_frames, device=device)[None, :]
         memory_mask = positions >= (window_num_frames - lengths[:, None])
         return window_num_frames, lengths, memory_mask
@@ -2065,6 +2074,7 @@ class PI05Policy(PreTrainedPolicy):
         key: str,
         max_frames: int,
         allow_empty: bool = False,
+        preserve_input_window: bool = False,
     ) -> tuple[int, Tensor, Tensor]:
         value = batch.get(key)
         if value is None:
@@ -2079,7 +2089,11 @@ class PI05Policy(PreTrainedPolicy):
                 available = (~pad.to(device=device).bool()).sum(dim=1)
         minimum = 0 if allow_empty else 1
         lengths = available.clamp(min=minimum, max=max_frames)
-        window_num_frames = max(1, int(lengths.max().item()))
+        window_num_frames = (
+            min(int(value.shape[1]), max_frames)
+            if preserve_input_window and value.ndim >= 3
+            else max(1, int(lengths.max().item()))
+        )
         positions = torch.arange(window_num_frames, device=device)[None, :]
         mask = positions >= (window_num_frames - lengths[:, None])
         return window_num_frames, lengths, mask
@@ -2886,13 +2900,14 @@ class PI05Policy(PreTrainedPolicy):
 
         # Prepare inputs
         mem_vit_window_num_frames, _mem_vit_lengths, mem_vit_memory_mask = self._mem_vit_window_plan(
-            batch, randomize=False
+            batch, randomize=False, preserve_input_window=True
         )
         state_window_num_frames, _state_lengths, state_memory_mask = (
             self._fixed_memory_window_plan(
                 batch,
                 key=OBS_STATE,
                 max_frames=self.config.state_num_frames,
+                preserve_input_window=True,
             )
             if self.config.state_action_encoding == "continuous"
             else (1, None, None)
@@ -2916,6 +2931,7 @@ class PI05Policy(PreTrainedPolicy):
                 key=OBS_ACTION_HISTORY,
                 max_frames=self.config.state_num_frames - 1,
                 allow_empty=True,
+                preserve_input_window=True,
             )
             kwargs["action_history"] = self._prepare_action_history(batch, action_window)
             kwargs["action_history_mask"] = action_mask

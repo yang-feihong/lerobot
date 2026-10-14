@@ -361,6 +361,66 @@ def test_semantic_phase_boolean_priors_clip_at_completion_and_add_hold_tail():
     assert stats["arm_reset"]["negative_labels"] == 9
 
 
+def test_semantic_phase_boolean_priors_include_internal_completion_tail():
+    actions = np.zeros((5, len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)), dtype=np.float32)
+    policy_cfg = SimpleNamespace(
+        type="pi05",
+        action_predict_arm_teleop_inactive=True,
+        action_predict_arm_reset=True,
+        action_predict_gripper=False,
+        action_predict_task_complete=True,
+        gripper_target_representation="continuous_position",
+        action_gripper_target_true_side="negative",
+        action_bool_loss_weight=4.0,
+        action_bool_true_fractions={},
+        chunk_size=3,
+        control_frequency_hz=10,
+    )
+    primary = SemanticView(
+        intent_id="open",
+        canonical_intent="goal_open",
+        instructions=("Open the door.",),
+        status="active",
+        action_supervision="demonstrated",
+        frame_start=0,
+        frame_stop=4,
+        completion_frame=2,
+        view_kind="primary",
+    )
+    catalog = SemanticViewCatalog(
+        path=Path("semantic_views.json"),
+        episodes={0: (primary,)},
+        sha256="test",
+        action_stride_dataset_frames=1,
+        semantic_names=("goal_open/active",),
+        selected_episodes=(0,),
+        segments={0: (SemanticSegment("handle_press", 0, 4, "full_episode"),)},
+    )
+
+    stats = configure_action_bool_balance(
+        SimpleNamespace(trainable_config=policy_cfg, resume=False),
+        _fake_dataset(actions, CONTROL_EXTENDED_DATASET_ACTION_NAMES),
+        semantic_views=catalog,
+        semantic_phases=["handle_press"],
+        semantic_state_instruction_matrix={
+            "handle_press": {
+                "goal_open": {
+                    "status": "active",
+                    "action_supervision": "demonstrated",
+                    "completion_boundary": "goal_end",
+                }
+            }
+        },
+    )
+
+    assert stats["task_complete"]["positive_labels"] == 9
+    assert stats["task_complete"]["negative_labels"] == 3
+    assert stats["arm_teleop_inactive"]["positive_labels"] == 9
+    assert stats["arm_teleop_inactive"]["negative_labels"] == 3
+    assert stats["arm_reset"]["positive_labels"] == 0
+    assert stats["arm_reset"]["negative_labels"] == 12
+
+
 def test_arm_mode_overlap_is_rejected_during_dataset_preflight():
     actions = np.zeros((5, len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)), dtype=np.float32)
     actions[2, 3:5] = 1.0

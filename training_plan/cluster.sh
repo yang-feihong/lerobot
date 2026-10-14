@@ -119,6 +119,12 @@ task_node() {
     awk -F '\t' -v task="${wanted}" '$1 == task {print $2; found=1} END {exit !found}'
 }
 
+task_target_steps() {
+  local wanted="$1" configured
+  configured="$("${semantic_plan_args[@]}" resolve "${wanted}" | sed -n '9p')"
+  printf '%s\n' "${configured:-${TRAIN_STEPS}}"
+}
+
 validate_plan_resources() {
   local task node gpu_csv port gpu
   local -A occupied=() ports=()
@@ -481,7 +487,7 @@ run_task_container() {
 }
 
 run_task_dry_run() {
-  local node="$1" task="$2" mode="$3" gpu="$4" port="$5" checkpoint="${6:-}"
+  local node="$1" task="$2" mode="$3" gpu="$4" port="$5" checkpoint="${6:-}" target_steps
   local code command_q output dry_name
   node_profile "${node}"
   code="$(container_code_dir)"
@@ -490,6 +496,7 @@ run_task_dry_run() {
     prepare_resume_io "${node}" "${checkpoint}"
   fi
   if [[ "${mode}" == start ]]; then
+    target_steps="$(task_target_steps "${task}")"
     printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" dry-run "${task}" "${gpu}" "${port}"
   else
     printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" resume-dry-run "${task}" "${gpu}" "${checkpoint}" "${port}"
@@ -517,15 +524,16 @@ run_task_dry_run() {
     [[ "${output}" == *"--policy.action_predict_task_blocked=false"* ]] || {
       echo "${node}/${task}: dry-run changed task-blocked output" >&2; return 1;
     }
-    [[ "${output}" == *"--steps=${TRAIN_STEPS}"* ]] || {
+    [[ "${output}" == *"--steps=${target_steps}"* ]] || {
       echo "${node}/${task}: start dry-run has wrong training horizon" >&2; return 1;
     }
   else
     [[ "${output}" == *"--resume=true"* && "${output}" == *"--wandb.resume_training_run=true"* ]] || {
       echo "${node}/${task}: resume dry-run did not preserve the original run" >&2; return 1;
     }
-    [[ "${output}" != *"--steps="* ]] || {
-      echo "${node}/${task}: resume dry-run unexpectedly overrides saved steps" >&2; return 1;
+    target_steps="$(task_target_steps "${task}")"
+    [[ "${output}" == *"--steps=${target_steps}"* ]] || {
+      echo "${node}/${task}: resume dry-run has wrong training horizon" >&2; return 1;
     }
   fi
   echo "${node}/${task}: ${mode} dry-run OK"
@@ -572,7 +580,7 @@ start_task() {
 }
 
 resume_task() {
-  local node="$1" task="$2" gpu port run_dir step checkpoint name
+  local node="$1" task="$2" gpu port run_dir step checkpoint name target_steps
   read -r gpu port < <(task_resources "${task}")
   if [[ -n "$(find_running_task "${node}" "${task}")" ]]; then
     echo "${node}/${task}: already running"
@@ -582,7 +590,8 @@ resume_task() {
   [[ -n "${run_dir}" ]] || { echo "${node}/${task}: no run directory" >&2; return 1; }
   step="$(latest_complete_checkpoint "${node}" "${run_dir}")"
   [[ -n "${step}" ]] || { echo "${node}/${task}: no complete checkpoint" >&2; return 1; }
-  if (( 10#${step} >= TRAIN_STEPS )); then
+  target_steps="$(task_target_steps "${task}")"
+  if (( 10#${step} >= target_steps )); then
     echo "${node}/${task}: complete at ${step}"
     return
   fi

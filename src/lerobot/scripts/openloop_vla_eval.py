@@ -661,6 +661,8 @@ def _compute_metrics(
     discrete_action_names: frozenset[str] = frozenset(
         {"arm_teleop_inactive", "arm_reset", "gripper_target", "task_complete"}
     ),
+    *,
+    discrete_threshold: float = 0.5,
 ) -> dict[str, Any]:
     err = pred - expert
     mae = np.mean(np.abs(err), axis=0)
@@ -677,8 +679,16 @@ def _compute_metrics(
         row[f"rmse/{name}"] = float(rmse[i])
         if name not in discrete_action_names:
             continue
-        expert_true = expert[:, i] < 0 if name == "gripper_target" else expert[:, i] > 0
-        pred_true = pred[:, i] < 0 if name == "gripper_target" else pred[:, i] > 0
+        expert_true = (
+            expert[:, i] < 0
+            if name == "gripper_target"
+            else expert[:, i] > discrete_threshold
+        )
+        pred_true = (
+            pred[:, i] < 0
+            if name == "gripper_target"
+            else pred[:, i] > discrete_threshold
+        )
         true_positive = int(np.count_nonzero(expert_true & pred_true))
         predicted_positive = int(np.count_nonzero(pred_true))
         expected_positive = int(np.count_nonzero(expert_true))
@@ -1273,13 +1283,17 @@ def main() -> None:
         discrete_metric_names.add("gripper_target")
     discrete_metric_names = frozenset(discrete_metric_names)
 
-    def compute_metrics(scope, expert, pred, action_names):
+    def compute_metrics(scope, expert, pred, action_names, *, normalized=False):
         return _compute_metrics(
             scope,
             expert,
             pred,
             action_names,
             discrete_action_names=discrete_metric_names,
+            # Physical boolean channels use the [0, 1] contract. Quantile-
+            # normalized boolean channels use [-1, 1], whose equivalent
+            # decision boundary is zero.
+            discrete_threshold=0.0 if normalized else 0.5,
         )
 
     meta = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
@@ -1843,6 +1857,7 @@ def main() -> None:
                 _normalize_execution_action_array(expert, meta, execution_stats),
                 _normalize_execution_action_array(pred, meta, execution_stats),
                 execution_action_names,
+                normalized=True,
             )
         )
         chunk_metrics_rows.append(
@@ -1859,6 +1874,7 @@ def main() -> None:
                 _normalize_execution_action_array(valid_expert_chunks, meta, execution_stats),
                 _normalize_execution_action_array(valid_pred_chunks, meta, execution_stats),
                 execution_action_names,
+                normalized=True,
             )
         )
         trajectory_metrics_rows.append(
@@ -1884,6 +1900,7 @@ def main() -> None:
                     _normalize_with_stats(expert_trajectory, trajectory_stats),
                     _normalize_with_stats(pred_trajectory, trajectory_stats),
                     trajectory_action_names,
+                    normalized=True,
                 )
             )
             normalized_trajectory_chunk_metrics_rows.append(
@@ -1892,6 +1909,7 @@ def main() -> None:
                     _normalize_with_stats(valid_expert_trajectory_chunks, trajectory_stats),
                     _normalize_with_stats(valid_pred_trajectory_chunks, trajectory_stats),
                     trajectory_action_names,
+                    normalized=True,
                 )
             )
         else:
@@ -2033,6 +2051,7 @@ def main() -> None:
             _normalize_execution_action_array(all_expert_arr, meta, execution_stats),
             _normalize_execution_action_array(all_pred_arr, meta, execution_stats),
             execution_action_names,
+            normalized=True,
         ),
     )
     chunk_metrics_rows.insert(
@@ -2046,6 +2065,7 @@ def main() -> None:
             _normalize_execution_action_array(all_expert_chunk_arr, meta, execution_stats),
             _normalize_execution_action_array(all_pred_chunk_arr, meta, execution_stats),
             execution_action_names,
+            normalized=True,
         ),
     )
 
@@ -2075,6 +2095,7 @@ def main() -> None:
                 _normalize_with_stats(all_expert_trajectory_arr, trajectory_stats),
                 _normalize_with_stats(all_pred_trajectory_arr, trajectory_stats),
                 trajectory_action_names,
+                normalized=True,
             ),
         )
         normalized_trajectory_chunk_metrics_rows.insert(
@@ -2084,6 +2105,7 @@ def main() -> None:
                 _normalize_with_stats(all_expert_trajectory_chunk_arr, trajectory_stats),
                 _normalize_with_stats(all_pred_trajectory_chunk_arr, trajectory_stats),
                 trajectory_action_names,
+                normalized=True,
             ),
         )
     else:

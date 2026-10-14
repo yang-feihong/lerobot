@@ -91,7 +91,7 @@ case "$eval_stage" in
     ;;
   handle_press)
     stage_dataset_repo_id="local/b2_z1_vla_stage2_handle_press_with_randomized_pose"
-    stage_dataset_root="$vla_storage_root/datasets/b2_z1/converted/independent_handle_press_legacy"
+    stage_dataset_root="$vla_storage_root/datasets/b2_z1/converted/independent_handle_press_0907_0915"
     ;;
   door_traversal)
     stage_dataset_repo_id="local/b2_z1_vla_staff1_command_clean_door_traversal"

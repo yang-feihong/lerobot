@@ -72,21 +72,22 @@ def _sidecar(tmp_path: Path, intent: str = "goal_approach") -> Path:
 
 def test_stage1_contract_is_explicit_and_validates_sidecar(tmp_path):
     matrix = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
-    task = semantic_plan.resolve_task(matrix, "staff1_stage1_full_mem")
+    task = semantic_plan.resolve_task(matrix, "all_scenes_stage1_full_mem")
     assert task["training_preset"] == "stage1_only"
-    assert semantic_plan.state_weights(matrix, "staff1_stage1_full_mem") == {"approach": 1.0}
-    assert semantic_plan.selected_matrix(matrix, "staff1_stage1_full_mem") == {
+    assert task["train_steps"] == 100_000
+    assert semantic_plan.state_weights(matrix, "all_scenes_stage1_full_mem") == {"approach": 1.0}
+    assert semantic_plan.selected_matrix(matrix, "all_scenes_stage1_full_mem") == {
         "approach": {
             "goal_approach": {
                 "status": "active",
                 "action_supervision": "demonstrated",
-                "completion_boundary": "state_end",
+                "completion_boundary": "goal_end",
             }
         }
     }
     assert semantic_plan.validate_sidecar(
         matrix,
-        "staff1_stage1_full_mem",
+        "all_scenes_stage1_full_mem",
         _sidecar(tmp_path),
     ) == {"episodes": 1, "segments": 1, "frames": 10}
 
@@ -96,7 +97,7 @@ def test_stage1_contract_rejects_wrong_language(tmp_path):
     with pytest.raises(ValueError, match="exactly one configured state-instruction relation"):
         semantic_plan.validate_sidecar(
             matrix,
-            "staff1_stage1_full_mem",
+            "all_scenes_stage1_full_mem",
             _sidecar(tmp_path, intent="goal_open"),
         )
 
@@ -117,7 +118,7 @@ def test_inline_task_contract_is_equivalent_to_preset(tmp_path):
                 "goal_approach": {
                     "status": "active",
                     "action_supervision": "demonstrated",
-                    "completion_boundary": "state_end",
+                    "completion_boundary": "goal_end",
                 }
             }
         },
@@ -129,11 +130,11 @@ def test_inline_task_contract_is_equivalent_to_preset(tmp_path):
     )
     loaded = semantic_plan.load_plan(PRESETS_PATH, inline_path)
     assert semantic_plan.state_weights(loaded, "inline_stage1") == semantic_plan.state_weights(
-        loaded, "staff1_stage1_full_mem"
+        loaded, "all_scenes_stage1_full_mem"
     )
     assert semantic_plan.selected_matrix(
         loaded, "inline_stage1"
-    ) == semantic_plan.selected_matrix(loaded, "staff1_stage1_full_mem")
+    ) == semantic_plan.selected_matrix(loaded, "all_scenes_stage1_full_mem")
 
 
 def test_task_cannot_mix_preset_and_inline_matrix(tmp_path):
@@ -163,9 +164,10 @@ def test_task_cannot_mix_preset_and_inline_matrix(tmp_path):
 
 def test_two_gpu_task_is_valid():
     plan = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
-    task = semantic_plan.resolve_task(plan, "all_scenes_stage1_full_mem")
+    task = semantic_plan.resolve_task(plan, "staff1_stage3_full_mem")
     assert task["resources"] == {
         "node": "wb3",
         "gpu_ids": [0, 1],
         "main_process_port": 29500,
     }
+    assert task["train_steps"] == 70_000
