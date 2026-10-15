@@ -58,6 +58,54 @@ def semantic_source_split_keys(
     return source_by_episode
 
 
+def split_episode_indices(
+    *,
+    episode_indices: list[int],
+    episode_tasks: list[list[str]],
+    eval_split: float,
+    stratum_by_episode: dict[int, str] | None = None,
+) -> tuple[list[int], list[int]]:
+    """Resolve the deterministic episode split shared by training and evaluation.
+
+    Episodes are kept in their input order.  Within every stratum the final
+    ``ceil(n * eval_split)`` episodes form the held-out set.  Passing a stratum
+    mapping is how semantic-view datasets split by physical source instead of
+    by their historical task text; ordinary datasets fall back to task text.
+    """
+    if not 0.0 <= eval_split < 1.0:
+        raise ValueError(f"eval_split must be in [0.0, 1.0), got {eval_split}")
+    if not episode_indices:
+        return [], []
+    if eval_split == 0.0:
+        return list(episode_indices), []
+
+    strata: dict[str, list[int]] = {}
+    for episode_index in episode_indices:
+        if episode_index < 0 or episode_index >= len(episode_tasks):
+            raise ValueError(
+                f"episode index {episode_index} is outside metadata range [0, {len(episode_tasks)})"
+            )
+        if stratum_by_episode is not None:
+            try:
+                split_key = stratum_by_episode[episode_index]
+            except KeyError as exc:
+                raise ValueError(
+                    f"missing train/eval split stratum for episode {episode_index}"
+                ) from exc
+        else:
+            tasks = episode_tasks[episode_index]
+            split_key = tasks[0] if tasks else ""
+        strata.setdefault(split_key, []).append(episode_index)
+
+    train_episodes: list[int] = []
+    eval_episodes: list[int] = []
+    for episodes in strata.values():
+        n_eval = math.ceil(len(episodes) * eval_split)
+        train_episodes.extend(episodes[:-n_eval])
+        eval_episodes.extend(episodes[-n_eval:])
+    return train_episodes, eval_episodes
+
+
 def resolve_delta_timestamps(
     cfg: PreTrainedConfig | RewardModelConfig, ds_meta: LeRobotDatasetMetadata
 ) -> dict[str, list] | None:
@@ -338,11 +386,17 @@ def make_train_eval_datasets(
             split_key = f"{mixture_source_by_episode.get(ep_idx, '')}\0{task_key}"
         stratum_to_episodes.setdefault(split_key, []).append(ep_idx)
 
-    train_episodes, eval_episodes = [], []
-    for eps in stratum_to_episodes.values():
-        n_eval = math.ceil(len(eps) * cfg.dataset.eval_split)
-        train_episodes.extend(eps[: len(eps) - n_eval])
-        eval_episodes.extend(eps[len(eps) - n_eval :])
+    stratum_by_episode = {
+        episode_index: split_key
+        for split_key, episode_indices in stratum_to_episodes.items()
+        for episode_index in episode_indices
+    }
+    train_episodes, eval_episodes = split_episode_indices(
+        episode_indices=list(base_episodes),
+        episode_tasks=episode_tasks,
+        eval_split=cfg.dataset.eval_split,
+        stratum_by_episode=stratum_by_episode,
+    )
 
     if not train_episodes:
         raise ValueError(

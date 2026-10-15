@@ -118,11 +118,11 @@ fi
 remote_manifest="$(mktemp)"
 local_manifest="$(mktemp)"
 trap 'rm -f "${remote_manifest}" "${local_manifest}"' EXIT
-"${ssh_base[@]}" "cd '${remote_snapshot}/pretrained_model' && find . -type f -print0 | sort -z | xargs -0 sha256sum" \
+"${ssh_base[@]}" "cd '${remote_snapshot}/pretrained_model' && LC_ALL=C find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum" \
   >"${remote_manifest}"
 (
   cd "${local_model}"
-  find . -type f -print0 | sort -z | xargs -0 sha256sum
+  LC_ALL=C find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum
 ) >"${local_manifest}"
 if ! cmp -s "${remote_manifest}" "${local_manifest}"; then
   echo "Checksum mismatch; evaluation snapshot retained: ${remote_snapshot}" >&2

@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from lerobot.datasets.factory import semantic_source_split_keys
+from lerobot.datasets.factory import semantic_source_split_keys, split_episode_indices
 from lerobot.datasets.semantic_views import (
     SemanticSegment,
     apply_semantic_views_to_batch,
@@ -164,6 +164,25 @@ def test_semantic_source_split_keys_reject_mixed_source_episode(tmp_path):
     )
     with pytest.raises(ValueError, match="one physical source group"):
         semantic_source_split_keys(load_semantic_views(path), [0])
+
+
+def test_split_episode_indices_holds_out_each_physical_source():
+    train, held_out = split_episode_indices(
+        episode_indices=[0, 1, 2, 3, 4, 5],
+        episode_tasks=[["same task"]] * 6,
+        eval_split=0.2,
+        stratum_by_episode={
+            0: "staff1",
+            1: "staff1",
+            2: "staff1",
+            3: "independent_stage2",
+            4: "independent_stage2",
+            5: "independent_stage2",
+        },
+    )
+
+    assert train == [0, 1, 3, 4]
+    assert held_out == [2, 5]
 
 
 def _batch():

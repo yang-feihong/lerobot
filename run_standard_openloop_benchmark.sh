@@ -22,6 +22,7 @@ inherited_cuda_visible_devices="${CUDA_VISIBLE_DEVICES:-}"
 batch_size=""
 num_workers="4"
 plot_workers="2"
+dataset_split="train"
 print_config="false"
 
 while (( $# > 0 )); do
@@ -34,12 +35,18 @@ while (( $# > 0 )); do
     --batch-size=*) batch_size="${1#*=}" ;;
     --num-workers=*) num_workers="${1#*=}" ;;
     --plot-workers=*) plot_workers="${1#*=}" ;;
+    --dataset-split=*) dataset_split="${1#*=}" ;;
     --protocol=*) protocol_path="${1#*=}" ;;
     --print-config) print_config="true" ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
+
+case "$dataset_split" in
+  train|eval) ;;
+  *) echo "--dataset-split must be train or eval" >&2; exit 2 ;;
+esac
 
 if [[ "$device" == cuda* && "$gpu_id_explicit" == "true" && -n "$inherited_cuda_visible_devices" \
       && "$inherited_cuda_visible_devices" != "$gpu_id" ]]; then
@@ -56,9 +63,15 @@ fi
 [[ -n "$output_dir" ]] || { echo "--output-dir is required" >&2; exit 2; }
 [[ -f "$protocol_path" ]] || { echo "Protocol not found: $protocol_path" >&2; exit 2; }
 
-mapfile -t protocol < <(python3 - "$protocol_path" <<'PY'
+mapfile -t protocol < <(python3 - "$protocol_path" "$dataset_split" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1], encoding="utf-8"))
+split = sys.argv[2]
+partitions = d.get("partitions")
+if partitions is not None:
+    if split not in partitions:
+        raise SystemExit(f"Protocol has no {split!r} partition")
+    d = {**d, **partitions[split]}
 for key in (
     "protocol_id", "dataset_repo_id", "episodes", "max_episodes",
     "max_frames_per_episode", "frame_stride", "max_chunk_plots_per_episode",
@@ -70,6 +83,7 @@ print("true" if d["include_onset_windows"] else "false")
 print(d["dataset_info_sha256"])
 print(d["dataset_total_episodes"])
 print(d["dataset_total_frames"])
+print(split)
 PY
 )
 
@@ -89,6 +103,7 @@ include_onset_windows="${protocol[12]}"
 expected_dataset_info_sha256="${protocol[13]}"
 expected_dataset_total_episodes="${protocol[14]}"
 expected_dataset_total_frames="${protocol[15]}"
+resolved_dataset_split="${protocol[16]}"
 
 if [[ -z "$batch_size" ]]; then
   batch_size="$protocol_batch_size"
@@ -120,8 +135,8 @@ if actual != expected:
 PY
 
 if [[ "$print_config" == "true" ]]; then
-  printf 'protocol_id=%s\npolicy_path=%s\ndataset_repo_id=%s\ndataset_root=%s\noutput_dir=%s\nepisodes=%s\nframe_stride=%s\ntask=%s\n' \
-    "$protocol_id" "$policy_path" "$dataset_repo_id" "$dataset_root" "$output_dir" \
+  printf 'protocol_id=%s\ndataset_split=%s\npolicy_path=%s\ndataset_repo_id=%s\ndataset_root=%s\noutput_dir=%s\nepisodes=%s\nframe_stride=%s\ntask=%s\n' \
+    "$protocol_id" "$resolved_dataset_split" "$policy_path" "$dataset_repo_id" "$dataset_root" "$output_dir" \
     "$episodes" "$frame_stride" "$task"
   exit 0
 fi
@@ -146,7 +161,7 @@ cmd=(
   --dataset-repo-id "$dataset_repo_id"
   --dataset-root "$dataset_root"
   --output-dir "$output_dir"
-  --split all
+  --split "$resolved_dataset_split"
   --episodes "$episodes"
   --max-episodes "$max_episodes"
   --max-frames-per-episode "$max_frames"
@@ -173,10 +188,13 @@ else
   "${cmd[@]}"
 fi
 
-python3 - "$protocol_path" "$output_dir/standard_full_horizon_metrics.json" <<'PY'
+python3 - "$protocol_path" "$output_dir/standard_full_horizon_metrics.json" "$resolved_dataset_split" <<'PY'
 import json, sys
 protocol = json.load(open(sys.argv[1], encoding="utf-8"))
 result = json.load(open(sys.argv[2], encoding="utf-8"))
+split = sys.argv[3]
+if protocol.get("partitions") is not None:
+    protocol = {**protocol, **protocol["partitions"][split]}
 if result["horizon_steps"] != protocol["required_horizon_steps"]:
     raise SystemExit(
         f"Unexpected horizon: {result['horizon_steps']} != {protocol['required_horizon_steps']}"
@@ -194,6 +212,7 @@ if contract["evaluated_action_step_count"] != expected_steps:
         f"{contract['evaluated_action_step_count']} != {expected_steps}"
     )
 result["protocol_id"] = protocol["protocol_id"]
+result["dataset_split"] = split
 open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(result, indent=2) + "\n")
 PY
 

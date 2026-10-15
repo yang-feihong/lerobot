@@ -43,3 +43,7 @@ python -m lerobot.scripts.compare_openloop_standard_metrics RESULT_A RESULT_B
 
 比较器会拒绝 schema v1、缺少协议 ID、非确定性 flow noise、不同语言、不同
 样本指纹或不同 GT 指纹的结果。
+
+历史单阶段 Stage1/Stage3 checkpoint 训练时统一使用 `Open the door.`。评测这类
+checkpoint 时，应分别使用带 `historical_open_prompt` 的协议；它们保持与主协议
+完全相同的数据分区、锚点和物理指标，只把语言恢复为该 checkpoint 的训练语义。

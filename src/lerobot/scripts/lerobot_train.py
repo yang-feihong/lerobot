@@ -22,8 +22,10 @@ import dataclasses
 import hashlib
 import json
 import logging
+import shutil
 import sys
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
@@ -104,6 +106,68 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
+
+CHECKPOINT_SAVE_RETRY_INTERVAL_S = 10 * 60
+
+
+def _run_checkpoint_save_with_retry(
+    checkpoint_dir: Path,
+    save_once: Callable[[], None],
+    *,
+    retry_interval_s: float = CHECKPOINT_SAVE_RETRY_INTERVAL_S,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> None:
+    """Run a complete checkpoint write, retrying forever after failures.
+
+    The numbered checkpoint directory is treated as an incomplete transaction
+    until ``save_once`` returns.  A failed attempt is removed before retrying so
+    stale or truncated files cannot be mistaken for a valid checkpoint.  The
+    caller is responsible for placing a distributed barrier after this helper;
+    non-writing ranks then wait while rank 0 retries.
+
+    ``Exception`` is deliberately caught instead of ``BaseException`` so an
+    operator can still terminate training with KeyboardInterrupt/SystemExit.
+    """
+    attempt = 1
+    while True:
+        try:
+            if checkpoint_dir.is_symlink():
+                checkpoint_dir.unlink()
+            elif checkpoint_dir.exists():
+                logging.warning(
+                    "Removing incomplete checkpoint directory before save attempt %d: %s",
+                    attempt,
+                    checkpoint_dir,
+                )
+                shutil.rmtree(checkpoint_dir)
+
+            save_once()
+            if attempt > 1:
+                logging.info(
+                    "Checkpoint save succeeded on attempt %d: %s",
+                    attempt,
+                    checkpoint_dir,
+                )
+            return
+        except Exception:
+            logging.exception(
+                "Checkpoint save attempt %d failed for %s; retrying in %.0f seconds with no retry limit",
+                attempt,
+                checkpoint_dir,
+                retry_interval_s,
+            )
+            try:
+                if checkpoint_dir.is_symlink():
+                    checkpoint_dir.unlink()
+                elif checkpoint_dir.exists():
+                    shutil.rmtree(checkpoint_dir)
+            except Exception:
+                logging.exception(
+                    "Failed to clean incomplete checkpoint %s; cleanup will be retried",
+                    checkpoint_dir,
+                )
+            sleep_fn(retry_interval_s)
+            attempt += 1
 
 
 def _configure_quantile_fallback_for_training(
@@ -2465,46 +2529,57 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
                 checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
-                # Saving a checkpoint temporarily needs room for both the previous
-                # rolling checkpoint and the new one. Prune only checkpoints that
-                # would become obsolete after a successful save, while retaining
-                # the latest complete recovery point and every configured milestone.
-                pre_save_removed = []
-                if cfg.keep_last_checkpoints > 0:
-                    pre_save_removed = prune_checkpoints(
-                        checkpoint_dir.parent,
-                        keep_last=max(cfg.keep_last_checkpoints - 1, 1),
-                        keep_every_n_steps=cfg.keep_checkpoint_every_n_steps,
+
+                def save_local_checkpoint_once(
+                    checkpoint_dir: Path = checkpoint_dir,
+                    step: int = step,
+                    model_state_dict: dict | None = model_state_dict,
+                    optim_state_dict: dict | None = optim_state_dict,
+                ) -> None:
+                    # Saving temporarily needs room for both the previous rolling
+                    # checkpoint and the new one. Keep the latest complete recovery
+                    # point and every configured milestone while freeing obsolete ones.
+                    pre_save_removed = []
+                    if cfg.keep_last_checkpoints > 0:
+                        pre_save_removed = prune_checkpoints(
+                            checkpoint_dir.parent,
+                            keep_last=max(cfg.keep_last_checkpoints - 1, 1),
+                            keep_every_n_steps=cfg.keep_checkpoint_every_n_steps,
+                        )
+                    if pre_save_removed:
+                        logging.info(
+                            "Removed obsolete checkpoints before save: %s",
+                            ", ".join(path.name for path in pre_save_removed),
+                        )
+                    save_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        step=step,
+                        cfg=cfg,
+                        policy=accelerator.unwrap_model(policy),
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        num_processes=accelerator.num_processes,
+                        batch_size=cfg.batch_size * cfg.gradient_accumulation_steps,
+                        model_state_dict=model_state_dict,
+                        optim_state_dict=optim_state_dict,
                     )
-                if pre_save_removed:
-                    logging.info(
-                        "Removed obsolete checkpoints before save: %s",
-                        ", ".join(path.name for path in pre_save_removed),
-                    )
-                save_checkpoint(
-                    checkpoint_dir=checkpoint_dir,
-                    step=step,
-                    cfg=cfg,
-                    policy=accelerator.unwrap_model(policy),
-                    optimizer=optimizer,
-                    scheduler=lr_scheduler,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    num_processes=accelerator.num_processes,
-                    batch_size=cfg.batch_size * cfg.gradient_accumulation_steps,
-                    model_state_dict=model_state_dict,
-                    optim_state_dict=optim_state_dict,
-                )
-                if transformed_action_stats_payload is not None:
-                    save_transformed_action_stats(
-                        transformed_action_stats_payload,
-                        checkpoint_dir / PRETRAINED_MODEL_DIR / PI05_TRANSFORMED_ACTION_STATS_NAME,
-                    )
-                if semantic_views is not None:
-                    (checkpoint_dir / PRETRAINED_MODEL_DIR / "semantic_views.json").write_bytes(
-                        semantic_views.path.read_bytes()
-                    )
-                update_last_checkpoint(checkpoint_dir)
+                    if transformed_action_stats_payload is not None:
+                        save_transformed_action_stats(
+                            transformed_action_stats_payload,
+                            checkpoint_dir / PRETRAINED_MODEL_DIR / PI05_TRANSFORMED_ACTION_STATS_NAME,
+                        )
+                    if semantic_views is not None:
+                        (checkpoint_dir / PRETRAINED_MODEL_DIR / "semantic_views.json").write_bytes(
+                            semantic_views.path.read_bytes()
+                        )
+                    update_last_checkpoint(checkpoint_dir)
+
+                _run_checkpoint_save_with_retry(checkpoint_dir, save_local_checkpoint_once)
+
+                # Remote logging/upload failures are not local checkpoint failures:
+                # do not repeatedly rewrite an already valid checkpoint for them.
                 if cfg.save_checkpoint_to_hub:
                     push_checkpoint_to_hub(
                         checkpoint_dir,

@@ -31,7 +31,12 @@ from tqdm import tqdm
 from lerobot.configs import PreTrainedConfig
 from lerobot.datasets import LeRobotDataset
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
-from lerobot.datasets.factory import resolve_delta_timestamps
+from lerobot.datasets.factory import (
+    resolve_delta_timestamps,
+    semantic_source_split_keys,
+    split_episode_indices,
+)
+from lerobot.datasets.semantic_views import load_semantic_views
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.pi05.b2_action_transform import (
     absolute_ee_pose_to_reference_delta,
@@ -547,27 +552,55 @@ def _resolve_image_source(
     }
 
 
-def _split_episodes(meta: LeRobotDatasetMetadata, split: str, eval_split: float) -> list[int]:
+def _split_episodes(
+    meta: LeRobotDatasetMetadata,
+    split: str,
+    eval_split: float,
+    *,
+    dataset_root: Path | None = None,
+    semantic_views_path: Path | None = None,
+    expected_semantic_views_sha256: str | None = None,
+) -> tuple[list[int], str]:
     all_episodes = list(range(meta.total_episodes))
     if split == "all" or eval_split == 0.0:
-        return all_episodes
+        return all_episodes, "all"
 
-    episode_tasks = meta.episodes["tasks"]
-    task_to_episodes: dict[str, list[int]] = {}
-    for ep_idx in all_episodes:
-        task_key = episode_tasks[ep_idx][0] if episode_tasks[ep_idx] else ""
-        task_to_episodes.setdefault(task_key, []).append(ep_idx)
+    if semantic_views_path is None and dataset_root is not None:
+        candidate = dataset_root / "meta" / "semantic_views.json"
+        if candidate.is_file():
+            semantic_views_path = candidate
 
-    selected: list[int] = []
-    for eps in task_to_episodes.values():
-        n_eval = math.ceil(len(eps) * eval_split)
-        if split == "eval":
-            selected.extend(eps[len(eps) - n_eval :])
-        elif split == "train":
-            selected.extend(eps[: len(eps) - n_eval])
-        else:
-            raise ValueError(f"Unknown split={split!r}; expected train/eval/all")
-    return selected
+    stratum_by_episode = None
+    split_strategy = "task"
+    if semantic_views_path is not None:
+        if not semantic_views_path.is_file():
+            raise FileNotFoundError(f"Semantic views file does not exist: {semantic_views_path}")
+        catalog = load_semantic_views(semantic_views_path)
+        if (
+            expected_semantic_views_sha256 is not None
+            and catalog.sha256 != expected_semantic_views_sha256
+        ):
+            raise ValueError(
+                "Evaluation semantic-view sidecar differs from the checkpoint used for training: "
+                f"expected={expected_semantic_views_sha256}, actual={catalog.sha256}, "
+                f"path={semantic_views_path}"
+            )
+        if catalog.selected_episodes is not None:
+            all_episodes = list(catalog.selected_episodes)
+        stratum_by_episode = semantic_source_split_keys(catalog, all_episodes)
+        split_strategy = "semantic_source"
+
+    train_episodes, eval_episodes = split_episode_indices(
+        episode_indices=all_episodes,
+        episode_tasks=meta.episodes["tasks"],
+        eval_split=eval_split,
+        stratum_by_episode=stratum_by_episode,
+    )
+    if split == "train":
+        return train_episodes, split_strategy
+    if split == "eval":
+        return eval_episodes, split_strategy
+    raise ValueError(f"Unknown split={split!r}; expected train/eval/all")
 
 
 def _limit_episodes(episodes: list[int], max_episodes: int) -> list[int]:
@@ -1157,6 +1190,14 @@ def main() -> None:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--split", choices=["train", "eval", "all"], default="eval")
     parser.add_argument("--eval-split", type=float, default=0.1)
+    parser.add_argument(
+        "--semantic-views-path",
+        default=None,
+        help=(
+            "Semantic-view sidecar used by training to stratify the split by physical source. "
+            "By default <dataset-root>/meta/semantic_views.json is detected automatically."
+        ),
+    )
     parser.add_argument("--episodes", default=None, help="Comma/range list, e.g. 1,5,9-12. Overrides split.")
     parser.add_argument("--max-episodes", type=int, default=8, help="0 means no limit.")
     parser.add_argument(
@@ -1320,8 +1361,22 @@ def main() -> None:
         args.max_frames_per_episode = 0 if explicit_episode_selection else 300
     if args.max_chunk_plots_per_episode is None:
         args.max_chunk_plots_per_episode = 0 if explicit_episode_selection else 20
+    split_strategy = "explicit_episodes"
     if episodes is None:
-        episodes = _split_episodes(meta, args.split, args.eval_split)
+        episodes, split_strategy = _split_episodes(
+            meta,
+            args.split,
+            args.eval_split,
+            dataset_root=Path(args.dataset_root).expanduser(),
+            semantic_views_path=(
+                Path(args.semantic_views_path).expanduser()
+                if args.semantic_views_path is not None
+                else None
+            ),
+            expected_semantic_views_sha256=getattr(
+                policy_cfg, "semantic_view_manifest_sha256", None
+            ),
+        )
     episodes = _limit_episodes(episodes, args.max_episodes)
     if not episodes:
         raise ValueError("No episodes selected for open-loop evaluation.")
@@ -1838,7 +1893,7 @@ def main() -> None:
         evaluated_anchor_count += int(len(frame_index))
         evaluated_action_step_count += int(valid_mask.sum())
         for frame, task in zip(frame_index.tolist(), item["task"], strict=True):
-            sample_digest.update(f"{ep_idx}:{int(frame)}:{task}\n".encode("utf-8"))
+            sample_digest.update(f"{ep_idx}:{int(frame)}:{task}\n".encode())
         b2_target_digest.update(policy_cfg.b2_action_representation.encode("utf-8"))
         _update_array_hash(b2_target_digest, expert_trajectory_chunks[..., :3])
         _update_array_hash(b2_target_digest, valid_mask)
@@ -2280,6 +2335,7 @@ def main() -> None:
         "evaluation_dataset_frequency_hz": float(meta.fps),
         "model_control_frequency_hz": getattr(policy_cfg, "control_frequency_hz", None),
         "split": args.split,
+        "split_strategy": split_strategy,
         "eval_split": args.eval_split,
         "episodes": sorted(per_episode),
         "num_frames": int(all_expert_arr.shape[0]),

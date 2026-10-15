@@ -27,6 +27,7 @@ dataset_repo_id_overridden="false"
 dataset_root_overridden="false"
 
 eval_split="0.1"
+semantic_views_path=""
 
 # Empty means that the evaluator selects representative episodes from the
 # metadata-defined train/eval split. Explicit episode ranges still override it.
@@ -73,6 +74,8 @@ while (( $# > 0 )); do
     --max-frames-per-episode=*) max_frames_per_episode="${1#*=}" ;;
     --frame-stride=*) frame_stride="${1#*=}" ;;
     --include-onset-windows=*) include_onset_windows="${1#*=}" ;;
+    --eval-split=*) eval_split="${1#*=}" ;;
+    --semantic-views-path=*) semantic_views_path="${1#*=}" ;;
     --splits=*) eval_splits="${1#*=}" ;;
     --print-config) print_config="true" ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
@@ -128,8 +131,9 @@ case "$eval_splits" in
 esac
 
 if [[ "$print_config" == true ]]; then
-  printf 'stage=%s\npolicy_path=%s\ndataset_repo_id=%s\ndataset_root=%s\noutput_root=%s\nsplits=%s\n' \
-    "$eval_stage" "$policy_path" "$dataset_repo_id" "$dataset_root" "$output_root" "$eval_splits"
+  printf 'stage=%s\npolicy_path=%s\ndataset_repo_id=%s\ndataset_root=%s\noutput_root=%s\nsplits=%s\neval_split=%s\nsemantic_views_path=%s\n' \
+    "$eval_stage" "$policy_path" "$dataset_repo_id" "$dataset_root" "$output_root" "$eval_splits" \
+    "$eval_split" "${semantic_views_path:-<auto>}"
   exit 0
 fi
 
@@ -166,6 +170,9 @@ run_openloop() {
     --task-variant first
     --plot-workers "$plot_workers"
   )
+  if [[ -n "$semantic_views_path" ]]; then
+    cmd+=(--semantic-views-path "$semantic_views_path")
+  fi
   if [[ "$include_onset_windows" == "false" ]]; then
     cmd+=(--no-include-onset-windows)
   elif [[ "$include_onset_windows" != "true" ]]; then

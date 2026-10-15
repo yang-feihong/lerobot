@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -18,12 +19,83 @@ from lerobot.scripts.openloop_vla_eval import (
     _manipulation_onset_windows,
     _openloop_model_action_names,
     _physical_metric_means,
-    _report_common_output_metric_sums,
     _reanchor_episode_plot_actions,
+    _report_common_output_metric_sums,
     _resolve_image_source,
+    _split_episodes,
     _unnormalize_model_action,
     _world_trajectory_plot_limits,
 )
+
+
+def test_openloop_train_eval_split_matches_training_task_strata():
+    meta = SimpleNamespace(
+        total_episodes=6,
+        episodes={"tasks": [["a"], ["a"], ["a"], ["b"], ["b"], ["b"]]},
+    )
+
+    train, strategy = _split_episodes(meta, "train", 0.2)
+    held_out, held_out_strategy = _split_episodes(meta, "eval", 0.2)
+
+    assert strategy == held_out_strategy == "task"
+    assert train == [0, 1, 3, 4]
+    assert held_out == [2, 5]
+
+
+def test_openloop_split_auto_detects_semantic_physical_sources(tmp_path):
+    metadata_root = tmp_path / "meta"
+    metadata_root.mkdir()
+    (metadata_root / "semantic_views.json").write_text(
+        json.dumps(
+            {
+                "format": "lerobot.semantic_views",
+                "version": 1,
+                "selected_episodes": [0, 1, 2, 3],
+                "intents": {"go": {"instructions": ["Go."]}},
+                "episodes": {
+                    str(index): {
+                        "segments": [
+                            {
+                                "phase": "approach",
+                                "frame_start": 0,
+                                "frame_stop": 2,
+                                "source_group": "staff1" if index < 2 else "staff2",
+                            }
+                        ],
+                        "views": [
+                            {
+                                "intent_id": "go",
+                                "status": "active",
+                                "action_supervision": "demonstrated",
+                            }
+                        ],
+                    }
+                    for index in range(4)
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    meta = SimpleNamespace(
+        total_episodes=5,
+        episodes={"tasks": [["same task"]] * 5},
+    )
+
+    train, strategy = _split_episodes(meta, "train", 0.1, dataset_root=tmp_path)
+    held_out, held_out_strategy = _split_episodes(meta, "eval", 0.1, dataset_root=tmp_path)
+
+    assert strategy == held_out_strategy == "semantic_source"
+    assert train == [0, 2]
+    assert held_out == [1, 3]
+
+    with pytest.raises(ValueError, match="differs from the checkpoint"):
+        _split_episodes(
+            meta,
+            "eval",
+            0.1,
+            dataset_root=tmp_path,
+            expected_semantic_views_sha256="not-the-current-sidecar",
+        )
 
 
 def test_physical_metric_means_preserve_empty_supervision_as_none():
