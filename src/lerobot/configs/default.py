@@ -65,9 +65,7 @@ class DatasetConfig:
     # Exact physical-state x canonical-instruction relations enabled for this
     # run.  This is the preferred interface; view-kind weights are retained
     # only for loading historical training configurations.
-    semantic_state_instruction_matrix: dict[str, dict[str, dict[str, str]]] = field(
-        default_factory=dict
-    )
+    semantic_state_instruction_matrix: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
     semantic_view_kind_weights: dict[str, float] = field(default_factory=dict)
     # Optional physical phase selection over complete episodes.  The sidecar
     # owns the per-episode frame boundaries; these fields only select and
@@ -129,14 +127,15 @@ class DatasetConfig:
                     raise ValueError("semantic instruction relation has an invalid status")
                 if relation["action_supervision"] not in {"demonstrated", "hold"}:
                     raise ValueError("semantic instruction relation has invalid action_supervision")
-                if relation["completion_boundary"] not in {"none", "state_end", "goal_end"}:
+                if relation["completion_boundary"] not in {
+                    "none",
+                    "state_end",
+                    "goal_end",
+                    "future_goal_end",
+                }:
                     raise ValueError("semantic instruction relation has invalid completion_boundary")
-        if self.semantic_phase_weights and set(self.semantic_phase_weights) != set(
-            self.semantic_phases
-        ):
-            raise ValueError(
-                "dataset.semantic_phase_weights must exactly match dataset.semantic_phases"
-            )
+        if self.semantic_phase_weights and set(self.semantic_phase_weights) != set(self.semantic_phases):
+            raise ValueError("dataset.semantic_phase_weights must exactly match dataset.semantic_phases")
         for name, weights in (
             ("semantic_phase_weights", self.semantic_phase_weights),
             ("semantic_source_weights", self.semantic_source_weights),
@@ -148,9 +147,7 @@ class DatasetConfig:
         if self.semantic_view_kind_weights and self.semantic_views_path is None:
             raise ValueError("dataset.semantic_view_kind_weights requires dataset.semantic_views_path")
         if self.semantic_state_instruction_matrix and self.semantic_views_path is None:
-            raise ValueError(
-                "dataset.semantic_state_instruction_matrix requires dataset.semantic_views_path"
-            )
+            raise ValueError("dataset.semantic_state_instruction_matrix requires dataset.semantic_views_path")
         if self.semantic_state_instruction_matrix and set(self.semantic_state_instruction_matrix) != set(
             self.semantic_phases
         ):

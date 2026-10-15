@@ -44,8 +44,8 @@ from lerobot.scripts.pi05_vla_server import (
     _rtc_enabled_for_chunk_scheduling,
     _smooth_b2_execution_velocity,
     _to_execution_actions,
-    decode_observation_packet,
     decode_image_packet,
+    decode_observation_packet,
     encode_action_packet,
     execution_action_names,
 )
@@ -228,16 +228,14 @@ def test_checkpoint_hot_swap_signature_requires_identical_runtime_schema(tmp_pat
         for name in names:
             (directory / name).write_text(json.dumps({"name": name, "schema": 1}))
 
-    (first / "config.json").write_text(
-        json.dumps({"name": "config.json", "schema": 1, "pretrained_path": "/base/model"})
-    )
+    (first / "config.json").write_text(json.dumps({"max_action_dim": 32, "pretrained_path": "/base/model"}))
     (second / "config.json").write_text(
-        json.dumps({"name": "config.json", "schema": 1, "pretrained_path": "/resume/checkpoint"})
+        json.dumps({"max_action_dim": 32, "pretrained_path": "/resume/checkpoint"})
     )
 
     assert _checkpoint_hot_swap_signature(first) == _checkpoint_hot_swap_signature(second)
 
-    (second / "config.json").write_text(json.dumps({"name": "config.json", "schema": 2}))
+    (second / "config.json").write_text(json.dumps({"max_action_dim": 64}))
     assert _checkpoint_hot_swap_signature(first) != _checkpoint_hot_swap_signature(second)
 
 
@@ -256,7 +254,14 @@ def test_checkpoint_hot_swap_signature_ignores_training_only_fields(tmp_path) ->
         directory.mkdir()
         (directory / "adapter_config.json").write_text(json.dumps({"r": 16}))
         (directory / "pi05_deployment_metadata.json").write_text(
-            json.dumps({"action": {"model_names": ["b2_delta_x"]}})
+            json.dumps(
+                {
+                    "action": {
+                        "model_names": ["b2_delta_x"],
+                        "flow_loss_schema": ("group_balanced" if directory == first else "group_balanced_v2"),
+                    }
+                }
+            )
         )
         for name in ("policy_preprocessor.json", "policy_postprocessor.json"):
             (directory / name).write_text(json.dumps(processor))
@@ -769,9 +774,7 @@ def test_server_loads_current_contract_for_all_representation_pairs(
     pre_task_blocked_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     pre_task_blocked_metadata["action"]["predict"].pop("task_blocked")
     pre_task_blocked_metadata["action"]["boolean_decoding"]["true_side"].pop("task_blocked")
-    pre_task_blocked_metadata["action"]["boolean_decoding"]["output_values"].pop(
-        "task_blocked"
-    )
+    pre_task_blocked_metadata["action"]["boolean_decoding"]["output_values"].pop("task_blocked")
     pre_task_blocked_metadata["action"].pop("task_blocked_semantics")
     metadata_path.write_text(json.dumps(pre_task_blocked_metadata), encoding="utf-8")
     pre_task_blocked_contract = _load_checkpoint_contract(tmp_path, config, 50.0)

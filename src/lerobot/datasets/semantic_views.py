@@ -230,9 +230,7 @@ def semantic_phase_sampling_groups(
         source_names = sorted(source for candidate_phase, source in pools if candidate_phase == phase)
         if not source_weight_map:
             groups.append(
-                np.concatenate(
-                    [part for source in source_names for part in pools[(phase, source)]]
-                )
+                np.concatenate([part for source in source_names for part in pools[(phase, source)]])
             )
             weights.append(float(phase_weight_map[phase] / phase_total))
             names.append(f"{phase}/*")
@@ -284,8 +282,7 @@ def semantic_state_for_frame(
     matches = [
         segment
         for segment in catalog.segments.get(episode, ())
-        if segment.phase in state_instruction_matrix
-        and segment.frame_start <= frame < segment.frame_stop
+        if segment.phase in state_instruction_matrix and segment.frame_start <= frame < segment.frame_stop
     ]
     if len(matches) != 1:
         raise ValueError(
@@ -314,6 +311,8 @@ def semantic_view_matches_relation(
             view.completion_frame is not None
             and state.frame_start < view.completion_frame <= state.frame_stop
         )
+    elif requested_boundary == "future_goal_end":
+        completion_matches = view.completion_frame is not None and view.completion_frame > state.frame_stop
     else:
         raise ValueError(f"unsupported completion boundary: {requested_boundary}")
     return (
@@ -394,10 +393,10 @@ def apply_semantic_views_to_batch(
                 for view in views
                 if semantic_view_matches_relation(view, state, state_instruction_matrix)
             )
-            if len(views) != 1:
+            if not views:
                 raise ValueError(
-                    "semantic state-instruction matrix requires exactly one view at "
-                    f"episode={int(episode)}, frame={int(frame)}; matches={len(views)}"
+                    "semantic state-instruction matrix requires at least one view at "
+                    f"episode={int(episode)}, frame={int(frame)}"
                 )
         if not views:
             raise ValueError(
@@ -472,11 +471,7 @@ def semantic_status_priors(
     group_frames: dict[tuple[str, str], int] = {}
     for episode, length in episode_lengths.items():
         if phases:
-            segments = [
-                segment
-                for segment in catalog.segments.get(episode, ())
-                if segment.phase in phases
-            ]
+            segments = [segment for segment in catalog.segments.get(episode, ()) if segment.phase in phases]
             frame_groups = [
                 (frame, (segment.phase, segment.source_group))
                 for segment in segments
@@ -502,16 +497,15 @@ def semantic_status_priors(
                     for view in views
                     if semantic_view_matches_relation(view, state, state_instruction_matrix)
                 ]
-                if len(views) != 1:
+                if not views:
                     raise ValueError(
-                        "semantic state-instruction matrix requires exactly one view at "
-                        f"episode={episode}, frame={frame}; matches={len(views)}"
+                        "semantic state-instruction matrix requires at least one view at "
+                        f"episode={episode}, frame={frame}"
                     )
                 weights = [view.weight for view in views]
             else:
                 weights = [
-                    view.weight * _view_kind_weight(view_kind_weights, view.view_kind)
-                    for view in views
+                    view.weight * _view_kind_weight(view_kind_weights, view.view_kind) for view in views
                 ]
             total = sum(weights)
             if total <= 0:
@@ -534,9 +528,7 @@ def semantic_status_priors(
                 else:
                     positive_fraction = 0.0
                 complete_mass += weight * positive_fraction
-            accumulator = group_expected.setdefault(
-                group, {"task_complete": 0.0, "task_blocked": 0.0}
-            )
+            accumulator = group_expected.setdefault(group, {"task_complete": 0.0, "task_blocked": 0.0})
             accumulator["task_complete"] += complete_mass / total
             accumulator["task_blocked"] += (
                 sum(weight for view, weight in zip(views, weights, strict=True) if view.status == "blocked")
@@ -561,18 +553,12 @@ def semantic_status_priors(
     for phase in phases:
         groups = [group for group in group_frames if group[0] == phase]
         if source_weights:
-            raw_source_weights = np.asarray(
-                [source_weights[group[1]] for group in groups], dtype=np.float64
-            )
+            raw_source_weights = np.asarray([source_weights[group[1]] for group in groups], dtype=np.float64)
         else:
-            raw_source_weights = np.asarray(
-                [group_frames[group] for group in groups], dtype=np.float64
-            )
+            raw_source_weights = np.asarray([group_frames[group] for group in groups], dtype=np.float64)
         raw_source_weights /= raw_source_weights.sum()
         for group, conditional_weight in zip(groups, raw_source_weights, strict=True):
             group_weight = configured_phase_weights[phase] / phase_total * conditional_weight
             for name in result:
-                result[name] += (
-                    group_weight * group_expected[group][name] / group_frames[group]
-                )
+                result[name] += group_weight * group_expected[group][name] / group_frames[group]
     return result

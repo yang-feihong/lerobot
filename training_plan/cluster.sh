@@ -31,13 +31,15 @@ required=(
   CLUSTER_WB4_SSH_HOST CLUSTER_WB4_DATA_ROOT CLUSTER_WB4_SOURCE_ROOT CLUSTER_WB4_GPU_COUNT CLUSTER_WB4_CONTAINER_USER
   CLUSTER_WB5_SSH_HOST CLUSTER_WB5_DATA_ROOT CLUSTER_WB5_SOURCE_ROOT CLUSTER_WB5_GPU_COUNT CLUSTER_WB5_CONTAINER_USER
   CLUSTER_WB6_SSH_HOST CLUSTER_WB6_DATA_ROOT CLUSTER_WB6_SOURCE_ROOT CLUSTER_WB6_GPU_COUNT CLUSTER_WB6_CONTAINER_USER
+  CLUSTER_LEROBOT_SSH_HOST CLUSTER_LEROBOT_DATA_ROOT CLUSTER_LEROBOT_MODEL_ROOT
+  CLUSTER_LEROBOT_SOURCE_ROOT CLUSTER_LEROBOT_GPU_COUNT CLUSTER_LEROBOT_CONTAINER_USER
 )
 for name in "${required[@]}"; do
   [[ -n "${!name:-}" ]] || { echo "Missing ${name} in ${env_file}" >&2; exit 2; }
 done
 [[ -f "${CLUSTER_SSH_CONFIG}" ]] || { echo "Missing SSH config: ${CLUSTER_SSH_CONFIG}" >&2; exit 1; }
 
-nodes=(f wb1 wb2 wb3 wb4 wb5 wb6)
+nodes=(f wb1 wb2 wb3 wb4 wb5 wb6 lerobot)
 semantic_plan_args=(
   python3 "${plan_dir}/semantic_plan.py"
   --presets "${plan_dir}/semantic_training_presets.json"
@@ -46,6 +48,8 @@ semantic_plan_args=(
 
 node_profile() {
   local node="$1"
+  host_model_data=""
+  host_hf_cache=""
   case "${node}" in
     f)
       ssh_host="${CLUSTER_F_SSH_HOST}"
@@ -56,6 +60,8 @@ node_profile() {
       image_archive="${CLUSTER_F_IMAGE_ARCHIVE}"
       gpu_count="${CLUSTER_F_GPU_COUNT}"
       container_user="${CLUSTER_F_CONTAINER_USER}"
+      host_model_data="${host_data}"
+      host_hf_cache="${host_data}/lerobot/cache/huggingface"
       ;;
     wb6)
       ssh_host="${CLUSTER_WB6_SSH_HOST}"
@@ -66,6 +72,8 @@ node_profile() {
       image_archive="${CLUSTER_F_IMAGE_ARCHIVE}"
       gpu_count="${CLUSTER_WB6_GPU_COUNT}"
       container_user="${CLUSTER_WB6_CONTAINER_USER}"
+      host_model_data="${host_data}"
+      host_hf_cache="${host_data}/lerobot/cache/huggingface"
       ;;
     wb1|wb2|wb3|wb4|wb5)
       local prefix="CLUSTER_${node^^}"
@@ -80,6 +88,20 @@ node_profile() {
       image_archive="${CLUSTER_CU124_IMAGE_ARCHIVE}"
       gpu_count="${!gpu_var}"
       container_user="${!user_var}"
+      host_model_data="${host_data}"
+      host_hf_cache="${host_data}/lerobot/cache/huggingface"
+      ;;
+    lerobot)
+      ssh_host="${CLUSTER_LEROBOT_SSH_HOST}"
+      host_data="${CLUSTER_LEROBOT_DATA_ROOT}"
+      host_model_data="${CLUSTER_LEROBOT_MODEL_ROOT}"
+      host_hf_cache="${host_model_data}/lerobot/cache/huggingface"
+      host_source="${CLUSTER_LEROBOT_SOURCE_ROOT}"
+      image="${CLUSTER_CU124_IMAGE}"
+      image_id="${CLUSTER_CU124_IMAGE_ID}"
+      image_archive="${CLUSTER_CU124_IMAGE_ARCHIVE}"
+      gpu_count="${CLUSTER_LEROBOT_GPU_COUNT}"
+      container_user="${CLUSTER_LEROBOT_CONTAINER_USER}"
       ;;
     *) echo "Unknown node: ${node}" >&2; exit 2 ;;
   esac
@@ -194,17 +216,19 @@ usage() {
   cat <<'EOF'
 Usage:
   training_plan/cluster.sh describe
-  training_plan/cluster.sh check [all|f|wb1|wb2|wb3|wb4|wb5|wb6]
-  training_plan/cluster.sh sync-code [all|f|wb1|wb2|wb3|wb4|wb5|wb6]
-  training_plan/cluster.sh prepare [all|f|wb1|wb2|wb3|wb4|wb5|wb6]
-  training_plan/cluster.sh dry-run-plan [all|f|wb1|wb2|wb3|wb4|wb5|wb6]
+  training_plan/cluster.sh check [all|f|wb1|wb2|wb3|wb4|wb5|wb6|lerobot]
+  training_plan/cluster.sh sync-code [all|f|wb1|wb2|wb3|wb4|wb5|wb6|lerobot]
+  training_plan/cluster.sh prepare [all|f|wb1|wb2|wb3|wb4|wb5|wb6|lerobot]
+  training_plan/cluster.sh dry-run-plan [all|f|wb1|wb2|wb3|wb4|wb5|wb6|lerobot]
   training_plan/cluster.sh dry-run-task TASK_ID
   training_plan/cluster.sh resume-dry-run-plan
   training_plan/cluster.sh resume-dry-run-task TASK_ID
-  training_plan/cluster.sh start-plan [all|f|wb1|wb2|wb3|wb4|wb5|wb6]
+  training_plan/cluster.sh fork-dry-run-task TASK_ID CHECKPOINT
+  training_plan/cluster.sh start-plan [all|f|wb1|wb2|wb3|wb4|wb5|wb6|lerobot]
   training_plan/cluster.sh start-task TASK_ID
   training_plan/cluster.sh resume-plan
   training_plan/cluster.sh resume-task TASK_ID
+  training_plan/cluster.sh fork-task TASK_ID CHECKPOINT
   training_plan/cluster.sh status
   training_plan/cluster.sh archive-f-checkpoints
 
@@ -234,9 +258,9 @@ describe() {
   printf 'commit=%s container=%s\n' "$(code_commit)" "${CLUSTER_CONTAINER_NAME}"
   for node in "${nodes[@]}"; do
     node_profile "${node}"
-    printf '%s host=%s gpus=%s image=%s image_id=%s data=%s source=%s\n' \
+    printf '%s host=%s gpus=%s image=%s image_id=%s data=%s models=%s source=%s\n' \
       "${node}" "${ssh_host}" "${gpu_count}" "${image}" "${image_id}" \
-      "${host_data}" "${host_source}"
+      "${host_data}" "${host_model_data}" "${host_source}"
     mapfile -t task_list < <(node_tasks "${node}")
     for task in "${task_list[@]}"; do
       read -r gpu port < <(task_resources "${task}")
@@ -362,7 +386,7 @@ probe_gpu_container() {
   local node="$1" probe_name output
   node_profile "${node}"
   probe_name="${CLUSTER_CONTAINER_NAME}-gpu-probe"
-  output="$(ssh_node "${node}" "docker rm -f '${probe_name}' >/dev/null 2>&1 || true; docker run -d --name '${probe_name}' --user '${container_user}' --gpus all -e NVIDIA_DISABLE_REQUIRE=1 -e LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64 '${image}' /lerobot/.venv/bin/python -c 'import torch; assert torch.cuda.is_available(); print(torch.version.cuda, torch.cuda.get_device_name(0))' >/dev/null; for i in 1 2 3 4 5; do state=\$(docker inspect '${probe_name}' --format '{{.State.Status}}'); test \"\$state\" != running && break; sleep 1; done; docker inspect '${probe_name}' --format '{{.State.ExitCode}}'; docker logs '${probe_name}' 2>&1; docker rm '${probe_name}' >/dev/null")"
+  output="$(ssh_node "${node}" "docker rm -f '${probe_name}' >/dev/null 2>&1 || true; docker run -d --name '${probe_name}' --user '${container_user}' --gpus all -v '${host_data}:/data:ro' -v '${host_hf_cache}:/data/lerobot/cache/huggingface:rw' -e HOME=/data/lerobot/home -e HF_HOME=/data/lerobot/cache/huggingface -e NVIDIA_DISABLE_REQUIRE=1 -e NVIDIA_REQUIRE_CUDA= -e LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64 '${image}' /lerobot/.venv/bin/python -c 'import netrc, pathlib, torch; assert netrc.netrc().authenticators(\"api.wandb.ai\"); probe=pathlib.Path(\"/data/lerobot/cache/huggingface/.write_probe\"); probe.write_text(\"ok\"); probe.unlink(); assert torch.cuda.is_available(); print(torch.version.cuda, torch.cuda.get_device_name(0))' >/dev/null; for i in 1 2 3 4 5; do state=\$(docker inspect '${probe_name}' --format '{{.State.Status}}'); test \"\$state\" != running && break; sleep 1; done; docker inspect '${probe_name}' --format '{{.State.ExitCode}}'; docker logs '${probe_name}' 2>&1; docker rm '${probe_name}' >/dev/null")"
   [[ "${output}" == 0$'\n'* ]] || { echo "${node}: CUDA probe failed: ${output}" >&2; return 1; }
   echo "${node}: CUDA probe ${output//$'\n'/ }"
 }
@@ -425,7 +449,7 @@ prepare_node() {
 ensure_runtime_home() {
   local node="$1"
   node_profile "${node}"
-  ssh_node "${node}" "mkdir -p '${host_source}' '${host_data}/lerobot/cache/huggingface' '${host_data}/lerobot/home'; if ! test -s '${host_data}/lerobot/home/.netrc' && test -s /root/.netrc; then install -m 600 /root/.netrc '${host_data}/lerobot/home/.netrc'; fi; test -s '${host_data}/lerobot/home/.netrc' || { echo 'Missing persistent W&B credential: ${host_data}/lerobot/home/.netrc' >&2; exit 1; }; chmod 600 '${host_data}/lerobot/home/.netrc'; chown -R '${container_user}' '${host_data}/lerobot/home' '${host_data}/lerobot/cache'"
+  ssh_node "${node}" "mkdir -p '${host_source}' '${host_hf_cache}'; test ! -L '${host_data}/lerobot/home' || { echo 'Persistent HOME must be a real directory inside the mounted data root, not a symlink' >&2; exit 1; }; test ! -L '${host_hf_cache}' || { echo 'Persistent Hugging Face cache must be a real directory' >&2; exit 1; }; mkdir -p '${host_data}/lerobot/home'; if ! test -s '${host_data}/lerobot/home/.netrc' && test -s /root/.netrc; then install -m 600 /root/.netrc '${host_data}/lerobot/home/.netrc'; fi; test -s '${host_data}/lerobot/home/.netrc' || { echo 'Missing persistent W&B credential: ${host_data}/lerobot/home/.netrc' >&2; exit 1; }; chmod 600 '${host_data}/lerobot/home/.netrc'; chown -R '${container_user}' '${host_data}/lerobot/home' '${host_hf_cache}'; uid='${container_user%%:*}'; gid='${container_user##*:}'; setpriv --reuid \"\$uid\" --regid \"\$gid\" --clear-groups test -r '${host_data}/lerobot/home/.netrc' || { echo 'Container user cannot read persistent W&B credential' >&2; exit 1; }; setpriv --reuid \"\$uid\" --regid \"\$gid\" --clear-groups test -w '${host_hf_cache}' || { echo 'Container user cannot write persistent Hugging Face cache' >&2; exit 1; }"
 }
 
 task_container_name() {
@@ -434,16 +458,20 @@ task_container_name() {
 
 prepare_resume_io() {
   local node="$1" checkpoint="$2"
-  local checkpoint_rel host_checkpoint host_run container_run probe_script probe_q
+  local checkpoint_rel host_checkpoint host_run container_run probe_script probe_q model_mount
   node_profile "${node}"
   [[ "${checkpoint}" == /data/models/trained/pi05/*/checkpoints/[0-9]* ]] || {
     echo "${node}: refusing to prepare unexpected resume path: ${checkpoint}" >&2
     return 1
   }
   checkpoint_rel="${checkpoint#/data/}"
-  host_checkpoint="${host_data}/${checkpoint_rel}"
+  host_checkpoint="${host_model_data}/${checkpoint_rel}"
   host_run="${host_checkpoint%/checkpoints/*}"
-  container_run="/data/${host_run#${host_data}/}"
+  container_run="${checkpoint%/checkpoints/*}"
+  model_mount=""
+  if [[ "${host_model_data}" != "${host_data}" ]]; then
+    model_mount="-v '${host_model_data}/models/trained/pi05:/data/models/trained/pi05:rw'"
+  fi
 
   # Checkpoints are sometimes copied by root between training nodes, while
   # wb2--wb5 deliberately run containers as uid 1001.  Normalize ownership
@@ -454,17 +482,21 @@ prepare_resume_io() {
   ssh_node "${node}" "set -eu
     test -d '${host_checkpoint}'
     chown -R '${container_user}' '${host_run}'
-    docker run --rm --entrypoint bash --user '${container_user}' -v '${host_data}:/data:rw' '${image}' -lc ${probe_q}"
+    docker run --rm --entrypoint bash --user '${container_user}' -v '${host_data}:/data:rw' ${model_mount} '${image}' -lc ${probe_q}"
   echo "${node}: resume I/O preflight OK (${container_user}, ${checkpoint})"
 }
 
 run_task_container() {
   local node="$1" task="$2" mode="$3" gpu="$4" port="$5" checkpoint="${6:-}"
-  local name code command_q existing
+  local name code command_q existing model_mount
   node_profile "${node}"
   ensure_runtime_home "${node}"
   name="$(task_container_name "${node}" "${task}")"
   code="$(container_code_dir)"
+  model_mount=""
+  if [[ "${host_model_data}" != "${host_data}" ]]; then
+    model_mount="-v '${host_model_data}/models/trained/pi05:/data/models/trained/pi05:rw'"
+  fi
   existing="$(ssh_node "${node}" "docker inspect '${name}' --format '{{.State.Status}}' 2>/dev/null || true")"
   if [[ "${existing}" == running ]]; then
     echo "${node}/${task}: already running in ${name}"
@@ -474,30 +506,38 @@ run_task_container() {
     echo "${node}/${task}: existing stopped container ${name}; use resume-plan after preserving its logs" >&2
     return 1
   }
-  if [[ "${mode}" == resume ]]; then
+  if [[ "${mode}" == resume || "${mode}" == fork ]]; then
     prepare_resume_io "${node}" "${checkpoint}"
   fi
   if [[ "${mode}" == start ]]; then
     printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" start "${task}" "${gpu}" "${port}"
+  elif [[ "${mode}" == fork ]]; then
+    printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" fork "${task}" "${gpu}" "${checkpoint}" "${port}"
   else
     printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" resume "${task}" "${gpu}" "${checkpoint}" "${port}"
   fi
-  ssh_node "${node}" "docker run -d --name '${name}' --user '${container_user}' --gpus all --ipc=host --shm-size=64g --stop-timeout=120 -v '${host_data}:/data:rw' -v '${host_source}:/workspace/source:rw' -w '${code}' -e NVIDIA_DISABLE_REQUIRE=1 -e LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64 -e PYTHONPATH='${code}/src' -e UV_PROJECT_ENVIRONMENT=/lerobot/.venv -e VIRTUAL_ENV=/lerobot/.venv -e LEROBOT_RUNTIME_BIN=/lerobot/.venv/bin -e LEROBOT_TRAIN_FOREGROUND=true -e PATH=/lerobot/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -e HF_HOME=/data/lerobot/cache/huggingface -e HOME=/data/lerobot/home -e TZ=Asia/Shanghai '${image}' ${command_q} >/dev/null"
+  ssh_node "${node}" "mkdir -p '${host_model_data}/models/trained/pi05'; docker run -d --name '${name}' --user '${container_user}' --gpus all --ipc=host --shm-size=64g --stop-timeout=120 -v '${host_data}:/data:rw' -v '${host_hf_cache}:/data/lerobot/cache/huggingface:rw' ${model_mount} -v '${host_source}:/workspace/source:rw' -w '${code}' -e NVIDIA_DISABLE_REQUIRE=1 -e NVIDIA_REQUIRE_CUDA= -e LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64 -e PYTHONPATH='${code}/src' -e UV_PROJECT_ENVIRONMENT=/lerobot/.venv -e VIRTUAL_ENV=/lerobot/.venv -e LEROBOT_RUNTIME_BIN=/lerobot/.venv/bin -e LEROBOT_TRAIN_FOREGROUND=true -e PATH=/lerobot/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -e HF_HOME=/data/lerobot/cache/huggingface -e HF_HUB_OFFLINE=1 -e HOME=/data/lerobot/home -e TZ=Asia/Shanghai '${image}' ${command_q} >/dev/null"
   echo "${node}/${task}: started ${name} (${mode})"
 }
 
 run_task_dry_run() {
   local node="$1" task="$2" mode="$3" gpu="$4" port="$5" checkpoint="${6:-}" target_steps
-  local code command_q output dry_name
+  local code command_q output dry_name model_mount
   node_profile "${node}"
   code="$(container_code_dir)"
   dry_name="${CLUSTER_CONTAINER_NAME}-dry-run-${task}"
-  if [[ "${mode}" == resume ]]; then
+  model_mount=""
+  if [[ "${host_model_data}" != "${host_data}" ]]; then
+    model_mount="-v '${host_model_data}/models/trained/pi05:/data/models/trained/pi05:ro'"
+  fi
+  if [[ "${mode}" == resume || "${mode}" == fork ]]; then
     prepare_resume_io "${node}" "${checkpoint}"
   fi
   if [[ "${mode}" == start ]]; then
     target_steps="$(task_target_steps "${task}")"
     printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" dry-run "${task}" "${gpu}" "${port}"
+  elif [[ "${mode}" == fork ]]; then
+    printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" fork-dry-run "${task}" "${gpu}" "${checkpoint}" "${port}"
   else
     printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" resume-dry-run "${task}" "${gpu}" "${checkpoint}" "${port}"
   fi
@@ -505,7 +545,7 @@ run_task_dry_run() {
   # CPU-only short-lived container and read its logs after it exits instead.
   output="$(ssh_node "${node}" "set -e
     docker rm -f '${dry_name}' >/dev/null 2>&1 || true
-    docker run -d --name '${dry_name}' --entrypoint bash --user '${container_user}' -v '${host_data}:/data:ro' -v '${host_source}:/workspace/source:rw' -w '${code}' -e PYTHONPATH='${code}/src' -e UV_PROJECT_ENVIRONMENT=/lerobot/.venv -e VIRTUAL_ENV=/lerobot/.venv -e LEROBOT_RUNTIME_BIN=/lerobot/.venv/bin -e PATH=/lerobot/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -e HF_HOME=/data/lerobot/cache/huggingface -e HOME=/tmp -e TZ=Asia/Shanghai '${image}' -lc ${command_q@Q} >/dev/null
+    docker run -d --name '${dry_name}' --entrypoint bash --user '${container_user}' -v '${host_data}:/data:ro' -v '${host_hf_cache}:/data/lerobot/cache/huggingface:rw' ${model_mount} -v '${host_source}:/workspace/source:rw' -w '${code}' -e PYTHONPATH='${code}/src' -e UV_PROJECT_ENVIRONMENT=/lerobot/.venv -e VIRTUAL_ENV=/lerobot/.venv -e LEROBOT_RUNTIME_BIN=/lerobot/.venv/bin -e PATH=/lerobot/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -e HF_HOME=/data/lerobot/cache/huggingface -e HF_HUB_OFFLINE=1 -e HOME=/tmp -e TZ=Asia/Shanghai '${image}' -lc ${command_q@Q} >/dev/null
     for i in 1 2 3 4 5 6 7 8 9 10; do
       state=\$(docker inspect '${dry_name}' --format '{{.State.Status}}')
       test \"\${state}\" != running && break
@@ -527,13 +567,21 @@ run_task_dry_run() {
     [[ "${output}" == *"--steps=${target_steps}"* ]] || {
       echo "${node}/${task}: start dry-run has wrong training horizon" >&2; return 1;
     }
-  else
+  elif [[ "${mode}" == resume ]]; then
     [[ "${output}" == *"--resume=true"* && "${output}" == *"--wandb.resume_training_run=true"* ]] || {
       echo "${node}/${task}: resume dry-run did not preserve the original run" >&2; return 1;
     }
     target_steps="$(task_target_steps "${task}")"
     [[ "${output}" == *"--steps=${target_steps}"* ]] || {
       echo "${node}/${task}: resume dry-run has wrong training horizon" >&2; return 1;
+    }
+  else
+    [[ "${output}" == *"--resume=true"* && "${output}" == *"--wandb.resume_training_run=false"* ]] || {
+      echo "${node}/${task}: fork dry-run did not create a new W&B run" >&2; return 1;
+    }
+    target_steps="$(task_target_steps "${task}")"
+    [[ "${output}" == *"--steps=${target_steps}"* ]] || {
+      echo "${node}/${task}: fork dry-run has wrong training horizon" >&2; return 1;
     }
   fi
   echo "${node}/${task}: ${mode} dry-run OK"
@@ -547,7 +595,7 @@ find_running_task() {
 latest_run_dir() {
   local node="$1" task="$2"
   node_profile "${node}"
-  ssh_node "${node}" "find '${host_data}/models/trained/pi05' -mindepth 1 -maxdepth 1 -type d -name '*training_job_${task}_arm_mode_complete' -printf '%T@ %p\\n' | sort -nr | head -1 | cut -d' ' -f2-"
+  ssh_node "${node}" "find '${host_model_data}/models/trained/pi05' -mindepth 1 -maxdepth 1 -type d -name '*training_job_${task}_arm_mode_complete' -printf '%T@ %p\\n' | sort -nr | head -1 | cut -d' ' -f2-"
 }
 
 latest_complete_checkpoint() {
@@ -670,6 +718,7 @@ start_one_task() {
 dry_run_one_task() {
   local task="$1" mode="${2:-start}" node gpu port run_dir step checkpoint=""
   node="$(task_node "${task}")" || { echo "Unknown task: ${task}" >&2; return 2; }
+  ensure_runtime_home "${node}"
   sync_code "${node}"
   check_node "${node}"
   read -r gpu port < <(task_resources "${task}")
@@ -686,9 +735,30 @@ dry_run_one_task() {
 resume_one_task() {
   local task="$1" node
   node="$(task_node "${task}")" || { echo "Unknown task: ${task}" >&2; return 2; }
+  ensure_runtime_home "${node}"
   sync_code "${node}"
   check_node "${node}"
   resume_task "${node}" "${task}"
+}
+
+fork_one_task() {
+  local task="$1" checkpoint="$2" node gpu port
+  node="$(task_node "${task}")" || { echo "Unknown task: ${task}" >&2; return 2; }
+  ensure_runtime_home "${node}"
+  sync_code "${node}"
+  check_node "${node}"
+  read -r gpu port < <(task_resources "${task}")
+  run_task_container "${node}" "${task}" fork "${gpu}" "${port}" "${checkpoint}"
+}
+
+fork_dry_run_one_task() {
+  local task="$1" checkpoint="$2" node gpu port
+  node="$(task_node "${task}")" || { echo "Unknown task: ${task}" >&2; return 2; }
+  ensure_runtime_home "${node}"
+  sync_code "${node}"
+  check_node "${node}"
+  read -r gpu port < <(task_resources "${task}")
+  run_task_dry_run "${node}" "${task}" fork "${gpu}" "${port}" "${checkpoint}"
 }
 
 status() {
@@ -740,10 +810,12 @@ case "${1:-}" in
   dry-run-task) dry_run_one_task "${2:?TASK_ID is required}" start ;;
   resume-dry-run-plan) dry_run_plan resume ;;
   resume-dry-run-task) dry_run_one_task "${2:?TASK_ID is required}" resume ;;
+  fork-dry-run-task) fork_dry_run_one_task "${2:?TASK_ID is required}" "${3:?CHECKPOINT is required}" ;;
   start-plan) plan_action start "${2:-all}" ;;
   start-task) start_one_task "${2:?TASK_ID is required}" ;;
   resume-plan) plan_action resume ;;
   resume-task) resume_one_task "${2:?TASK_ID is required}" ;;
+  fork-task) fork_one_task "${2:?TASK_ID is required}" "${3:?CHECKPOINT is required}" ;;
   status) status ;;
   archive-f-checkpoints) exec bash "${plan_dir}/storage_guard.sh" archive ;;
   *) usage >&2; exit 2 ;;

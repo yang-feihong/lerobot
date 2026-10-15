@@ -63,6 +63,62 @@
           }
         }
       }
+    },
+    "three_goal_conditioned": {
+      "state_weights": {"approach": 1.0, "handle_press": 1.0, "traversal": 1.0},
+      "state_instruction_matrix": {
+        "approach": {
+          "goal_approach": {
+            "status": "active",
+            "action_supervision": "demonstrated",
+            "completion_boundary": "goal_end"
+          },
+          "goal_open": {
+            "status": "active",
+            "action_supervision": "demonstrated",
+            "completion_boundary": "future_goal_end"
+          },
+          "goal_enter": {
+            "status": "active",
+            "action_supervision": "demonstrated",
+            "completion_boundary": "future_goal_end"
+          }
+        },
+        "handle_press": {
+          "goal_approach": {
+            "status": "complete",
+            "action_supervision": "hold",
+            "completion_boundary": "none"
+          },
+          "goal_open": {
+            "status": "active",
+            "action_supervision": "demonstrated",
+            "completion_boundary": "goal_end"
+          },
+          "goal_enter": {
+            "status": "active",
+            "action_supervision": "demonstrated",
+            "completion_boundary": "future_goal_end"
+          }
+        },
+        "traversal": {
+          "goal_approach": {
+            "status": "complete",
+            "action_supervision": "hold",
+            "completion_boundary": "none"
+          },
+          "goal_open": {
+            "status": "complete",
+            "action_supervision": "hold",
+            "completion_boundary": "none"
+          },
+          "goal_enter": {
+            "status": "active",
+            "action_supervision": "demonstrated",
+            "completion_boundary": "goal_end"
+          }
+        }
+      }
     }
   }
 }

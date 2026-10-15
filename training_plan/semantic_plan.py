@@ -15,8 +15,8 @@ VALID_DATASET_FAMILIES = {"staff1", "all_scenes"}
 VALID_MEMORY_MODES = {"standard", "mem_vit", "full_mem"}
 VALID_STATUSES = {"active", "complete", "blocked"}
 VALID_ACTION_SUPERVISION = {"demonstrated", "hold"}
-VALID_COMPLETION_BOUNDARIES = {"none", "state_end", "goal_end"}
-VALID_NODES = {"f", "wb1", "wb2", "wb3", "wb4", "wb5", "wb6"}
+VALID_COMPLETION_BOUNDARIES = {"none", "state_end", "goal_end", "future_goal_end"}
+VALID_NODES = {"f", "wb1", "wb2", "wb3", "wb4", "wb5", "wb6", "lerobot"}
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -56,10 +56,7 @@ def _validate_semantic_definition(name: str, definition: Any) -> None:
     if set(weights) != set(matrix):
         raise ValueError(f"{name} state weights and matrix rows must exactly match")
     if any(
-        not isinstance(state, str)
-        or not state
-        or not isinstance(weight, (int, float))
-        or weight <= 0
+        not isinstance(state, str) or not state or not isinstance(weight, (int, float)) or weight <= 0
         for state, weight in weights.items()
     ):
         raise ValueError(f"{name} has invalid state_weights")
@@ -76,9 +73,7 @@ def _validate_resources(task_id: str, resources: Any) -> None:
         "gpu_ids",
         "main_process_port",
     }:
-        raise ValueError(
-            f"task {task_id!r} resources require exactly node, gpu_ids and main_process_port"
-        )
+        raise ValueError(f"task {task_id!r} resources require exactly node, gpu_ids and main_process_port")
     if resources["node"] not in VALID_NODES:
         raise ValueError(f"task {task_id!r} has invalid resource node")
     gpu_ids = resources["gpu_ids"]
@@ -116,7 +111,7 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
         if not isinstance(task, dict):
             raise ValueError(f"task {task_id!r} must be an object")
         common = {"dataset_family", "memory_mode", "resources"}
-        optional = {"train_steps"}
+        optional = {"train_steps", "semantic_views_file"}
         preset_keys = common | {"training_preset"}
         inline_keys = common | {"state_weights", "state_instruction_matrix"}
         task_keys = frozenset(task)
@@ -129,10 +124,18 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
             raise ValueError(f"task {task_id!r} has invalid dataset_family")
         if task["memory_mode"] not in VALID_MEMORY_MODES:
             raise ValueError(f"task {task_id!r} has invalid memory_mode")
-        if "train_steps" in task and (
-            not isinstance(task["train_steps"], int) or task["train_steps"] <= 0
-        ):
+        if "train_steps" in task and (not isinstance(task["train_steps"], int) or task["train_steps"] <= 0):
             raise ValueError(f"task {task_id!r} train_steps must be a positive integer")
+        semantic_views_file = task.get("semantic_views_file", "semantic_views.json")
+        if (
+            not isinstance(semantic_views_file, str)
+            or not semantic_views_file
+            or Path(semantic_views_file).name != semantic_views_file
+            or not semantic_views_file.endswith(".json")
+        ):
+            raise ValueError(
+                f"task {task_id!r} semantic_views_file must be a JSON filename under dataset meta/"
+            )
         _validate_resources(task_id, task["resources"])
         if "training_preset" in task:
             if task["training_preset"] not in presets:
@@ -195,9 +198,7 @@ def validate_sidecar(payload: dict[str, Any], task_id: str, sidecar_path: Path) 
         state: {_relation_tuple(intent, relation) for intent, relation in matrix[state].items()}
         for state in selected_states
     }
-    seen: dict[str, set[tuple[str, str, str, str]]] = {
-        state: set() for state in selected_states
-    }
+    seen: dict[str, set[tuple[str, str, str, str]]] = {state: set() for state in selected_states}
     segment_count = 0
     frame_count = 0
     for episode_key, episode in episodes.items():
@@ -246,6 +247,11 @@ def validate_sidecar(payload: dict[str, Any], task_id: str, sidecar_path: Path) 
                             and completion_frame is not None
                             and start < int(completion_frame) <= stop
                         )
+                        or (
+                            relation[3] == "future_goal_end"
+                            and completion_frame is not None
+                            and int(completion_frame) > stop
+                        )
                     )
                 ]
                 if len(matching_relations) != 1:
@@ -261,10 +267,12 @@ def validate_sidecar(payload: dict[str, Any], task_id: str, sidecar_path: Path) 
                     for view_start, view_stop, relation in enabled
                     if view_start <= left and right <= view_stop
                 ]
-                if len(covering) != 1:
+                covering_set = set(covering)
+                if len(covering) != len(covering_set) or covering_set != allowed[state]:
                     raise ValueError(
-                        f"task {task_id} requires exactly one configured state-instruction relation over "
-                        f"episode {episode_key}, state {state}, frames [{left}, {right}); got {covering}"
+                        f"task {task_id} requires every configured state-instruction relation exactly once over "
+                        f"episode {episode_key}, state {state}, frames [{left}, {right}); "
+                        f"expected={sorted(allowed[state])}, got={sorted(covering)}"
                     )
             segment_count += 1
             frame_count += stop - start
@@ -299,6 +307,7 @@ def command_resolve(args: argparse.Namespace) -> None:
         ",".join(str(gpu_id) for gpu_id in resources["gpu_ids"]),
         str(resources["main_process_port"]),
         str(task.get("train_steps", "")),
+        str(task.get("semantic_views_file", "semantic_views.json")),
     )
     print("\n".join(values))
 
@@ -325,6 +334,7 @@ def command_describe(args: argparse.Namespace) -> None:
     )
     print(f"enabled_states={_compact(list(weights))}")
     print(f"state_weights={_compact(weights)}")
+    print(f"semantic_views_file={task.get('semantic_views_file', 'semantic_views.json')}")
     print("state_instruction_matrix:")
     for state, instructions in matrix.items():
         for intent, relation in instructions.items():

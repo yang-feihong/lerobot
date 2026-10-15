@@ -82,6 +82,20 @@ def _make_dummy_stats(features: dict) -> dict:
 # ── Construction contracts ───────────────────────────────────────────
 
 
+def test_explicit_local_root_does_not_fall_back_to_hub(tmp_path, monkeypatch):
+    """Local filesystem failures must be reported instead of hidden by a Hub lookup."""
+
+    root = tmp_path / "dataset"
+
+    def fail_local_load(self):
+        raise FileNotFoundError("local Arrow cache is unavailable")
+
+    monkeypatch.setattr(LeRobotDatasetMetadata, "_load_metadata", fail_local_load)
+
+    with pytest.raises(FileNotFoundError, match="local Arrow cache is unavailable"):
+        LeRobotDatasetMetadata(repo_id="local/test", root=root)
+
+
 def test_create_produces_valid_info_on_disk(tmp_path):
     """create() writes info.json and the returned object reflects the provided settings."""
     root = tmp_path / "new_ds"

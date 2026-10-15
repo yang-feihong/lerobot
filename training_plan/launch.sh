@@ -48,6 +48,8 @@ Usage:
   training_plan/launch.sh dry-run TASK_ID GPU_ID [PORT]
   training_plan/launch.sh resume TASK_ID GPU_ID CHECKPOINT [PORT]
   training_plan/launch.sh resume-dry-run TASK_ID GPU_ID CHECKPOINT [PORT]
+  training_plan/launch.sh fork TASK_ID GPU_ID CHECKPOINT [PORT]
+  training_plan/launch.sh fork-dry-run TASK_ID GPU_ID CHECKPOINT [PORT]
 
 TASK_ID values are defined in training_plan/training_jobs.json:
 EOF
@@ -61,7 +63,7 @@ mapfile -t semantic_task_spec < <(
   python3 "${plan_dir}/semantic_plan.py" \
     --presets "${semantic_presets_file}" --jobs "${training_jobs_file}" resolve "${task_id}"
 )
-[[ "${#semantic_task_spec[@]}" -eq 9 ]] || {
+[[ "${#semantic_task_spec[@]}" -eq 10 ]] || {
   echo "Failed to resolve semantic task ${task_id} from ${training_jobs_file}" >&2
   exit 2
 }
@@ -74,6 +76,7 @@ configured_node="${semantic_task_spec[5]}"
 configured_gpu_ids="${semantic_task_spec[6]}"
 configured_port="${semantic_task_spec[7]}"
 task_train_steps="${semantic_task_spec[8]}"
+semantic_views_file="${semantic_task_spec[9]:-semantic_views.json}"
 effective_train_steps="${task_train_steps:-${TRAIN_STEPS}}"
 semantic_source_weights='{}'
 
@@ -90,7 +93,7 @@ else
   }
   dataset_root="${ALL_SCENES_DATASET_ROOT}"
 fi
-semantic_views_path="${dataset_root}/meta/semantic_views.json"
+semantic_views_path="${dataset_root}/meta/${semantic_views_file}"
 
 memory_args=()
 case "${memory_mode}" in
@@ -121,7 +124,7 @@ esac
 
 command="${1:-}"
 gpu_id="${3:-${configured_gpu_ids}}"
-if [[ "${command}" == resume || "${command}" == resume-dry-run ]]; then
+if [[ "${command}" == resume || "${command}" == resume-dry-run || "${command}" == fork || "${command}" == fork-dry-run ]]; then
   port="${5:-${configured_port}}"
 else
   port="${4:-${configured_port}}"
@@ -230,7 +233,7 @@ case "${command}" in
     describe
     exec bash "${repo_root}/train_vla_pi05.sh" "${common_args[@]}"
     ;;
-  resume|resume-dry-run)
+  resume|resume-dry-run|fork|fork-dry-run)
     checkpoint="${4:-}"
     [[ -n "${checkpoint}" ]] || { echo "Missing checkpoint path." >&2; exit 2; }
     checkpoint="$(readlink -f "${checkpoint}")"
@@ -239,7 +242,7 @@ case "${command}" in
     if ! python3 - "${resume_config}" "${dataset_root}" "${semantic_phases}" "${semantic_phase_weights}" \
       "${semantic_state_instruction_matrix}" "${memory_mode}" \
       "${B2_ACTION_REPRESENTATION}" "${Z1_ACTION_REPRESENTATION}" \
-      "${PREDICT_TASK_COMPLETE}" "${PREDICT_TASK_BLOCKED}" <<'PY'
+      "${PREDICT_TASK_COMPLETE}" "${PREDICT_TASK_BLOCKED}" "${command}" <<'PY'
 import json
 import sys
 
@@ -253,6 +256,7 @@ expected_phase_weights = json.loads(sys.argv[4])
 expected_state_instruction_matrix = json.loads(sys.argv[5])
 expected_encoding = "continuous" if sys.argv[6] == "full_mem" else "text"
 saved_matrix = dataset.get("semantic_state_instruction_matrix", {})
+fork_mode = sys.argv[11] in {"fork", "fork-dry-run"}
 
 
 def matrix_topology(matrix):
@@ -269,8 +273,8 @@ expected = {
     "dataset.semantic_phase_weights": dataset.get("semantic_phase_weights") == expected_phase_weights,
     # An explicit updated-training-objective resume may change relation details
     # such as state_end -> goal_end, but it must remain the same state/intent task.
-    "dataset.semantic_state_instruction_matrix topology": matrix_topology(saved_matrix)
-    == matrix_topology(expected_state_instruction_matrix),
+    "dataset.semantic_state_instruction_matrix topology": fork_mode
+    or matrix_topology(saved_matrix) == matrix_topology(expected_state_instruction_matrix),
     "policy.state_action_encoding": policy.get("state_action_encoding") == expected_encoding,
     "policy.b2_action_representation": policy.get("b2_action_representation") == sys.argv[7],
     "policy.z1_action_representation": policy.get("z1_action_representation") == sys.argv[8],
@@ -307,11 +311,13 @@ PY
       --action-continuous-group-weight="${ACTION_CONTINUOUS_GROUP_WEIGHT}"
       --action-discrete-group-weight="${ACTION_DISCRETE_GROUP_WEIGHT}"
     )
-    if [[ "${command}" == resume-dry-run ]]; then
+    if [[ "${command}" == fork || "${command}" == fork-dry-run ]]; then
+      fork_name="$(date +%Y%m%d_%H%M%S)_mem_pi05_b2_z1_vla_training_job_${task_id}_arm_mode_complete"
+      resume_args+=(--resume-new-run-name="${fork_name}")
+    fi
+    if [[ "${command}" == resume-dry-run || "${command}" == fork-dry-run ]]; then
       resume_args+=(--dry-run=true)
     fi
-    # No --resume-new-run-name is passed: train_vla_pi05.sh therefore restores
-    # wandb.run_id and uses resume="must" for the original W&B run.
     exec bash "${repo_root}/train_vla_pi05.sh" "${resume_args[@]}"
     ;;
   *) usage >&2; exit 2 ;;

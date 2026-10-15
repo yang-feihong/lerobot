@@ -94,7 +94,7 @@ def test_stage1_contract_is_explicit_and_validates_sidecar(tmp_path):
 
 def test_stage1_contract_rejects_wrong_language(tmp_path):
     matrix = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
-    with pytest.raises(ValueError, match="exactly one configured state-instruction relation"):
+    with pytest.raises(ValueError, match="every configured state-instruction relation exactly once"):
         semantic_plan.validate_sidecar(
             matrix,
             "all_scenes_stage1_full_mem",
@@ -132,9 +132,26 @@ def test_inline_task_contract_is_equivalent_to_preset(tmp_path):
     assert semantic_plan.state_weights(loaded, "inline_stage1") == semantic_plan.state_weights(
         loaded, "all_scenes_stage1_full_mem"
     )
-    assert semantic_plan.selected_matrix(
-        loaded, "inline_stage1"
-    ) == semantic_plan.selected_matrix(loaded, "all_scenes_stage1_full_mem")
+    assert semantic_plan.selected_matrix(loaded, "inline_stage1") == semantic_plan.selected_matrix(
+        loaded, "all_scenes_stage1_full_mem"
+    )
+
+
+def test_goal_conditioned_contract_covers_every_state_and_goal():
+    payload = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
+    task = payload["tasks"]["staff1_goal_conditioned_full_mem"]
+    matrix = semantic_plan.selected_matrix(payload, "staff1_goal_conditioned_full_mem")
+    assert task["semantic_views_file"] == "semantic_views_three_goal_conditioned.json"
+    assert set(matrix) == {"approach", "handle_press", "traversal"}
+    assert all(
+        set(relations) == {"goal_approach", "goal_open", "goal_enter"} for relations in matrix.values()
+    )
+    assert matrix["approach"]["goal_open"]["completion_boundary"] == "future_goal_end"
+    assert matrix["handle_press"]["goal_approach"] == {
+        "status": "complete",
+        "action_supervision": "hold",
+        "completion_boundary": "none",
+    }
 
 
 def test_task_cannot_mix_preset_and_inline_matrix(tmp_path):
@@ -149,9 +166,7 @@ def test_task_cannot_mix_preset_and_inline_matrix(tmp_path):
         },
         "training_preset": "stage1_only",
         "state_weights": {"approach": 1.0},
-        "state_instruction_matrix": payload["training_presets"]["stage1_only"][
-            "state_instruction_matrix"
-        ],
+        "state_instruction_matrix": payload["training_presets"]["stage1_only"]["state_instruction_matrix"],
     }
     invalid_path = tmp_path / "invalid.json"
     invalid_path.write_text(

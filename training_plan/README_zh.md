@@ -44,6 +44,11 @@ MEM-ViT 使用 LoRA 或 frozen 模式时，新 checkpoint 不再重复保存冻�
 }
 ```
 
+任务默认读取数据集的 `meta/semantic_views.json`。当一种训练语义需要经过正式构建器
+筛选出的专用候选视图时，可在任务中显式填写同一 `meta/` 目录下的文件名，例如
+`"semantic_views_file": "semantic_views_three_goal_conditioned.json"`。该字段只选择语义
+侧车，不复制或改写物理数据；入口仍会对专用侧车执行逐 episode 的完整矩阵验收。
+
 不使用快捷配置时，在 `training_jobs.json` 的该任务内直接填写完整权重和矩阵：
 
 ```json

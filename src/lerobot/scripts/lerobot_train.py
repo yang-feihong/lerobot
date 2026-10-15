@@ -989,8 +989,8 @@ def configure_action_bool_balance(
         float(dataset.meta.fps),
         control_frequency_hz,
     )
-    forced_semantic_holds = 0
-    semantic_completed_targets: dict[int, np.ndarray] = {}
+    semantic_complete_mass: dict[int, np.ndarray] = {}
+    semantic_hold_mass: dict[int, np.ndarray] = {}
     use_phase_multiplicity = semantic_views is not None and bool(semantic_phases)
     if use_phase_multiplicity:
         if not semantic_state_instruction_matrix:
@@ -1005,7 +1005,8 @@ def configure_action_bool_balance(
         episode_multiplicities = {}
         for episode_index, length in zip(episode_indices, lengths, strict=True):
             multiplicity = np.zeros(length, dtype=np.int64)
-            completed_targets = np.zeros(length, dtype=bool)
+            complete_mass = np.zeros(length, dtype=np.float64)
+            hold_mass = np.zeros(length, dtype=np.float64)
             for segment in semantic_views.segments.get(episode_index, ()):
                 if segment.phase not in semantic_phases:
                     continue
@@ -1024,35 +1025,39 @@ def configure_action_bool_balance(
                         else view.view_kind == "primary"
                     )
                 ]
-                if len(matching_views) != 1:
+                if not matching_views:
                     raise ValueError(
-                        "Every selected semantic segment must have exactly one configured covering view: "
-                        f"episode={episode_index}, phase={segment.phase}, matches={len(matching_views)}"
-                    )
-                view = matching_views[0]
-                if (
-                    view.status != "active"
-                    or view.action_supervision != "demonstrated"
-                    or view.completion_frame is None
-                    or not segment.frame_start < view.completion_frame <= segment.frame_stop
-                ):
-                    raise ValueError(
-                        "Selected semantic views must supervise the demonstrated action and "
-                        "complete inside the selected segment for exact arm-mode balancing: "
+                        "Every selected semantic segment must have at least one configured covering view: "
                         f"episode={episode_index}, phase={segment.phase}"
                     )
-                segment_length = segment.frame_stop - segment.frame_start
-                completed_targets[view.completion_frame : segment.frame_stop] = True
+                weights = np.asarray([view.weight for view in matching_views], dtype=np.float64)
+                if np.any(weights < 0) or float(weights.sum()) <= 0:
+                    raise ValueError(
+                        "Configured semantic views must have nonnegative weights with positive total: "
+                        f"episode={episode_index}, phase={segment.phase}"
+                    )
+                weights /= weights.sum()
+                starts = np.arange(segment.frame_start, segment.frame_stop, dtype=np.int64)
                 for offset in offsets:
                     offset = int(offset)
                     if offset < 0:
                         raise ValueError("Action sample offsets must be nonnegative")
-                    first_target = segment.frame_start + offset
-                    if first_target < segment.frame_stop:
-                        multiplicity[first_target : segment.frame_stop] += 1
-                    forced_semantic_holds += min(offset, segment_length)
+                    virtual_targets = starts + offset
+                    # Temporal dataset padding repeats the final physical action.  Semantic
+                    # completion then turns the padded suffix into an explicit hold, so every
+                    # action slot remains part of the boolean prior just as it is in the batch.
+                    target_indices = np.minimum(virtual_targets, length - 1)
+                    np.add.at(multiplicity, target_indices, 1)
+                    for view, probability in zip(matching_views, weights, strict=True):
+                        completed = np.full(len(virtual_targets), view.status == "complete")
+                        if view.status != "complete" and view.completion_frame is not None:
+                            completed = virtual_targets >= view.completion_frame
+                        held = completed | (view.action_supervision == "hold")
+                        np.add.at(complete_mass, target_indices, probability * completed)
+                        np.add.at(hold_mass, target_indices, probability * held)
             episode_multiplicities[episode_index] = multiplicity
-            semantic_completed_targets[episode_index] = completed_targets
+            semantic_complete_mass[episode_index] = complete_mass
+            semantic_hold_mass[episode_index] = hold_mass
     else:
         episode_multiplicities = {
             episode_index: action_label_multiplicity(
@@ -1062,7 +1067,7 @@ def configure_action_bool_balance(
             ).numpy()
             for episode_index, length in zip(episode_indices, lengths, strict=True)
         }
-    counts: dict[str, list[int]] = {name: [0, 0] for name in enabled_names}
+    counts: dict[str, list[float]] = {name: [0.0, 0.0] for name in enabled_names}
     if counts:
         missing_names = [name for name in counts if name not in action_names]
         if missing_names:
@@ -1103,32 +1108,39 @@ def configure_action_bool_balance(
                     "arm_teleop_inactive",
                     "arm_reset",
                 }:
-                    semantically_complete = np.fromiter(
+                    completed = np.fromiter(
                         (
-                            semantic_completed_targets[int(episode_index)][int(frame_index)]
+                            semantic_complete_mass[int(episode_index)][int(frame_index)]
                             for episode_index, frame_index in zip(
                                 batch_episode_indices, frame_indices, strict=True
                             )
                         ),
-                        dtype=bool,
+                        dtype=np.float64,
+                        count=len(frame_indices),
+                    )
+                    held = np.fromiter(
+                        (
+                            semantic_hold_mass[int(episode_index)][int(frame_index)]
+                            for episode_index, frame_index in zip(
+                                batch_episode_indices, frame_indices, strict=True
+                            )
+                        ),
+                        dtype=np.float64,
                         count=len(frame_indices),
                     )
                     if name == "task_complete":
-                        target_true = semantically_complete
+                        positive = float(completed.sum())
                     elif name == "arm_teleop_inactive":
-                        target_true = target_true | semantically_complete
+                        positive = float((held + (label_multiplicity - held) * target_true).sum())
                     else:
-                        target_true = target_true & ~semantically_complete
-                positive = int(label_multiplicity[target_true].sum())
+                        positive = float(((label_multiplicity - held) * target_true).sum())
+                    total = float(label_multiplicity.sum())
+                    counts[name][0] += positive
+                    counts[name][1] += total - positive
+                    continue
+                positive = float(label_multiplicity[target_true].sum())
                 counts[name][0] += positive
-                counts[name][1] += int(label_multiplicity.sum()) - positive
-        if use_phase_multiplicity:
-            if "arm_teleop_inactive" in counts:
-                counts["arm_teleop_inactive"][0] += forced_semantic_holds
-            if "arm_reset" in counts:
-                counts["arm_reset"][1] += forced_semantic_holds
-            if "task_complete" in counts:
-                counts["task_complete"][0] += forced_semantic_holds
+                counts[name][1] += float(label_multiplicity.sum()) - positive
 
     stats: dict[str, dict[str, int | float]] = {}
     true_fractions: dict[str, float] = {}
@@ -1886,9 +1898,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     len(semantic_eligible_frames),
                     ", ".join(
                         f"{name}={weight:.1%}"
-                        for name, weight in zip(
-                            semantic_group_names, semantic_group_weights, strict=True
-                        )
+                        for name, weight in zip(semantic_group_names, semantic_group_weights, strict=True)
                     ),
                 )
         if cfg.dataset_mixture_sampling.enabled:
@@ -1981,9 +1991,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if semantic_views is not None:
         physical_eval_group_names = tuple(cfg.dataset.semantic_phases) or tuple(
             dict.fromkeys(
-                segment.phase
-                for segments in semantic_views.segments.values()
-                for segment in segments
+                segment.phase for segments in semantic_views.segments.values() for segment in segments
             )
         )
     else:
@@ -2285,13 +2293,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 and active_cfg.io_schema_resolved
             )
             physical_names = (
-                physical_metric_names(active_cfg.action_feature_names or [])
-                if physical_eval_enabled
-                else ()
+                physical_metric_names(active_cfg.action_feature_names or []) if physical_eval_enabled else ()
             )
             physical_sums: dict[str, dict[str, list[float]]] = {
-                group: {name: [0.0, 0.0] for name in physical_names}
-                for group in physical_eval_group_names
+                group: {name: [0.0, 0.0] for name in physical_names} for group in physical_eval_group_names
             }
             physical_sample_counts = dict.fromkeys(physical_eval_group_names, 0)
             physical_batch_index = 0
@@ -2393,9 +2398,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                                 physical_batch,
                                 noise=noise,
                             )
-                            expert_physical = _unnormalize_physical_action(
-                                normalized_expert, postprocessor
-                            )
+                            expert_physical = _unnormalize_physical_action(normalized_expert, postprocessor)
                             predicted_physical = _unnormalize_physical_action(
                                 normalized_predicted, postprocessor
                             )
@@ -2472,16 +2475,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
             physical_eval_metrics: dict[str, float | int] = {}
             if physical_eval_enabled:
-                flat_names = [
-                    (group, name)
-                    for group in physical_eval_group_names
-                    for name in physical_names
-                ]
-                flat_values = [
-                    value
-                    for group, name in flat_names
-                    for value in physical_sums[group][name]
-                ]
+                flat_names = [(group, name) for group in physical_eval_group_names for name in physical_names]
+                flat_values = [value for group, name in flat_names for value in physical_sums[group][name]]
                 reduced = accelerator.reduce(
                     torch.tensor(flat_values, dtype=torch.float64, device=device), reduction="sum"
                 ).cpu()
@@ -2489,9 +2484,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     metric_sum = float(reduced[index * 2])
                     count = int(reduced[index * 2 + 1])
                     if count:
-                        physical_eval_metrics[f"physical_validation/{group}/{name}"] = (
-                            metric_sum / count
-                        )
+                        physical_eval_metrics[f"physical_validation/{group}/{name}"] = metric_sum / count
                 sample_values = accelerator.reduce(
                     torch.tensor(
                         [physical_sample_counts[group] for group in physical_eval_group_names],
@@ -2500,9 +2493,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     ),
                     reduction="sum",
                 ).cpu()
-                for group, count in zip(
-                    physical_eval_group_names, sample_values.tolist(), strict=True
-                ):
+                for group, count in zip(physical_eval_group_names, sample_values.tolist(), strict=True):
                     physical_eval_metrics[f"physical_validation/{group}/sample_count"] = int(count)
 
             if is_main_process:

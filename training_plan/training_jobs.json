@@ -13,10 +13,11 @@
         "main_process_port": 29500
       }
     },
-    "all_scenes_joint_full_mem": {
-      "dataset_family": "all_scenes",
+    "staff1_goal_conditioned_full_mem": {
+      "dataset_family": "staff1",
       "memory_mode": "full_mem",
-      "training_preset": "three_stage_joint",
+      "training_preset": "three_goal_conditioned",
+      "semantic_views_file": "semantic_views_three_goal_conditioned.json",
       "train_steps": 100000,
       "resources": {
         "node": "f",
@@ -75,6 +76,17 @@
       "train_steps": 70000,
       "resources": {
         "node": "wb3",
+        "gpu_ids": [0, 1],
+        "main_process_port": 29500
+      }
+    },
+    "staff1_stage1_full_mem": {
+      "dataset_family": "staff1",
+      "memory_mode": "full_mem",
+      "training_preset": "stage1_only",
+      "train_steps": 70000,
+      "resources": {
+        "node": "lerobot",
         "gpu_ids": [0, 1],
         "main_process_port": 29500
       }

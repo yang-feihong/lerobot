@@ -60,7 +60,9 @@ def test_completion_tail_sampling_is_monotonic_and_physically_capped():
     actions[4:, 15] = 1
     resolved = resolve_task_complete_sampling(
         _fake_dataset(actions),
-        SimpleNamespace(type="pi05", task_complete_sample_tail_seconds=0.2, action_predict_task_complete=True),
+        SimpleNamespace(
+            type="pi05", task_complete_sample_tail_seconds=0.2, action_predict_task_complete=True
+        ),
     )
     assert resolved == ([7], {0: 7})
 
@@ -68,7 +70,9 @@ def test_completion_tail_sampling_is_monotonic_and_physically_capped():
     with pytest.raises(ValueError, match="monotonic"):
         resolve_task_complete_sampling(
             _fake_dataset(actions),
-            SimpleNamespace(type="pi05", task_complete_sample_tail_seconds=0.2, action_predict_task_complete=True),
+            SimpleNamespace(
+                type="pi05", task_complete_sample_tail_seconds=0.2, action_predict_task_complete=True
+            ),
         )
 
 
@@ -76,7 +80,9 @@ def test_completion_tail_sampling_excludes_episode_without_completion():
     actions = np.zeros((8, 16), dtype=np.float32)
     resolved = resolve_task_complete_sampling(
         _fake_dataset(actions),
-        SimpleNamespace(type="pi05", task_complete_sample_tail_seconds=0.2, action_predict_task_complete=True),
+        SimpleNamespace(
+            type="pi05", task_complete_sample_tail_seconds=0.2, action_predict_task_complete=True
+        ),
     )
     assert resolved == ([0], {0: 0})
 
@@ -86,7 +92,9 @@ def test_completion_sampling_is_disabled_when_completion_is_not_an_output():
     assert (
         resolve_task_complete_sampling(
             _fake_dataset(actions),
-            SimpleNamespace(type="pi05", task_complete_sample_tail_seconds=0.2, action_predict_task_complete=False),
+            SimpleNamespace(
+                type="pi05", task_complete_sample_tail_seconds=0.2, action_predict_task_complete=False
+            ),
         )
         is None
     )
@@ -419,6 +427,84 @@ def test_semantic_phase_boolean_priors_include_internal_completion_tail():
     assert stats["arm_teleop_inactive"]["negative_labels"] == 3
     assert stats["arm_reset"]["positive_labels"] == 0
     assert stats["arm_reset"]["negative_labels"] == 12
+
+
+def test_semantic_phase_boolean_priors_average_multiple_goal_views():
+    actions = np.zeros((5, len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)), dtype=np.float32)
+    policy_cfg = SimpleNamespace(
+        type="pi05",
+        action_predict_arm_teleop_inactive=True,
+        action_predict_arm_reset=True,
+        action_predict_gripper=False,
+        action_predict_task_complete=True,
+        gripper_target_representation="continuous_position",
+        action_gripper_target_true_side="negative",
+        action_bool_loss_weight=4.0,
+        action_bool_true_fractions={},
+        chunk_size=2,
+        control_frequency_hz=10,
+    )
+    finish_current_goal = SemanticView(
+        intent_id="approach",
+        canonical_intent="goal_approach",
+        instructions=("Approach the door.",),
+        status="active",
+        action_supervision="demonstrated",
+        frame_start=0,
+        frame_stop=3,
+        completion_frame=3,
+        view_kind="goal_conditioned",
+    )
+    continue_to_future_goal = SemanticView(
+        intent_id="open",
+        canonical_intent="goal_open",
+        instructions=("Open the door.",),
+        status="active",
+        action_supervision="demonstrated",
+        frame_start=0,
+        frame_stop=5,
+        completion_frame=4,
+        view_kind="goal_conditioned",
+    )
+    catalog = SemanticViewCatalog(
+        path=Path("semantic_views.json"),
+        episodes={0: (finish_current_goal, continue_to_future_goal)},
+        sha256="test",
+        action_stride_dataset_frames=1,
+        semantic_names=("goal_approach/active", "goal_open/active"),
+        selected_episodes=(0,),
+        segments={0: (SemanticSegment("approach", 0, 3, "full_episode"),)},
+    )
+
+    stats = configure_action_bool_balance(
+        SimpleNamespace(trainable_config=policy_cfg, resume=False),
+        _fake_dataset(actions, CONTROL_EXTENDED_DATASET_ACTION_NAMES),
+        semantic_views=catalog,
+        semantic_phases=["approach"],
+        semantic_state_instruction_matrix={
+            "approach": {
+                "goal_approach": {
+                    "status": "active",
+                    "action_supervision": "demonstrated",
+                    "completion_boundary": "state_end",
+                },
+                "goal_open": {
+                    "status": "active",
+                    "action_supervision": "demonstrated",
+                    "completion_boundary": "future_goal_end",
+                },
+            }
+        },
+    )
+
+    # Six action labels are sampled.  Only the final label of the approach-goal
+    # view is complete; that view is selected with probability 1/2.
+    assert stats["task_complete"]["positive_labels"] == pytest.approx(0.5)
+    assert stats["task_complete"]["negative_labels"] == pytest.approx(5.5)
+    assert stats["arm_teleop_inactive"]["positive_labels"] == pytest.approx(0.5)
+    assert stats["arm_teleop_inactive"]["negative_labels"] == pytest.approx(5.5)
+    assert stats["arm_reset"]["positive_labels"] == 0
+    assert stats["arm_reset"]["negative_labels"] == 6
 
 
 def test_arm_mode_overlap_is_rejected_during_dataset_preflight():

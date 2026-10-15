@@ -589,12 +589,8 @@ def _load_checkpoint_contract(
         and expected_predict.get("task_blocked") is False
     ):
         expected_predict.pop("task_blocked", None)
-        expected["action"].get("boolean_decoding", {}).get("true_side", {}).pop(
-            "task_blocked", None
-        )
-        expected["action"].get("boolean_decoding", {}).get("output_values", {}).pop(
-            "task_blocked", None
-        )
+        expected["action"].get("boolean_decoding", {}).get("true_side", {}).pop("task_blocked", None)
+        expected["action"].get("boolean_decoding", {}).get("output_values", {}).pop("task_blocked", None)
         expected["action"].pop("task_blocked_semantics", None)
     if saved != expected:
         raise ValueError("pi05_deployment_metadata.json disagrees with checkpoint config.json")
@@ -723,70 +719,112 @@ def _checkpoint_hot_swap_signature(policy_path: Path) -> str:
         if not path.is_file():
             raise FileNotFoundError(f"Checkpoint is missing hot-swap metadata: {path}")
         documents[name] = json.loads(path.read_text(encoding="utf-8"))
+    # Use a structural allowlist.  A denylist of training fields is inherently
+    # unsafe here: every newly recorded loss/sampling key would spuriously make
+    # an otherwise compatible checkpoint rebuild the multi-billion-parameter
+    # base model.  Unknown config and deployment-metadata keys are therefore
+    # non-structural by default.
+    structural_config_fields = {
+        "type",
+        "dtype",
+        "input_features",
+        "output_features",
+        "normalization_mapping",
+        "chunk_size",
+        "n_action_steps",
+        "n_obs_steps",
+        "max_state_dim",
+        "max_action_dim",
+        "image_resolution",
+        "empty_cameras",
+        "paligemma_variant",
+        "action_expert_variant",
+        "tokenizer_max_length",
+        "max_period",
+        "min_period",
+        "use_peft",
+        "state_action_encoding",
+        "io_schema_resolved",
+        "action_feature_names",
+        "dataset_action_feature_names",
+        "dataset_camera_keys",
+        "dataset_state_feature_names",
+        "resolved_state_feature_names",
+        "state_feature_indices",
+        "action_dt_seconds",
+        "control_frequency_hz",
+        "dataset_frequency_hz",
+        "b2_action_representation",
+        "b2_global_pose_state_indices",
+        "z1_action_representation",
+        "ee_delta_rotation_representation",
+        "ee_state_anchor_indices",
+        "ee_supervision_source",
+        "ee_target_dataset_semantics",
+        "gripper_target_representation",
+        "relative_exclude_joints",
+        "use_relative_actions",
+        "action_gripper_negative_value",
+        "action_gripper_nonnegative_value",
+        "action_gripper_target_true_side",
+        "action_predict_arm_reset",
+        "action_predict_arm_teleop_inactive",
+        "action_predict_ee_pose",
+        "action_predict_gripper",
+        "action_predict_task_blocked",
+        "action_predict_task_complete",
+        "discrete_action_training_mode",
+        "action_history_enabled",
+        "state_num_frames",
+        "state_history_frame_interval_seconds",
+        "state_history_frame_stride",
+        "state_use_arm_gripper_feedback",
+        "state_use_arm_joint_positions",
+        "state_use_arm_joint_velocities",
+        "state_use_b2_angular_velocity",
+        "state_use_b2_joint_positions",
+        "state_use_b2_joint_velocities",
+        "state_use_b2_linear_velocity",
+        "state_use_b2_trunk_pose",
+        "mem_vit_enabled",
+        "mem_vit_finetune_mode",
+        "mem_vit_num_frames",
+        "mem_vit_min_num_frames",
+        "mem_vit_max_num_frames",
+        "mem_vit_frame_interval_seconds",
+        "mem_vit_frame_stride",
+        "mem_vit_temporal_every",
+        "mem_vit_use_original_for_k1",
+        "mem_vit_base_weights_embedded",
+        "mem_vit_embedded_tensor_count",
+        "mem_vit_artifact_id",
+        "mem_vit_sha256",
+        "policy_base_artifact_id",
+        "policy_base_sha256",
+        "policy_tokenizer_artifact_id",
+        "policy_tokenizer_sha256",
+        "rtc_config",
+        "training_rtc_config",
+    }
     config = documents["config.json"]
-    # Only inference structure and runtime contracts belong in this signature.
-    # Dataset semantics, sampling, and optimization settings can differ between
-    # checkpoints that share the exact same deployable network (for example a
-    # Stage1-only model and a three-stage joint model).  Keeping those fields in
-    # the signature needlessly destroys the resident worker and reloads the
-    # multi-billion-parameter base model.
-    for non_structural_field in (
-        "pretrained_path",
-        "pretrained_revision",
-        "device",
-        "compile_model",
-        "compile_mode",
-        "num_inference_steps",
-        # Dataset priors used only to balance training losses.
-        "action_bool_true_fractions",
-        # Controls which padded targets contribute to the training loss.
-        "action_supervise_terminal_static_padding",
-        # Training-time MEM history augmentation.  Deployment history timing is
-        # described separately by the fixed inference contract.
-        "mem_vit_random_interval_sampling",
-        "mem_vit_global_interval_std_seconds",
-        "mem_vit_local_interval_std_seconds",
-        "mem_vit_min_interval_seconds",
-        "mem_vit_max_interval_seconds",
-        # Language/state relations and semantic manifests only select training
-        # samples.  The instruction itself is already a normal runtime input.
-        "semantic_state_instruction_matrix",
-        "semantic_view_kind_weights",
-        "semantic_view_manifest_sha256",
-        "semantic_view_manifest_version",
-        "task_complete_sample_tail_seconds",
-        # Loss balancing and optimization never alter inference structure.
-        "action_bool_balance_eps",
-        "action_bool_loss_weight",
-        "action_continuous_group_weight",
-        "action_continuous_loss_weight",
-        "action_discrete_group_weight",
-        "action_loss_schema",
-        "action_masked_continuous_min_weight",
-        "gradient_checkpointing",
-        "lr_scheduler_type",
-        "new_module_optimizer_lr_multiplier",
-        "optimizer_betas",
-        "optimizer_eps",
-        "optimizer_grad_clip_norm",
-        "optimizer_lr",
-        "optimizer_weight_decay",
-        "scheduler_decay_lr",
-        "scheduler_decay_steps",
-        "scheduler_warmup_steps",
-        "time_sampling_beta_alpha",
-        "time_sampling_beta_beta",
-        "time_sampling_offset",
-        "time_sampling_scale",
-        "use_amp",
-        # Repository bookkeeping is unrelated to model execution.
-        "license",
-        "private",
-        "push_to_hub",
-        "repo_id",
-        "tags",
+    documents["config.json"] = {key: config[key] for key in sorted(structural_config_fields) if key in config}
+
+    # Adapter metadata is itself structural, except for filesystem/revision and
+    # initialization bookkeeping which does not change the saved tensor layout.
+    adapter_config = documents["adapter_config.json"]
+    for non_structural_adapter_field in (
+        "base_model_name_or_path",
+        "revision",
+        "inference_mode",
+        "init_lora_weights",
+        "peft_version",
     ):
-        config.pop(non_structural_field, None)
+        adapter_config.pop(non_structural_adapter_field, None)
+
+    # Deployment metadata is descriptive and is validated when the checkpoint
+    # contract is loaded.  It must never decide architecture compatibility;
+    # the structural config and processor topology below are authoritative.
+    documents.pop("pi05_deployment_metadata.json", None)
 
     for processor_name in ("policy_preprocessor.json", "policy_postprocessor.json"):
         for step in documents[processor_name].get("steps", ()):
@@ -1298,9 +1336,7 @@ class AsyncRTCPolicy:
         self.mem_image_stride = max(
             1, round(float(config.mem_vit_frame_interval_seconds or 0.0) * self.low_level_hz)
         )
-        self.mem_image_interval_ns = max(
-            1, round(float(config.mem_vit_frame_interval_seconds or 0.0) * 1e9)
-        )
+        self.mem_image_interval_ns = max(1, round(float(config.mem_vit_frame_interval_seconds or 0.0) * 1e9))
         self.continuous_state_enabled = config.state_action_encoding == "continuous"
         self.state_num_frames = int(config.state_num_frames) if self.continuous_state_enabled else 1
         self.state_history_stride = max(
@@ -1595,11 +1631,7 @@ class AsyncRTCPolicy:
                         "prev_chunk_left_over": rtc_prefix,
                     }
                 actions = self.policy.predict_action_chunk(batch, **conditioning)
-                if (
-                    warmup_index == 0
-                    and self.chunk_scheduling_mode == "RTC"
-                    and self._warmup_inferences > 1
-                ):
+                if warmup_index == 0 and self.chunk_scheduling_mode == "RTC" and self._warmup_inferences > 1:
                     # Keep the prefix independent from torch.compile's reusable CUDA graph
                     # outputs, then exercise RTC guidance before the service reports ready.
                     rtc_prefix = actions.detach().cpu().clone().to(self.device)
@@ -1620,9 +1652,7 @@ class AsyncRTCPolicy:
                     actions = self.policy.predict_action_chunk(
                         batch,
                         inference_delay=(
-                            min(1, self.training_rtc_max_delay)
-                            if self.rtc_config.mode == "training"
-                            else 0
+                            min(1, self.training_rtc_max_delay) if self.rtc_config.mode == "training" else 0
                         ),
                         prev_chunk_left_over=prefix,
                     )
@@ -1791,7 +1821,7 @@ class AsyncRTCPolicy:
             image_capture_ns = [record.capture_ns for record in self._image_history]
         recent_image_intervals_s = [
             (right - left) / 1e9
-            for left, right in zip(image_capture_ns[-9:-1], image_capture_ns[-8:])
+            for left, right in zip(image_capture_ns[-9:-1], image_capture_ns[-8:], strict=True)
         ]
         return {
             "ok": self._worker.is_alive() and self._last_error is None,
@@ -2429,9 +2459,7 @@ class VLARequestHandler(BaseHTTPRequestHandler):
                 if length <= 0 or length > 4096:
                     raise ValueError(f"Invalid Content-Length: {length}")
                 request_value = json.loads(self.rfile.read(length))
-                result = self.engine.set_chunk_scheduling_mode(
-                    str(request_value["mode"]).upper()
-                )
+                result = self.engine.set_chunk_scheduling_mode(str(request_value["mode"]).upper())
                 self._write_json(HTTPStatus.OK, result)
             except Exception as exc:
                 LOG.warning("Rejected chunk scheduling mode: %s", exc)
@@ -2445,9 +2473,7 @@ class VLARequestHandler(BaseHTTPRequestHandler):
                 request_value = json.loads(self.rfile.read(length))
                 if not isinstance(request_value.get("enabled"), bool):
                     raise ValueError("enabled must be a boolean")
-                result = self.engine.set_stop_on_model_task_complete(
-                    request_value["enabled"]
-                )
+                result = self.engine.set_stop_on_model_task_complete(request_value["enabled"])
                 self._write_json(HTTPStatus.OK, result)
             except Exception as exc:
                 LOG.warning("Rejected task-complete termination setting: %s", exc)

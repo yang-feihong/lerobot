@@ -482,14 +482,11 @@ def lerobot_dataset_metadata_factory(
             tasks=tasks,
             episodes=episodes,
         )
-        with (
-            patch("lerobot.datasets.dataset_metadata.get_safe_version") as mock_get_safe_version_patch,
-            patch("lerobot.datasets.dataset_metadata.snapshot_download") as mock_snapshot_download_patch,
-        ):
-            mock_get_safe_version_patch.side_effect = lambda repo_id, version: version
-            mock_snapshot_download_patch.side_effect = mock_snapshot_download
-
-            return LeRobotDatasetMetadata(repo_id=repo_id, root=root)
+        # Materialize the fixture directly at its authoritative local root.  The
+        # production constructor intentionally never treats an explicit root as
+        # a Hub download destination.
+        mock_snapshot_download(repo_id, local_dir=root, allow_patterns="meta/")
+        return LeRobotDatasetMetadata(repo_id=repo_id, root=root)
 
     return _create_lerobot_dataset_metadata
 

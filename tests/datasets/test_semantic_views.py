@@ -357,6 +357,57 @@ def test_state_instruction_matrix_selects_exact_relation_not_view_kind(tmp_path)
     assert batch[ACTION][0, :, 15].tolist() == [0.0, 0.0, 0.0, 1.0]
 
 
+def test_state_instruction_matrix_randomizes_across_multiple_goal_relations(tmp_path):
+    catalog = _catalog(
+        tmp_path,
+        [
+            {
+                "intent_id": "go",
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "completion_frame": 10,
+            },
+            {
+                "intent_id": "pass",
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "completion_frame": 20,
+            },
+        ],
+    )
+    catalog = replace(
+        catalog,
+        segments={0: (SemanticSegment("approach", 0, 10, "full_episode"),)},
+    )
+    matrix = {
+        "approach": {
+            "go": {
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "completion_boundary": "state_end",
+            },
+            "pass": {
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "completion_boundary": "future_goal_end",
+            },
+        }
+    }
+    observed = set()
+    for step in range(32):
+        batch = _batch()
+        apply_semantic_views_to_batch(
+            batch,
+            catalog,
+            step=step,
+            seed=0,
+            randomize=True,
+            state_instruction_matrix=matrix,
+        )
+        observed.add(batch["task"][0])
+    assert observed == {"Open the door.", "Push the door open.", "Enter the room."}
+
+
 def test_goal_end_relation_accepts_completion_inside_state_and_holds_completed_chunk(tmp_path):
     catalog = _catalog(
         tmp_path,
