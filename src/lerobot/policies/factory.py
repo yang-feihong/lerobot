@@ -610,6 +610,9 @@ def make_policy(
 
     policy_cls = get_policy_class(cfg.type)
 
+    if isinstance(cfg, PI05Config) and cfg.pretrained_path and cfg.io_schema_resolved:
+        cfg.restore_pretrained_metadata(cfg.pretrained_path, revision=cfg.pretrained_revision)
+
     kwargs = {}
     if checkpoint_only:
         features = {**cfg.input_features, **cfg.output_features}
@@ -646,11 +649,12 @@ def make_policy(
 
         resolved_dataset_frequency = float(ds_meta.fps)
         resolved_control_frequency = float(cfg.control_frequency_hz or resolved_dataset_frequency)
-        resolved_camera_keys = list(ds_meta.camera_keys)
+        resolved_camera_keys = cfg.canonical_camera_order(list(ds_meta.camera_keys))
         if cfg.io_schema_resolved:
             if cfg.control_frequency_hz is None:
                 raise ValueError("Checkpoint deployment metadata is missing control_frequency_hz")
-            if cfg.dataset_camera_keys != resolved_camera_keys:
+            empty_keys = {f"observation.images.empty_camera_{i}" for i in range(cfg.empty_cameras)}
+            if cfg.dataset_camera_keys is None or set(cfg.dataset_camera_keys) - empty_keys != set(resolved_camera_keys):
                 raise ValueError(
                     "Checkpoint camera-key contract does not match dataset: "
                     f"checkpoint={cfg.dataset_camera_keys}, dataset={resolved_camera_keys}"
@@ -669,7 +673,8 @@ def make_policy(
                 resolved_control_frequency,
             )
         cfg.control_frequency_hz = resolved_control_frequency
-        cfg.dataset_camera_keys = resolved_camera_keys
+        if not cfg.io_schema_resolved:
+            cfg.dataset_camera_keys = resolved_camera_keys
 
         dataset_action = cfg.output_features.get(ACTION)
         dataset_action_names = ds_meta.features.get(ACTION, {}).get("names")
@@ -780,6 +785,10 @@ def make_policy(
         cfg._runtime_dataset_meta = ds_meta
 
     kwargs["config"] = cfg
+    if isinstance(cfg, PI05Config) and cfg.pretrained_path:
+        # PEFT loads weights from a separate base path, but the input protocol
+        # always belongs to the selected task checkpoint (the adapter).
+        kwargs["checkpoint_metadata_path"] = cfg.pretrained_path
 
     # Pass dataset_stats to the policy if available (needed for some policies like SARM)
     if ds_meta is not None and hasattr(ds_meta, "stats"):

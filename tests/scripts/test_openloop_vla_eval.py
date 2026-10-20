@@ -16,16 +16,65 @@ from lerobot.scripts.openloop_vla_eval import (
     _deterministic_flow_noise,
     _episode_anchor_plot_names,
     _episode_b2_command_anchors,
+    _limit_indices_evenly_per_episode,
     _manipulation_onset_windows,
     _openloop_model_action_names,
     _physical_metric_means,
     _reanchor_episode_plot_actions,
     _report_common_output_metric_sums,
     _resolve_image_source,
+    _semantic_completion_offset_local_indices,
+    _semantic_eligible_local_indices,
+    _semantic_matrix_for_goal,
     _split_episodes,
     _unnormalize_model_action,
     _world_trajectory_plot_limits,
 )
+
+
+def test_semantic_openloop_uses_training_phase_boundaries_and_goal_relation():
+    segment = SimpleNamespace(phase="traversal", frame_start=10, frame_stop=20)
+    catalog = SimpleNamespace(segments={3: (segment,), 4: (segment,)})
+    assert _semantic_eligible_local_indices(
+        [3, 3, 3, 4], [9, 10, 19, 20], catalog, ["traversal"]
+    ) == {1, 2}
+
+    matrix = {
+        "approach": {"goal_open": {"status": "active"}, "goal_enter": {"status": "active"}},
+        "traversal": {"goal_open": {"status": "complete"}, "goal_enter": {"status": "active"}},
+    }
+    assert _semantic_matrix_for_goal(matrix, "goal_enter") == {
+        "approach": {"goal_enter": {"status": "active"}},
+        "traversal": {"goal_enter": {"status": "active"}},
+    }
+    with pytest.raises(ValueError, match="Unknown semantic goal"):
+        _semantic_matrix_for_goal(matrix, "goal_missing")
+
+
+def test_semantic_openloop_selects_exact_completion_offsets():
+    def view(goal, completion):
+        return SimpleNamespace(
+            canonical_intent=goal,
+            status="active",
+            completion_frame=completion,
+        )
+
+    catalog = SimpleNamespace(
+        episodes={0: (view("goal_approach", 100),), 1: (view("goal_approach", 50),)}
+    )
+    assert _semantic_completion_offset_local_indices(
+        [0, 0, 0, 1, 1],
+        [74, 75, 100, 25, 49],
+        catalog,
+        goal="goal_approach",
+        offsets=[-25, 0],
+    ) == {1, 2, 3}
+
+
+def test_openloop_frame_limit_spans_each_episode_instead_of_only_its_start():
+    indices = list(range(12))
+    episodes = [0] * 6 + [1] * 6
+    assert _limit_indices_evenly_per_episode(indices, episodes, 3) == [0, 2, 5, 6, 8, 11]
 
 
 def test_openloop_train_eval_split_matches_training_task_strata():

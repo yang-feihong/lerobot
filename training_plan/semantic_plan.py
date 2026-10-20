@@ -11,8 +11,13 @@ from typing import Any
 PRESETS_FORMAT = "lerobot.semantic_training_presets"
 JOBS_FORMAT = "lerobot.training_jobs"
 VERSION = 1
-VALID_DATASET_FAMILIES = {"staff1", "all_scenes"}
-VALID_MEMORY_MODES = {"standard", "mem_vit", "full_mem"}
+VALID_DATASET_FAMILIES = {
+    "staff1",
+    "all_scenes",
+    "all_scenes_simulation",
+    "staff3_grasp",
+}
+VALID_MEMORY_MODES = {"standard", "mem_vit", "image_mem", "full_mem"}
 VALID_STATUSES = {"active", "complete", "blocked"}
 VALID_ACTION_SUPERVISION = {"demonstrated", "hold"}
 VALID_COMPLETION_BOUNDARIES = {"none", "state_end", "goal_end", "future_goal_end"}
@@ -111,7 +116,13 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
         if not isinstance(task, dict):
             raise ValueError(f"task {task_id!r} must be an object")
         common = {"dataset_family", "memory_mode", "resources"}
-        optional = {"train_steps", "semantic_views_file"}
+        optional = {
+            "train_steps",
+            "semantic_views_file",
+            "allow_resume_semantic_adoption",
+            "allow_resume_artifact_adoption",
+            "run_dir_name",
+        }
         preset_keys = common | {"training_preset"}
         inline_keys = common | {"state_weights", "state_instruction_matrix"}
         task_keys = frozenset(task)
@@ -124,6 +135,10 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
             raise ValueError(f"task {task_id!r} has invalid dataset_family")
         if task["memory_mode"] not in VALID_MEMORY_MODES:
             raise ValueError(f"task {task_id!r} has invalid memory_mode")
+        if not isinstance(task.get("allow_resume_semantic_adoption", False), bool):
+            raise ValueError(f"task {task_id!r} allow_resume_semantic_adoption must be boolean")
+        if not isinstance(task.get("allow_resume_artifact_adoption", False), bool):
+            raise ValueError(f"task {task_id!r} allow_resume_artifact_adoption must be boolean")
         if "train_steps" in task and (not isinstance(task["train_steps"], int) or task["train_steps"] <= 0):
             raise ValueError(f"task {task_id!r} train_steps must be a positive integer")
         semantic_views_file = task.get("semantic_views_file", "semantic_views.json")
@@ -136,6 +151,13 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
             raise ValueError(
                 f"task {task_id!r} semantic_views_file must be a JSON filename under dataset meta/"
             )
+        run_dir_name = task.get("run_dir_name", "")
+        if run_dir_name and (
+            not isinstance(run_dir_name, str)
+            or Path(run_dir_name).name != run_dir_name
+            or "/" in run_dir_name
+        ):
+            raise ValueError(f"task {task_id!r} run_dir_name must be a single directory name")
         _validate_resources(task_id, task["resources"])
         if "training_preset" in task:
             if task["training_preset"] not in presets:
@@ -308,6 +330,9 @@ def command_resolve(args: argparse.Namespace) -> None:
         str(resources["main_process_port"]),
         str(task.get("train_steps", "")),
         str(task.get("semantic_views_file", "semantic_views.json")),
+        "true" if task.get("allow_resume_semantic_adoption", False) else "false",
+        str(task.get("run_dir_name", "")),
+        "true" if task.get("allow_resume_artifact_adoption", False) else "false",
     )
     print("\n".join(values))
 

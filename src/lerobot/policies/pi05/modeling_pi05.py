@@ -1797,6 +1797,7 @@ class PI05Policy(PreTrainedPolicy):
         local_files_only: bool = False,
         revision: str | None = None,
         strict: bool = True,
+        checkpoint_metadata_path: str | Path | None = None,
         **kwargs,
     ) -> T:
         """Override the from_pretrained method to handle key remapping and display important disclaimer."""
@@ -1822,6 +1823,19 @@ class PI05Policy(PreTrainedPolicy):
                 **kwargs,
             )
 
+        else:
+            # For PEFT the base loader receives the adapter's resolved config:
+            # never replace that contract with the base model's camera order.
+            config.restore_pretrained_metadata(
+                checkpoint_metadata_path or pretrained_name_or_path,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                revision=revision,
+            )
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
         model = cls(config, **kwargs)
@@ -2059,9 +2073,7 @@ class PI05Policy(PreTrainedPolicy):
         # torch.compile to build a new graph on the first live observations even
         # though model loading had reported READY after a K=6 warmup.
         window_num_frames = (
-            int(image.shape[1])
-            if preserve_input_window and image.ndim >= 5
-            else int(lengths.max().item())
+            int(image.shape[1]) if preserve_input_window and image.ndim >= 5 else int(lengths.max().item())
         )
         positions = torch.arange(window_num_frames, device=device)[None, :]
         memory_mask = positions >= (window_num_frames - lengths[:, None])
@@ -2596,9 +2608,7 @@ class PI05Policy(PreTrainedPolicy):
                 group_loss = sum(part_numerators[name] for name in group_names) / safe_element_weight
                 active_group_weight = group_valid.to(losses.dtype) * configured_weight
                 total_group_weight = total_group_weight + active_group_weight
-                group_values.append(
-                    (group_names, safe_element_weight, group_loss, active_group_weight)
-                )
+                group_values.append((group_names, safe_element_weight, group_loss, active_group_weight))
             safe_total_group_weight = total_group_weight.clamp_min(1e-6)
             per_sample_loss = losses.new_zeros(losses.shape[0])
             for group_names, safe_element_weight, group_loss, active_group_weight in group_values:
@@ -2606,9 +2616,7 @@ class PI05Policy(PreTrainedPolicy):
                 per_sample_loss = per_sample_loss + group_fraction * group_loss
                 for name in group_names:
                     within_group_fraction = part_weights[name] / safe_element_weight
-                    part_contributions[name] = (
-                        group_fraction * part_numerators[name] / safe_element_weight
-                    )
+                    part_contributions[name] = group_fraction * part_numerators[name] / safe_element_weight
                     part_weight_fractions[name] = group_fraction * within_group_fraction
         else:
             total_weight_per_sample = sum(part_weights.values()).clamp_min(1e-6)
@@ -2830,16 +2838,13 @@ class PI05Policy(PreTrainedPolicy):
             "discrete_accuracy/task_complete": masked_accuracy(complete_prediction, complete, valid),
             "continuous_mask_frac/ee_pose": float(ee_valid.float().mean().detach().cpu()),
             "arm_mode_frac/ee": float(
-                ((arm_mode == 0) & action_valid).sum().detach().cpu()
-                / action_valid.sum().clamp_min(1).cpu()
+                ((arm_mode == 0) & action_valid).sum().detach().cpu() / action_valid.sum().clamp_min(1).cpu()
             ),
             "arm_mode_frac/inactive": float(
-                ((arm_mode == 1) & action_valid).sum().detach().cpu()
-                / action_valid.sum().clamp_min(1).cpu()
+                ((arm_mode == 1) & action_valid).sum().detach().cpu() / action_valid.sum().clamp_min(1).cpu()
             ),
             "arm_mode_frac/reset": float(
-                ((arm_mode == 2) & action_valid).sum().detach().cpu()
-                / action_valid.sum().clamp_min(1).cpu()
+                ((arm_mode == 2) & action_valid).sum().detach().cpu() / action_valid.sum().clamp_min(1).cpu()
             ),
         }
         info.update(

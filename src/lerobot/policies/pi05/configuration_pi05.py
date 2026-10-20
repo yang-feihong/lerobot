@@ -73,6 +73,8 @@ class PI05Config(PreTrainedConfig):
     # Training provenance used for timestamp resampling and resume checks. This
     # is intentionally excluded from pi05_deployment_metadata.json.
     dataset_frequency_hz: float | None = None
+    # Explicit model camera/token order; historical name kept for compatibility.
+    # This must not be copied from the dataset's JSON insertion order.
     dataset_camera_keys: list[str] | None = None
 
     # Robot I/O schema. These selections are serialized in every checkpoint.
@@ -99,9 +101,7 @@ class PI05Config(PreTrainedConfig):
     action_predict_task_blocked: bool = False
     semantic_view_manifest_sha256: str | None = None
     semantic_view_manifest_version: int | None = None
-    semantic_state_instruction_matrix: dict[str, dict[str, dict[str, str]]] = field(
-        default_factory=dict
-    )
+    semantic_state_instruction_matrix: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
     semantic_view_kind_weights: dict[str, float] = field(default_factory=dict)
     discrete_action_training_mode: str = "continuous_flow"
     ee_target_dataset_semantics: str = "joint_control_inactive_interpolated"
@@ -406,13 +406,11 @@ class PI05Config(PreTrainedConfig):
             )
         if self.action_continuous_group_weight <= 0:
             raise ValueError(
-                "action_continuous_group_weight must be > 0, got "
-                f"{self.action_continuous_group_weight}"
+                f"action_continuous_group_weight must be > 0, got {self.action_continuous_group_weight}"
             )
         if self.action_discrete_group_weight <= 0:
             raise ValueError(
-                "action_discrete_group_weight must be > 0, got "
-                f"{self.action_discrete_group_weight}"
+                f"action_discrete_group_weight must be > 0, got {self.action_discrete_group_weight}"
             )
         if self.action_masked_continuous_min_weight < 0:
             raise ValueError(
@@ -434,7 +432,9 @@ class PI05Config(PreTrainedConfig):
             self.mem_vit_enabled = True
         for name in ("policy_base_sha256", "mem_vit_sha256", "policy_tokenizer_sha256"):
             digest = getattr(self, name)
-            if digest is not None and (len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)):
+            if digest is not None and (
+                len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)
+            ):
                 raise ValueError(f"{name} must be a lowercase 64-character SHA256 digest")
         if (self.policy_base_artifact_id is None) != (self.policy_base_sha256 is None):
             raise ValueError("policy base artifact id and SHA256 must be configured together")
@@ -447,9 +447,7 @@ class PI05Config(PreTrainedConfig):
         if self.mem_vit_embedded_tensor_count < 0:
             raise ValueError("mem_vit_embedded_tensor_count must be non-negative")
         if self.mem_vit_base_weights_embedded != (self.mem_vit_embedded_tensor_count > 0):
-            raise ValueError(
-                "mem_vit_base_weights_embedded and mem_vit_embedded_tensor_count disagree"
-            )
+            raise ValueError("mem_vit_base_weights_embedded and mem_vit_embedded_tensor_count disagree")
         if self.mem_vit_base_weights_embedded and not self.mem_vit_enabled:
             raise ValueError("embedded MEM-ViT weights require mem_vit_enabled=true")
         if self.mem_vit_finetune_mode not in {"full", "lora", "frozen"}:
@@ -516,6 +514,77 @@ class PI05Config(PreTrainedConfig):
         if self.action_history_enabled and self.state_num_frames < 2:
             raise ValueError("action_history_enabled requires state_num_frames >= 2")
 
+    @staticmethod
+    def canonical_camera_order(keys: list[str]) -> list[str]:
+        """New models use body/base first, then a deterministic order."""
+        return sorted(
+            keys,
+            key=lambda key: (
+                "empty_camera_" in key,
+                not key.rsplit(".", 1)[-1].startswith("base"),
+                key,
+            ),
+        )
+
+    @property
+    def image_features(self) -> dict[str, PolicyFeature]:
+        features = super().image_features
+        if self.dataset_camera_keys is None:
+            keys = self.canonical_camera_order(list(features))
+        else:
+            keys = list(self.dataset_camera_keys)
+            if len(keys) != len(set(keys)):
+                raise ValueError("Camera contract contains duplicate camera keys")
+            missing = set(features) - set(keys)
+            extra = set(keys) - set(features)
+            # Synthetic empty cameras are added by validate_features, not datasets.
+            empty = {f"{OBS_IMAGES}.empty_camera_{i}" for i in range(self.empty_cameras)}
+            if extra or missing - empty:
+                raise ValueError(
+                    f"Camera contract disagrees with input_features: missing={missing}, extra={extra}"
+                )
+            keys.extend(sorted(missing))
+        return {key: features[key] for key in keys}
+
+    def restore_camera_metadata(self, metadata: dict) -> None:
+        """Checkpoint metadata, never JSON object order, defines existing model inputs."""
+        keys = metadata.get("observation", {}).get("camera_keys_in_model_order")
+        if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
+            raise ValueError("Checkpoint metadata is missing camera_keys_in_model_order")
+        features = super().image_features
+        if len(keys) != len(set(keys)) or set(keys) != set(features):
+            raise ValueError("Checkpoint camera metadata disagrees with input_features")
+        self.dataset_camera_keys = list(keys)
+        # Also keep serialized feature order consistent for external consumers.
+        self.input_features = {
+            **{key: self.input_features[key] for key in keys},
+            **{key: feature for key, feature in self.input_features.items() if key not in keys},
+        }
+
+    def restore_pretrained_metadata(self, model_id: str | Path, **download_kwargs) -> None:
+        path = Path(model_id)
+        if path.is_dir():
+            metadata_path = path / PI05_DEPLOYMENT_METADATA_NAME
+            if not metadata_path.is_file():
+                if self.io_schema_resolved:
+                    raise FileNotFoundError(f"Checkpoint is missing camera metadata: {metadata_path}")
+                return
+        else:
+            from huggingface_hub import hf_hub_download
+            from huggingface_hub.errors import EntryNotFoundError
+
+            try:
+                metadata_path = Path(
+                    hf_hub_download(
+                        repo_id=str(model_id), filename=PI05_DEPLOYMENT_METADATA_NAME, **download_kwargs
+                    )
+                )
+            except EntryNotFoundError:
+                if self.io_schema_resolved:
+                    raise
+                return
+        self.restore_camera_metadata(json.loads(metadata_path.read_text(encoding="utf-8")))
+
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
         for i in range(self.empty_cameras):
@@ -525,6 +594,9 @@ class PI05Config(PreTrainedConfig):
                 shape=(3, *self.image_resolution),  # Use configured image resolution
             )
             self.input_features[key] = empty_camera
+
+        # Freeze a single explicit order before either training or inference.
+        self.dataset_camera_keys = list(self.image_features)
 
         if OBS_STATE not in self.input_features:
             state_feature = PolicyFeature(
@@ -599,9 +671,14 @@ class PI05Config(PreTrainedConfig):
         # defaults byte-for-byte equivalent in structure to those checkpoints.
         if rtc is not None and rtc.get("mode") == "inference":
             rtc.pop("mode")
+        model_image_features = self.image_features
+        camera_keys_in_model_order = list(model_image_features)
         image_features = {
-            key: {"shape": list(feature.shape), "type": feature.type.value}
-            for key, feature in self.image_features.items()
+            key: {
+                "shape": list(model_image_features[key].shape),
+                "type": model_image_features[key].type.value,
+            }
+            for key in camera_keys_in_model_order
         }
         return {
             "format": "lerobot.pi05.deployment",
@@ -634,7 +711,7 @@ class PI05Config(PreTrainedConfig):
                 "replan_interval_seconds": (None if action_dt is None else self.n_action_steps * action_dt),
             },
             "observation": {
-                "camera_keys_in_model_order": list(self.image_features),
+                "camera_keys_in_model_order": camera_keys_in_model_order,
                 "image_features": image_features,
                 "state": {
                     "source_names": self.dataset_state_feature_names,
@@ -766,9 +843,7 @@ class PI05Config(PreTrainedConfig):
                     },
                 },
                 "task_complete_semantics": (
-                    "explicit_true_in_the_terminal_stage_hold"
-                    if self.action_predict_task_complete
-                    else None
+                    "explicit_true_in_the_terminal_stage_hold" if self.action_predict_task_complete else None
                 ),
                 "task_blocked_semantics": (
                     "instruction_precondition_is_not_satisfied_in_the_current_state"
@@ -808,7 +883,8 @@ class PI05Config(PreTrainedConfig):
                     "min_history_span_seconds": (
                         None
                         if image_history_interval is None
-                        else (min_history_frames - 1) * (
+                        else (min_history_frames - 1)
+                        * (
                             self.mem_vit_min_interval_seconds
                             if self.mem_vit_random_interval_sampling
                             else image_history_interval
@@ -817,7 +893,8 @@ class PI05Config(PreTrainedConfig):
                     "max_history_span_seconds": (
                         None
                         if image_history_interval is None
-                        else (max_history_frames - 1) * (
+                        else (max_history_frames - 1)
+                        * (
                             self.mem_vit_max_interval_seconds
                             if self.mem_vit_random_interval_sampling
                             else image_history_interval

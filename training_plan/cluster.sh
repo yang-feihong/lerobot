@@ -5,8 +5,16 @@ plan_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${plan_dir}/.." && pwd)"
 env_file="${ENV_FILE:-${plan_dir}/.env}"
 lock_file="${plan_dir}/artifacts.lock"
+training_jobs_file="${TRAINING_JOBS_FILE:-${plan_dir}/training_jobs.json}"
 [[ -f "${env_file}" ]] || { echo "Missing ${env_file}" >&2; exit 1; }
 [[ -f "${lock_file}" ]] || { echo "Missing ${lock_file}" >&2; exit 1; }
+[[ -f "${training_jobs_file}" ]] || { echo "Missing ${training_jobs_file}" >&2; exit 1; }
+training_jobs_file="$(readlink -f "${training_jobs_file}")"
+[[ "$(dirname "${training_jobs_file}")" == "${plan_dir}" ]] || {
+  echo "TRAINING_JOBS_FILE must be a maintained plan under ${plan_dir}." >&2
+  exit 2
+}
+training_jobs_rel="training_plan/$(basename "${training_jobs_file}")"
 set -a
 # shellcheck disable=SC1090
 source "${env_file}"
@@ -24,6 +32,9 @@ required=(
   STAFF1_BOUNDARIES_SHA256
   ALL_SCENES_EPISODES ALL_SCENES_VIDEOS ALL_SCENES_INFO_SHA256
   ALL_SCENES_SEMANTIC_SHA256 ALL_SCENES_BOUNDARIES_SHA256
+  ALL_SCENES_SIMULATION_EPISODES ALL_SCENES_SIMULATION_VIDEOS
+  ALL_SCENES_SIMULATION_INFO_SHA256 ALL_SCENES_SIMULATION_SEMANTIC_SHA256
+  ALL_SCENES_SIMULATION_BOUNDARIES_SHA256
   CLUSTER_F_SSH_HOST CLUSTER_F_DATA_ROOT CLUSTER_F_SOURCE_ROOT CLUSTER_F_GPU_COUNT CLUSTER_F_CONTAINER_USER
   CLUSTER_WB1_SSH_HOST CLUSTER_WB1_DATA_ROOT CLUSTER_WB1_SOURCE_ROOT CLUSTER_WB1_GPU_COUNT CLUSTER_WB1_CONTAINER_USER
   CLUSTER_WB2_SSH_HOST CLUSTER_WB2_DATA_ROOT CLUSTER_WB2_SOURCE_ROOT CLUSTER_WB2_GPU_COUNT CLUSTER_WB2_CONTAINER_USER
@@ -43,7 +54,7 @@ nodes=(f wb1 wb2 wb3 wb4 wb5 wb6 lerobot)
 semantic_plan_args=(
   python3 "${plan_dir}/semantic_plan.py"
   --presets "${plan_dir}/semantic_training_presets.json"
-  --jobs "${plan_dir}/training_jobs.json"
+  --jobs "${training_jobs_file}"
 )
 
 node_profile() {
@@ -147,6 +158,18 @@ task_target_steps() {
   printf '%s\n' "${configured:-${TRAIN_STEPS}}"
 }
 
+task_memory_mode() {
+  "${semantic_plan_args[@]}" resolve "$1" | sed -n '2p'
+}
+
+task_dataset_family() {
+  "${semantic_plan_args[@]}" resolve "$1" | sed -n '1p'
+}
+
+task_run_dir_name() {
+  "${semantic_plan_args[@]}" resolve "$1" | sed -n '12p'
+}
+
 validate_plan_resources() {
   local task node gpu_csv port gpu
   local -A occupied=() ports=()
@@ -191,7 +214,7 @@ snapshot_file_list() {
     printf '%s\0' training_plan/cluster.sh training_plan/storage_guard.sh \
       training_plan/artifacts.lock training_plan/base_artifact_registry.json training_plan/README_zh.md \
       training_plan/semantic_plan.py training_plan/semantic_training_presets.json \
-      training_plan/training_jobs.json
+      training_plan/training_jobs.json "${training_jobs_rel}"
   } | sort -zu
 }
 
@@ -222,12 +245,12 @@ Usage:
   training_plan/cluster.sh dry-run-plan [all|f|wb1|wb2|wb3|wb4|wb5|wb6|lerobot]
   training_plan/cluster.sh dry-run-task TASK_ID
   training_plan/cluster.sh resume-dry-run-plan
-  training_plan/cluster.sh resume-dry-run-task TASK_ID
+  training_plan/cluster.sh resume-dry-run-task TASK_ID [CHECKPOINT]
   training_plan/cluster.sh fork-dry-run-task TASK_ID CHECKPOINT
   training_plan/cluster.sh start-plan [all|f|wb1|wb2|wb3|wb4|wb5|wb6|lerobot]
   training_plan/cluster.sh start-task TASK_ID
   training_plan/cluster.sh resume-plan
-  training_plan/cluster.sh resume-task TASK_ID
+  training_plan/cluster.sh resume-task TASK_ID [CHECKPOINT]
   training_plan/cluster.sh fork-task TASK_ID CHECKPOINT
   training_plan/cluster.sh status
   training_plan/cluster.sh archive-f-checkpoints
@@ -394,6 +417,7 @@ probe_gpu_container() {
 check_node() {
   local node="$1" commit code_dir actual_image actual_gpus
   local staff1_episodes staff1_videos all_scenes_episodes all_scenes_videos
+  local mixed_root mixed_episodes mixed_videos
   node_profile "${node}"
   commit="$(code_commit)"
   code_dir="${host_source}/lerobot_main_${commit}"
@@ -432,6 +456,22 @@ check_node() {
       echo "${node}: all-scenes dataset metadata checksum mismatch" >&2; return 1;
     }
     verify_dataset_readable "${node}" "${host_data}/datasets/b2_z1/training/all_scenes" all-scenes
+  fi
+  if node_tasks "${node}" | while read -r task; do
+    "${semantic_plan_args[@]}" resolve "${task}" | head -1
+  done | grep -qx all_scenes_simulation; then
+    mixed_root="${host_data}/datasets/b2_z1/training/all_scenes_plus_simulation_auto_open_v1"
+    ssh_node "${node}" "test -f '${mixed_root}/meta/info.json'" || {
+      echo "${node}: all-scenes-simulation dataset missing" >&2; return 1;
+    }
+    read -r mixed_episodes mixed_videos < <(ssh_node "${node}" "printf '%s %s\\n' \"\$(find '${mixed_root}/data' -type f -name '*.parquet' | wc -l)\" \"\$(find '${mixed_root}/videos' -type f -name '*.mp4' | wc -l)\"")
+    [[ "${mixed_episodes}" == "${ALL_SCENES_SIMULATION_EPISODES}" && "${mixed_videos}" == "${ALL_SCENES_SIMULATION_VIDEOS}" ]] || {
+      echo "${node}: all-scenes-simulation dataset file-count mismatch" >&2; return 1;
+    }
+    ssh_node "${node}" "{ echo '${ALL_SCENES_SIMULATION_INFO_SHA256}  ${mixed_root}/meta/info.json'; echo '${ALL_SCENES_SIMULATION_SEMANTIC_SHA256}  ${mixed_root}/meta/semantic_views.json'; echo '${ALL_SCENES_SIMULATION_BOUNDARIES_SHA256}  ${mixed_root}/meta/stage_boundaries.json'; } | sha256sum -c - >/dev/null" || {
+      echo "${node}: all-scenes-simulation dataset metadata checksum mismatch" >&2; return 1;
+    }
+    verify_dataset_readable "${node}" "${mixed_root}" all-scenes-simulation
   fi
   echo "${node}: OK image=${actual_image} gpus=${actual_gpus} code=${commit}"
 }
@@ -510,18 +550,18 @@ run_task_container() {
     prepare_resume_io "${node}" "${checkpoint}"
   fi
   if [[ "${mode}" == start ]]; then
-    printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" start "${task}" "${gpu}" "${port}"
+    printf -v command_q '%q ' env "TRAINING_JOBS_FILE=${code}/${training_jobs_rel}" bash "${code}/training_plan/launch.sh" start "${task}" "${gpu}" "${port}"
   elif [[ "${mode}" == fork ]]; then
-    printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" fork "${task}" "${gpu}" "${checkpoint}" "${port}"
+    printf -v command_q '%q ' env "TRAINING_JOBS_FILE=${code}/${training_jobs_rel}" bash "${code}/training_plan/launch.sh" fork "${task}" "${gpu}" "${checkpoint}" "${port}"
   else
-    printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" resume "${task}" "${gpu}" "${checkpoint}" "${port}"
+    printf -v command_q '%q ' env "TRAINING_JOBS_FILE=${code}/${training_jobs_rel}" bash "${code}/training_plan/launch.sh" resume "${task}" "${gpu}" "${checkpoint}" "${port}"
   fi
   ssh_node "${node}" "mkdir -p '${host_model_data}/models/trained/pi05'; docker run -d --name '${name}' --user '${container_user}' --gpus all --ipc=host --shm-size=64g --stop-timeout=120 -v '${host_data}:/data:rw' -v '${host_hf_cache}:/data/lerobot/cache/huggingface:rw' ${model_mount} -v '${host_source}:/workspace/source:rw' -w '${code}' -e NVIDIA_DISABLE_REQUIRE=1 -e NVIDIA_REQUIRE_CUDA= -e LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64 -e PYTHONPATH='${code}/src' -e UV_PROJECT_ENVIRONMENT=/lerobot/.venv -e VIRTUAL_ENV=/lerobot/.venv -e LEROBOT_RUNTIME_BIN=/lerobot/.venv/bin -e LEROBOT_TRAIN_FOREGROUND=true -e PATH=/lerobot/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -e HF_HOME=/data/lerobot/cache/huggingface -e HF_HUB_OFFLINE=1 -e HOME=/data/lerobot/home -e TZ=Asia/Shanghai '${image}' ${command_q} >/dev/null"
   echo "${node}/${task}: started ${name} (${mode})"
 }
 
 run_task_dry_run() {
-  local node="$1" task="$2" mode="$3" gpu="$4" port="$5" checkpoint="${6:-}" target_steps
+  local node="$1" task="$2" mode="$3" gpu="$4" port="$5" checkpoint="${6:-}" target_steps dataset_family
   local code command_q output dry_name model_mount
   node_profile "${node}"
   code="$(container_code_dir)"
@@ -535,11 +575,11 @@ run_task_dry_run() {
   fi
   if [[ "${mode}" == start ]]; then
     target_steps="$(task_target_steps "${task}")"
-    printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" dry-run "${task}" "${gpu}" "${port}"
+    printf -v command_q '%q ' env "TRAINING_JOBS_FILE=${code}/${training_jobs_rel}" bash "${code}/training_plan/launch.sh" dry-run "${task}" "${gpu}" "${port}"
   elif [[ "${mode}" == fork ]]; then
-    printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" fork-dry-run "${task}" "${gpu}" "${checkpoint}" "${port}"
+    printf -v command_q '%q ' env "TRAINING_JOBS_FILE=${code}/${training_jobs_rel}" bash "${code}/training_plan/launch.sh" fork-dry-run "${task}" "${gpu}" "${checkpoint}" "${port}"
   else
-    printf -v command_q '%q ' bash "${code}/training_plan/launch.sh" resume-dry-run "${task}" "${gpu}" "${checkpoint}" "${port}"
+    printf -v command_q '%q ' env "TRAINING_JOBS_FILE=${code}/${training_jobs_rel}" bash "${code}/training_plan/launch.sh" resume-dry-run "${task}" "${gpu}" "${checkpoint}" "${port}"
   fi
   # Mizar's frontend does not relay stdout from foreground docker run. Launch a
   # CPU-only short-lived container and read its logs after it exits instead.
@@ -575,9 +615,27 @@ run_task_dry_run() {
     [[ "${output}" == *"--steps=${target_steps}"* ]] || {
       echo "${node}/${task}: resume dry-run has wrong training horizon" >&2; return 1;
     }
+    [[ "${output}" == *"--policy.policy_base_artifact_id=${BASE_POLICY_ARTIFACT_ID}"* \
+      && "${output}" == *"--policy.policy_base_sha256=${BASE_POLICY_SHA256}"* \
+      && "${output}" == *"--policy.policy_tokenizer_artifact_id=${POLICY_TOKENIZER_ARTIFACT_ID}"* \
+      && "${output}" == *"--policy.policy_tokenizer_sha256=${POLICY_TOKENIZER_SHA256}"* ]] || {
+      echo "${node}/${task}: resume dry-run omitted locked policy artifacts" >&2; return 1;
+    }
+    if [[ "$(task_memory_mode "${task}")" != standard ]]; then
+      [[ "${output}" == *"--policy.mem_vit_artifact_id=${MEM_VIT_ARTIFACT_ID}"* \
+        && "${output}" == *"--policy.mem_vit_sha256=${MEM_VIT_SHA256}"* \
+        && "${output}" == *"--policy.mem_vit_base_weights_embedded=false"* \
+        && "${output}" == *"--policy.mem_vit_embedded_tensor_count=0"* ]] || {
+        echo "${node}/${task}: resume dry-run omitted portable MEM artifact contract" >&2; return 1;
+      }
+    fi
   else
     [[ "${output}" == *"--resume=true"* && "${output}" == *"--wandb.resume_training_run=false"* ]] || {
       echo "${node}/${task}: fork dry-run did not create a new W&B run" >&2; return 1;
+    }
+    dataset_family="$(task_dataset_family "${task}")"
+    [[ "${output}" == *"--dataset.repo_id=local/b2_z1_vla_${dataset_family}_training"* ]] || {
+      echo "${node}/${task}: fork dry-run retained the source checkpoint dataset identity" >&2; return 1;
     }
     target_steps="$(task_target_steps "${task}")"
     [[ "${output}" == *"--steps=${target_steps}"* ]] || {
@@ -588,13 +646,19 @@ run_task_dry_run() {
 }
 
 find_running_task() {
-  local node="$1" task="$2"
-  ssh_node "${node}" "for c in \$(docker ps --format '{{.Names}}'); do docker top \"\$c\" -eo pid,args 2>/dev/null; done | grep -F -- 'training_job_${task}_arm_mode_complete' | grep -v grep | head -1" || true
+  local node="$1" task="$2" name
+  name="$(task_container_name "${node}" "${task}")"
+  ssh_node "${node}" "test \"\$(docker inspect '${name}' --format '{{.State.Status}}' 2>/dev/null)\" = running && echo '${name}'" || true
 }
 
 latest_run_dir() {
-  local node="$1" task="$2"
+  local node="$1" task="$2" configured
   node_profile "${node}"
+  configured="$(task_run_dir_name "${task}")"
+  if [[ -n "${configured}" ]]; then
+    ssh_node "${node}" "test -d '${host_model_data}/models/trained/pi05/${configured}' && printf '%s\n' '${host_model_data}/models/trained/pi05/${configured}'"
+    return
+  fi
   ssh_node "${node}" "find '${host_model_data}/models/trained/pi05' -mindepth 1 -maxdepth 1 -type d -name '*training_job_${task}_arm_mode_complete' -printf '%T@ %p\\n' | sort -nr | head -1 | cut -d' ' -f2-"
 }
 
@@ -628,22 +692,38 @@ start_task() {
 }
 
 resume_task() {
-  local node="$1" task="$2" gpu port run_dir step checkpoint name target_steps
+  local node="$1" task="$2" requested_checkpoint="${3:-}" gpu port run_dir step checkpoint name target_steps
   read -r gpu port < <(task_resources "${task}")
   if [[ -n "$(find_running_task "${node}" "${task}")" ]]; then
     echo "${node}/${task}: already running"
     return
   fi
-  run_dir="$(latest_run_dir "${node}" "${task}")"
-  [[ -n "${run_dir}" ]] || { echo "${node}/${task}: no run directory" >&2; return 1; }
-  step="$(latest_complete_checkpoint "${node}" "${run_dir}")"
-  [[ -n "${step}" ]] || { echo "${node}/${task}: no complete checkpoint" >&2; return 1; }
+  if [[ -n "${requested_checkpoint}" ]]; then
+    [[ "${requested_checkpoint}" == /data/models/trained/pi05/*/checkpoints/[0-9]* ]] || {
+      echo "${node}/${task}: invalid explicit checkpoint: ${requested_checkpoint}" >&2
+      return 2
+    }
+    checkpoint="${requested_checkpoint}"
+    step="${checkpoint##*/}"
+    node_profile "${node}"
+    run_dir="${host_model_data}/${checkpoint#/data/}"
+    run_dir="${run_dir%/checkpoints/*}"
+    ssh_node "${node}" "test -d '${run_dir}/checkpoints/${step}'" || {
+      echo "${node}/${task}: explicit checkpoint is missing on ${node}: ${checkpoint}" >&2
+      return 1
+    }
+  else
+    run_dir="$(latest_run_dir "${node}" "${task}")"
+    [[ -n "${run_dir}" ]] || { echo "${node}/${task}: no run directory" >&2; return 1; }
+    step="$(latest_complete_checkpoint "${node}" "${run_dir}")"
+    [[ -n "${step}" ]] || { echo "${node}/${task}: no complete checkpoint" >&2; return 1; }
+    checkpoint="/data/models/trained/pi05/$(basename "${run_dir}")/checkpoints/${step}"
+  fi
   target_steps="$(task_target_steps "${task}")"
   if (( 10#${step} >= target_steps )); then
     echo "${node}/${task}: complete at ${step}"
     return
   fi
-  checkpoint="/data/models/trained/pi05/$(basename "${run_dir}")/checkpoints/${step}"
   remove_incomplete_checkpoint_dirs "${node}" "${run_dir}" "${step}"
   name="$(task_container_name "${node}" "${task}")"
   ssh_node "${node}" "mkdir -p '${host_data}/lerobot/logs'; if test -n \"\$(docker inspect '${name}' --format '{{.State.Status}}' 2>/dev/null)\"; then docker logs '${name}' >'${host_data}/lerobot/logs/${name}.container.log' 2>&1 || true; docker rm '${name}' >/dev/null; fi"
@@ -716,29 +796,33 @@ start_one_task() {
 }
 
 dry_run_one_task() {
-  local task="$1" mode="${2:-start}" node gpu port run_dir step checkpoint=""
+  local task="$1" mode="${2:-start}" requested_checkpoint="${3:-}" node gpu port run_dir step checkpoint=""
   node="$(task_node "${task}")" || { echo "Unknown task: ${task}" >&2; return 2; }
   ensure_runtime_home "${node}"
   sync_code "${node}"
   check_node "${node}"
   read -r gpu port < <(task_resources "${task}")
   if [[ "${mode}" == resume ]]; then
-    run_dir="$(latest_run_dir "${node}" "${task}")"
-    [[ -n "${run_dir}" ]] || { echo "${node}/${task}: no run directory" >&2; return 1; }
-    step="$(latest_complete_checkpoint "${node}" "${run_dir}")"
-    [[ -n "${step}" ]] || { echo "${node}/${task}: no complete checkpoint" >&2; return 1; }
-    checkpoint="/data/models/trained/pi05/$(basename "${run_dir}")/checkpoints/${step}"
+    if [[ -n "${requested_checkpoint}" ]]; then
+      checkpoint="${requested_checkpoint}"
+    else
+      run_dir="$(latest_run_dir "${node}" "${task}")"
+      [[ -n "${run_dir}" ]] || { echo "${node}/${task}: no run directory" >&2; return 1; }
+      step="$(latest_complete_checkpoint "${node}" "${run_dir}")"
+      [[ -n "${step}" ]] || { echo "${node}/${task}: no complete checkpoint" >&2; return 1; }
+      checkpoint="/data/models/trained/pi05/$(basename "${run_dir}")/checkpoints/${step}"
+    fi
   fi
   run_task_dry_run "${node}" "${task}" "${mode}" "${gpu}" "${port}" "${checkpoint}"
 }
 
 resume_one_task() {
-  local task="$1" node
+  local task="$1" checkpoint="${2:-}" node
   node="$(task_node "${task}")" || { echo "Unknown task: ${task}" >&2; return 2; }
   ensure_runtime_home "${node}"
   sync_code "${node}"
   check_node "${node}"
-  resume_task "${node}" "${task}"
+  resume_task "${node}" "${task}" "${checkpoint}"
 }
 
 fork_one_task() {
@@ -809,12 +893,12 @@ case "${1:-}" in
   dry-run-plan) dry_run_plan start "${2:-all}" ;;
   dry-run-task) dry_run_one_task "${2:?TASK_ID is required}" start ;;
   resume-dry-run-plan) dry_run_plan resume ;;
-  resume-dry-run-task) dry_run_one_task "${2:?TASK_ID is required}" resume ;;
+  resume-dry-run-task) dry_run_one_task "${2:?TASK_ID is required}" resume "${3:-}" ;;
   fork-dry-run-task) fork_dry_run_one_task "${2:?TASK_ID is required}" "${3:?CHECKPOINT is required}" ;;
   start-plan) plan_action start "${2:-all}" ;;
   start-task) start_one_task "${2:?TASK_ID is required}" ;;
   resume-plan) plan_action resume ;;
-  resume-task) resume_one_task "${2:?TASK_ID is required}" ;;
+  resume-task) resume_one_task "${2:?TASK_ID is required}" "${3:-}" ;;
   fork-task) fork_one_task "${2:?TASK_ID is required}" "${3:?CHECKPOINT is required}" ;;
   status) status ;;
   archive-f-checkpoints) exec bash "${plan_dir}/storage_guard.sh" archive ;;

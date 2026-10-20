@@ -225,4 +225,12 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
-            return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+            result = draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+        restore_metadata = getattr(result, "restore_pretrained_metadata", None)
+        if callable(restore_metadata):
+            restore_metadata(
+                model_id, revision=revision, cache_dir=cache_dir, force_download=force_download,
+                proxies=proxies, resume_download=resume_download, token=token,
+                local_files_only=local_files_only,
+            )
+        return result

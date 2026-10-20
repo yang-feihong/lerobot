@@ -4,6 +4,26 @@
 维护在 `training_plan/artifacts.lock`。入口不读取隐藏的机器默认值，也不依赖
 远程工作区的未提交修改。
 
+## 相机顺序契约
+
+新训练统一将机身 `observation.images.base_0_rgb` 放在腕部相机之前，其余相机按 key
+确定性排序，空相机放最后；不继承数据集 JSON 对象的插入顺序。
+已有任务 checkpoint 的 resume、继承 schema 的分支训练和推理，均恢复其自身
+`pi05_deployment_metadata.json → observation.camera_keys_in_model_order`，因此历史
+grasp 的腕部优先顺序仍保留。相机集合变化或 metadata 缺失/重复会报错，不能静默换序。
+portable artifact 路径重写保留 JSON key 顺序；模型执行顺序另由显式列表保障。
+仅更新代码即可正确加载历史 checkpoint，无需修改原 checkpoint。
+
+## 本轮编排入口
+
+`TRAINING_JOBS_FILE` 可选择本目录维护的 `object_grasp_training_jobs.json` 或
+`all_scenes_simulation_fork_jobs.json`，支持 `staff3_grasp`、`all_scenes_simulation` 数据源
+及仅图像历史的 `image_mem` 模式。`resume-task` / `resume-dry-run-task` 可额外传明确的
+checkpoint 路径；`run_dir_name` 固定原 run，避免误选最新同名任务。
+历史任务语义或 artifact 身份的接纳必须显式设置对应 `allow_resume_*_adoption`，
+仍校验动作、状态和记忆协议。`sync_full_checkpoint.sh` 与
+`sync_full_checkpoint_chunks.sh` 用于包括 optimizer/RNG 的完整恢复点传输并校验哈希。
+
 ## 可迁移 checkpoint 基座
 
 新 checkpoint 通过 `pretrained_model/base_artifacts.json` 记录基础 policy、MEM-ViT 和

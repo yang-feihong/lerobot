@@ -418,13 +418,12 @@ class TrainPipelineConfig(HubMixin):
                     )
                 with metadata_path.open() as f:
                     saved_metadata = json.load(f)
+                self.policy.restore_camera_metadata(saved_metadata)
                 current_metadata = deployment_metadata()
                 metadata_matches = saved_metadata == current_metadata
                 task_status_extension = (
                     self.resume_with_updated_dataset
-                    and is_task_status_deployment_metadata_extension(
-                        saved_metadata, current_metadata
-                    )
+                    and is_task_status_deployment_metadata_extension(saved_metadata, current_metadata)
                 )
                 training_loss_update = (
                     self.resume_with_updated_training_objective
@@ -485,9 +484,7 @@ class TrainPipelineConfig(HubMixin):
         if self.eval_steps > 0 and self.dataset.eval_split == 0.0:
             raise ValueError("eval_steps > 0 requires dataset.eval_split > 0.0 to hold out eval data.")
         if self.physical_eval_samples < 0:
-            raise ValueError(
-                f"physical_eval_samples must be non-negative, got {self.physical_eval_samples}"
-            )
+            raise ValueError(f"physical_eval_samples must be non-negative, got {self.physical_eval_samples}")
         if self.physical_eval_samples > 0 and self.eval_steps <= 0:
             raise ValueError("physical_eval_samples > 0 requires eval_steps > 0")
         if self.gradient_accumulation_steps < 1:

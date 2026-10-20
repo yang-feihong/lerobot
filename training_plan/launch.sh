@@ -63,7 +63,7 @@ mapfile -t semantic_task_spec < <(
   python3 "${plan_dir}/semantic_plan.py" \
     --presets "${semantic_presets_file}" --jobs "${training_jobs_file}" resolve "${task_id}"
 )
-[[ "${#semantic_task_spec[@]}" -eq 10 ]] || {
+[[ "${#semantic_task_spec[@]}" -eq 13 ]] || {
   echo "Failed to resolve semantic task ${task_id} from ${training_jobs_file}" >&2
   exit 2
 }
@@ -77,22 +77,21 @@ configured_gpu_ids="${semantic_task_spec[6]}"
 configured_port="${semantic_task_spec[7]}"
 task_train_steps="${semantic_task_spec[8]}"
 semantic_views_file="${semantic_task_spec[9]:-semantic_views.json}"
+allow_resume_semantic_adoption="${semantic_task_spec[10]}"
+allow_resume_artifact_adoption="${semantic_task_spec[12]}"
 effective_train_steps="${task_train_steps:-${TRAIN_STEPS}}"
 semantic_source_weights='{}'
 
-if [[ "${dataset_family}" == staff1 ]]; then
-  [[ -n "${STAFF1_DATASET_ROOT:-}" ]] || {
-    echo "Task ${task_id} requires STAFF1_DATASET_ROOT in ${env_file}." >&2
-    exit 2
-  }
-  dataset_root="${STAFF1_DATASET_ROOT}"
-else
-  [[ -n "${ALL_SCENES_DATASET_ROOT:-}" ]] || {
-    echo "Task ${task_id} requires ALL_SCENES_DATASET_ROOT in ${env_file}." >&2
-    exit 2
-  }
-  dataset_root="${ALL_SCENES_DATASET_ROOT}"
-fi
+case "${dataset_family}" in
+  staff1) dataset_root="${STAFF1_DATASET_ROOT:-}" ;;
+  all_scenes) dataset_root="${ALL_SCENES_DATASET_ROOT:-}" ;;
+  all_scenes_simulation) dataset_root="${ALL_SCENES_SIMULATION_DATASET_ROOT:-}" ;;
+  staff3_grasp) dataset_root="${STAFF3_GRASP_DATASET_ROOT:-}" ;;
+esac
+[[ -n "${dataset_root}" ]] || {
+  echo "Task ${task_id} has no configured dataset root for ${dataset_family} in ${env_file}." >&2
+  exit 2
+}
 semantic_views_path="${dataset_root}/meta/${semantic_views_file}"
 
 memory_args=()
@@ -105,6 +104,19 @@ case "${memory_mode}" in
       --enable-mem=true --state-action-encoding=text
       --mem-random-min-num-frames=1 --mem-random-max-num-frames=1
       --mem-random-interval-sampling=false
+    )
+    ;;
+  image_mem)
+    memory_args+=(
+      --enable-mem=true --state-action-encoding=text
+      --mem-random-min-num-frames="${MEM_RANDOM_MIN_NUM_FRAMES}"
+      --mem-random-max-num-frames="${MEM_RANDOM_MAX_NUM_FRAMES}"
+      --mem-frame-interval-seconds="${MEM_FRAME_INTERVAL_SECONDS}"
+      --mem-random-interval-sampling="${MEM_RANDOM_INTERVAL_SAMPLING}"
+      --mem-global-interval-std-seconds="${MEM_GLOBAL_INTERVAL_STD_SECONDS}"
+      --mem-local-interval-std-seconds="${MEM_LOCAL_INTERVAL_STD_SECONDS}"
+      --mem-min-interval-seconds="${MEM_MIN_INTERVAL_SECONDS}"
+      --mem-max-interval-seconds="${MEM_MAX_INTERVAL_SECONDS}"
     )
     ;;
   full_mem)
@@ -242,7 +254,16 @@ case "${command}" in
     if ! python3 - "${resume_config}" "${dataset_root}" "${semantic_phases}" "${semantic_phase_weights}" \
       "${semantic_state_instruction_matrix}" "${memory_mode}" \
       "${B2_ACTION_REPRESENTATION}" "${Z1_ACTION_REPRESENTATION}" \
-      "${PREDICT_TASK_COMPLETE}" "${PREDICT_TASK_BLOCKED}" "${command}" <<'PY'
+      "${PREDICT_TASK_COMPLETE}" "${PREDICT_TASK_BLOCKED}" "${command}" \
+      "${allow_resume_semantic_adoption}" \
+      "${MEM_RANDOM_MIN_NUM_FRAMES}" "${MEM_RANDOM_MAX_NUM_FRAMES}" \
+      "${MEM_FRAME_INTERVAL_SECONDS}" "${MEM_RANDOM_INTERVAL_SAMPLING}" \
+      "${MEM_GLOBAL_INTERVAL_STD_SECONDS}" "${MEM_LOCAL_INTERVAL_STD_SECONDS}" \
+      "${MEM_MIN_INTERVAL_SECONDS}" "${MEM_MAX_INTERVAL_SECONDS}" \
+      "${allow_resume_artifact_adoption}" \
+      "${BASE_POLICY_ARTIFACT_ID}" "${BASE_POLICY_SHA256}" \
+      "${MEM_VIT_ARTIFACT_ID}" "${MEM_VIT_SHA256}" \
+      "${POLICY_TOKENIZER_ARTIFACT_ID}" "${POLICY_TOKENIZER_SHA256}" <<'PY'
 import json
 import sys
 
@@ -257,6 +278,25 @@ expected_state_instruction_matrix = json.loads(sys.argv[5])
 expected_encoding = "continuous" if sys.argv[6] == "full_mem" else "text"
 saved_matrix = dataset.get("semantic_state_instruction_matrix", {})
 fork_mode = sys.argv[11] in {"fork", "fork-dry-run"}
+adopt_semantics = sys.argv[12] == "true"
+saved_semantics_are_empty = (
+    dataset.get("semantic_phases", []) == []
+    and dataset.get("semantic_phase_weights", {}) == {}
+    and saved_matrix == {}
+)
+adopt_artifacts = sys.argv[21] == "true"
+artifact_fields = (
+    "policy_base_artifact_id",
+    "policy_base_sha256",
+    "mem_vit_artifact_id",
+    "mem_vit_sha256",
+    "policy_tokenizer_artifact_id",
+    "policy_tokenizer_sha256",
+)
+saved_artifacts = tuple(policy.get(name) for name in artifact_fields)
+expected_artifacts = tuple(sys.argv[index] for index in range(22, 28))
+artifact_contract_matches = saved_artifacts == expected_artifacts
+legacy_artifact_contract_is_empty = all(value in (None, "") for value in saved_artifacts)
 
 
 def matrix_topology(matrix):
@@ -266,16 +306,49 @@ def matrix_topology(matrix):
     } if isinstance(matrix, dict) else None
 
 
+def memory_matches() -> bool:
+    mode = sys.argv[6]
+    enabled = bool(policy.get("mem_vit_enabled", False))
+    if mode == "standard":
+        return not enabled
+    if not enabled:
+        return False
+    if mode == "mem_vit":
+        return (
+            policy.get("mem_vit_min_num_frames") == 1
+            and policy.get("mem_vit_max_num_frames") == 1
+            and policy.get("mem_vit_random_interval_sampling") is False
+        )
+    return (
+        policy.get("mem_vit_min_num_frames") == int(sys.argv[13])
+        and policy.get("mem_vit_max_num_frames") == int(sys.argv[14])
+        and float(policy.get("mem_vit_frame_interval_seconds")) == float(sys.argv[15])
+        and policy.get("mem_vit_random_interval_sampling") is (sys.argv[16] == "true")
+        and float(policy.get("mem_vit_global_interval_std_seconds")) == float(sys.argv[17])
+        and float(policy.get("mem_vit_local_interval_std_seconds")) == float(sys.argv[18])
+        and float(policy.get("mem_vit_min_interval_seconds")) == float(sys.argv[19])
+        and float(policy.get("mem_vit_max_interval_seconds")) == float(sys.argv[20])
+    )
+
+
 expected = {
     "wandb.run_id": isinstance(run_id, str) and bool(run_id.strip()),
-    "dataset.root": dataset.get("root") == sys.argv[2],
-    "dataset.semantic_phases": dataset.get("semantic_phases") == expected_phases,
-    "dataset.semantic_phase_weights": dataset.get("semantic_phase_weights") == expected_phase_weights,
+    "dataset.root": fork_mode
+    or dataset.get("root") == sys.argv[2]
+    or (adopt_semantics and saved_semantics_are_empty),
+    "dataset.semantic_phases": dataset.get("semantic_phases") == expected_phases
+    or (adopt_semantics and saved_semantics_are_empty),
+    "dataset.semantic_phase_weights": dataset.get("semantic_phase_weights") == expected_phase_weights
+    or (adopt_semantics and saved_semantics_are_empty),
     # An explicit updated-training-objective resume may change relation details
     # such as state_end -> goal_end, but it must remain the same state/intent task.
     "dataset.semantic_state_instruction_matrix topology": fork_mode
-    or matrix_topology(saved_matrix) == matrix_topology(expected_state_instruction_matrix),
+    or matrix_topology(saved_matrix) == matrix_topology(expected_state_instruction_matrix)
+    or (adopt_semantics and saved_semantics_are_empty),
     "policy.state_action_encoding": policy.get("state_action_encoding") == expected_encoding,
+    "policy memory configuration": memory_matches(),
+    "policy artifact identity contract": artifact_contract_matches
+    or (adopt_artifacts and legacy_artifact_contract_is_empty),
     "policy.b2_action_representation": policy.get("b2_action_representation") == sys.argv[7],
     "policy.z1_action_representation": policy.get("z1_action_representation") == sys.argv[8],
     "policy.action_predict_arm_teleop_inactive": policy.get("action_predict_arm_teleop_inactive") is True,
@@ -301,6 +374,7 @@ PY
       --resume-with-updated-training-objective=true
       --steps="${effective_train_steps}"
       --dataset-root="${dataset_root}"
+      --dataset-repo-id="local/b2_z1_vla_${dataset_family}_training"
       --semantic-views-path="${semantic_views_path}"
       --semantic-state-instruction-matrix="${semantic_state_instruction_matrix}"
       --semantic-phases="${semantic_phases}"
@@ -310,7 +384,17 @@ PY
       --action-loss-schema="${ACTION_LOSS_SCHEMA}"
       --action-continuous-group-weight="${ACTION_CONTINUOUS_GROUP_WEIGHT}"
       --action-discrete-group-weight="${ACTION_DISCRETE_GROUP_WEIGHT}"
+      --policy-base-artifact-id="${BASE_POLICY_ARTIFACT_ID}"
+      --policy-base-sha256="${BASE_POLICY_SHA256}"
+      --policy-tokenizer-artifact-id="${POLICY_TOKENIZER_ARTIFACT_ID}"
+      --policy-tokenizer-sha256="${POLICY_TOKENIZER_SHA256}"
     )
+    if [[ "${memory_mode}" != standard ]]; then
+      resume_args+=(
+        --mem-vit-artifact-id="${MEM_VIT_ARTIFACT_ID}"
+        --mem-vit-sha256="${MEM_VIT_SHA256}"
+      )
+    fi
     if [[ "${command}" == fork || "${command}" == fork-dry-run ]]; then
       fork_name="$(date +%Y%m%d_%H%M%S)_mem_pi05_b2_z1_vla_training_job_${task_id}_arm_mode_complete"
       resume_args+=(--resume-new-run-name="${fork_name}")

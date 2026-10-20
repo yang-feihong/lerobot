@@ -35,6 +35,7 @@ from lerobot.scripts.pi05_vla_server import (
     SE2TrajectoryController,
     _apply_completion_stop,
     _b2_velocity_smoothing_transition_step,
+    _camera_bindings,
     _checkpoint_hot_swap_signature,
     _decode_discrete_actions,
     _deployment_rtc_config,
@@ -51,6 +52,52 @@ from lerobot.scripts.pi05_vla_server import (
 )
 
 EXECUTION_ACTION_NAMES = execution_action_names("ee_delta")
+
+
+@pytest.mark.parametrize("wrist_first", [False, True])
+def test_real_robot_jpeg_roles_reach_metadata_model_slots(wrist_first):
+    from PIL import Image
+
+    from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+
+    base_key = "observation.images.base_0_rgb"
+    wrist_key = "observation.images.left_wrist_0_rgb"
+    keys = [wrist_key, base_key] if wrist_first else [base_key, wrist_key]
+
+    def jpeg(value):
+        buffer = BytesIO()
+        Image.fromarray(np.full((224, 224, 3), value, dtype=np.uint8)).save(buffer, format="JPEG")
+        return np.frombuffer(buffer.getvalue(), dtype=np.uint8)
+
+    record = SimpleNamespace(base_jpeg=jpeg(0), wrist_jpeg=jpeg(255))
+    engine = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    engine._mailbox_condition = Lock()
+    engine._observation_history = [record]
+    engine._image_history = [record]
+    engine.state_num_frames = engine.state_history_stride = 1
+    engine.mem_image_num_frames = engine.mem_image_stride = 1
+    engine.mem_image_interval_ns = 1
+    engine.mem_enabled = engine.action_history_enabled = False
+    engine.base_camera_key, engine.wrist_camera_key = _camera_bindings(tuple(keys))
+    engine._source_state = lambda _: torch.zeros(1)
+    def samples(*args, **kwargs):
+        return [record], torch.zeros(1, 1, dtype=torch.bool)
+
+    engine._sample_memory_records = engine._sample_image_records = samples
+    packet = SimpleNamespace(sim_step=0, capture_finished_ns=1, task="test")
+    batch = engine._make_batch(packet)
+
+    policy = PI05Policy.__new__(PI05Policy)
+    torch.nn.Module.__init__(policy)
+    policy.register_parameter("dummy", torch.nn.Parameter(torch.zeros(1)))
+    policy.config = PI05Config(
+        device="cpu", dataset_camera_keys=keys,
+        input_features={key: PolicyFeature(FeatureType.VISUAL, (3, 224, 224)) for key in reversed(keys)},
+    )
+    images, _, _ = policy._preprocess_images(batch)
+    assert [image.mean().item() for image in images] == [
+        1.0 if key == wrist_key else -1.0 for key in keys
+    ]
 
 
 def _image_packet(capture_ns: int) -> ImagePacket:
@@ -411,7 +458,7 @@ def test_server_derives_rtc_mode_from_checkpoint(training_enabled: bool, expecte
         chunk_scheduling_mode="RTC",
         rtc_schedule="EXP",
         rtc_max_guidance_weight=10.0,
-        rtc_execution_horizon=13,
+        rtc_execution_horizon=25,
     )
 
     rtc_config = _deployment_rtc_config(config, args)
@@ -427,7 +474,7 @@ def test_sync_scheduling_disables_training_rtc_conditioning() -> None:
         chunk_scheduling_mode="SYNC",
         rtc_schedule="EXP",
         rtc_max_guidance_weight=10.0,
-        rtc_execution_horizon=13,
+        rtc_execution_horizon=25,
     )
 
     rtc_config = _deployment_rtc_config(config, args)

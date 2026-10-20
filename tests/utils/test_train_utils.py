@@ -55,6 +55,23 @@ def test_get_step_identifier():
     assert get_step_identifier(456789, 1_000_000) == "0456789"
 
 
+def test_portable_artifact_rewrite_preserves_camera_order(tmp_path):
+    from lerobot.common.train_utils import _replace_saved_artifact_paths
+    from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
+    from lerobot.policies.pi05.configuration_pi05 import PI05Config
+
+    keys = ["observation.images.left_wrist_0_rgb", "observation.images.base_0_rgb"]
+    config = PI05Config(
+        device="cpu", dataset_camera_keys=keys,
+        input_features={key: PolicyFeature(FeatureType.VISUAL, (3, 224, 224)) for key in keys},
+        policy_base_artifact_id="test/policy", policy_base_sha256="0" * 64,
+    )
+    config._save_pretrained(tmp_path)
+    _replace_saved_artifact_paths(tmp_path, config)
+    assert list(json.loads((tmp_path / "config.json").read_text())["input_features"]) == keys
+    assert list(PreTrainedConfig.from_pretrained(tmp_path).image_features) == keys
+
+
 def test_get_step_checkpoint_dir():
     output_dir = Path("/checkpoints")
     step_dir = get_step_checkpoint_dir(output_dir, 1000, 5)
@@ -163,6 +180,29 @@ def test_save_checkpoint_peft(mock_save_training_state, tmp_path, optimizer):
     policy.save_pretrained.assert_called_once()
     cfg.save_pretrained.assert_called_once()
     policy.config.save_pretrained.assert_called_once()
+    mock_save_training_state.assert_called_once()
+
+
+@patch("lerobot.common.train_utils.save_training_state")
+def test_save_checkpoint_detects_peft_in_inherited_pi05_policy_config(
+    mock_save_training_state, tmp_path, optimizer
+):
+    from lerobot.policies.pi05.configuration_pi05 import PI05Config
+
+    policy_config = PI05Config(device="cpu", use_peft=True)
+    policy = Mock(config=policy_config)
+
+    def save_adapter(path, state_dict=None):
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "adapter_model.safetensors").write_bytes(b"adapter")
+
+    policy.save_pretrained.side_effect = save_adapter
+    cfg = SimpleNamespace(peft=None, policy=policy_config, save_pretrained=Mock())
+
+    save_checkpoint(tmp_path, 10, cfg, policy, optimizer)
+
+    assert (tmp_path / "pretrained_model/config.json").is_file()
+    assert (tmp_path / "pretrained_model/pi05_deployment_metadata.json").is_file()
     mock_save_training_state.assert_called_once()
 
 

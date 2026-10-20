@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from lerobot.configs import PreTrainedConfig
+from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.policies import factory as policy_factory
 from lerobot.policies.pi05.b2_action_transform import (
     CONTROL_EXTENDED_DATASET_ACTION_NAMES,
@@ -159,12 +159,170 @@ def test_checkpoint_metadata_describes_explicit_completion_protocol(tmp_path):
     metadata = json.loads((tmp_path / "pi05_deployment_metadata.json").read_text())
     assert metadata["action"]["predict"]["arm_teleop_inactive"] is True
     assert "b2_active" not in metadata["action"]["predict"]
-    assert (
-        metadata["action"]["task_complete_semantics"]
-        == "explicit_true_in_the_terminal_stage_hold"
-    )
+    assert metadata["action"]["task_complete_semantics"] == "explicit_true_in_the_terminal_stage_hold"
     restored = PreTrainedConfig.from_pretrained(tmp_path)
     assert restored.deployment_metadata() == metadata
+
+
+def test_deployment_metadata_preserves_explicit_dataset_camera_order() -> None:
+    wrist_key = "observation.images.left_wrist_0_rgb"
+    base_key = "observation.images.base_0_rgb"
+    config = PI05Config(
+        input_features={
+            base_key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
+            wrist_key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
+        },
+        dataset_camera_keys=[wrist_key, base_key],
+    )
+
+    observation = config.deployment_metadata()["observation"]
+
+    assert observation["camera_keys_in_model_order"] == [wrist_key, base_key]
+    assert list(observation["image_features"]) == [wrist_key, base_key]
+
+
+BASE_CAMERA = "observation.images.base_0_rgb"
+WRIST_CAMERA = "observation.images.left_wrist_0_rgb"
+
+
+def _camera_config(keys, **kwargs):
+    return PI05Config(
+        device="cpu",
+        input_features={key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)) for key in keys},
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("keys", [[WRIST_CAMERA, BASE_CAMERA], [BASE_CAMERA, WRIST_CAMERA]])
+def test_new_camera_order_is_independent_of_dataset_keys(keys):
+    config = _camera_config(keys)
+    config.validate_features()
+    assert list(config.image_features) == [BASE_CAMERA, WRIST_CAMERA]
+    assert config.dataset_camera_keys == [BASE_CAMERA, WRIST_CAMERA]
+
+
+def test_sorted_config_load_restores_checkpoint_camera_metadata(tmp_path):
+    config = _camera_config([WRIST_CAMERA, BASE_CAMERA], dataset_camera_keys=[WRIST_CAMERA, BASE_CAMERA])
+    config._save_pretrained(tmp_path)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(json.loads(config_path.read_text()), sort_keys=True))
+    restored = PreTrainedConfig.from_pretrained(tmp_path)
+    assert list(restored.image_features) == [WRIST_CAMERA, BASE_CAMERA]
+    assert list(restored.input_features)[:2] == [WRIST_CAMERA, BASE_CAMERA]
+
+
+def test_hub_config_load_restores_checkpoint_metadata(tmp_path, monkeypatch):
+    config = _camera_config([BASE_CAMERA, WRIST_CAMERA], dataset_camera_keys=[WRIST_CAMERA, BASE_CAMERA])
+    config._save_pretrained(tmp_path)
+
+    def download(*, filename, **kwargs):
+        return str(tmp_path / filename)
+
+    monkeypatch.setattr("lerobot.configs.policies.hf_hub_download", download)
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
+    assert list(PreTrainedConfig.from_pretrained("test/model").image_features) == [WRIST_CAMERA, BASE_CAMERA]
+
+
+def test_resolved_checkpoint_without_metadata_fails_closed(tmp_path):
+    config = _camera_config([BASE_CAMERA, WRIST_CAMERA], io_schema_resolved=True)
+    config._save_pretrained(tmp_path)
+    (tmp_path / "pi05_deployment_metadata.json").unlink()
+    with pytest.raises(FileNotFoundError, match="camera metadata"):
+        PreTrainedConfig.from_pretrained(tmp_path)
+
+
+def test_resume_restores_metadata_before_contract_comparison(tmp_path, monkeypatch):
+    from lerobot.configs.default import DatasetConfig
+    from lerobot.configs.train import TrainPipelineConfig
+
+    config = _camera_config(
+        [BASE_CAMERA, WRIST_CAMERA], dataset_camera_keys=[WRIST_CAMERA, BASE_CAMERA], io_schema_resolved=True
+    )
+    pipeline = TrainPipelineConfig(dataset=DatasetConfig(repo_id="local/test"), policy=config)
+    config._save_pretrained(tmp_path)
+    pipeline._save_pretrained(tmp_path)
+    config.dataset_camera_keys = [BASE_CAMERA, WRIST_CAMERA]
+    monkeypatch.setattr("lerobot.configs.train.parser.parse_arg", lambda _: str(tmp_path / "train_config.json"))
+    pipeline._resolve_resume_checkpoint()
+    assert list(pipeline.policy.image_features) == [WRIST_CAMERA, BASE_CAMERA]
+
+
+@pytest.mark.parametrize(
+    "keys", [[BASE_CAMERA], [BASE_CAMERA, BASE_CAMERA], [BASE_CAMERA, WRIST_CAMERA, "unknown"]]
+)
+def test_invalid_checkpoint_camera_contract_is_rejected(keys):
+    config = _camera_config([WRIST_CAMERA, BASE_CAMERA])
+    with pytest.raises(ValueError, match="camera metadata"):
+        config.restore_camera_metadata({"observation": {"camera_keys_in_model_order": keys}})
+
+
+def test_camera_contract_includes_synthetic_empty_cameras(tmp_path):
+    config = _camera_config([WRIST_CAMERA, BASE_CAMERA], empty_cameras=1)
+    config.validate_features()
+    expected = [BASE_CAMERA, WRIST_CAMERA, "observation.images.empty_camera_0"]
+    assert list(config.image_features) == expected
+    config._save_pretrained(tmp_path)
+    assert list(PreTrainedConfig.from_pretrained(tmp_path).image_features) == expected
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_factory_uses_canonical_new_order_but_preserves_resume_metadata(monkeypatch, tmp_path, resume):
+    meta = SimpleNamespace(
+        features={
+            WRIST_CAMERA: {
+                "dtype": "video",
+                "shape": (224, 224, 3),
+                "names": ["height", "width", "channels"],
+            },
+            BASE_CAMERA: {"dtype": "video", "shape": (224, 224, 3), "names": ["height", "width", "channels"]},
+            OBS_STATE: {"dtype": "float32", "shape": (49,), "names": _state_names()},
+            ACTION: {
+                "dtype": "float32",
+                "shape": (25,),
+                "names": list(CONTROL_EXTENDED_DATASET_ACTION_NAMES),
+            },
+        },
+        fps=50,
+        camera_keys=[WRIST_CAMERA, BASE_CAMERA],
+        stats={},
+        root=tmp_path,
+    )
+
+    class DummyPolicy(torch.nn.Module):
+        def __init__(self, config, **kwargs):
+            super().__init__()
+            self.config = config
+
+        @classmethod
+        def from_pretrained(cls, **kwargs):
+            return cls(**kwargs)
+
+    monkeypatch.setattr(policy_factory, "get_policy_class", lambda _: DummyPolicy)
+    config = policy_factory.make_policy(PI05Config(device="cpu"), ds_meta=meta).config
+    assert list(config.image_features) == [BASE_CAMERA, WRIST_CAMERA]
+    if resume:
+        config.dataset_camera_keys = [WRIST_CAMERA, BASE_CAMERA]
+        config._save_pretrained(tmp_path)
+        # Simulate a stale train_config and differently ordered dataset JSON.
+        config.dataset_camera_keys = [BASE_CAMERA, WRIST_CAMERA]
+        config.pretrained_path = tmp_path
+        meta.camera_keys.reverse()
+        resumed = policy_factory.make_policy(config, ds_meta=meta)
+        assert list(resumed.config.image_features) == [WRIST_CAMERA, BASE_CAMERA]
+
+
+@pytest.mark.parametrize("order", [[BASE_CAMERA, WRIST_CAMERA], [WRIST_CAMERA, BASE_CAMERA]])
+def test_actual_image_preprocessing_matches_metadata_slots(order):
+    from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+
+    policy = PI05Policy.__new__(PI05Policy)
+    torch.nn.Module.__init__(policy)
+    policy.register_parameter("dummy", torch.nn.Parameter(torch.zeros(1)))
+    policy.config = _camera_config([BASE_CAMERA, WRIST_CAMERA], dataset_camera_keys=order)
+    # Distinct physical image contents, deliberately independent of dict order.
+    batch = {WRIST_CAMERA: torch.ones(1, 3, 224, 224), BASE_CAMERA: torch.zeros(1, 3, 224, 224)}
+    images, _, _ = policy._preprocess_images(batch)
+    assert [image.mean().item() for image in images] == [-1.0 if key == BASE_CAMERA else 1.0 for key in order]
 
 
 def test_current_config_defaults_to_control_action() -> None:

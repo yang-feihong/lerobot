@@ -1,0 +1,31 @@
+{
+  "format": "lerobot.training_jobs",
+  "version": 1,
+  "jobs": {
+    "staff3_object_grasp_image_mem": {
+      "dataset_family": "staff3_grasp",
+      "memory_mode": "image_mem",
+      "train_steps": 50000,
+      "run_dir_name": "20261016_155152_mem_pi05_b2_z1_vla_object_grasp_staff3_arm_mode_complete",
+      "allow_resume_semantic_adoption": true,
+      "allow_resume_artifact_adoption": true,
+      "state_weights": {
+        "object_grasp": 1.0
+      },
+      "state_instruction_matrix": {
+        "object_grasp": {
+          "object_grasp": {
+            "status": "active",
+            "action_supervision": "demonstrated",
+            "completion_boundary": "goal_end"
+          }
+        }
+      },
+      "resources": {
+        "node": "wb5",
+        "gpu_ids": [0, 1, 2, 3],
+        "main_process_port": 29500
+      }
+    }
+  }
+}

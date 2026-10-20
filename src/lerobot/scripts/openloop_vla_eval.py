@@ -36,7 +36,7 @@ from lerobot.datasets.factory import (
     semantic_source_split_keys,
     split_episode_indices,
 )
-from lerobot.datasets.semantic_views import load_semantic_views
+from lerobot.datasets.semantic_views import apply_semantic_views_to_batch, load_semantic_views
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.pi05.b2_action_transform import (
     absolute_ee_pose_to_reference_delta,
@@ -607,6 +607,100 @@ def _limit_episodes(episodes: list[int], max_episodes: int) -> list[int]:
     if max_episodes <= 0 or len(episodes) <= max_episodes:
         return episodes
     return episodes[:max_episodes]
+
+
+def _semantic_eligible_local_indices(
+    episode_indices: list[int],
+    frame_indices: list[int],
+    catalog: Any,
+    phases: list[str],
+) -> set[int]:
+    """Return dataset-local rows inside the same semantic phases used in training."""
+    selected_phases = set(phases)
+    if not selected_phases:
+        return set(range(len(episode_indices)))
+    eligible: set[int] = set()
+    for local_index, (episode, frame) in enumerate(
+        zip(episode_indices, frame_indices, strict=True)
+    ):
+        if any(
+            segment.phase in selected_phases
+            and segment.frame_start <= int(frame) < segment.frame_stop
+            for segment in catalog.segments.get(int(episode), ())
+        ):
+            eligible.add(local_index)
+    return eligible
+
+
+def _semantic_completion_offset_local_indices(
+    episode_indices: list[int],
+    frame_indices: list[int],
+    catalog: Any,
+    *,
+    goal: str,
+    offsets: list[int],
+) -> set[int]:
+    """Select exact dataset rows at offsets from an instruction completion frame."""
+    requested_offsets = {int(offset) for offset in offsets}
+    completion_by_episode: dict[int, int] = {}
+    for episode in {int(value) for value in episode_indices}:
+        candidates = {
+            int(view.completion_frame)
+            for view in catalog.episodes.get(episode, ())
+            if view.canonical_intent == goal
+            and view.status == "active"
+            and view.completion_frame is not None
+        }
+        if len(candidates) > 1:
+            raise ValueError(
+                f"Episode {episode} has ambiguous completion frames for {goal!r}: "
+                f"{sorted(candidates)}"
+            )
+        if candidates:
+            completion_by_episode[episode] = next(iter(candidates))
+
+    return {
+        local_index
+        for local_index, (episode, frame) in enumerate(
+            zip(episode_indices, frame_indices, strict=True)
+        )
+        if int(episode) in completion_by_episode
+        and int(frame) - completion_by_episode[int(episode)] in requested_offsets
+    }
+
+
+def _semantic_matrix_for_goal(
+    matrix: dict[str, dict[str, dict[str, str]]], goal: str | None
+) -> dict[str, dict[str, dict[str, str]]]:
+    if goal is None:
+        return matrix
+    filtered = {
+        state: {goal: relations[goal]}
+        for state, relations in matrix.items()
+        if goal in relations
+    }
+    if not filtered:
+        available = sorted({candidate for relations in matrix.values() for candidate in relations})
+        raise ValueError(f"Unknown semantic goal {goal!r}; available goals: {available}")
+    return filtered
+
+
+def _limit_indices_evenly_per_episode(
+    indices: list[int], episode_indices: list[int], limit: int
+) -> list[int]:
+    if limit <= 0:
+        return indices
+    grouped: dict[int, list[int]] = defaultdict(list)
+    for index in indices:
+        grouped[int(episode_indices[index])].append(index)
+    selected: list[int] = []
+    for group in grouped.values():
+        if len(group) <= limit:
+            selected.extend(group)
+            continue
+        positions = np.linspace(0, len(group) - 1, limit)
+        selected.extend(group[int(round(position))] for position in positions)
+    return sorted(set(selected))
 
 
 def _default_action_names(meta: LeRobotDatasetMetadata, action_dim: int) -> list[str]:
@@ -1198,6 +1292,30 @@ def main() -> None:
             "By default <dataset-root>/meta/semantic_views.json is detected automatically."
         ),
     )
+    parser.add_argument(
+        "--semantic-goal",
+        default=None,
+        help=(
+            "Canonical goal key (for example goal_enter) to materialize from a goal-conditioned "
+            "semantic sidecar. This changes both language and supervision consistently."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-phase",
+        action="append",
+        default=[],
+        help="Restrict evaluation to this checkpoint-trained phase; repeat for multiple phases.",
+    )
+    parser.add_argument(
+        "--semantic-completion-offset",
+        action="append",
+        type=int,
+        default=[],
+        help=(
+            "Evaluate only this frame offset from --semantic-goal's annotated completion "
+            "boundary; repeat for multiple offsets. Uses native dataset histories."
+        ),
+    )
     parser.add_argument("--episodes", default=None, help="Comma/range list, e.g. 1,5,9-12. Overrides split.")
     parser.add_argument("--max-episodes", type=int, default=8, help="0 means no limit.")
     parser.add_argument(
@@ -1285,10 +1403,19 @@ def main() -> None:
         raise ValueError(f"frame_stride must be at least 1, got {args.frame_stride}")
     if args.chunk_plot_stride < 1:
         raise ValueError(f"chunk_plot_stride must be at least 1, got {args.chunk_plot_stride}")
+    if args.semantic_completion_offset and args.semantic_goal is None:
+        raise ValueError("--semantic-completion-offset requires --semantic-goal")
 
     init_logging()
 
     policy_path = _resolve_policy_path(args.policy_path)
+    train_config_path = policy_path / "train_config.json"
+    train_config_document = (
+        json.loads(train_config_path.read_text(encoding="utf-8"))
+        if train_config_path.is_file()
+        else {}
+    )
+    checkpoint_dataset_config = train_config_document.get("dataset", {})
     if args.output_dir is None:
         output_dir = policy_path.parent.parent / "openloop_eval" / f"{args.split}_latest"
     else:
@@ -1355,6 +1482,40 @@ def main() -> None:
             )
     delta_timestamps = resolve_delta_timestamps(policy_cfg, meta)
 
+    semantic_views = None
+    semantic_views_path = (
+        Path(args.semantic_views_path).expanduser()
+        if args.semantic_views_path is not None
+        else (
+            policy_path / "semantic_views.json"
+            if (policy_path / "semantic_views.json").is_file()
+            else (
+                Path(checkpoint_dataset_config["semantic_views_path"]).expanduser()
+                if checkpoint_dataset_config.get("semantic_views_path")
+                else None
+            )
+        )
+    )
+    if semantic_views_path is not None:
+        semantic_views = load_semantic_views(semantic_views_path)
+        expected_sha256 = getattr(policy_cfg, "semantic_view_manifest_sha256", None)
+        if expected_sha256 is not None and semantic_views.sha256 != expected_sha256:
+            raise ValueError(
+                "Evaluation semantic-view sidecar differs from the checkpoint used for training: "
+                f"expected={expected_sha256}, actual={semantic_views.sha256}, "
+                f"path={semantic_views_path}"
+            )
+    semantic_matrix = _semantic_matrix_for_goal(
+        checkpoint_dataset_config.get("semantic_state_instruction_matrix", {})
+        or getattr(policy_cfg, "semantic_state_instruction_matrix", {})
+        or {},
+        args.semantic_goal,
+    )
+    checkpoint_semantic_phases = list(checkpoint_dataset_config.get("semantic_phases", ()) or ())
+    checkpoint_semantic_view_kind_weights = (
+        checkpoint_dataset_config.get("semantic_view_kind_weights", {}) or {}
+    )
+
     episodes = _parse_episodes(args.episodes)
     explicit_episode_selection = episodes is not None
     if args.max_frames_per_episode is None:
@@ -1368,11 +1529,7 @@ def main() -> None:
             args.split,
             args.eval_split,
             dataset_root=Path(args.dataset_root).expanduser(),
-            semantic_views_path=(
-                Path(args.semantic_views_path).expanduser()
-                if args.semantic_views_path is not None
-                else None
-            ),
+            semantic_views_path=semantic_views_path,
             expected_semantic_views_sha256=getattr(
                 policy_cfg, "semantic_view_manifest_sha256", None
             ),
@@ -1466,17 +1623,47 @@ def main() -> None:
         for index, frame_index in enumerate(dataset.hf_dataset["frame_index"])
         if int(frame_index) % args.frame_stride == 0
     ]
+    semantic_phases = args.semantic_phase or checkpoint_semantic_phases
+    unknown_semantic_phases = set(semantic_phases) - set(checkpoint_semantic_phases)
+    if unknown_semantic_phases:
+        raise ValueError(
+            "Requested semantic phases were not used to train this checkpoint: "
+            f"{sorted(unknown_semantic_phases)}"
+        )
+    if semantic_views is not None and semantic_phases:
+        semantic_eligible = _semantic_eligible_local_indices(
+            [int(value) for value in dataset.hf_dataset["episode_index"]],
+            [int(value) for value in dataset.hf_dataset["frame_index"]],
+            semantic_views,
+            semantic_phases,
+        )
+        sampled_indices = [index for index in sampled_indices if index in semantic_eligible]
+        if not sampled_indices:
+            raise ValueError(
+                f"No sampled frames remain in semantic phases {semantic_phases}"
+            )
+    if args.semantic_completion_offset:
+        if semantic_views is None:
+            raise ValueError("--semantic-completion-offset requires a semantic-view sidecar")
+        completion_eligible = _semantic_completion_offset_local_indices(
+            [int(value) for value in dataset.hf_dataset["episode_index"]],
+            [int(value) for value in dataset.hf_dataset["frame_index"]],
+            semantic_views,
+            goal=args.semantic_goal,
+            offsets=args.semantic_completion_offset,
+        )
+        sampled_indices = [index for index in sampled_indices if index in completion_eligible]
+        if not sampled_indices:
+            raise ValueError(
+                "No sampled frames remain at semantic completion offsets "
+                f"{sorted(set(args.semantic_completion_offset))}"
+            )
     if args.max_frames_per_episode > 0 and not args.include_onset_windows:
-        limited_indices: list[int] = []
-        limited_counts: dict[int, int] = defaultdict(int)
-        episode_index_column = dataset.hf_dataset["episode_index"]
-        for index in sampled_indices:
-            episode_index = int(episode_index_column[index])
-            if limited_counts[episode_index] >= args.max_frames_per_episode:
-                continue
-            limited_indices.append(index)
-            limited_counts[episode_index] += 1
-        sampled_indices = limited_indices
+        sampled_indices = _limit_indices_evenly_per_episode(
+            sampled_indices,
+            [int(value) for value in dataset.hf_dataset["episode_index"]],
+            args.max_frames_per_episode,
+        )
     required_onset_frames: set[tuple[int, int]] = set()
     if (
         args.include_onset_windows
@@ -1600,7 +1787,17 @@ def main() -> None:
                         filtered[key] = value
                 batch = filtered
 
-            if args.task_variant != "dataset":
+            if semantic_views is not None:
+                apply_semantic_views_to_batch(
+                    batch,
+                    semantic_views,
+                    step=step,
+                    seed=args.seed,
+                    randomize=args.task_variant == "random",
+                    view_kind_weights=checkpoint_semantic_view_kind_weights,
+                    state_instruction_matrix=semantic_matrix,
+                )
+            elif args.task_variant != "dataset":
                 apply_task_variants_to_batch(
                     batch,
                     task_variants,

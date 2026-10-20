@@ -144,7 +144,7 @@ def _replace_saved_artifact_paths(pretrained_dir: Path, policy_cfg: PI05Config) 
             continue
         parsed = json.loads(path.read_text(encoding="utf-8"))
         replace_named_paths(parsed)
-        path.write_text(json.dumps(parsed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        path.write_text(json.dumps(parsed, indent=2) + "\n", encoding="utf-8")
     processor_path = pretrained_dir / "policy_preprocessor.json"
     if processor_path.is_file() and policy_cfg.policy_tokenizer_artifact_id is not None:
         payload = json.loads(processor_path.read_text(encoding="utf-8"))
@@ -153,7 +153,7 @@ def _replace_saved_artifact_paths(pretrained_dir: Path, policy_cfg: PI05Config) 
             step_config = step.get("config", {})
             if step.get("registry_name") == "tokenizer_processor" and step_config.get("tokenizer_name"):
                 step_config["tokenizer_name"] = tokenizer_uri
-        processor_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        processor_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def get_step_identifier(step: int, total_steps: int) -> str:
@@ -288,18 +288,25 @@ def save_checkpoint(
     """
     pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
     policy_cfg = policy.config
+    # A fresh-optimizer fork loaded from a trained PEFT checkpoint can have
+    # cfg.peft=None even though the instantiated policy is still PEFT.  The
+    # policy config is authoritative for checkpoint serialization; otherwise
+    # only adapter files are emitted and config/deployment metadata are lost.
+    policy_uses_peft = cfg.peft is not None or (
+        isinstance(policy_cfg, PI05Config) and policy_cfg.use_peft
+    )
     portable_artifacts = (
-        cfg.peft is not None
+        policy_uses_peft
         and isinstance(policy_cfg, PI05Config)
         and policy_cfg.policy_base_artifact_id is not None
     )
     embed_mem_vit_base = (
-        cfg.peft is not None
+        policy_uses_peft
         and isinstance(policy_cfg, PI05Config)
         and policy_cfg.mem_vit_enabled
         and (not portable_artifacts or policy_cfg.mem_vit_finetune_mode == "full")
     )
-    if cfg.peft is not None and model_state_dict is not None:
+    if policy_uses_peft and model_state_dict is not None:
         with _peft_modules_to_save_from_state_dict(policy):
             policy.save_pretrained(pretrained_dir, state_dict=model_state_dict)
     else:
@@ -319,7 +326,7 @@ def save_checkpoint(
             cfg.policy.mem_vit_embedded_tensor_count = appended
         logging.info("Stored %d MEM-ViT base tensors in the PEFT checkpoint", appended)
     cfg.save_pretrained(pretrained_dir)
-    if cfg.peft is not None:
+    if policy_uses_peft:
         # When using PEFT, policy.save_pretrained will only write the adapter weights + config, not the
         # policy config which we need for loading the model. In this case we'll write it ourselves.
         policy.config.save_pretrained(pretrained_dir)

@@ -610,12 +610,13 @@ fi
 
 resume_args=()
 policy_source_args=(--policy.path="$base_policy")
+policy_artifact_args=()
 if [[ -n "$policy_base_artifact_id" || -n "$policy_base_sha256" ]]; then
   if [[ -z "$policy_base_artifact_id" || -z "$policy_base_sha256" ]]; then
     echo "--policy-base-artifact-id and --policy-base-sha256 must be set together." >&2
     exit 2
   fi
-  policy_source_args+=(
+  policy_artifact_args+=(
     --policy.policy_base_artifact_id="$policy_base_artifact_id"
     --policy.policy_base_sha256="$policy_base_sha256"
   )
@@ -625,10 +626,30 @@ if [[ -n "$policy_tokenizer_artifact_id" || -n "$policy_tokenizer_sha256" ]]; th
     echo "--policy-tokenizer-artifact-id and --policy-tokenizer-sha256 must be set together." >&2
     exit 2
   fi
-  policy_source_args+=(
+  policy_artifact_args+=(
     --policy.policy_tokenizer_artifact_id="$policy_tokenizer_artifact_id"
     --policy.policy_tokenizer_sha256="$policy_tokenizer_sha256"
   )
+fi
+if [[ -n "$mem_vit_artifact_id" || -n "$mem_vit_sha256" ]]; then
+  if [[ -z "$mem_vit_artifact_id" || -z "$mem_vit_sha256" ]]; then
+    echo "--mem-vit-artifact-id and --mem-vit-sha256 must be set together." >&2
+    exit 2
+  fi
+  policy_artifact_args+=(
+    --policy.mem_vit_artifact_id="$mem_vit_artifact_id"
+    --policy.mem_vit_sha256="$mem_vit_sha256"
+  )
+  if [[ -n "$resume_checkpoint" ]]; then
+    # A maintained plan may explicitly adopt the portable artifact contract
+    # from a legacy self-contained MEM checkpoint. The checkpoint remains the
+    # source of learned weights and optimizer/RNG state; only future export
+    # representation changes from embedded base tensors to locked artifacts.
+    policy_artifact_args+=(
+      --policy.mem_vit_base_weights_embedded=false
+      --policy.mem_vit_embedded_tensor_count=0
+    )
+  fi
 fi
 if [[ -n "$resume_checkpoint" ]]; then
   resume_checkpoint="$(readlink -f "$resume_checkpoint")"
@@ -810,14 +831,6 @@ if [[ "$enable_mem" == "true" && -z "$resume_checkpoint" ]]; then
     exit 1
   fi
   policy_mem_args+=(--policy.mem_vit_checkpoint="$mem_vit_checkpoint")
-  if [[ -n "$mem_vit_artifact_id" || -n "$mem_vit_sha256" ]]; then
-    if [[ -z "$mem_vit_artifact_id" || -z "$mem_vit_sha256" ]]; then
-      echo "--mem-vit-artifact-id and --mem-vit-sha256 must be set together." >&2
-      exit 2
-    fi
-    policy_mem_args+=(--policy.mem_vit_artifact_id="$mem_vit_artifact_id")
-    policy_mem_args+=(--policy.mem_vit_sha256="$mem_vit_sha256")
-  fi
   policy_mem_args+=(--policy.mem_vit_finetune_mode="$mem_vit_finetune_mode")
   policy_mem_args+=(--policy.mem_vit_frame_interval_seconds="$mem_frame_interval_seconds")
   policy_mem_args+=(--policy.mem_vit_random_interval_sampling="$mem_random_interval_sampling")
@@ -1030,6 +1043,7 @@ train_args=(
   "${resume_args[@]}" \
   "${dataset_args[@]}" \
   "${policy_source_args[@]}" \
+  "${policy_artifact_args[@]}" \
   "${policy_io_args[@]}" \
   "${policy_runtime_args[@]}" \
   "${policy_mem_args[@]}" \

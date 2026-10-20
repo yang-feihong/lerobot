@@ -8,6 +8,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = REPO_ROOT / "training_plan/semantic_plan.py"
 PRESETS_PATH = REPO_ROOT / "training_plan/semantic_training_presets.json"
 JOBS_PATH = REPO_ROOT / "training_plan/training_jobs.json"
+OBJECT_GRASP_JOBS_PATH = REPO_ROOT / "training_plan/object_grasp_training_jobs.json"
+ALL_SCENES_SIMULATION_JOBS_PATH = (
+    REPO_ROOT / "training_plan/all_scenes_simulation_fork_jobs.json"
+)
 SPEC = importlib.util.spec_from_file_location("semantic_plan", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 semantic_plan = importlib.util.module_from_spec(SPEC)
@@ -186,3 +190,43 @@ def test_two_gpu_task_is_valid():
         "main_process_port": 29500,
     }
     assert task["train_steps"] == 70_000
+
+
+def test_object_grasp_resume_contract_is_explicit():
+    plan = semantic_plan.load_plan(PRESETS_PATH, OBJECT_GRASP_JOBS_PATH)
+    task = semantic_plan.resolve_task(plan, "staff3_object_grasp_image_mem")
+    assert task["dataset_family"] == "staff3_grasp"
+    assert task["memory_mode"] == "image_mem"
+    assert task["train_steps"] == 50_000
+    assert task["allow_resume_semantic_adoption"] is True
+    assert task["allow_resume_artifact_adoption"] is True
+    assert semantic_plan.selected_matrix(plan, "staff3_object_grasp_image_mem") == {
+        "object_grasp": {
+            "object_grasp": {
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "completion_boundary": "goal_end",
+            }
+        }
+    }
+
+
+def test_all_scenes_simulation_fork_contracts_are_explicit():
+    plan = semantic_plan.load_plan(PRESETS_PATH, ALL_SCENES_SIMULATION_JOBS_PATH)
+    expected = {
+        "all_scenes_simulation_stage1_full_mem_100k_to_150k": ("stage1_only", "f"),
+        "all_scenes_simulation_stage2_full_mem_100k_to_150k": ("stage2_only", "wb1"),
+        "all_scenes_simulation_stage3_full_mem_100k_to_150k": ("stage3_only", "wb2"),
+    }
+    assert set(plan["tasks"]) == set(expected)
+    for task_id, (preset, node) in expected.items():
+        task = semantic_plan.resolve_task(plan, task_id)
+        assert task["dataset_family"] == "all_scenes_simulation"
+        assert task["memory_mode"] == "full_mem"
+        assert task["training_preset"] == preset
+        assert task["train_steps"] == 150_000
+        assert task["resources"] == {
+            "node": node,
+            "gpu_ids": [0, 1, 2, 3],
+            "main_process_port": 29500,
+        }

@@ -527,7 +527,7 @@ def _feature_shape(feature: object) -> tuple[int, ...]:
 
 def _camera_bindings(camera_keys: tuple[str, ...]) -> tuple[str, str]:
     wrist = tuple(key for key in camera_keys if "wrist" in key.lower())
-    base = tuple(key for key in camera_keys if "wrist" not in key.lower())
+    base = tuple(key for key in camera_keys if key.rsplit(".", 1)[-1].lower().startswith("base"))
     if len(base) != 1 or len(wrist) != 1:
         raise ValueError(f"Cannot bind checkpoint cameras to base/wrist packets: {camera_keys}")
     return base[0], wrist[0]
@@ -571,6 +571,7 @@ def _load_checkpoint_contract(
         raise ValueError("Checkpoint deployment metadata must use lerobot.pi05.deployment version 10")
     if not config.io_schema_resolved:
         raise ValueError("Checkpoint contains unresolved PI0.5 I/O metadata")
+    config.restore_camera_metadata(saved)
 
     action = saved["action"]
     observation = saved["observation"]
@@ -972,6 +973,9 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
             executed_ee_target_names=executed_ee_target_names,
             actual_ee_state=actual_ee_state,
             telemetry_history=telemetry_history,
+            diagnostic_flow_seed=(
+                int(packet["diagnostic_flow_seed"].item()) if "diagnostic_flow_seed" in packet else None
+            ),
             server_received_ns=time.monotonic_ns(),
         )
 
@@ -1050,6 +1054,10 @@ class ObservationPacket:
     executed_ee_target_names: tuple[str, ...]
     actual_ee_state: np.ndarray
     telemetry_history: tuple[MemoryObservation, ...]
+    # Optional and intentionally absent from production packets. It lets
+    # open-loop counterfactuals reuse identical flow noise, so a modality swap
+    # is not confounded by a fresh stochastic sample.
+    diagnostic_flow_seed: int | None
     server_received_ns: int
 
 
@@ -1291,6 +1299,8 @@ class AsyncRTCPolicy:
         self.stop_on_model_task_complete = bool(args.stop_on_model_task_complete)
         self.b2_velocity_smoothing_time_constant_s = float(args.b2_velocity_smoothing_time_constant_s)
         self.camera_keys = contract.camera_keys
+        if tuple(self.policy.config.image_features) != self.camera_keys:
+            raise ValueError("Loaded model camera slots disagree with checkpoint metadata")
         self.base_camera_key, self.wrist_camera_key = _camera_bindings(self.camera_keys)
         self.camera_shapes = {key: _feature_shape(config.input_features[key]) for key in self.camera_keys}
         if any(len(shape) != 3 for shape in self.camera_shapes.values()):
@@ -1819,9 +1829,10 @@ class AsyncRTCPolicy:
             latest = self._latest_record
         with self._mailbox_condition:
             image_capture_ns = [record.capture_ns for record in self._image_history]
+        recent_image_capture_ns = image_capture_ns[-9:]
         recent_image_intervals_s = [
             (right - left) / 1e9
-            for left, right in zip(image_capture_ns[-9:-1], image_capture_ns[-8:], strict=True)
+            for left, right in zip(recent_image_capture_ns[:-1], recent_image_capture_ns[1:], strict=True)
         ]
         return {
             "ok": self._worker.is_alive() and self._last_error is None,
@@ -2251,6 +2262,20 @@ class AsyncRTCPolicy:
         preprocessed = time.perf_counter()
         inference_delay_steps, sim_rate = self._estimated_delay()
         conditioning = self._rtc_conditioning(packet, inference_delay_steps)
+        diagnostic_flow_seed = getattr(packet, "diagnostic_flow_seed", None)
+        if diagnostic_flow_seed is not None:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(diagnostic_flow_seed)
+            conditioning["noise"] = torch.randn(
+                (
+                    1,
+                    int(self.policy.config.chunk_size),
+                    int(self.policy.config.max_action_dim),
+                ),
+                generator=generator,
+                dtype=torch.float32,
+                device="cpu",
+            ).to(self.device)
         # Both RTC modes operate without autograd or tensor version counters.
         with torch.inference_mode():
             actions = self.policy.predict_action_chunk(batch, **conditioning)
@@ -2592,7 +2617,7 @@ def parse_args() -> argparse.Namespace:
         choices=B2_POSE_DELTA_CONTROL_MODES,
         required=True,
     )
-    parser.add_argument("--rtc-execution-horizon", type=int, default=13)
+    parser.add_argument("--rtc-execution-horizon", type=int, default=25)
     parser.add_argument("--rtc-max-guidance-weight", type=float, default=10.0)
     parser.add_argument(
         "--rtc-schedule", choices=[item.value for item in RTCAttentionSchedule], default="EXP"
