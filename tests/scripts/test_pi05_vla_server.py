@@ -49,9 +49,59 @@ from lerobot.scripts.pi05_vla_server import (
     decode_observation_packet,
     encode_action_packet,
     execution_action_names,
+    _decode_model_image_history,
+    _RecordedImageBatch,
+    RolloutRecorder,
 )
 
 EXECUTION_ACTION_NAMES = execution_action_names("ee_delta")
+
+
+def test_recorded_image_history_reproduces_selected_tensors_and_padding():
+    from PIL import Image
+
+    def image_packet(step, color):
+        images = []
+        for value in (color, 255 - color):
+            buf = BytesIO()
+            Image.fromarray(np.full((8, 8, 3), value, dtype=np.uint8)).save(buf, format="JPEG")
+            images.append(np.frombuffer(buf.getvalue(), dtype=np.uint8))
+        return ImagePacket(images[0], images[1], step, step, step, step, step, step)
+
+    engine = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    engine._mailbox_condition = Lock()
+    engine._observation_history = [SimpleNamespace()]
+    engine._image_history = [image_packet(0, 10), image_packet(5, 80), image_packet(10, 150)]
+    engine.state_num_frames = engine.state_history_stride = 1
+    engine.mem_image_num_frames = 3
+    engine.mem_image_stride = engine.mem_image_interval_ns = 5
+    engine.mem_enabled = True
+    engine.action_history_enabled = False
+    engine.base_camera_key = "observation.images.base_0_rgb"
+    engine.wrist_camera_key = "observation.images.left_wrist_0_rgb"
+    engine._source_state = lambda _: torch.zeros(1)
+    engine._sample_memory_records = lambda *a, **kw: ([SimpleNamespace()], torch.zeros(1, 1, dtype=torch.bool))
+    packet = SimpleNamespace(sim_step=5, capture_finished_ns=5, task="Open the door.")
+    live = engine._make_batch(packet)
+    snapshot = live.model_image_history
+    # A different/empty live camera cache must have no effect on recorded replay.
+    engine._image_history = []
+    packet.recorded_image_history = snapshot
+    replay = engine._make_batch(packet)
+    assert replay.model_image_history == snapshot
+    for key in (engine.base_camera_key, engine.wrist_camera_key):
+        assert torch.equal(live[key], replay[key])
+        assert torch.equal(live[key + "_is_pad"], replay[key + "_is_pad"])
+        assert replay[key + "_is_pad"].tolist() == [[True, False, False]]
+    assert "model_image_history" not in live  # not a model/processor feature
+    with np.load(BytesIO(snapshot), allow_pickle=False) as recorded:
+        assert recorded["sim_step"].tolist() == [0, 0, 5]
+        np.testing.assert_array_equal(recorded["base_jpeg_2"], image_packet(5, 80).base_jpeg)
+    for changes in ({"source_step": 6}, {"count": 2}, {"wrist_key": "wrong"}):
+        args = dict(source_step=5, count=3, base_key=engine.base_camera_key, wrist_key=engine.wrist_camera_key)
+        args.update(changes)
+        with pytest.raises(ValueError):
+            _decode_model_image_history(snapshot, **args)
 
 
 @pytest.mark.parametrize("wrist_first", [False, True])
@@ -405,7 +455,7 @@ def test_checkpoint_hot_swap_signature_ignores_training_only_fields(tmp_path) ->
     assert _checkpoint_hot_swap_signature(first) != _checkpoint_hot_swap_signature(second)
 
 
-def test_action_packet_contains_replayable_model_and_execution_outputs() -> None:
+def test_action_packet_contains_replayable_model_and_execution_outputs(tmp_path) -> None:
     record = ActionRecord(
         sequence=3,
         source_step=11,
@@ -434,6 +484,7 @@ def test_action_packet_contains_replayable_model_and_execution_outputs() -> None
         sim_steps_per_wall_second=50.0,
         rtc_mode="training",
         rtc_conditioning_delay_steps=2,
+        model_image_history=b"recorded-image-history",
     )
 
     with np.load(BytesIO(encode_action_packet(record)), allow_pickle=False) as packet:
@@ -445,6 +496,10 @@ def test_action_packet_contains_replayable_model_and_execution_outputs() -> None
         assert float(packet["predict_seconds"]) == pytest.approx(0.15)
         assert str(packet["rtc_mode"]) == "training"
         assert int(packet["rtc_conditioning_delay_steps"]) == 2
+        assert packet["model_image_history"].tobytes() == record.model_image_history
+    RolloutRecorder(str(tmp_path)).action(record)
+    with np.load(tmp_path / "vla/actions/000003.npz", allow_pickle=False) as saved:
+        assert saved["model_image_history"].tobytes() == record.model_image_history
 
 
 @pytest.mark.parametrize(
@@ -965,7 +1020,9 @@ def test_infer_records_model_action_names_and_source_step_anchor(
         return torch.zeros((1, 2, len(model_names)))
 
     policy.policy = SimpleNamespace(predict_action_chunk=predict)
-    policy._make_batch = lambda _packet: {}
+    raw_batch = _RecordedImageBatch()
+    raw_batch.model_image_history = b"selected-image-window"
+    policy._make_batch = lambda _packet: raw_batch
     policy._previous_prefix = lambda _packet: None
     policy._estimated_delay = lambda: (7, 50.0)
     policy._b2_velocity_filter_context = lambda _packet: (torch.zeros(3), None)
@@ -1000,6 +1057,7 @@ def test_infer_records_model_action_names_and_source_step_anchor(
     )
 
     assert record.model_action_names == model_names
+    assert record.model_image_history == raw_batch.model_image_history
     assert record.original.shape == (2, len(model_names))
     assert record.processed.shape == (2, len(EXECUTION_ACTION_NAMES))
     assert record.source_step == 25

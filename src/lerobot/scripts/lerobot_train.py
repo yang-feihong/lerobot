@@ -67,6 +67,8 @@ from lerobot.datasets.semantic_views import (
     semantic_phase_sampling_groups,
     semantic_status_priors,
     semantic_view_matches_relation,
+    semantic_view_start_allowed,
+    with_incomplete_static_start_filter,
 )
 from lerobot.datasets.static_horizon_sampling import build_static_horizon_pool
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
@@ -1038,6 +1040,16 @@ def configure_action_bool_balance(
                     )
                 weights /= weights.sum()
                 starts = np.arange(segment.frame_start, segment.frame_stop, dtype=np.int64)
+                probabilities = np.repeat(weights[:, None], len(starts), axis=1)
+                if semantic_views.static_first_action_frames is not None:
+                    probabilities *= np.asarray([
+                        [semantic_view_start_allowed(semantic_views, view, episode_index, int(frame))
+                         for frame in starts] for view in matching_views
+                    ])
+                    mass = probabilities.sum(axis=0)
+                    keep = mass > 0
+                    starts = starts[keep]
+                    probabilities = probabilities[:, keep] / mass[keep]
                 for offset in offsets:
                     offset = int(offset)
                     if offset < 0:
@@ -1048,7 +1060,7 @@ def configure_action_bool_balance(
                     # action slot remains part of the boolean prior just as it is in the batch.
                     target_indices = np.minimum(virtual_targets, length - 1)
                     np.add.at(multiplicity, target_indices, 1)
-                    for view, probability in zip(matching_views, weights, strict=True):
+                    for view, probability in zip(matching_views, probabilities, strict=True):
                         completed = np.full(len(virtual_targets), view.status == "complete")
                         if view.status != "complete" and view.completion_frame is not None:
                             completed = virtual_targets >= view.completion_frame
@@ -1344,6 +1356,17 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     task_variants = (
         {} if semantic_views is not None else load_task_variants(dataset.root, cfg.dataset.task_variants_path)
     )
+    # Validation retains all original inputs; only the training catalog is indexed.
+    eval_semantic_views = semantic_views
+    if semantic_views is not None and cfg.dataset.semantic_exclude_incomplete_static_starts:
+        if not cfg.dataset.semantic_phases:
+            raise ValueError("Incomplete static-start filtering requires dataset.semantic_phases")
+        semantic_views = with_incomplete_static_start_filter(semantic_views, dataset)
+        logging.info(
+            "Incomplete static-start rule: indexed %d exact-zero B2 + inactive train frames; "
+            "exclude only instruction pairs whose first target is not complete",
+            len(semantic_views.static_first_action_frames),
+        )
     if semantic_views is not None:
         expected_episodes = set(dataset.episodes or range(dataset.meta.total_episodes))
         missing = expected_episodes - set(semantic_views.episodes)
@@ -1361,6 +1384,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "phases": cfg.dataset.semantic_phases,
                 "phase_weights": cfg.dataset.semantic_phase_weights,
                 "source_weights": cfg.dataset.semantic_source_weights,
+                "exclude_incomplete_static_starts": cfg.dataset.semantic_exclude_incomplete_static_starts,
             }
             (cfg.output_dir / "semantic_view_runtime.json").write_text(
                 json.dumps(semantic_record, indent=2), encoding="utf-8"
@@ -1891,6 +1915,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 phases=cfg.dataset.semantic_phases,
                 phase_weights=cfg.dataset.semantic_phase_weights,
                 source_weights=cfg.dataset.semantic_source_weights,
+                state_instruction_matrix=cfg.dataset.semantic_state_instruction_matrix,
+                view_kind_weights=cfg.dataset.semantic_view_kind_weights,
             )
             if is_main_process:
                 logging.info(
@@ -2027,7 +2053,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         eligible_eval_indices = None
         if semantic_views is not None and cfg.dataset.semantic_phases:
             semantic_eval_frames, _, _, _ = semantic_phase_sampling_groups(
-                semantic_views,
+                eval_semantic_views,
                 list(eval_dataset.meta.episodes["dataset_from_index"]),
                 list(eval_dataset.episodes or range(eval_dataset.meta.total_episodes)),
                 phases=cfg.dataset.semantic_phases,
@@ -2316,7 +2342,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     if semantic_views is not None:
                         apply_semantic_views_to_batch(
                             eval_batch,
-                            semantic_views,
+                            eval_semantic_views,
                             # Validation uses a stable hash of the physical sample,
                             # covering every enabled intent without changing across eval steps.
                             step=0,

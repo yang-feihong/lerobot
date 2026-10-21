@@ -1,5 +1,6 @@
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
@@ -448,6 +449,56 @@ def test_goal_end_relation_accepts_completion_inside_state_and_holds_completed_c
     )
     assert batch[ACTION][0, :, 15].tolist() == [1.0, 1.0, 1.0, 1.0]
     assert torch.equal(batch[ACTION][0, :, :3], torch.zeros_like(batch[ACTION][0, :, :3]))
+
+
+@pytest.mark.parametrize(
+    "frame,expected_complete", [(3, [0, 0, 0, 0]), (8, [0, 0, 0, 0]), (12, [0, 1, 1, 1]), (13, [1, 1, 1, 1])]
+)
+def test_full_episode_command_uses_entry_boundary_in_every_state(tmp_path, frame, expected_complete):
+    catalog = _catalog(
+        tmp_path,
+        [
+            {
+                "intent_id": "pass",
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "frame_start": 0,
+                "frame_stop": 15,
+                "completion_frame": 13,
+            }
+        ],
+    )
+    view = replace(
+        catalog.episodes[0][0],
+        canonical_intent="full_episode_command",
+        instructions=("Open the door and enter the room.",),
+    )
+    catalog = replace(
+        catalog,
+        episodes={0: (view,)},
+        segments={
+            0: (
+                SemanticSegment("approach", 0, 5),
+                SemanticSegment("handle_press", 5, 10),
+                SemanticSegment("traversal", 10, 15),
+            )
+        },
+    )
+    preset = json.loads(
+        (Path(__file__).resolve().parents[2] / "training_plan/semantic_training_presets.json").read_text()
+    )
+    matrix = preset["presets"]["three_goal_plus_full"]["state_instruction_matrix"]
+    batch = _batch()
+    batch["frame_index"] = torch.tensor([frame])
+    batch[ACTION][0, :, :3] = 0.4
+    apply_semantic_views_to_batch(
+        batch, catalog, step=0, seed=0, randomize=False, state_instruction_matrix=matrix
+    )
+    assert batch["task"] == ["Open the door and enter the room."]
+    assert batch[ACTION][0, :, 15].tolist() == expected_complete
+    for index, complete in enumerate(expected_complete):
+        expected = torch.zeros(3) if complete else torch.full((3,), 0.4)
+        assert torch.equal(batch[ACTION][0, index, :3], expected)
 
 
 def test_status_priors_include_active_view_completion_suffix(tmp_path):

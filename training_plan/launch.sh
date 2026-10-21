@@ -87,6 +87,7 @@ case "${dataset_family}" in
   all_scenes) dataset_root="${ALL_SCENES_DATASET_ROOT:-}" ;;
   all_scenes_simulation) dataset_root="${ALL_SCENES_SIMULATION_DATASET_ROOT:-}" ;;
   staff3_grasp) dataset_root="${STAFF3_GRASP_DATASET_ROOT:-}" ;;
+  pull_door) dataset_root="${PULL_DOOR_DATASET_ROOT:-}" ;;
 esac
 [[ -n "${dataset_root}" ]] || {
   echo "Task ${task_id} has no configured dataset root for ${dataset_family} in ${env_file}." >&2

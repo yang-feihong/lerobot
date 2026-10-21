@@ -16,7 +16,8 @@ portable artifact 路径重写保留 JSON key 顺序；模型执行顺序另由�
 
 ## 本轮编排入口
 
-`TRAINING_JOBS_FILE` 可选择本目录维护的 `object_grasp_training_jobs.json` 或
+`TRAINING_JOBS_FILE` 可选择本目录维护的 `object_grasp_training_jobs.json`、
+`object_grasp_camera_fixed_jobs.json` 或
 `all_scenes_simulation_fork_jobs.json`，支持 `staff3_grasp`、`all_scenes_simulation` 数据源
 及仅图像历史的 `image_mem` 模式。`resume-task` / `resume-dry-run-task` 可额外传明确的
 checkpoint 路径；`run_dir_name` 固定原 run，避免误选最新同名任务。
@@ -45,8 +46,90 @@ MEM-ViT 使用 LoRA 或 frozen 模式时，新 checkpoint 不再重复保存冻�
 - `training_plan/training_jobs.json` 是本轮训练任务配置，选择数据集、记忆模式和训练语义；
 - `training_plan/.env` 保存本轮任务共享的步数、batch、模型路径等运行参数。
 
-模板库目前提供 `stage1_only`、`stage2_only`、`stage3_only`、
-`three_stage_joint` 四个快捷项。每个快捷项自身包含完整矩阵。
+模板库目前提供 `grasp`、`stage1_only`、`stage2_only`、`stage3_only`、
+`three_stage_joint`、`three_goal_conditioned`、`three_goal_plus_full`，以及拉门专用的
+`pull_stage1`、`pull_stage2`、`pull_stage3`、`pull_joint`。
+每个快捷项自身包含完整矩阵。
+
+后续正式训练统一按以下分层配置，由 `cluster.sh → launch.sh → train_vla_pi05.sh`
+执行：可复用的训练语义放在 preset，任务 JSON 引用 `training_preset` 并选择数据源、
+MEM、sidecar、训练步数、机器/GPU；共享参数在 `.env`，内容身份在 `artifacts.lock`。
+新训练组织方式优先新增或复用 preset，不在任务文件中重复矩阵或手工拼接训练命令。
+内联矩阵保留为兼容能力，与 preset 使用同一解析和验收链路。
+
+`grasp` 定义 `object_grasp × object_grasp` 的 1×1 矩阵，使用 demonstrated 专家动作和
+`goal_end` 完成点；两份正式 grasp 任务均引用 `"training_preset": "grasp"`。
+数据来源 Staff3、`image_mem` 和 GPU 分配属于任务配置，不写入 preset。
+未来 grasp 与开门混合训练同样通过数据/sidecar 和 preset/任务配置组织；需先准备兼容的
+混合数据和采样语义，本次不新增该混合方案。
+
+### 拉门配置
+
+| preset | 物理阶段 × 指令 | 用途 |
+|---|---|---|
+| `pull_stage1` | `approach × goal_approach` | 接近门 |
+| `pull_stage2` | `handle_press × goal_open` | 操作门把手；`handle_press` 沿用统一三阶段 schema 的阶段键 |
+| `pull_stage3` | `traversal × goal_enter` | 拉门通过 |
+| `pull_joint` | 上述三条关系，阶段权重 1:1:1 | 分阶段联合训练，各阶段只用对应指令 |
+
+这四项均采用 demonstrated 动作和 `goal_end`。任务指定
+`"dataset_family": "pull_door"`、`"training_preset": "pull_joint"`（或某个单阶段），
+由 `.env` 的 `PULL_DOOR_DATASET_ROOT` 选择拉门训练集，仍走统一入口。
+矩阵中的阶段/goal 是统一语义键，推/拉方向必须来自拉门自己的同 episode 标注及动作；
+不复用推门语言，也不将独立录制的三个阶段拼成伪全流程 episode。
+
+2026-10-21 本地三份独立拉门数据均已完成清洗：`cleaned/pull_door_approach`
+保留 319 条、`cleaned/pull_door_handle` 保留 206 条、`cleaned/pull_door_traversal`
+保留 102 条。三者均有 v2 `stage_boundaries.json`（含完成点），且
+`diagnostics/independent_door_cleaning_audit.json` 状态为 ok；对应原始标注各有
+322/295/105 条 ok 记录。`pull_door_handle` 是历史 `complete_pull_door` 的正式名称，
+仅表示独立操作门把手录制；`full_episode_pull` 标注 stage 不代表跨越三阶段。
+统一 `training/pull_door` 已生成并验收：627 条、556489 帧，三份 cleaned 与统一集均有
+`semantic_views.json` 和四档 `task_variants.json`。语言按原始录制路径精确匹配，禁止使用
+清洗前的 episode 编号回退；1254 个视频为源数据硬链接，state/action 不变。
+正式准备入口为 `data_postprocessing/lerobot/prepare_pull_door_training.sh`（已有输出拒绝覆盖），
+验收结果在统一集 `diagnostics/pull_door_training_audit.json`，四个 preset 及全部完成点均通过。
+本次仅准备本地数据，未新增远程任务或启动训练；选择资源后仍须执行
+`dry-run-task` 再训练。`pull_joint` 不等同于跨状态目标条件训练，本次不新增
+拉门的跨状态或全流程 command 预设。
+
+`three_goal_plus_full` 保留 `three_goal_conditioned` 的全部关系，并在三个物理状态中
+加入 `full_episode_command`。完整流程语言来自同一 episode 的四档独立标注；在
+approach/handle_press 中以 `future_goal_end` 延续到入室完成点，在 traversal 中使用
+`goal_end`。各状态中四种意图默认等概率，四档语言在选中意图内采样，不增加物理帧权重。
+
+Semantic 训练默认排除“当前指令未 complete，且动作首帧 B2 三维速度精确为 0、
+机械臂 inactive”的帧×指令配对。只看首帧，不检查夹爪、reset 或后续是否运动；
+complete 依当前指令的完成边界判定，不使用其他阶段的原始 complete 标记。
+同一物理帧可保留 Open/complete 而排除 Enter/未完成；没有合法指令的物理帧不会进入
+采样池。阶段权重保持不变，其余合法配对重新归一化，验证集不做此过滤。
+配置保存为 `dataset.semantic_exclude_incomplete_static_starts=true`；启动脚本支持
+`--exclude-incomplete-static-starts=false` 以复现旧规则。旧 checkpoint resume 若因此
+改变标签比例，仍须显式使用原有“更新数据集”续训入口，不绕过一致性校验。
+
+新任务同时指定以下两个字段（不会自动更换现有任务的 sidecar）：
+
+```json
+{
+  "training_preset": "three_goal_plus_full",
+  "semantic_views_file": "semantic_views_three_goal_plus_full.json"
+}
+```
+
+专用 sidecar 使用 `data_postprocessing/lerobot/build_goal_conditioned_semantic_views.py`
+构建，支持重复 `--full-episode-annotations` 来传入多个来源的 `annotations.json`：
+
+```bash
+python3 ../data_postprocessing/lerobot/build_goal_conditioned_semantic_views.py \
+  --source DATASET/meta/semantic_views.json \
+  --full-episode-annotations ANNOTATIONS/full_episode/full_episode_command/staff1/annotations.json \
+  --output DATASET/meta/semantic_views_three_goal_plus_full.json
+```
+
+构建器精确匹配 `episode.source_path` 和标注 `video_path`；只保留三目标覆盖完整且有
+完整流程标注的 episode。它复用同一 episode 的 `goal_enter` 区间和完成边界，但保留
+完整流程自身的语言，不从其他 episode 或 `goal_enter` 语言补缺。原始 sidecar 和视频
+均不改写。sidecar 缺少新关系时，统一入口的逐帧矩阵校验会拒绝启动。
 
 单次任务支持两种互斥、等价的配置形式。使用快捷配置时，在
 `training_jobs.json` 中只引用名称：

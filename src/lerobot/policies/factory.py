@@ -609,6 +609,7 @@ def make_policy(
         )
 
     policy_cls = get_policy_class(cfg.type)
+    restore_checkpoint_camera_metadata = isinstance(cfg, PI05Config) and cfg.io_schema_resolved
 
     if isinstance(cfg, PI05Config) and cfg.pretrained_path and cfg.io_schema_resolved:
         cfg.restore_pretrained_metadata(cfg.pretrained_path, revision=cfg.pretrained_revision)
@@ -786,6 +787,9 @@ def make_policy(
 
     kwargs["config"] = cfg
     if isinstance(cfg, PI05Config) and cfg.pretrained_path:
+        # Resolving a new dataset schema above does not turn the base artifact
+        # into a task checkpoint with a persisted camera contract.
+        kwargs["restore_checkpoint_camera_metadata"] = restore_checkpoint_camera_metadata
         # PEFT loads weights from a separate base path, but the input protocol
         # always belongs to the selected task checkpoint (the adapter).
         kwargs["checkpoint_metadata_path"] = cfg.pretrained_path

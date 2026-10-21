@@ -16,6 +16,7 @@ VALID_DATASET_FAMILIES = {
     "all_scenes",
     "all_scenes_simulation",
     "staff3_grasp",
+    "pull_door",
 }
 VALID_MEMORY_MODES = {"standard", "mem_vit", "image_mem", "full_mem"}
 VALID_STATUSES = {"active", "complete", "blocked"}

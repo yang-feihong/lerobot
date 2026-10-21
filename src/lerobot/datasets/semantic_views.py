@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +62,61 @@ class SemanticViewCatalog:
     semantic_names: tuple[str, ...]
     selected_episodes: tuple[int, ...] | None
     segments: dict[int, tuple[SemanticSegment, ...]]
+    # Runtime train-split index only; never written into the dataset sidecar.
+    static_first_action_frames: frozenset[tuple[int, int]] | None = None
+    recorded_complete_frames: frozenset[tuple[int, int]] = frozenset()
+
+
+def with_incomplete_static_start_filter(catalog: SemanticViewCatalog, dataset) -> SemanticViewCatalog:
+    """Index exact-zero B2 + inactive first actions, independently of future/gripper/reset."""
+    names = list(dataset.meta.features[ACTION].get("names") or [])
+    required = ("b2_vx", "b2_vy", "b2_omega_z", "arm_teleop_inactive", "task_complete")
+    missing = set(required) - set(names)
+    if missing:
+        raise ValueError(f"Incomplete static-start filtering requires action fields: {sorted(missing)}")
+    b2 = [names.index(name) for name in required[:3]]
+    inactive = names.index("arm_teleop_inactive")
+    complete = names.index("task_complete")
+    static_frames = set()
+    complete_frames = set()
+    columns = dataset.hf_dataset.select_columns(["episode_index", "frame_index", ACTION]).with_format("numpy")
+    for batch in columns.iter(batch_size=65_536):
+        actions = np.asarray(batch[ACTION])
+        episodes = np.asarray(batch["episode_index"])
+        frames = np.asarray(batch["frame_index"])
+        static = (actions[:, b2] == 0.0).all(axis=1) & (actions[:, inactive] >= .5)
+        static_frames.update(zip(episodes[static].tolist(), frames[static].tolist(), strict=True))
+        done = actions[:, complete] >= .5
+        complete_frames.update(zip(episodes[done].tolist(), frames[done].tolist(), strict=True))
+    return replace(catalog, static_first_action_frames=frozenset(static_frames),
+                   recorded_complete_frames=frozenset(complete_frames))
+
+
+def semantic_view_start_allowed(catalog: SemanticViewCatalog, view: SemanticView, episode: int, frame: int) -> bool:
+    """Decide eligibility from this instruction's final first-step supervision."""
+    if catalog.static_first_action_frames is None:
+        return True
+    complete = view.status == "complete" or (
+        view.completion_frame is not None and frame >= view.completion_frame
+    ) or (
+        view.completion_frame is None and view.completion_source == "recorded"
+        and (episode, frame) in catalog.recorded_complete_frames
+    )
+    if complete:
+        return True
+    return view.action_supervision != "hold" and (episode, frame) not in catalog.static_first_action_frames
+
+
+def semantic_sample_views(catalog, episode, frame, state_instruction_matrix=None):
+    """Shared pre-sampling and materialization eligibility, with schema errors kept explicit."""
+    views = tuple(view for view in catalog.episodes.get(episode, ())
+                  if view.frame_start is None or view.frame_start <= frame < view.frame_stop)
+    if state_instruction_matrix:
+        state = semantic_state_for_frame(catalog, episode, frame, state_instruction_matrix)
+        views = tuple(v for v in views if semantic_view_matches_relation(v, state, state_instruction_matrix))
+    if not views:
+        raise ValueError(f"semantic-view sidecar has no enabled relation at episode={episode}, frame={frame}")
+    return tuple(v for v in views if semantic_view_start_allowed(catalog, v, episode, frame))
 
 
 def load_semantic_views(path: str | Path) -> SemanticViewCatalog:
@@ -175,6 +230,8 @@ def semantic_phase_sampling_groups(
     phases: list[str],
     phase_weights: dict[str, float] | None = None,
     source_weights: dict[str, float] | None = None,
+    state_instruction_matrix: dict[str, dict[str, dict[str, str]]] | None = None,
+    view_kind_weights: dict[str, float] | None = None,
 ) -> tuple[np.ndarray, list[np.ndarray], list[float], list[str]]:
     """Resolve configured semantic segments into absolute frame pools.
 
@@ -205,13 +262,16 @@ def semantic_phase_sampling_groups(
             if segment.phase not in phase_weight_map:
                 continue
             offset = int(episode_from_indices[episode])
-            pools.setdefault((segment.phase, segment.source_group), []).append(
-                np.arange(
-                    offset + segment.frame_start,
-                    offset + segment.frame_stop,
-                    dtype=np.int64,
-                )
-            )
+            frames = np.arange(segment.frame_start, segment.frame_stop, dtype=np.int64)
+            if catalog.static_first_action_frames is not None:
+                frames = np.asarray([
+                    frame for frame in frames if any(
+                        view.weight * (1.0 if state_instruction_matrix else _view_kind_weight(view_kind_weights, view.view_kind)) > 0
+                        for view in semantic_sample_views(catalog, episode, int(frame), state_instruction_matrix)
+                    )
+                ], dtype=np.int64)
+            if len(frames):
+                pools.setdefault((segment.phase, segment.source_group), []).append(offset + frames)
     missing = [phase for phase in phases if not any(key[0] == phase for key in pools)]
     if missing:
         raise ValueError(f"selected semantic phases have no frames: {missing}")
@@ -403,6 +463,11 @@ def apply_semantic_views_to_batch(
                 "semantic-view sidecar has no enabled state-instruction relation for "
                 f"episode={int(episode)}, frame={int(frame)}"
             )
+        views = tuple(view for view in views if semantic_view_start_allowed(catalog, view, int(episode), int(frame)))
+        if not views:
+            raise ValueError(
+                f"Sampler selected an excluded incomplete static start: episode={episode}, frame={frame}"
+            )
         digest = hashlib.blake2b(
             f"{seed}:{step}:{int(sample)}:{int(episode)}".encode(), digest_size=16
         ).digest()
@@ -507,6 +572,11 @@ def semantic_status_priors(
                 weights = [
                     view.weight * _view_kind_weight(view_kind_weights, view.view_kind) for view in views
                 ]
+            allowed = [(view, weight) for view, weight in zip(views, weights, strict=True)
+                       if semantic_view_start_allowed(catalog, view, episode, frame)]
+            if not allowed:
+                continue
+            views, weights = zip(*allowed, strict=True)
             total = sum(weights)
             if total <= 0:
                 raise ValueError(f"no enabled semantic view for episode={episode} frame={frame}")

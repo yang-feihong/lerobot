@@ -24,6 +24,13 @@ def dry_run(*args):
         )
 
 
+def test_mem_is_enabled_by_default():
+    result = dry_run()
+    assert result.returncode == 0, result.stderr
+    flags = dict(arg.split("=", 1) for arg in shlex.split(result.stdout) if arg.startswith("--"))
+    assert "--policy.mem_vit_checkpoint" in flags
+
+
 @pytest.mark.parametrize("finetune", ["lora", "expert", "full"])
 @pytest.mark.parametrize("vision", [None, "full", "lora", "frozen"])
 @pytest.mark.parametrize("freeze", [False, True])
@@ -71,6 +78,29 @@ def test_resume_does_not_override_saved_vision_or_peft_strategy(tmp_path):
     assert "--policy.freeze_vision_encoder" not in flags
     assert "--policy.peft_train_active_modules_only" not in flags
     assert "--peft.method_type" not in flags
+
+
+def test_resume_can_adopt_locked_portable_artifacts(tmp_path):
+    checkpoint = tmp_path / "run/checkpoints/000500"
+    pretrained = checkpoint / "pretrained_model"
+    pretrained.mkdir(parents=True)
+    (pretrained / "train_config.json").write_text("{}")
+    result = dry_run(
+        f"--resume-checkpoint={checkpoint}",
+        "--policy-base-artifact-id=policy-v1",
+        f"--policy-base-sha256={'1' * 64}",
+        "--mem-vit-artifact-id=mem-v1",
+        f"--mem-vit-sha256={'2' * 64}",
+        "--policy-tokenizer-artifact-id=tokenizer-v1",
+        f"--policy-tokenizer-sha256={'3' * 64}",
+    )
+    assert result.returncode == 0, result.stderr
+    flags = dict(arg.split("=", 1) for arg in shlex.split(result.stdout) if arg.startswith("--"))
+    assert flags["--policy.policy_base_artifact_id"] == "policy-v1"
+    assert flags["--policy.mem_vit_artifact_id"] == "mem-v1"
+    assert flags["--policy.policy_tokenizer_artifact_id"] == "tokenizer-v1"
+    assert flags["--policy.mem_vit_base_weights_embedded"] == "false"
+    assert flags["--policy.mem_vit_embedded_tensor_count"] == "0"
 
 
 @pytest.mark.parametrize(

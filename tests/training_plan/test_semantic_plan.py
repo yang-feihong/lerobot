@@ -181,6 +181,23 @@ def test_task_cannot_mix_preset_and_inline_matrix(tmp_path):
         semantic_plan.load_plan(PRESETS_PATH, invalid_path)
 
 
+def test_full_episode_preset_extends_three_goals_without_changing_existing_relations():
+    plan = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
+    presets = plan["training_presets"]
+    old = presets["three_goal_conditioned"]
+    new = presets["three_goal_plus_full"]
+    assert new["state_weights"] == old["state_weights"]
+    for state, relations in new["state_instruction_matrix"].items():
+        assert {key: value for key, value in relations.items() if key != "full_episode_command"} == (
+            old["state_instruction_matrix"][state]
+        )
+        assert relations["full_episode_command"] == {
+            "status": "active",
+            "action_supervision": "demonstrated",
+            "completion_boundary": "goal_end" if state == "traversal" else "future_goal_end",
+        }
+
+
 def test_two_gpu_task_is_valid():
     plan = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
     task = semantic_plan.resolve_task(plan, "staff1_stage3_full_mem")
@@ -200,6 +217,7 @@ def test_object_grasp_resume_contract_is_explicit():
     assert task["train_steps"] == 50_000
     assert task["allow_resume_semantic_adoption"] is True
     assert task["allow_resume_artifact_adoption"] is True
+    assert task["training_preset"] == "grasp"
     assert semantic_plan.selected_matrix(plan, "staff3_object_grasp_image_mem") == {
         "object_grasp": {
             "object_grasp": {
@@ -209,6 +227,90 @@ def test_object_grasp_resume_contract_is_explicit():
             }
         }
     }
+
+
+@pytest.mark.parametrize(
+    "jobs_file",
+    ["object_grasp_training_jobs.json", "object_grasp_camera_fixed_jobs.json"],
+)
+def test_grasp_tasks_share_the_named_preset_and_validate_grasp_views(tmp_path, jobs_file):
+    plan = semantic_plan.load_plan(PRESETS_PATH, REPO_ROOT / "training_plan" / jobs_file)
+    task_id, task = next(iter(plan["tasks"].items()))
+    assert task["training_preset"] == "grasp"
+    assert "state_weights" not in task and "state_instruction_matrix" not in task
+    assert task["dataset_family"] == "staff3_grasp"
+    assert task["memory_mode"] == "image_mem"
+    assert task["train_steps"] == 50_000
+    assert task["resources"] == {
+        "node": "wb5",
+        "gpu_ids": [0, 1, 2, 3],
+        "main_process_port": 29500,
+    }
+    assert semantic_plan.state_weights(plan, task_id) == {"object_grasp": 1.0}
+    sidecar = _sidecar(tmp_path, intent="object_grasp")
+    sample = json.loads(sidecar.read_text())
+    sample["episodes"]["0"]["segments"][0]["phase"] = "object_grasp"
+    sidecar.write_text(json.dumps(sample))
+    assert semantic_plan.validate_sidecar(plan, task_id, sidecar) == {
+        "episodes": 1,
+        "segments": 1,
+        "frames": 10,
+    }
+
+
+@pytest.mark.parametrize(
+    "preset,reference,selected_segments",
+    [
+        ("pull_stage1", "stage1_only", 1),
+        ("pull_stage2", "stage2_only", 1),
+        ("pull_stage3", "stage3_only", 1),
+        ("pull_joint", "three_stage_joint", 3),
+    ],
+)
+def test_pull_presets_use_separate_recordings_with_matching_phase_language(
+    tmp_path, preset, reference, selected_segments
+):
+    jobs = tmp_path / "pull_jobs.json"
+    jobs.write_text(json.dumps({
+        "format": "lerobot.training_jobs", "version": 1,
+        "jobs": {"pull_test": {
+            "dataset_family": "pull_door", "memory_mode": "full_mem",
+            "training_preset": preset,
+            "resources": {"node": "f", "gpu_ids": [0, 1, 2, 3], "main_process_port": 29500},
+        }},
+    }))
+    plan = semantic_plan.load_plan(PRESETS_PATH, jobs)
+    assert semantic_plan.resolve_task(plan, "pull_test")["dataset_family"] == "pull_door"
+    assert plan["training_presets"][preset] == plan["training_presets"][reference]
+    intents, episodes = {}, {}
+    for index, (phase, goal, instruction) in enumerate([
+        ("approach", "goal_approach", "Approach the door."),
+        ("handle_press", "goal_open", "Pull the door open toward yourself."),
+        ("traversal", "goal_enter", "Pull open the door and walk inside."),
+    ]):
+        intents[goal] = {"canonical_intent": goal, "instructions": [instruction]}
+        episodes[str(index)] = {
+            "source_path": f"/pull/independent_recording_{index}.bag",
+            "segments": [{"phase": phase, "frame_start": 0, "frame_stop": 10}],
+            "views": [{
+                "intent_id": goal, "frame_start": 0, "frame_stop": 10, "completion_frame": 8,
+                "status": "active", "action_supervision": "demonstrated",
+            }],
+        }
+    sidecar = tmp_path / "pull_views.json"
+    sidecar.write_text(json.dumps({
+        "format": "lerobot.semantic_views", "version": 1, "intents": intents, "episodes": episodes,
+    }))
+    assert semantic_plan.validate_sidecar(plan, "pull_test", sidecar) == {
+        "episodes": 3, "segments": selected_segments, "frames": 10 * selected_segments,
+    }
+    if preset == "pull_joint":
+        # A missing post-handle recording cannot silently become joint coverage.
+        payload = json.loads(sidecar.read_text())
+        del payload["episodes"]["2"]
+        sidecar.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match="no sidecar coverage"):
+            semantic_plan.validate_sidecar(plan, "pull_test", sidecar)
 
 
 def test_all_scenes_simulation_fork_contracts_are_explicit():

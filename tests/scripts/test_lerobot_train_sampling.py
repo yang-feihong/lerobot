@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -429,7 +430,8 @@ def test_semantic_phase_boolean_priors_include_internal_completion_tail():
     assert stats["arm_reset"]["negative_labels"] == 12
 
 
-def test_semantic_phase_boolean_priors_average_multiple_goal_views():
+@pytest.mark.parametrize("filter_static", [False, True])
+def test_semantic_phase_boolean_priors_average_multiple_goal_views(filter_static):
     actions = np.zeros((5, len(CONTROL_EXTENDED_DATASET_ACTION_NAMES)), dtype=np.float32)
     policy_cfg = SimpleNamespace(
         type="pi05",
@@ -476,6 +478,8 @@ def test_semantic_phase_boolean_priors_average_multiple_goal_views():
         segments={0: (SemanticSegment("approach", 0, 3, "full_episode"),)},
     )
 
+    if filter_static:
+        catalog = replace(catalog, static_first_action_frames=frozenset({(0, 0), (0, 1)}))
     stats = configure_action_bool_balance(
         SimpleNamespace(trainable_config=policy_cfg, resume=False),
         _fake_dataset(actions, CONTROL_EXTENDED_DATASET_ACTION_NAMES),
@@ -500,11 +504,11 @@ def test_semantic_phase_boolean_priors_average_multiple_goal_views():
     # Six action labels are sampled.  Only the final label of the approach-goal
     # view is complete; that view is selected with probability 1/2.
     assert stats["task_complete"]["positive_labels"] == pytest.approx(0.5)
-    assert stats["task_complete"]["negative_labels"] == pytest.approx(5.5)
+    assert stats["task_complete"]["negative_labels"] == pytest.approx(1.5 if filter_static else 5.5)
     assert stats["arm_teleop_inactive"]["positive_labels"] == pytest.approx(0.5)
-    assert stats["arm_teleop_inactive"]["negative_labels"] == pytest.approx(5.5)
+    assert stats["arm_teleop_inactive"]["negative_labels"] == pytest.approx(1.5 if filter_static else 5.5)
     assert stats["arm_reset"]["positive_labels"] == 0
-    assert stats["arm_reset"]["negative_labels"] == 6
+    assert stats["arm_reset"]["negative_labels"] == (2 if filter_static else 6)
 
 
 def test_arm_mode_overlap_is_rejected_during_dataset_preflight():

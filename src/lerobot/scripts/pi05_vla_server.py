@@ -977,6 +977,11 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
                 int(packet["diagnostic_flow_seed"].item()) if "diagnostic_flow_seed" in packet else None
             ),
             server_received_ns=time.monotonic_ns(),
+            recorded_image_history=(
+                np.asarray(packet["model_image_history"], dtype=np.uint8).tobytes()
+                if "model_image_history" in packet and packet["model_image_history"].size
+                else None
+            ),
         )
 
 
@@ -984,6 +989,7 @@ def encode_action_packet(record: ActionRecord) -> bytes:
     output = BytesIO()
     np.savez(
         output,
+        model_image_history=np.frombuffer(record.model_image_history or b"", dtype=np.uint8),
         protocol_version=np.asarray(PROTOCOL_VERSION, dtype=np.int64),
         sequence=np.asarray(record.sequence, dtype=np.int64),
         source_step=np.asarray(record.source_step, dtype=np.int64),
@@ -1059,6 +1065,7 @@ class ObservationPacket:
     # is not confounded by a fresh stochastic sample.
     diagnostic_flow_seed: int | None
     server_received_ns: int
+    recorded_image_history: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -1090,6 +1097,61 @@ class ActionRecord:
     sim_steps_per_wall_second: float
     rtc_mode: str = "inference"
     rtc_conditioning_delay_steps: int = 0
+    model_image_history: bytes | None = None
+
+
+class _RecordedImageBatch(dict):
+    """Keep recording data outside the dictionary passed to the model processors."""
+
+    model_image_history: bytes
+
+
+def _encode_model_image_history(packet, records, is_pad, base_key, wrist_key) -> bytes:
+    arrays = {
+        "format_version": np.int64(1),
+        "source_step": np.int64(packet.sim_step),
+        "base_camera_key": np.asarray(base_key),
+        "wrist_camera_key": np.asarray(wrist_key),
+        "is_pad": is_pad.detach().cpu().numpy().reshape(-1),
+    }
+    for field in ("capture_ns", "base_capture_ns", "wrist_capture_ns", "encoded_ns", "server_received_ns", "sim_step"):
+        arrays[field] = np.asarray(
+            [getattr(record, field, -1) if getattr(record, field, -1) is not None else -1 for record in records],
+            dtype=np.int64,
+        )
+    for index, record in enumerate(records):
+        arrays[f"base_jpeg_{index}"] = np.asarray(record.base_jpeg, dtype=np.uint8)
+        arrays[f"wrist_jpeg_{index}"] = np.asarray(record.wrist_jpeg, dtype=np.uint8)
+    output = BytesIO()
+    # JPEGs are already compressed. Avoid CPU-heavy recompression in the inference path.
+    np.savez(output, **arrays)
+    return output.getvalue()
+
+
+def _decode_model_image_history(payload, *, source_step, count, base_key, wrist_key):
+    with np.load(BytesIO(payload), allow_pickle=False) as data:
+        if int(data["format_version"]) != 1 or int(data["source_step"]) != source_step:
+            raise ValueError("Recorded model image history version/source_step mismatch")
+        if str(data["base_camera_key"].item()) != base_key or str(data["wrist_camera_key"].item()) != wrist_key:
+            raise ValueError("Recorded model image history physical camera roles mismatch")
+        pad = np.asarray(data["is_pad"])
+        if pad.dtype != np.bool_ or pad.ndim != 1 or len(pad) != count:
+            raise ValueError("Recorded model image history frame count/padding mismatch")
+        for field in ("capture_ns", "base_capture_ns", "wrist_capture_ns", "encoded_ns", "server_received_ns", "sim_step"):
+            if data[field].shape != (count,):
+                raise ValueError(f"Recorded model image history invalid {field}")
+        records = []
+        for index in range(count):
+            images = {}
+            for role in ("base", "wrist"):
+                array = data[f"{role}_jpeg_{index}"]
+                if array.dtype != np.uint8 or array.ndim != 1 or not array.size:
+                    raise ValueError("Recorded model image history invalid JPEG bytes")
+                images[f"{role}_jpeg"] = array.copy()
+            values = {field: int(data[field][index]) for field in ("capture_ns", "base_capture_ns", "wrist_capture_ns", "encoded_ns", "server_received_ns", "sim_step")}
+            values["sim_step"] = None if values["sim_step"] < 0 else values["sim_step"]
+            records.append(ImagePacket(**images, **values))
+    return records, torch.from_numpy(pad.copy()).unsqueeze(0)
 
 
 class RolloutRecorder:
@@ -1181,6 +1243,7 @@ class RolloutRecorder:
         with self._lock:
             np.savez_compressed(
                 path,
+                model_image_history=np.frombuffer(record.model_image_history or b"", dtype=np.uint8),
                 sequence=np.asarray(record.sequence),
                 source_step=np.asarray(record.source_step),
                 action_names=np.asarray(record.action_names),
@@ -2172,18 +2235,30 @@ class AsyncRTCPolicy:
             stride=self.state_history_stride,
         )
         state = torch.stack([self._source_state(record) for record in state_records]).unsqueeze(0)
-        batch: dict[str, object] = {
+        batch: dict[str, object] = _RecordedImageBatch({
             OBS_STATE: state,
             f"{OBS_STATE}_is_pad": state_pad,
-        }
+        })
 
-        image_records, image_pad = self._sample_image_records(
-            image_history,
-            packet.capture_finished_ns,
-            current_step=packet.sim_step,
-            count=self.mem_image_num_frames,
-            interval_ns=self.mem_image_interval_ns,
-            stride=self.mem_image_stride,
+        if getattr(packet, "recorded_image_history", None):
+            image_records, image_pad = _decode_model_image_history(
+                packet.recorded_image_history,
+                source_step=packet.sim_step,
+                count=self.mem_image_num_frames,
+                base_key=self.base_camera_key,
+                wrist_key=self.wrist_camera_key,
+            )
+        else:
+            image_records, image_pad = self._sample_image_records(
+                image_history,
+                packet.capture_finished_ns,
+                current_step=packet.sim_step,
+                count=self.mem_image_num_frames,
+                interval_ns=self.mem_image_interval_ns,
+                stride=self.mem_image_stride,
+            )
+        batch.model_image_history = getattr(packet, "recorded_image_history", None) or _encode_model_image_history(
+            packet, image_records, image_pad, self.base_camera_key, self.wrist_camera_key
         )
         encoded_images = {
             self.base_camera_key: [record.base_jpeg for record in image_records],
@@ -2258,7 +2333,9 @@ class AsyncRTCPolicy:
     def _infer_unlocked(self, packet: ObservationPacket) -> ActionRecord:
         started_ns = time.monotonic_ns()
         started = time.perf_counter()
-        batch = self.preprocessor(self._make_batch(packet))
+        raw_batch = self._make_batch(packet)
+        model_image_history = getattr(raw_batch, "model_image_history", None)
+        batch = self.preprocessor(raw_batch)
         preprocessed = time.perf_counter()
         inference_delay_steps, sim_rate = self._estimated_delay()
         conditioning = self._rtc_conditioning(packet, inference_delay_steps)
@@ -2372,6 +2449,7 @@ class AsyncRTCPolicy:
             rtc_conditioning_delay_steps=int(conditioning.get("inference_delay", 0)),
             velocity_smoothing_transition_step=smoothing_transition_step,
             sim_steps_per_wall_second=sim_rate,
+            model_image_history=model_image_history,
         )
         self._next_sequence += 1
         return record

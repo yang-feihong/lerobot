@@ -11,7 +11,7 @@ vla_storage_root="${VLA_STORAGE_ROOT:-/data}"
 # User configuration
 # =========================
 
-enable_mem="false"
+enable_mem="true"
 
 # Physical I/O schema. These values are persisted in every checkpoint and are
 # automatically restored by resume and open-loop evaluation.
@@ -115,6 +115,7 @@ motion_ee_translation_threshold_m="0.05"
 motion_ee_rotation_threshold_rad="0.17453292519943295"
 motion_gripper_change_threshold="0.5"
 static_horizon_sampling="true"
+exclude_incomplete_static_starts="true"
 interior_static_weight="0.0"
 terminal_static_weight="1.0" # increase above 1.0 to strengthen terminal holds
 # Whether right-padding after a legal terminal hold remains part of the action
@@ -235,6 +236,7 @@ motion_ee_translation_threshold_m_explicit="false"
 motion_ee_rotation_threshold_rad_explicit="false"
 motion_gripper_change_threshold_explicit="false"
 static_horizon_sampling_explicit="false"
+exclude_incomplete_static_starts_explicit="false"
 interior_static_weight_explicit="false"
 terminal_static_weight_explicit="false"
 supervise_terminal_static_padding_explicit="false"
@@ -363,6 +365,7 @@ while (( $# > 0 )); do
     --motion-ee-rotation-threshold-rad=*) motion_ee_rotation_threshold_rad="${1#*=}"; motion_ee_rotation_threshold_rad_explicit="true" ;;
     --motion-gripper-change-threshold=*) motion_gripper_change_threshold="${1#*=}"; motion_gripper_change_threshold_explicit="true" ;;
     --static-horizon-sampling=*) static_horizon_sampling="${1#*=}"; static_horizon_sampling_explicit="true" ;;
+    --exclude-incomplete-static-starts=*) exclude_incomplete_static_starts="${1#*=}"; exclude_incomplete_static_starts_explicit="true" ;;
     --interior-static-weight=*) interior_static_weight="${1#*=}"; interior_static_weight_explicit="true" ;;
     --terminal-static-weight=*) terminal_static_weight="${1#*=}"; terminal_static_weight_explicit="true" ;;
     --supervise-terminal-static-padding=*) supervise_terminal_static_padding="${1#*=}"; supervise_terminal_static_padding_explicit="true" ;;
@@ -921,6 +924,7 @@ if [[ -z "$resume_checkpoint" ]]; then
   sampling_args+=(
     --motion_balanced_sampling.enabled="$motion_balanced_sampling"
     --static_horizon_sampling.enabled="$static_horizon_sampling"
+    --dataset.semantic_exclude_incomplete_static_starts="$exclude_incomplete_static_starts"
     --static_horizon_sampling.interior_weight="$interior_static_weight"
     --static_horizon_sampling.terminal_weight="$terminal_static_weight"
     --dataset_mixture_sampling.enabled="$dataset_mixture_sampling"
@@ -944,6 +948,7 @@ else
   [[ "$motion_ee_rotation_threshold_rad_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.ee_rotation_threshold_rad="$motion_ee_rotation_threshold_rad")
   [[ "$motion_gripper_change_threshold_explicit" == "false" ]] || sampling_args+=(--motion_balanced_sampling.gripper_change_threshold="$motion_gripper_change_threshold")
   [[ "$static_horizon_sampling_explicit" == "false" ]] || sampling_args+=(--static_horizon_sampling.enabled="$static_horizon_sampling")
+  [[ "$exclude_incomplete_static_starts_explicit" == "false" ]] || sampling_args+=(--dataset.semantic_exclude_incomplete_static_starts="$exclude_incomplete_static_starts")
   [[ "$interior_static_weight_explicit" == "false" ]] || sampling_args+=(--static_horizon_sampling.interior_weight="$interior_static_weight")
   [[ "$terminal_static_weight_explicit" == "false" ]] || sampling_args+=(--static_horizon_sampling.terminal_weight="$terminal_static_weight")
   [[ "$dataset_mixture_sampling_explicit" == "false" ]] || sampling_args+=(--dataset_mixture_sampling.enabled="$dataset_mixture_sampling")
@@ -1179,6 +1184,7 @@ fi
 if [[ -z "$resume_checkpoint" ]]; then
   echo "Motion sampling:  legacy enabled=$motion_balanced_sampling"
   echo "Static horizons:  enabled=$static_horizon_sampling, interior_weight=$interior_static_weight, terminal_weight=$terminal_static_weight"
+  echo "Semantic starts:  exclude incomplete B2-zero + arm-inactive=$exclude_incomplete_static_starts"
   echo "Terminal padding: supervise=$supervise_terminal_static_padding"
   echo "Dataset mixture:  enabled=$dataset_mixture_sampling, manifest=${dataset_mixture_manifest:-none}"
 else

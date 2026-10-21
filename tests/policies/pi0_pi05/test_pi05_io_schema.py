@@ -298,7 +298,7 @@ def test_factory_uses_canonical_new_order_but_preserves_resume_metadata(monkeypa
             return cls(**kwargs)
 
     monkeypatch.setattr(policy_factory, "get_policy_class", lambda _: DummyPolicy)
-    config = policy_factory.make_policy(PI05Config(device="cpu"), ds_meta=meta).config
+    config = policy_factory.make_policy(PI05Config(device="cpu", pretrained_path=tmp_path), ds_meta=meta).config
     assert list(config.image_features) == [BASE_CAMERA, WRIST_CAMERA]
     if resume:
         config.dataset_camera_keys = [WRIST_CAMERA, BASE_CAMERA]
@@ -323,6 +323,28 @@ def test_actual_image_preprocessing_matches_metadata_slots(order):
     batch = {WRIST_CAMERA: torch.ones(1, 3, 224, 224), BASE_CAMERA: torch.zeros(1, 3, 224, 224)}
     images, _, _ = policy._preprocess_images(batch)
     assert [image.mean().item() for image in images] == [-1.0 if key == BASE_CAMERA else 1.0 for key in order]
+
+
+@pytest.mark.parametrize("restore_metadata", [False, True])
+def test_base_initialization_keeps_new_camera_contract_without_checkpoint_metadata(
+    tmp_path, monkeypatch, restore_metadata
+):
+    from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+
+    config = _camera_config([WRIST_CAMERA, BASE_CAMERA], io_schema_resolved=True)
+    config.validate_features()
+
+    def stop_at_construction(self, config, **kwargs):
+        assert list(config.image_features) == [BASE_CAMERA, WRIST_CAMERA]
+        raise RuntimeError("reached model construction")
+
+    monkeypatch.setattr(PI05Policy, "__init__", stop_at_construction)
+    expected_error = FileNotFoundError if restore_metadata else RuntimeError
+    expected_message = "missing camera metadata" if restore_metadata else "reached model construction"
+    with pytest.raises(expected_error, match=expected_message):
+        PI05Policy.from_pretrained(
+            tmp_path, config=config, restore_checkpoint_camera_metadata=restore_metadata
+        )
 
 
 def test_current_config_defaults_to_control_action() -> None:

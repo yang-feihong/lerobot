@@ -62,6 +62,9 @@ class DatasetConfig:
     # This supersedes task_variants_path when present without rewriting data.
     semantic_views_path: str | None = None
     random_semantic_view: bool = True
+    # Training-only eligibility rule, applied per physical-frame/instruction pair.
+    # Complete holds remain legal; B2=0 and arm inactive cannot supervise an incomplete goal.
+    semantic_exclude_incomplete_static_starts: bool = True
     # Exact physical-state x canonical-instruction relations enabled for this
     # run.  This is the preferred interface; view-kind weights are retained
     # only for loading historical training configurations.

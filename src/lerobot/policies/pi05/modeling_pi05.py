@@ -1798,6 +1798,7 @@ class PI05Policy(PreTrainedPolicy):
         revision: str | None = None,
         strict: bool = True,
         checkpoint_metadata_path: str | Path | None = None,
+        restore_checkpoint_camera_metadata: bool = True,
         **kwargs,
     ) -> T:
         """Override the from_pretrained method to handle key remapping and display important disclaimer."""
@@ -1823,7 +1824,7 @@ class PI05Policy(PreTrainedPolicy):
                 **kwargs,
             )
 
-        else:
+        elif restore_checkpoint_camera_metadata:
             # For PEFT the base loader receives the adapter's resolved config:
             # never replace that contract with the base model's camera order.
             config.restore_pretrained_metadata(

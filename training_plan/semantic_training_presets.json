@@ -2,6 +2,56 @@
   "format": "lerobot.semantic_training_presets",
   "version": 1,
   "presets": {
+    "pull_stage1": {
+      "state_weights": {"approach": 1.0},
+      "state_instruction_matrix": {
+        "approach": {
+          "goal_approach": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "goal_end"}
+        }
+      }
+    },
+    "pull_stage2": {
+      "state_weights": {"handle_press": 1.0},
+      "state_instruction_matrix": {
+        "handle_press": {
+          "goal_open": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "goal_end"}
+        }
+      }
+    },
+    "pull_stage3": {
+      "state_weights": {"traversal": 1.0},
+      "state_instruction_matrix": {
+        "traversal": {
+          "goal_enter": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "goal_end"}
+        }
+      }
+    },
+    "pull_joint": {
+      "state_weights": {"approach": 1.0, "handle_press": 1.0, "traversal": 1.0},
+      "state_instruction_matrix": {
+        "approach": {
+          "goal_approach": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "goal_end"}
+        },
+        "handle_press": {
+          "goal_open": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "goal_end"}
+        },
+        "traversal": {
+          "goal_enter": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "goal_end"}
+        }
+      }
+    },
+    "grasp": {
+      "state_weights": {"object_grasp": 1.0},
+      "state_instruction_matrix": {
+        "object_grasp": {
+          "object_grasp": {
+            "status": "active",
+            "action_supervision": "demonstrated",
+            "completion_boundary": "goal_end"
+          }
+        }
+      }
+    },
     "stage1_only": {
       "state_weights": {"approach": 1.0},
       "state_instruction_matrix": {
@@ -61,6 +111,29 @@
             "action_supervision": "demonstrated",
             "completion_boundary": "goal_end"
           }
+        }
+      }
+    },
+    "three_goal_plus_full": {
+      "state_weights": {"approach": 1.0, "handle_press": 1.0, "traversal": 1.0},
+      "state_instruction_matrix": {
+        "approach": {
+          "goal_approach": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "goal_end"},
+          "goal_open": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "future_goal_end"},
+          "goal_enter": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "future_goal_end"},
+          "full_episode_command": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "future_goal_end"}
+        },
+        "handle_press": {
+          "goal_approach": {"status": "complete", "action_supervision": "hold", "completion_boundary": "none"},
+          "goal_open": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "goal_end"},
+          "goal_enter": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "future_goal_end"},
+          "full_episode_command": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "future_goal_end"}
+        },
+        "traversal": {
+          "goal_approach": {"status": "complete", "action_supervision": "hold", "completion_boundary": "none"},
+          "goal_open": {"status": "complete", "action_supervision": "hold", "completion_boundary": "none"},
+          "goal_enter": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "goal_end"},
+          "full_episode_command": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "goal_end"}
         }
       }
     },
