@@ -69,6 +69,7 @@ mapfile -t semantic_task_spec < <(
 }
 dataset_family="${semantic_task_spec[0]}"
 memory_mode="${semantic_task_spec[1]}"
+export LEROBOT_TRAINING_PROFILE="${plan_dir}/training_profile.json"
 semantic_phases="${semantic_task_spec[2]}"
 semantic_phase_weights="${semantic_task_spec[3]}"
 semantic_state_instruction_matrix="${semantic_task_spec[4]}"

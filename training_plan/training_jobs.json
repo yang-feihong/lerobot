@@ -4,7 +4,6 @@
   "jobs": {
     "all_scenes_stage3_full_mem": {
       "dataset_family": "all_scenes",
-      "memory_mode": "full_mem",
       "training_preset": "stage3_only",
       "train_steps": 100000,
       "resources": {
@@ -15,7 +14,6 @@
     },
     "staff1_goal_conditioned_full_mem": {
       "dataset_family": "staff1",
-      "memory_mode": "full_mem",
       "training_preset": "three_goal_conditioned",
       "semantic_views_file": "semantic_views_three_goal_conditioned.json",
       "train_steps": 100000,
@@ -27,7 +25,6 @@
     },
     "staff1_stage2_full_mem": {
       "dataset_family": "staff1",
-      "memory_mode": "full_mem",
       "training_preset": "stage2_only",
       "train_steps": 100000,
       "resources": {
@@ -38,7 +35,6 @@
     },
     "staff1_joint_full_mem": {
       "dataset_family": "staff1",
-      "memory_mode": "full_mem",
       "training_preset": "three_stage_joint",
       "train_steps": 100000,
       "resources": {
@@ -49,7 +45,6 @@
     },
     "all_scenes_stage1_full_mem": {
       "dataset_family": "all_scenes",
-      "memory_mode": "full_mem",
       "training_preset": "stage1_only",
       "train_steps": 100000,
       "resources": {
@@ -60,7 +55,6 @@
     },
     "all_scenes_stage2_full_mem": {
       "dataset_family": "all_scenes",
-      "memory_mode": "full_mem",
       "training_preset": "stage2_only",
       "train_steps": 100000,
       "resources": {
@@ -71,7 +65,6 @@
     },
     "staff1_stage3_full_mem": {
       "dataset_family": "staff1",
-      "memory_mode": "full_mem",
       "training_preset": "stage3_only",
       "train_steps": 70000,
       "resources": {
@@ -82,7 +75,6 @@
     },
     "staff1_stage1_full_mem": {
       "dataset_family": "staff1",
-      "memory_mode": "full_mem",
       "training_preset": "stage1_only",
       "train_steps": 70000,
       "resources": {

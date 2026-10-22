@@ -66,7 +66,7 @@ if [[ "${source_host}" == local ]]; then
     echo "Local source checkpoint has no policy weight file." >&2
     exit 1
   }
-  (cd "${source_checkpoint}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) \
+  (cd "${source_checkpoint}" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) \
     >"${source_manifest}"
   if [[ "${RESUME_STAGING:-0}" == 1 ]]; then
     staging_check="test -d ${staging_q}"
@@ -86,7 +86,7 @@ else
   "${ssh_cmd[@]}" "${source_host}" \
     "test -s ${source_q}/pretrained_model/model.safetensors || test -s ${source_q}/pretrained_model/adapter_model.safetensors"
   "${ssh_cmd[@]}" "${source_host}" \
-    "cd ${source_q} && find . -type f -print0 | sort -z | xargs -0 sha256sum" \
+    "cd ${source_q} && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum" \
     >"${source_manifest}"
   if [[ "${destination_host}" == local ]]; then
     [[ ! -e "${destination_checkpoint}" && ! -e "${staging}" ]] || {
@@ -106,13 +106,13 @@ else
 fi
 
 if [[ "${destination_host}" == local ]]; then
-  (cd "${staging}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) \
+  (cd "${staging}" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) \
     >"${destination_manifest}"
   cmp "${source_manifest}" "${destination_manifest}"
   mv -- "${staging}" "${destination_checkpoint}"
 else
   "${ssh_cmd[@]}" "${destination_host}" \
-    "cd ${staging_q} && find . -type f -print0 | sort -z | xargs -0 sha256sum" \
+    "cd ${staging_q} && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum" \
     >"${destination_manifest}"
   cmp "${source_manifest}" "${destination_manifest}"
   "${ssh_cmd[@]}" "${destination_host}" "mv -- ${staging_q} ${destination_q}"

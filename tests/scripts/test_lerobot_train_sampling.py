@@ -5,7 +5,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from lerobot.datasets.semantic_views import SemanticSegment, SemanticView, SemanticViewCatalog
+from lerobot.datasets.semantic_views import (
+    SemanticSegment,
+    SemanticView,
+    SemanticViewCatalog,
+    semantic_relation_sampling_groups,
+)
 from lerobot.policies.pi05.b2_action_transform import (
     CONTROL_EXTENDED_DATASET_ACTION_NAMES,
     DATASET_ACTION_NAMES,
@@ -509,6 +514,81 @@ def test_semantic_phase_boolean_priors_average_multiple_goal_views(filter_static
     assert stats["arm_teleop_inactive"]["negative_labels"] == pytest.approx(1.5 if filter_static else 5.5)
     assert stats["arm_reset"]["positive_labels"] == 0
     assert stats["arm_reset"]["negative_labels"] == (2 if filter_static else 6)
+
+
+def test_cell_balanced_boolean_priors_follow_pair_counts_not_available_view_counts():
+    actions = np.zeros((5, 25), dtype=np.float32)
+    dataset = _fake_dataset(actions, CONTROL_EXTENDED_DATASET_ACTION_NAMES)
+    cfg = SimpleNamespace(
+        type="pi05",
+        action_predict_arm_teleop_inactive=True,
+        action_predict_arm_reset=True,
+        action_predict_gripper=False,
+        action_predict_task_complete=True,
+        gripper_target_representation="continuous_position",
+        action_gripper_target_true_side="negative",
+        action_bool_loss_weight=4.0,
+        action_bool_true_fractions={},
+        chunk_size=1,
+        control_frequency_hz=10,
+    )
+    catalog = SemanticViewCatalog(
+        Path("unused"),
+        {
+            0: (
+                SemanticView(
+                    "approach",
+                    "goal_approach",
+                    ("Approach.",),
+                    "active",
+                    "demonstrated",
+                    frame_start=0,
+                    frame_stop=3,
+                    completion_frame=2,
+                ),
+                SemanticView(
+                    "open",
+                    "goal_open",
+                    ("Open.",),
+                    "active",
+                    "demonstrated",
+                    frame_start=0,
+                    frame_stop=5,
+                    completion_frame=7,
+                ),
+            )
+        },
+        "sha",
+        1,
+        (),
+        (0,),
+        {0: (SemanticSegment("approach", 0, 5),)},
+    )
+    matrix = {
+        "approach": {
+            "goal_approach": {
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "completion_boundary": "goal_end",
+            },
+            "goal_open": {
+                "status": "active",
+                "action_supervision": "demonstrated",
+                "completion_boundary": "future_goal_end",
+            },
+        }
+    }
+    plan = semantic_relation_sampling_groups(catalog, [0], [0], state_instruction_matrix=matrix)
+    stats = configure_action_bool_balance(
+        SimpleNamespace(trainable_config=cfg, resume=False),
+        dataset,
+        semantic_views=catalog,
+        semantic_phases=["approach"],
+        semantic_state_instruction_matrix=matrix,
+        relation_sampling=plan,
+    )
+    assert stats["task_complete"]["true_fraction"] == pytest.approx(1 / 6)
+    assert stats["arm_teleop_inactive"]["true_fraction"] == pytest.approx(1 / 6)
 
 
 def test_arm_mode_overlap_is_rejected_during_dataset_preflight():

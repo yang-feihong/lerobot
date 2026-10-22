@@ -214,6 +214,8 @@ snapshot_file_list() {
     printf '%s\0' training_plan/cluster.sh training_plan/storage_guard.sh \
       training_plan/artifacts.lock training_plan/base_artifact_registry.json training_plan/README_zh.md \
       training_plan/semantic_plan.py training_plan/semantic_training_presets.json \
+      training_plan/training_profile.json src/lerobot/datasets/episode_split.py \
+      src/lerobot/common/training_profile.py \
       training_plan/training_jobs.json "${training_jobs_rel}"
   } | sort -zu
 }

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,25 @@ def _validate_resources(task_id: str, resources: Any) -> None:
 
 
 def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
+    profile = _load_json(Path(__file__).with_name("training_profile.json"))
+    if (
+        set(profile)
+        != {
+            "format",
+            "version",
+            "memory_mode",
+            "global_batch_size",
+            "reference_run",
+            "policy",
+            "training",
+            "dataset",
+            "adapter_schema",
+        }
+        or profile["format"] != "lerobot.training_profile"
+        or profile["version"] != VERSION
+        or profile["memory_mode"] not in VALID_MEMORY_MODES
+    ):
+        raise ValueError("invalid shared training_profile.json")
     presets_payload = _load_json(presets_path)
     if presets_payload.get("format") != PRESETS_FORMAT or presets_payload.get("version") != VERSION:
         raise ValueError(f"unsupported semantic training presets: {presets_path}")
@@ -116,7 +136,9 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
     for task_id, task in tasks.items():
         if not isinstance(task, dict):
             raise ValueError(f"task {task_id!r} must be an object")
-        common = {"dataset_family", "memory_mode", "resources"}
+        if "memory_mode" in task:
+            raise ValueError("Per-task memory_mode is forbidden; use shared training_profile.json")
+        common = {"dataset_family", "resources"}
         optional = {
             "train_steps",
             "semantic_views_file",
@@ -134,8 +156,6 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
             )
         if task["dataset_family"] not in VALID_DATASET_FAMILIES:
             raise ValueError(f"task {task_id!r} has invalid dataset_family")
-        if task["memory_mode"] not in VALID_MEMORY_MODES:
-            raise ValueError(f"task {task_id!r} has invalid memory_mode")
         if not isinstance(task.get("allow_resume_semantic_adoption", False), bool):
             raise ValueError(f"task {task_id!r} allow_resume_semantic_adoption must be boolean")
         if not isinstance(task.get("allow_resume_artifact_adoption", False), bool):
@@ -173,12 +193,12 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
                     "state_instruction_matrix": task["state_instruction_matrix"],
                 },
             )
-    return {"training_presets": presets, "tasks": tasks}
+    return {"training_presets": presets, "tasks": tasks, "training_profile": profile}
 
 
 def resolve_task(payload: dict[str, Any], task_id: str) -> dict[str, Any]:
     try:
-        return payload["tasks"][task_id]
+        return {**payload["tasks"][task_id], "memory_mode": payload["training_profile"]["memory_mode"]}
     except KeyError as exc:
         raise ValueError(f"unknown task id: {task_id}") from exc
 
@@ -211,6 +231,20 @@ def validate_sidecar(payload: dict[str, Any], task_id: str, sidecar_path: Path) 
     sidecar = _load_json(sidecar_path)
     if sidecar.get("format") != "lerobot.semantic_views" or sidecar.get("version") != 1:
         raise ValueError(f"unsupported semantic-view sidecar: {sidecar_path}")
+    provenance = sidecar.get("provenance", {})
+    if provenance.get("builder") == "build_goal_conditioned_semantic_views.py":
+        if provenance.get("selection_policy") != "available_goals_per_valid_stage":
+            raise ValueError(
+                "Legacy goal sidecar required whole-episode goal coverage; rebuild it from the canonical training sidecar"
+            )
+        canonical = sidecar_path.parent / "semantic_views.json"
+        if (
+            canonical.is_file()
+            and provenance["source_sha256"] != hashlib.sha256(canonical.read_bytes()).hexdigest()
+        ):
+            raise ValueError(
+                "Goal sidecar was not built from the current canonical training sidecar; rebuild it"
+            )
     intents = sidecar.get("intents")
     episodes = sidecar.get("episodes")
     if not isinstance(intents, dict) or not isinstance(episodes, dict):
@@ -278,12 +312,17 @@ def validate_sidecar(payload: dict[str, Any], task_id: str, sidecar_path: Path) 
                     )
                 ]
                 if len(matching_relations) != 1:
+                    if relation_prefix[0] in matrix[state]:
+                        raise ValueError(
+                            f"task {task_id} has inconsistent relation for episode {episode_key}, state {state}: {view}"
+                        )
                     continue
                 relation = matching_relations[0]
                 enabled.append((overlap_start, overlap_stop, relation))
                 boundaries.update((overlap_start, overlap_stop))
                 seen[state].add(relation)
             ordered = sorted(boundaries)
+            covered_frames = 0
             for left, right in zip(ordered, ordered[1:], strict=False):
                 covering = [
                     relation
@@ -291,22 +330,24 @@ def validate_sidecar(payload: dict[str, Any], task_id: str, sidecar_path: Path) 
                     if view_start <= left and right <= view_stop
                 ]
                 covering_set = set(covering)
-                if len(covering) != len(covering_set) or covering_set != allowed[state]:
+                if len(covering) != len(covering_set):
                     raise ValueError(
-                        f"task {task_id} requires every configured state-instruction relation exactly once over "
+                        f"task {task_id} has duplicate state-instruction supervision over "
                         f"episode {episode_key}, state {state}, frames [{left}, {right}); "
                         f"expected={sorted(allowed[state])}, got={sorted(covering)}"
                     )
-            segment_count += 1
-            frame_count += stop - start
+                if covering:
+                    covered_frames += right - left
+            segment_count += int(covered_frames > 0)
+            frame_count += covered_frames
     missing_states = [state for state in selected_states if not seen[state]]
     if missing_states:
         raise ValueError(f"task {task_id} has no sidecar coverage for states {sorted(missing_states)}")
     for state in selected_states:
-        missing_relations = allowed[state] - seen[state]
-        if missing_relations:
+        missing = allowed[state] - seen[state]
+        if missing:
             raise ValueError(
-                f"task {task_id} never observes configured relations for {state}: {sorted(missing_relations)}"
+                f"task {task_id} has configured cells with no sidecar supervision: {state}: {sorted(missing)}"
             )
     return {"episodes": len(episodes), "segments": segment_count, "frames": frame_count}
 

@@ -5,7 +5,12 @@ import numpy as np
 import pytest
 from datasets import Dataset
 
-from lerobot.datasets.semantic_views import SemanticSegment, SemanticView, SemanticViewCatalog
+from lerobot.datasets.semantic_views import (
+    SemanticSegment,
+    SemanticView,
+    SemanticViewCatalog,
+    with_incomplete_static_start_filter,
+)
 from lerobot.policies.pi05.b2_action_transform import (
     CONTROL_EXTENDED_DATASET_ACTION_NAMES,
     DATASET_ACTION_NAMES,
@@ -228,9 +233,7 @@ def test_task_complete_schema_extension_only_allows_appended_completion() -> Non
         "action_names": ["b2_vx", "gripper_target", "task_complete"],
     }
 
-    assert is_task_complete_schema_extension(
-        {"schema": base_schema}, {"schema": extended_schema}
-    )
+    assert is_task_complete_schema_extension({"schema": base_schema}, {"schema": extended_schema})
     assert not is_task_complete_schema_extension(
         {"schema": base_schema},
         {"schema": {**extended_schema, "control_frequency_hz": 25.0}},
@@ -284,8 +287,9 @@ def test_missing_blocked_schema_flag_is_backward_compatible_with_false() -> None
 
 @pytest.mark.parametrize("b2_representation", ["velocity", "pose_delta"])
 @pytest.mark.parametrize("z1_representation", ["ee_delta", "ee_state_delta"])
+@pytest.mark.parametrize("filtered", [False, True])
 def test_transformed_stats_support_all_formal_representation_pairs(
-    tmp_path, b2_representation: str, z1_representation: str
+    tmp_path, b2_representation: str, z1_representation: str, filtered: bool
 ) -> None:
     frames = 8
     canonical = np.zeros((frames, 16), dtype=np.float32)
@@ -297,6 +301,9 @@ def test_transformed_stats_support_all_formal_representation_pairs(
     stored = np.zeros((frames, 25), dtype=np.float32)
     stored[:, :16] = canonical
     stored[:, 16:25] = canonical[:, 5:14]
+    if filtered:
+        stored[[0, 3], :3] = 0
+        stored[[0, 3], 3] = 1
     state = np.zeros((frames, 9), dtype=np.float32)
     state[:, 0] = 1.0
     state[:, 4] = 1.0
@@ -349,7 +356,51 @@ def test_transformed_stats_support_all_formal_representation_pairs(
         list(CONTROL_EXTENDED_DATASET_ACTION_NAMES), **action_schema_kwargs(config)
     )
 
-    payload = compute_transformed_action_stats(dataset, config)
+    kwargs = {}
+    if filtered:
+        catalog = SemanticViewCatalog(
+            Path("unused"),
+            {
+                0: (
+                    SemanticView(
+                        "open",
+                        "goal_open",
+                        ("Open.",),
+                        "active",
+                        "demonstrated",
+                        frame_start=0,
+                        frame_stop=frames,
+                        completion_frame=3,
+                    ),
+                )
+            },
+            "sha",
+            1,
+            (),
+            (0,),
+            {0: (SemanticSegment("handle_press", 0, frames),)},
+        )
+        kwargs = {
+            "semantic_views": with_incomplete_static_start_filter(catalog, dataset),
+            "semantic_phases": ["handle_press"],
+            "semantic_state_instruction_matrix": {
+                "handle_press": {
+                    "goal_open": {
+                        "status": "active",
+                        "action_supervision": "demonstrated",
+                        "completion_boundary": "goal_end",
+                    }
+                }
+            },
+        }
+    payload = compute_transformed_action_stats(dataset, config, **kwargs)
+    if filtered:
+        expected = 6
+        if b2_representation == "pose_delta" or z1_representation == "ee_state_delta":
+            expected = (
+                frames - (config.chunk_size + int(z1_representation == "ee_delta") - 1) - 1
+            ) * config.chunk_size
+        assert payload["counts"]["all_transitions"] == expected
 
     assert payload["schema"]["representation"] == b2_representation
     assert payload["schema"]["z1_representation"] == z1_representation

@@ -22,6 +22,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import os
 import shutil
 import sys
 import time
@@ -58,17 +59,21 @@ from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
+from lerobot.datasets.episode_split import load_recording_ids, split_manifest, validate_resume_split
 from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.datasets.mixture_sampling import load_dataset_mixture_manifest
 from lerobot.datasets.motion_balanced_sampling import build_motion_priority_pool
 from lerobot.datasets.semantic_views import (
     apply_semantic_views_to_batch,
     load_semantic_views,
+    semantic_pair_probabilities,
     semantic_phase_sampling_groups,
+    semantic_relation_sampling_groups,
     semantic_status_priors,
     semantic_view_matches_relation,
     semantic_view_start_allowed,
     with_incomplete_static_start_filter,
+    with_semantic_temporal_filter,
 )
 from lerobot.datasets.static_horizon_sampling import build_static_horizon_pool
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
@@ -950,6 +955,7 @@ def configure_action_bool_balance(
     semantic_phases: list[str] | None = None,
     semantic_view_kind_weights: dict[str, float] | None = None,
     semantic_state_instruction_matrix: dict[str, dict[str, dict[str, str]]] | None = None,
+    relation_sampling=None,
 ) -> dict[str, dict[str, int | float]] | None:
     """Resolve fixed class priors for every enabled boolean action from the train split."""
     policy_cfg = cfg.trainable_config
@@ -1006,7 +1012,7 @@ def configure_action_bool_balance(
                 )
         episode_multiplicities = {}
         for episode_index, length in zip(episode_indices, lengths, strict=True):
-            multiplicity = np.zeros(length, dtype=np.int64)
+            multiplicity = np.zeros(length, dtype=np.float64)
             complete_mass = np.zeros(length, dtype=np.float64)
             hold_mass = np.zeros(length, dtype=np.float64)
             for segment in semantic_views.segments.get(episode_index, ()):
@@ -1015,8 +1021,8 @@ def configure_action_bool_balance(
                 matching_views = [
                     view
                     for view in semantic_views.episodes.get(episode_index, ())
-                    if (view.frame_start is None or view.frame_start <= segment.frame_start)
-                    and (view.frame_stop is None or view.frame_stop >= segment.frame_stop)
+                    if (view.frame_start is None or view.frame_start < segment.frame_stop)
+                    and (view.frame_stop is None or view.frame_stop > segment.frame_start)
                     and (
                         semantic_view_matches_relation(
                             view,
@@ -1028,10 +1034,7 @@ def configure_action_bool_balance(
                     )
                 ]
                 if not matching_views:
-                    raise ValueError(
-                        "Every selected semantic segment must have at least one configured covering view: "
-                        f"episode={episode_index}, phase={segment.phase}"
-                    )
+                    continue
                 weights = np.asarray([view.weight for view in matching_views], dtype=np.float64)
                 if np.any(weights < 0) or float(weights.sum()) <= 0:
                     raise ValueError(
@@ -1041,15 +1044,35 @@ def configure_action_bool_balance(
                 weights /= weights.sum()
                 starts = np.arange(segment.frame_start, segment.frame_stop, dtype=np.int64)
                 probabilities = np.repeat(weights[:, None], len(starts), axis=1)
-                if semantic_views.static_first_action_frames is not None:
-                    probabilities *= np.asarray([
-                        [semantic_view_start_allowed(semantic_views, view, episode_index, int(frame))
-                         for frame in starts] for view in matching_views
-                    ])
-                    mass = probabilities.sum(axis=0)
-                    keep = mass > 0
-                    starts = starts[keep]
-                    probabilities = probabilities[:, keep] / mass[keep]
+                probabilities *= np.asarray(
+                    [
+                        [
+                            (view.frame_start is None or view.frame_start <= frame < view.frame_stop)
+                            and semantic_view_start_allowed(semantic_views, view, episode_index, int(frame))
+                            for frame in starts
+                        ]
+                        for view in matching_views
+                    ]
+                )
+                mass = probabilities.sum(axis=0)
+                keep = mass > 0
+                starts = starts[keep]
+                probabilities = probabilities[:, keep] / mass[keep]
+                if relation_sampling is not None:
+                    absolute_starts = starts + int(episodes_meta[episode_index]["dataset_from_index"])
+                    probabilities = np.asarray(
+                        [
+                            semantic_pair_probabilities(
+                                relation_sampling, segment.phase, view.canonical_intent, absolute_starts
+                            )
+                            * (
+                                np.ones(len(starts), dtype=bool)
+                                if view.frame_start is None
+                                else ((starts >= view.frame_start) & (starts < view.frame_stop))
+                            )
+                            for view in matching_views
+                        ]
+                    ) * len(relation_sampling.eligible_frames)
                 for offset in offsets:
                     offset = int(offset)
                     if offset < 0:
@@ -1059,7 +1082,7 @@ def configure_action_bool_balance(
                     # completion then turns the padded suffix into an explicit hold, so every
                     # action slot remains part of the boolean prior just as it is in the batch.
                     target_indices = np.minimum(virtual_targets, length - 1)
-                    np.add.at(multiplicity, target_indices, 1)
+                    np.add.at(multiplicity, target_indices, probabilities.sum(axis=0))
                     for view, probability in zip(matching_views, probabilities, strict=True):
                         completed = np.full(len(virtual_targets), view.status == "complete")
                         if view.status != "complete" and view.completion_frame is not None:
@@ -1107,7 +1130,7 @@ def configure_action_bool_balance(
                     episode_multiplicities[int(episode_index)][int(frame_index)]
                     for episode_index, frame_index in zip(batch_episode_indices, frame_indices, strict=True)
                 ),
-                dtype=np.int64,
+                dtype=np.float64,
                 count=len(frame_indices),
             )
             for name, dim in action_indices.items():
@@ -1345,6 +1368,28 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if not is_main_process:
         dataset, eval_dataset = make_train_eval_datasets(cfg)
 
+    dataset_split_manifest = None
+    if cfg.dataset.eval_split > 0:
+        base_episodes = (
+            list(cfg.dataset.episodes)
+            if cfg.dataset.episodes is not None
+            else list(range(dataset.meta.total_episodes))
+        )
+        dataset_split_manifest = split_manifest(
+            load_recording_ids(dataset.root, base_episodes, semantic_views), cfg.dataset.eval_split
+        )
+        if cfg.resume:
+            saved_path = cfg.checkpoint_path / PRETRAINED_MODEL_DIR / "dataset_split.json"
+            saved_split = json.loads(saved_path.read_text()) if saved_path.is_file() else {}
+            validate_resume_split(
+                saved_split, dataset_split_manifest, updated_dataset=cfg.resume_with_updated_dataset
+            )
+        if is_main_process:
+            cfg.output_dir.mkdir(parents=True, exist_ok=True)
+            (cfg.output_dir / "dataset_split.json").write_text(
+                json.dumps(dataset_split_manifest, indent=2) + "\n"
+            )
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -1358,6 +1403,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     )
     # Validation retains all original inputs; only the training catalog is indexed.
     eval_semantic_views = semantic_views
+    if semantic_views is not None:
+        semantic_views = with_semantic_temporal_filter(semantic_views, dataset)
+        if eval_dataset is not None:
+            eval_semantic_views = with_semantic_temporal_filter(eval_semantic_views, eval_dataset)
     if semantic_views is not None and cfg.dataset.semantic_exclude_incomplete_static_starts:
         if not cfg.dataset.semantic_phases:
             raise ValueError("Incomplete static-start filtering requires dataset.semantic_phases")
@@ -1366,6 +1415,45 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             "Incomplete static-start rule: indexed %d exact-zero B2 + inactive train frames; "
             "exclude only instruction pairs whose first target is not complete",
             len(semantic_views.static_first_action_frames),
+        )
+    relation_sampling = None
+    if semantic_views is not None and cfg.dataset.semantic_state_instruction_matrix:
+        static_args = {}
+        if cfg.static_horizon_sampling.enabled:
+            from accelerate.utils import broadcast_object_list
+
+            from lerobot.policies.pi05.b2_action_transform import action_sample_offsets
+
+            offsets = action_sample_offsets(
+                cfg.trainable_config.chunk_size,
+                float(dataset.meta.fps),
+                float(cfg.trainable_config.control_frequency_hz or dataset.meta.fps),
+            )
+            pool = (
+                build_static_horizon_pool(
+                    dataset,
+                    horizon_frames=int(offsets[-1]) + 1,
+                    b2_tolerance=cfg.static_horizon_sampling.b2_tolerance,
+                    gripper_tolerance=cfg.static_horizon_sampling.gripper_tolerance,
+                )
+                if is_main_process
+                else None
+            )
+            pool = broadcast_object_list([pool])[0]
+            static_args = {
+                "interior_static_frames": pool.interior_frame_indices,
+                "terminal_static_frames": pool.terminal_frame_indices,
+                "interior_static_weight": cfg.static_horizon_sampling.interior_weight,
+                "terminal_static_weight": cfg.static_horizon_sampling.terminal_weight,
+            }
+        relation_sampling = semantic_relation_sampling_groups(
+            semantic_views,
+            list(dataset.meta.episodes["dataset_from_index"]),
+            list(dataset.episodes or range(dataset.meta.total_episodes)),
+            state_instruction_matrix=cfg.dataset.semantic_state_instruction_matrix,
+            phase_weights=cfg.dataset.semantic_phase_weights,
+            source_weights=cfg.dataset.semantic_source_weights,
+            **static_args,
         )
     if semantic_views is not None:
         expected_episodes = set(dataset.episodes or range(dataset.meta.total_episodes))
@@ -1385,6 +1473,20 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "phase_weights": cfg.dataset.semantic_phase_weights,
                 "source_weights": cfg.dataset.semantic_source_weights,
                 "exclude_incomplete_static_starts": cfg.dataset.semantic_exclude_incomplete_static_starts,
+                "sampling_strategy": "state_instruction_cells"
+                if relation_sampling is not None
+                else "physical_frames",
+                "sampling_groups": []
+                if relation_sampling is None
+                else [
+                    {"name": name, "weight": weight, "eligible_pairs": len(frames)}
+                    for name, weight, frames in zip(
+                        relation_sampling.names,
+                        relation_sampling.group_weights,
+                        relation_sampling.frame_groups,
+                        strict=True,
+                    )
+                ],
             }
             (cfg.output_dir / "semantic_view_runtime.json").write_text(
                 json.dumps(semantic_record, indent=2), encoding="utf-8"
@@ -1414,6 +1516,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         semantic_phases=cfg.dataset.semantic_phases,
         semantic_view_kind_weights=cfg.dataset.semantic_view_kind_weights,
         semantic_state_instruction_matrix=cfg.dataset.semantic_state_instruction_matrix,
+        relation_sampling=relation_sampling,
     )
     if semantic_views is not None:
         selected_episodes = dataset.episodes or list(range(dataset.meta.total_episodes))
@@ -1431,6 +1534,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             phases=cfg.dataset.semantic_phases,
             phase_weights=cfg.dataset.semantic_phase_weights,
             source_weights=cfg.dataset.semantic_source_weights,
+            relation_sampling=relation_sampling,
         )
         cfg.trainable_config.action_bool_true_fractions.update(status_priors)
         current_action_bool_priors = dict(cfg.trainable_config.action_bool_true_fractions)
@@ -1680,6 +1784,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
 
     # Wait for all processes to finish model creation before continuing
+    profile_audit = None
+    if "LEROBOT_TRAINING_PROFILE" in os.environ:
+        from lerobot.common.training_profile import audit_training_profile
+
+        profile_audit = audit_training_profile(
+            cfg, policy, Path(os.environ["LEROBOT_TRAINING_PROFILE"]), accelerator.num_processes
+        )
+        if is_main_process:
+            (cfg.output_dir / "training_profile_audit.json").write_text(
+                json.dumps(profile_audit, indent=2) + "\n"
+            )
+            logging.info("Mainline training profile audit PASSED: %s", profile_audit["checked_fields"])
     accelerator.wait_for_everyone()
 
     active_cfg = cfg.trainable_config
@@ -1851,7 +1967,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     pool.gripper_frames,
                     100.0 * priority_fraction,
                 )
-        if cfg.static_horizon_sampling.enabled:
+        if cfg.static_horizon_sampling.enabled and relation_sampling is None:
             if not isinstance(active_cfg, PI05Config):
                 raise ValueError("Static-horizon sampling currently requires a PI0.5 policy")
             from lerobot.policies.pi05.b2_action_transform import action_sample_offsets
@@ -1903,21 +2019,27 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     "semantic phase sampling supersedes dataset-mixture sampling; encode physical "
                     "source_group in semantic segments and use dataset.semantic_source_weights"
                 )
-            (
-                semantic_eligible_frames,
-                semantic_frame_groups,
-                semantic_group_weights,
-                semantic_group_names,
-            ) = semantic_phase_sampling_groups(
-                semantic_views,
-                list(dataset.meta.episodes["dataset_from_index"]),
-                list(dataset.episodes or range(dataset.meta.total_episodes)),
-                phases=cfg.dataset.semantic_phases,
-                phase_weights=cfg.dataset.semantic_phase_weights,
-                source_weights=cfg.dataset.semantic_source_weights,
-                state_instruction_matrix=cfg.dataset.semantic_state_instruction_matrix,
-                view_kind_weights=cfg.dataset.semantic_view_kind_weights,
-            )
+            if relation_sampling is not None:
+                semantic_eligible_frames = relation_sampling.eligible_frames
+                semantic_frame_groups = relation_sampling.frame_groups
+                semantic_group_weights = relation_sampling.group_weights
+                semantic_group_names = relation_sampling.names
+            else:
+                (
+                    semantic_eligible_frames,
+                    semantic_frame_groups,
+                    semantic_group_weights,
+                    semantic_group_names,
+                ) = semantic_phase_sampling_groups(
+                    semantic_views,
+                    list(dataset.meta.episodes["dataset_from_index"]),
+                    list(dataset.episodes or range(dataset.meta.total_episodes)),
+                    phases=cfg.dataset.semantic_phases,
+                    phase_weights=cfg.dataset.semantic_phase_weights,
+                    source_weights=cfg.dataset.semantic_source_weights,
+                    state_instruction_matrix=cfg.dataset.semantic_state_instruction_matrix,
+                    view_kind_weights=cfg.dataset.semantic_view_kind_weights,
+                )
             if is_main_process:
                 logging.info(
                     "Semantic phase sampling: frames=%d groups=%s",
@@ -1961,6 +2083,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             eligible_frame_indices=semantic_eligible_frames,
             sampling_group_frame_indices=semantic_frame_groups,
             sampling_group_weights=semantic_group_weights,
+            sampling_group_labels=None if relation_sampling is None else relation_sampling.intents,
+            sampling_group_frame_weights=None
+            if relation_sampling is None
+            else relation_sampling.frame_weights,
         )
         if cfg.resume and step > 0:
             # The resume offset depends on the (num_processes, batch_size) that produced `step`, so
@@ -2590,6 +2716,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     if semantic_views is not None:
                         (checkpoint_dir / PRETRAINED_MODEL_DIR / "semantic_views.json").write_bytes(
                             semantic_views.path.read_bytes()
+                        )
+                    if dataset_split_manifest is not None:
+                        (checkpoint_dir / PRETRAINED_MODEL_DIR / "dataset_split.json").write_text(
+                            json.dumps(dataset_split_manifest, indent=2) + "\n"
+                        )
+                    if profile_audit is not None:
+                        (checkpoint_dir / PRETRAINED_MODEL_DIR / "training_profile_audit.json").write_text(
+                            json.dumps(profile_audit, indent=2) + "\n"
                         )
                     update_last_checkpoint(checkpoint_dir)
 

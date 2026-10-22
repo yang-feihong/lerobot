@@ -1,0 +1,522 @@
+{
+  "format": "lerobot.training_profile",
+  "version": 1,
+  "memory_mode": "full_mem",
+  "global_batch_size": 48,
+  "reference_run": "20261008_105151_mem_pi05_b2_z1_vla_training_job_staff1_stage2_full_mem_arm_mode_complete",
+  "policy": {
+    "action_bool_balance_eps": 0.001,
+    "action_bool_loss_weight": 4,
+    "action_bool_true_fractions": {
+      "arm_reset": 0,
+      "arm_teleop_inactive": 0.22720016531389314,
+      "task_blocked": 0,
+      "task_complete": 0.21946209749906279
+    },
+    "action_continuous_group_weight": 3,
+    "action_continuous_loss_weight": 1,
+    "action_discrete_group_weight": 1,
+    "action_dt_seconds": 0.02,
+    "action_expert_variant": "gemma_300m",
+    "action_feature_names": [
+      "b2_delta_x",
+      "b2_delta_y",
+      "b2_delta_yaw",
+      "arm_teleop_inactive",
+      "arm_reset",
+      "height_invariant_ee_delta_rotvec_x",
+      "height_invariant_ee_delta_rotvec_y",
+      "height_invariant_ee_delta_rotvec_z",
+      "height_invariant_ee_delta_x",
+      "height_invariant_ee_delta_y",
+      "height_invariant_ee_delta_z",
+      "gripper_target",
+      "task_complete"
+    ],
+    "action_gripper_negative_value": -1.0471976,
+    "action_gripper_nonnegative_value": 0,
+    "action_gripper_target_true_side": "negative",
+    "action_history_enabled": false,
+    "action_loss_schema": "group_balanced_v2",
+    "action_masked_continuous_min_weight": 0,
+    "action_predict_arm_reset": true,
+    "action_predict_arm_teleop_inactive": true,
+    "action_predict_ee_pose": true,
+    "action_predict_gripper": true,
+    "action_predict_task_blocked": false,
+    "action_predict_task_complete": true,
+    "action_supervise_terminal_static_padding": true,
+    "b2_action_representation": "pose_delta",
+    "b2_global_pose_state_indices": null,
+    "chunk_size": 50,
+    "compile_mode": "max-autotune",
+    "compile_model": false,
+    "control_frequency_hz": 50,
+    "dataset_action_feature_names": [
+      "b2_vx",
+      "b2_vy",
+      "b2_omega_z",
+      "arm_teleop_inactive",
+      "arm_reset",
+      "height_invariant_ee_rot6d_col0_x",
+      "height_invariant_ee_rot6d_col0_y",
+      "height_invariant_ee_rot6d_col0_z",
+      "height_invariant_ee_rot6d_col1_x",
+      "height_invariant_ee_rot6d_col1_y",
+      "height_invariant_ee_rot6d_col1_z",
+      "height_invariant_ee_x",
+      "height_invariant_ee_y",
+      "height_invariant_ee_z",
+      "gripper_target",
+      "task_complete",
+      "control_height_invariant_ee_rot6d_col0_x",
+      "control_height_invariant_ee_rot6d_col0_y",
+      "control_height_invariant_ee_rot6d_col0_z",
+      "control_height_invariant_ee_rot6d_col1_x",
+      "control_height_invariant_ee_rot6d_col1_y",
+      "control_height_invariant_ee_rot6d_col1_z",
+      "control_height_invariant_ee_x",
+      "control_height_invariant_ee_y",
+      "control_height_invariant_ee_z"
+    ],
+    "dataset_camera_keys": [
+      "observation.images.base_0_rgb",
+      "observation.images.left_wrist_0_rgb"
+    ],
+    "dataset_frequency_hz": 50,
+    "dataset_state_feature_names": [
+      "arm_q_1",
+      "arm_q_2",
+      "arm_q_3",
+      "arm_q_4",
+      "arm_q_5",
+      "arm_q_6",
+      "arm_qd_1",
+      "arm_qd_2",
+      "arm_qd_3",
+      "arm_qd_4",
+      "arm_qd_5",
+      "arm_qd_6",
+      "arm_gripper_feedback",
+      "b2_joint_pos_FR_hip",
+      "b2_joint_pos_FR_thigh",
+      "b2_joint_pos_FR_calf",
+      "b2_joint_pos_FL_hip",
+      "b2_joint_pos_FL_thigh",
+      "b2_joint_pos_FL_calf",
+      "b2_joint_pos_RR_hip",
+      "b2_joint_pos_RR_thigh",
+      "b2_joint_pos_RR_calf",
+      "b2_joint_pos_RL_hip",
+      "b2_joint_pos_RL_thigh",
+      "b2_joint_pos_RL_calf",
+      "b2_joint_vel_FR_hip",
+      "b2_joint_vel_FR_thigh",
+      "b2_joint_vel_FR_calf",
+      "b2_joint_vel_FL_hip",
+      "b2_joint_vel_FL_thigh",
+      "b2_joint_vel_FL_calf",
+      "b2_joint_vel_RR_hip",
+      "b2_joint_vel_RR_thigh",
+      "b2_joint_vel_RR_calf",
+      "b2_joint_vel_RL_hip",
+      "b2_joint_vel_RL_thigh",
+      "b2_joint_vel_RL_calf",
+      "b2_trunk_roll",
+      "b2_trunk_pitch",
+      "b2_body_height",
+      "b2_position_x",
+      "b2_position_y",
+      "b2_yaw",
+      "b2_body_vx",
+      "b2_body_vy",
+      "b2_body_vz",
+      "b2_body_wx",
+      "b2_body_wy",
+      "b2_body_wz",
+      "height_invariant_ee_state_rot6d_col0_x",
+      "height_invariant_ee_state_rot6d_col0_y",
+      "height_invariant_ee_state_rot6d_col0_z",
+      "height_invariant_ee_state_rot6d_col1_x",
+      "height_invariant_ee_state_rot6d_col1_y",
+      "height_invariant_ee_state_rot6d_col1_z",
+      "height_invariant_ee_state_x",
+      "height_invariant_ee_state_y",
+      "height_invariant_ee_state_z"
+    ],
+    "device": "cuda:0",
+    "discrete_action_training_mode": "continuous_flow",
+    "dtype": "bfloat16",
+    "ee_delta_rotation_representation": "rotvec",
+    "ee_delta_supervision_mode": "all",
+    "ee_state_anchor_indices": [
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57
+    ],
+    "ee_supervision_source": "control_action",
+    "ee_target_dataset_semantics": "joint_control_inactive_interpolated",
+    "empty_cameras": 0,
+    "freeze_vision_encoder": false,
+    "gradient_checkpointing": true,
+    "gripper_target_representation": "continuous_position",
+    "image_resolution": [
+      224,
+      224
+    ],
+    "input_features": {
+      "observation.images.base_0_rgb": {
+        "shape": [
+          3,
+          640,
+          480
+        ],
+        "type": "VISUAL"
+      },
+      "observation.images.left_wrist_0_rgb": {
+        "shape": [
+          3,
+          480,
+          640
+        ],
+        "type": "VISUAL"
+      },
+      "observation.state": {
+        "shape": [
+          19
+        ],
+        "type": "STATE"
+      }
+    },
+    "io_schema_resolved": true,
+    "license": null,
+    "lr_scheduler_type": "constant_with_warmup",
+    "max_action_dim": 32,
+    "max_period": 4,
+    "max_state_dim": 32,
+    "mem_vit_artifact_id": "mem_vit_distill_20260716_142702",
+    "mem_vit_base_weights_embedded": false,
+    "mem_vit_checkpoint": "artifact://mem_vit_distill_20260716_142702",
+    "mem_vit_embedded_tensor_count": 0,
+    "mem_vit_enabled": true,
+    "mem_vit_finetune_mode": "lora",
+    "mem_vit_frame_interval_seconds": 0.5,
+    "mem_vit_frame_stride": 25,
+    "mem_vit_global_interval_std_seconds": 0.15,
+    "mem_vit_local_interval_std_seconds": 0.05,
+    "mem_vit_max_interval_seconds": 1,
+    "mem_vit_max_num_frames": 6,
+    "mem_vit_min_interval_seconds": 0.25,
+    "mem_vit_min_num_frames": 1,
+    "mem_vit_num_frames": 6,
+    "mem_vit_random_interval_sampling": true,
+    "mem_vit_sha256": "6680f3dc4a521c25afb1413527335ab282bf80deda5fca237d1acd8cfae6f017",
+    "mem_vit_temporal_every": 4,
+    "mem_vit_use_original_for_k1": true,
+    "min_period": 0.004,
+    "n_action_steps": 25,
+    "n_obs_steps": 1,
+    "new_module_optimizer_lr_multiplier": 40,
+    "normalization_mapping": {
+      "ACTION": "QUANTILES",
+      "STATE": "QUANTILES",
+      "VISUAL": "IDENTITY"
+    },
+    "num_inference_steps": 10,
+    "optimizer_betas": [
+      0.9,
+      0.95
+    ],
+    "optimizer_eps": 1e-8,
+    "optimizer_grad_clip_norm": 1,
+    "optimizer_lr": 0.000025,
+    "optimizer_weight_decay": 0.01,
+    "output_features": {
+      "action": {
+        "shape": [
+          13
+        ],
+        "type": "ACTION"
+      }
+    },
+    "paligemma_variant": "gemma_2b",
+    "peft_train_active_modules_only": true,
+    "policy_base_artifact_id": "lerobot_pi05_base_local_tokenizer_v1",
+    "policy_base_sha256": "0eb11ca9587678c1d2ef8cf32807c29f8ce53a2bfdfc1aa4a4c96f16fca59b0f",
+    "policy_tokenizer_artifact_id": "google_paligemma_3b_pt_224_tokenizer_v1",
+    "policy_tokenizer_sha256": "25210485649dfd698c80c4d0e737326b0ffcead7086968d4c7e0faf71cb21bb5",
+    "pretrained_path": "artifact://lerobot_pi05_base_local_tokenizer_v1",
+    "pretrained_revision": null,
+    "private": null,
+    "push_to_hub": false,
+    "relative_exclude_joints": [
+      "gripper"
+    ],
+    "repo_id": null,
+    "resolved_state_feature_names": [
+      "arm_q_1",
+      "arm_q_2",
+      "arm_q_3",
+      "arm_q_4",
+      "arm_q_5",
+      "arm_q_6",
+      "arm_gripper_feedback",
+      "b2_trunk_roll",
+      "b2_trunk_pitch",
+      "b2_body_height",
+      "height_invariant_ee_state_rot6d_col0_x",
+      "height_invariant_ee_state_rot6d_col0_y",
+      "height_invariant_ee_state_rot6d_col0_z",
+      "height_invariant_ee_state_rot6d_col1_x",
+      "height_invariant_ee_state_rot6d_col1_y",
+      "height_invariant_ee_state_rot6d_col1_z",
+      "height_invariant_ee_state_x",
+      "height_invariant_ee_state_y",
+      "height_invariant_ee_state_z"
+    ],
+    "rtc_config": null,
+    "scheduler_decay_lr": 0.0000025,
+    "scheduler_decay_steps": 30000,
+    "scheduler_warmup_steps": 1000,
+    "semantic_state_instruction_matrix": {
+      "handle_press": {
+        "goal_open": {
+          "action_supervision": "demonstrated",
+          "completion_boundary": "goal_end",
+          "status": "active"
+        }
+      }
+    },
+    "semantic_view_kind_weights": {},
+    "semantic_view_manifest_sha256": "0546bbe452c47ba7a254a90258175f1c6b6dc96a690948adb8d8da5969a94f92",
+    "semantic_view_manifest_version": 1,
+    "state_action_encoding": "continuous",
+    "state_feature_indices": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      12,
+      37,
+      38,
+      39,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57
+    ],
+    "state_history_frame_interval_seconds": 0.04,
+    "state_history_frame_stride": 2,
+    "state_num_frames": 13,
+    "state_use_arm_gripper_feedback": true,
+    "state_use_arm_joint_positions": true,
+    "state_use_arm_joint_velocities": false,
+    "state_use_b2_angular_velocity": false,
+    "state_use_b2_joint_positions": false,
+    "state_use_b2_joint_velocities": false,
+    "state_use_b2_linear_velocity": false,
+    "state_use_b2_trunk_pose": true,
+    "structured_action_crf_initial_stay_bias": 4,
+    "tags": null,
+    "task_complete_sample_tail_seconds": 2,
+    "time_sampling_beta_alpha": 1.5,
+    "time_sampling_beta_beta": 1,
+    "time_sampling_offset": 0.001,
+    "time_sampling_scale": 0.999,
+    "tokenizer_max_length": 200,
+    "train_expert_only": false,
+    "training_rtc_config": {
+      "delay_distribution": "uniform",
+      "enabled": false,
+      "simulated_delay": 16
+    },
+    "type": "pi05",
+    "use_amp": false,
+    "use_peft": true,
+    "use_relative_actions": false,
+    "z1_action_representation": "ee_state_delta"
+  },
+  "training": {
+    "batch_size": 2,
+    "cudnn_deterministic": false,
+    "dataset_mixture_sampling": {
+      "enabled": false,
+      "manifest_path": null
+    },
+    "env": null,
+    "env_eval_freq": 0,
+    "eval": {
+      "batch_size": 50,
+      "n_episodes": 50,
+      "recording": false,
+      "recording_private": false,
+      "recording_repo_id": null,
+      "use_async_envs": true
+    },
+    "eval_steps": 500,
+    "gradient_accumulation_steps": 6,
+    "keep_checkpoint_every_n_steps": 10000,
+    "keep_last_checkpoints": 2,
+    "log_freq": 10,
+    "max_eval_samples": 512,
+    "motion_balanced_sampling": {
+      "ee_rotation_threshold_rad": 0.17453292519943295,
+      "ee_translation_threshold_m": 0.05,
+      "enabled": false,
+      "gripper_change_threshold": 0.5,
+      "priority_fraction": 0.5
+    },
+    "num_workers": 4,
+    "optimizer": {
+      "betas": [
+        0.9,
+        0.95
+      ],
+      "eps": 1e-8,
+      "grad_clip_norm": 1,
+      "lr": 0.000025,
+      "type": "adamw",
+      "weight_decay": 0.01
+    },
+    "peft": {
+      "full_training_modules": null,
+      "init_type": null,
+      "lora_alpha": 32,
+      "method_type": "LORA",
+      "r": 16,
+      "target_modules": null
+    },
+    "persistent_workers": true,
+    "physical_eval_samples": 96,
+    "prefetch_factor": 4,
+    "rename_map": {},
+    "reward_model": null,
+    "sample_weighting": null,
+    "save_checkpoint": true,
+    "save_checkpoint_to_hub": false,
+    "save_freq": 500,
+    "scheduler": {
+      "num_warmup_steps": 1000,
+      "type": "constant_with_warmup"
+    },
+    "seed": 1000,
+    "static_horizon_sampling": {
+      "b2_tolerance": 0.000001,
+      "enabled": true,
+      "gripper_tolerance": 0.000001,
+      "interior_weight": 0,
+      "terminal_weight": 1
+    },
+    "tolerance_s": 0.0001,
+    "use_policy_training_preset": true
+  },
+  "dataset": {
+    "depth_output_unit": "mm",
+    "eval_split": 0.1,
+    "eval_task_variant": false,
+    "image_source": "real",
+    "image_source_seed": 1000,
+    "image_transforms": {
+      "enable": false,
+      "max_num_transforms": 3,
+      "random_order": false,
+      "tfs": {
+        "affine": {
+          "kwargs": {
+            "degrees": [
+              -5,
+              5
+            ],
+            "translate": [
+              0.05,
+              0.05
+            ]
+          },
+          "type": "RandomAffine",
+          "weight": 1
+        },
+        "brightness": {
+          "kwargs": {
+            "brightness": [
+              0.8,
+              1.2
+            ]
+          },
+          "type": "ColorJitter",
+          "weight": 1
+        },
+        "contrast": {
+          "kwargs": {
+            "contrast": [
+              0.8,
+              1.2
+            ]
+          },
+          "type": "ColorJitter",
+          "weight": 1
+        },
+        "hue": {
+          "kwargs": {
+            "hue": [
+              -0.05,
+              0.05
+            ]
+          },
+          "type": "ColorJitter",
+          "weight": 1
+        },
+        "saturation": {
+          "kwargs": {
+            "saturation": [
+              0.5,
+              1.5
+            ]
+          },
+          "type": "ColorJitter",
+          "weight": 1
+        },
+        "sharpness": {
+          "kwargs": {
+            "sharpness": [
+              0.5,
+              1.5
+            ]
+          },
+          "type": "SharpnessJitter",
+          "weight": 1
+        }
+      }
+    },
+    "mixed_sim_probability": 0.5,
+    "random_semantic_view": true,
+    "random_task_variant": true,
+    "return_uint8": false,
+    "revision": null,
+    "semantic_source_weights": {},
+    "semantic_view_kind_weights": {},
+    "sim_image_manifest": null,
+    "sim_image_root": null,
+    "streaming": false,
+    "task_variants_path": null,
+    "use_imagenet_stats": true,
+    "video_backend": "pyav",
+    "semantic_exclude_incomplete_static_starts": true
+  },
+  "adapter_schema": {
+    "tensor_count": 791,
+    "sha256": "c030c6692baa97ad124990ffb794c92e4e3a4ff3b38edfe190b483dfdd2f207f"
+  }
+}

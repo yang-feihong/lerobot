@@ -65,6 +65,8 @@ class EpisodeAwareSampler:
         eligible_frame_indices: list[int] | np.ndarray | None = None,
         sampling_group_frame_indices: list[list[int] | np.ndarray] | None = None,
         sampling_group_weights: list[float] | None = None,
+        sampling_group_labels: list[str] | None = None,
+        sampling_group_frame_weights: list[np.ndarray] | None = None,
     ):
         """
         Args:
@@ -175,17 +177,57 @@ class EpisodeAwareSampler:
                 raise ValueError("static-horizon weights remove every eligible frame")
             self._sampling_weights = weights
         if sampling_group_frame_indices is not None and source_episode_indices is not None:
-            raise ValueError(
-                "semantic frame-group sampling and episode-source sampling cannot be combined"
-            )
+            raise ValueError("semantic frame-group sampling and episode-source sampling cannot be combined")
         if sampling_group_frame_indices is not None and priority_fraction > 0.0:
-            raise ValueError(
-                "semantic frame-group sampling and motion-priority sampling cannot be combined"
-            )
+            raise ValueError("semantic frame-group sampling and motion-priority sampling cannot be combined")
         self._source_positions = self._resolve_source_positions(source_episode_indices, source_weights)
+        self._sampling_group_labels = sampling_group_labels
         self._sampling_group_positions = self._resolve_sampling_group_positions(
             sampling_group_frame_indices, sampling_group_weights
         )
+        self._sampling_group_frame_weights = None
+        if sampling_group_labels is not None:
+            if not shuffle:
+                raise ValueError("Labeled relation sampling requires shuffle=True")
+            if self._explicit_indices is None or len(sampling_group_labels) != len(
+                self._sampling_group_positions
+            ):
+                raise ValueError(
+                    "Labeled relation sampling requires explicit eligible frames and one label per group"
+                )
+            if any(not isinstance(label, str) or not label for label in sampling_group_labels):
+                raise ValueError("Relation labels must be nonempty canonical instruction names")
+            for label in set(sampling_group_labels):
+                positions = np.concatenate(
+                    [
+                        pool
+                        for pool, name in zip(
+                            self._sampling_group_positions, sampling_group_labels, strict=True
+                        )
+                        if name == label
+                    ]
+                )
+                if len(np.unique(positions)) != len(positions):
+                    raise ValueError("Sampling groups duplicate the same frame/instruction pair")
+        if sampling_group_frame_weights is not None:
+            if self._explicit_indices is None:
+                raise ValueError("Weighted frame groups require explicit eligible frames")
+            if len(sampling_group_frame_weights) != len(self._sampling_group_positions):
+                raise ValueError("Frame weights must cover every sampling group")
+            self._sampling_group_frame_weights = []
+            for frames, weights, positions in zip(
+                sampling_group_frame_indices,
+                sampling_group_frame_weights,
+                self._sampling_group_positions,
+                strict=True,
+            ):
+                frames, weights = np.asarray(frames), np.asarray(weights, dtype=np.float64)
+                if frames.shape != weights.shape or not np.all(np.diff(frames) > 0):
+                    raise ValueError("Weighted relation frames must be unique and sorted")
+                selected = weights[np.searchsorted(frames, self._explicit_indices[positions])]
+                if not np.all(np.isfinite(selected)) or np.any(selected <= 0):
+                    raise ValueError("Relation frame weights must be finite and positive")
+                self._sampling_group_frame_weights.append(selected)
 
     def _resolve_sampling_group_positions(
         self,
@@ -207,9 +249,9 @@ class EpisodeAwareSampler:
         if any(len(group) == 0 for group in positions):
             raise ValueError("every semantic sampling group must contain at least one eligible frame")
         claimed = np.concatenate(positions)
-        if len(np.unique(claimed)) != len(claimed):
+        if self._sampling_group_labels is None and len(np.unique(claimed)) != len(claimed):
             raise ValueError("semantic sampling frame groups overlap")
-        if len(claimed) != self._num_frames:
+        if len(np.unique(claimed)) != self._num_frames:
             raise ValueError("semantic sampling frame groups must partition every eligible frame")
         return positions
 
@@ -323,18 +365,25 @@ class EpisodeAwareSampler:
     def _sampling_group_order(self, generator: torch.Generator) -> torch.Tensor:
         counts = self._weighted_counts(self._num_frames, self.sampling_group_weights)
         parts = []
-        for pool, count in zip(self._sampling_group_positions, counts, strict=True):
+        for group_index, (pool, count) in enumerate(zip(self._sampling_group_positions, counts, strict=True)):
             tensor_pool = torch.from_numpy(pool)
-            if self._sampling_weights is None:
-                parts.append(self._draw_from_pool(tensor_pool, int(count), generator))
-                continue
-            selected = torch.multinomial(
-                torch.from_numpy(self._sampling_weights[pool]),
-                int(count),
-                replacement=True,
-                generator=generator,
+            weights = (
+                self._sampling_group_frame_weights[group_index]
+                if self._sampling_group_frame_weights is not None
+                else None
+                if self._sampling_weights is None
+                else self._sampling_weights[pool]
             )
-            parts.append(tensor_pool[selected])
+            if weights is None or (weights[0] > 0 and np.all(weights == weights[0])):
+                chosen = self._draw_from_pool(tensor_pool, int(count), generator)
+            else:
+                selected = torch.multinomial(
+                    torch.from_numpy(weights), int(count), replacement=True, generator=generator
+                )
+                chosen = tensor_pool[selected]
+            if self._sampling_group_labels is not None:
+                chosen = torch.stack((chosen, torch.full_like(chosen, group_index)), dim=1)
+            parts.append(chosen)
         combined = torch.cat(parts)
         return combined[torch.randperm(len(combined), generator=generator)]
 
@@ -397,14 +446,14 @@ class EpisodeAwareSampler:
             return self._absolute_to_relative[absolute_idx]
         return absolute_idx
 
-    def __iter__(self) -> Iterator[int]:
+    def __iter__(self) -> Iterator[int | tuple[int, str]]:
         # Advance epoch state eagerly, not on first consumption of the generator.
         epoch, start = self._epoch, self._start_index
         self._epoch += 1
         self._start_index = 0
         return self._iter_epoch(epoch, start)
 
-    def _iter_epoch(self, epoch: int, start: int) -> Iterator[int]:
+    def _iter_epoch(self, epoch: int, start: int) -> Iterator[int | tuple[int, str]]:
         if self.shuffle:
             generator = self._epoch_generator(epoch)
             if self._sampling_group_positions is not None:
@@ -437,7 +486,10 @@ class EpisodeAwareSampler:
                 combined = torch.cat((uniform, priority))
                 order = combined[torch.randperm(self._num_frames, generator=generator)]
             for k in range(start, self._num_frames):
-                yield self._frame_index(int(order[k]))
+                if self._sampling_group_labels is None:
+                    yield self._frame_index(int(order[k]))
+                else:
+                    yield self._frame_index(int(order[k, 0])), self._sampling_group_labels[int(order[k, 1])]
         else:
             for k in range(start, self._num_frames):
                 yield self._frame_index(k)

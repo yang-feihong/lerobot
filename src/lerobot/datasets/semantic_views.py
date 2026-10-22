@@ -5,14 +5,16 @@ instructions are meaningful for an episode and whether their action target is
 the recorded demonstration or a deterministic hold.  Sampling is hierarchical:
 the dataloader first chooses a physical frame, this module chooses one view,
 then it chooses one language realization.  Adding paraphrases therefore never
-changes a physical sample's probability.
+changes a physical sample's probability. Matrix-based training chooses the
+state/instruction cell before the physical frame and carries that intent through
+the dataloader; legacy frame-only sampling remains available without a matrix.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -62,9 +64,78 @@ class SemanticViewCatalog:
     semantic_names: tuple[str, ...]
     selected_episodes: tuple[int, ...] | None
     segments: dict[int, tuple[SemanticSegment, ...]]
+    recording_ids: dict[int, str] = field(default_factory=dict)
     # Runtime train-split index only; never written into the dataset sidecar.
     static_first_action_frames: frozenset[tuple[int, int]] | None = None
     recorded_complete_frames: frozenset[tuple[int, int]] = frozenset()
+    eligible_start_ranges: dict[int, tuple[tuple[int, int], ...]] | None = None
+    physical_segments: dict[int, tuple[SemanticSegment, ...]] | None = None
+    valid_frame_ranges: dict[int, tuple[tuple[int, int], ...]] | None = None
+    episode_lengths: dict[int, int] | None = None
+    future_action_frames: int = 0
+
+
+def with_semantic_temporal_filter(catalog: SemanticViewCatalog, dataset) -> SemanticViewCatalog:
+    """Index legal input/target windows without requiring unrelated stages or goals."""
+    reader = dataset.reader
+    random_history = reader._random_history_sampling
+    random_keys = set() if random_history is None else set(random_history.keys)
+    fixed_offsets = [
+        offset
+        for key, offsets in (reader.delta_indices or {}).items()
+        if key not in random_keys
+        for offset in offsets
+    ]
+    past = max(0, -min(fixed_offsets, default=0))
+    future = max(
+        0,
+        max(
+            (
+                offset
+                for key, offsets in (reader.delta_indices or {}).items()
+                if key != ACTION and key not in random_keys
+                for offset in offsets
+            ),
+            default=0,
+        ),
+    )
+    action_future = max(0, max((reader.delta_indices or {}).get(ACTION, [0])))
+    if random_history is not None:
+        past = max(past, random_history.minimum_span_frames)
+    valid_ranges = {}
+    eligible = {}
+    episode_lengths = {}
+    for episode in dataset.episodes or range(dataset.meta.total_episodes):
+        row = dataset.meta.episodes[episode]
+        length = int(row["dataset_to_index"]) - int(row["dataset_from_index"])
+        episode_lengths[episode] = length
+        components = []
+        physical = catalog.segments if catalog.physical_segments is None else catalog.physical_segments
+        for segment in sorted(physical.get(episode, ()), key=lambda s: s.frame_start):
+            if not 0 <= segment.frame_start < segment.frame_stop <= length:
+                raise ValueError(f"semantic segment exceeds physical episode {episode}")
+            if components and segment.frame_start < components[-1][1]:
+                raise ValueError(f"Overlapping physical stage ranges in episode {episode}")
+            if components and components[-1][1] == segment.frame_start:
+                components[-1] = (components[-1][0], segment.frame_stop)
+            else:
+                components.append((segment.frame_start, segment.frame_stop))
+        valid_ranges[episode] = tuple(components)
+        eligible[episode] = tuple(
+            (left, right)
+            for start, stop in components
+            for left, right in [(start + (past if start else 0), stop - (future if stop < length else 0))]
+            if left < right
+        )
+    result = replace(
+        catalog,
+        eligible_start_ranges=eligible,
+        valid_frame_ranges=valid_ranges,
+        episode_lengths=episode_lengths,
+        future_action_frames=action_future,
+    )
+    reader.set_valid_frame_ranges(valid_ranges, catalog=result)
+    return result
 
 
 def with_incomplete_static_start_filter(catalog: SemanticViewCatalog, dataset) -> SemanticViewCatalog:
@@ -84,38 +155,60 @@ def with_incomplete_static_start_filter(catalog: SemanticViewCatalog, dataset) -
         actions = np.asarray(batch[ACTION])
         episodes = np.asarray(batch["episode_index"])
         frames = np.asarray(batch["frame_index"])
-        static = (actions[:, b2] == 0.0).all(axis=1) & (actions[:, inactive] >= .5)
+        static = (actions[:, b2] == 0.0).all(axis=1) & (actions[:, inactive] >= 0.5)
         static_frames.update(zip(episodes[static].tolist(), frames[static].tolist(), strict=True))
-        done = actions[:, complete] >= .5
+        done = actions[:, complete] >= 0.5
         complete_frames.update(zip(episodes[done].tolist(), frames[done].tolist(), strict=True))
-    return replace(catalog, static_first_action_frames=frozenset(static_frames),
-                   recorded_complete_frames=frozenset(complete_frames))
-
-
-def semantic_view_start_allowed(catalog: SemanticViewCatalog, view: SemanticView, episode: int, frame: int) -> bool:
-    """Decide eligibility from this instruction's final first-step supervision."""
-    if catalog.static_first_action_frames is None:
-        return True
-    complete = view.status == "complete" or (
-        view.completion_frame is not None and frame >= view.completion_frame
-    ) or (
-        view.completion_frame is None and view.completion_source == "recorded"
-        and (episode, frame) in catalog.recorded_complete_frames
+    return replace(
+        catalog,
+        static_first_action_frames=frozenset(static_frames),
+        recorded_complete_frames=frozenset(complete_frames),
     )
-    if complete:
+
+
+def semantic_view_start_allowed(
+    catalog: SemanticViewCatalog, view: SemanticView, episode: int, frame: int
+) -> bool:
+    """Decide eligibility from this instruction's final first-step supervision."""
+    if catalog.eligible_start_ranges is not None and not any(
+        start <= frame < stop for start, stop in catalog.eligible_start_ranges.get(episode, ())
+    ):
+        return False
+    complete = (
+        view.status == "complete"
+        or (view.completion_frame is not None and frame >= view.completion_frame)
+        or (
+            view.completion_frame is None
+            and view.completion_source == "recorded"
+            and (episode, frame) in catalog.recorded_complete_frames
+        )
+    )
+    if catalog.valid_frame_ranges is not None:
+        component_stop = next(
+            stop for start, stop in catalog.valid_frame_ranges[episode] if start <= frame < stop
+        )
+        last_teacher = (
+            frame if complete or view.action_supervision == "hold" else frame + catalog.future_action_frames
+        )
+        if view.completion_frame is not None and not complete:
+            last_teacher = min(last_teacher, view.completion_frame - 1)
+        if component_stop < catalog.episode_lengths[episode] and last_teacher >= component_stop:
+            return False
+    if catalog.static_first_action_frames is None or complete:
         return True
     return view.action_supervision != "hold" and (episode, frame) not in catalog.static_first_action_frames
 
 
 def semantic_sample_views(catalog, episode, frame, state_instruction_matrix=None):
     """Shared pre-sampling and materialization eligibility, with schema errors kept explicit."""
-    views = tuple(view for view in catalog.episodes.get(episode, ())
-                  if view.frame_start is None or view.frame_start <= frame < view.frame_stop)
+    views = tuple(
+        view
+        for view in catalog.episodes.get(episode, ())
+        if view.frame_start is None or view.frame_start <= frame < view.frame_stop
+    )
     if state_instruction_matrix:
         state = semantic_state_for_frame(catalog, episode, frame, state_instruction_matrix)
         views = tuple(v for v in views if semantic_view_matches_relation(v, state, state_instruction_matrix))
-    if not views:
-        raise ValueError(f"semantic-view sidecar has no enabled relation at episode={episode}, frame={frame}")
     return tuple(v for v in views if semantic_view_start_allowed(catalog, v, episode, frame))
 
 
@@ -211,6 +304,22 @@ def load_semantic_views(path: str | Path) -> SemanticViewCatalog:
             raise ValueError("selected_episodes contains duplicates")
         if set(selected_episodes) != set(parsed):
             raise ValueError("selected_episodes must exactly match semantic-view episode keys")
+    physical_segments = None
+    boundaries_path = path.parent / "stage_boundaries.json"
+    if boundaries_path.is_file():
+        boundaries = json.loads(boundaries_path.read_text())
+        physical_segments = {}
+        for episode_key, entry in boundaries["episodes"].items():
+            physical_segments[int(episode_key)] = tuple(
+                SemanticSegment(
+                    phase,
+                    int(definition["frame_start"]),
+                    int(definition["frame_stop"]),
+                    str(definition["source_group"]),
+                )
+                for phase, definition in entry["phases"].items()
+                if definition["selected"]
+            )
     return SemanticViewCatalog(
         path,
         parsed,
@@ -219,6 +328,12 @@ def load_semantic_views(path: str | Path) -> SemanticViewCatalog:
         semantic_names,
         selected_episodes,
         parsed_segments,
+        recording_ids={
+            int(key): episode["recording_id"] if "recording_id" in episode else episode["source_path"]
+            for key, episode in episodes.items()
+            if "recording_id" in episode or "source_path" in episode
+        },
+        physical_segments=physical_segments,
     )
 
 
@@ -263,13 +378,25 @@ def semantic_phase_sampling_groups(
                 continue
             offset = int(episode_from_indices[episode])
             frames = np.arange(segment.frame_start, segment.frame_stop, dtype=np.int64)
-            if catalog.static_first_action_frames is not None:
-                frames = np.asarray([
-                    frame for frame in frames if any(
-                        view.weight * (1.0 if state_instruction_matrix else _view_kind_weight(view_kind_weights, view.view_kind)) > 0
-                        for view in semantic_sample_views(catalog, episode, int(frame), state_instruction_matrix)
+            frames = np.asarray(
+                [
+                    frame
+                    for frame in frames
+                    if any(
+                        view.weight
+                        * (
+                            1.0
+                            if state_instruction_matrix
+                            else _view_kind_weight(view_kind_weights, view.view_kind)
+                        )
+                        > 0
+                        for view in semantic_sample_views(
+                            catalog, episode, int(frame), state_instruction_matrix
+                        )
                     )
-                ], dtype=np.int64)
+                ],
+                dtype=np.int64,
+            )
             if len(frames):
                 pools.setdefault((segment.phase, segment.source_group), []).append(offset + frames)
     missing = [phase for phase in phases if not any(key[0] == phase for key in pools)]
@@ -317,6 +444,178 @@ def _choice_index(weights: list[float], token: bytes) -> int:
         if point < cumulative:
             return index
     return len(weights) - 1
+
+
+@dataclass(frozen=True)
+class SemanticRelationSampling:
+    eligible_frames: np.ndarray
+    frame_groups: list[np.ndarray]
+    group_weights: list[float]
+    states: list[str]
+    intents: list[str]
+    names: list[str]
+    frame_weights: list[np.ndarray]
+    episode_from_indices: np.ndarray
+
+
+def semantic_relation_sampling_groups(
+    catalog,
+    episode_from_indices,
+    selected_episodes,
+    *,
+    state_instruction_matrix,
+    phase_weights=None,
+    source_weights=None,
+    interior_static_frames=(),
+    terminal_static_frames=(),
+    interior_static_weight=1.0,
+    terminal_static_weight=1.0,
+) -> SemanticRelationSampling:
+    """Choose a state/instruction cell first, independently of its eligible frame count."""
+    phase_weights = phase_weights or dict.fromkeys(state_instruction_matrix, 1.0)
+    source_weights = source_weights or {}
+    if set(phase_weights) != set(state_instruction_matrix):
+        raise ValueError("State weights must match the configured relation matrix")
+    if any(not np.isfinite(w) or w <= 0 for w in (*phase_weights.values(), *source_weights.values())):
+        raise ValueError("Relation/source weights must be finite and positive")
+    if (
+        not 0 <= interior_static_weight <= 1
+        or not np.isfinite(terminal_static_weight)
+        or terminal_static_weight <= 0
+    ):
+        raise ValueError("Invalid static-horizon weights")
+    interior, terminal = set(interior_static_frames), set(terminal_static_frames)
+    pools = {}
+    for episode in selected_episodes:
+        offset = int(episode_from_indices[episode])
+        for segment in catalog.segments.get(episode, ()):
+            if segment.phase not in state_instruction_matrix:
+                continue
+            for view in catalog.episodes.get(episode, ()):
+                if view.weight <= 0 or not semantic_view_matches_relation(
+                    view, segment, state_instruction_matrix
+                ):
+                    continue
+                start = max(
+                    segment.frame_start, segment.frame_start if view.frame_start is None else view.frame_start
+                )
+                stop = min(
+                    segment.frame_stop, segment.frame_stop if view.frame_stop is None else view.frame_stop
+                )
+                frames, weights = [], []
+                for frame in range(start, stop):
+                    if not semantic_view_start_allowed(catalog, view, episode, frame):
+                        continue
+                    absolute = offset + frame
+                    complete = view.status == "complete" or (
+                        view.completion_frame is not None and frame >= view.completion_frame
+                    )
+                    weight = (
+                        terminal_static_weight
+                        if absolute in terminal
+                        else (interior_static_weight if absolute in interior and not complete else 1.0)
+                    )
+                    if weight > 0:
+                        frames.append(absolute)
+                        weights.append(weight)
+                if frames:
+                    key = (segment.phase, view.canonical_intent, segment.source_group)
+                    pools.setdefault(key, []).append(
+                        (np.asarray(frames, dtype=np.int64), np.asarray(weights))
+                    )
+    groups, frame_weights, group_weights, states, intents, names = [], [], [], [], [], []
+    if source_weights and set(source_weights) != {source for _, _, source in pools}:
+        raise ValueError("Source weights must match eligible physical source groups")
+    phase_total = sum(
+        phase_weights[state] * len(instructions) for state, instructions in state_instruction_matrix.items()
+    )
+    for state, instructions in state_instruction_matrix.items():
+        for intent in instructions:
+            sources = sorted(source for phase, goal, source in pools if phase == state and goal == intent)
+            if not sources:
+                raise ValueError(
+                    f"Configured state/instruction cell has no eligible samples: {state} x {intent}"
+                )
+            source_sets = [[source] for source in sources] if source_weights else [sources]
+            source_masses = [source_weights[source] for source in sources] if source_weights else [1.0]
+            for sources_in_group, mass in zip(source_sets, source_masses, strict=True):
+                parts = [part for source in sources_in_group for part in pools[(state, intent, source)]]
+                frames = np.concatenate([part[0] for part in parts])
+                weights = np.concatenate([part[1] for part in parts])
+                order = np.argsort(frames)
+                frames, weights = frames[order], weights[order]
+                if len(np.unique(frames)) != len(frames):
+                    raise ValueError(f"Duplicate supervision in {state} x {intent}")
+                groups.append(frames)
+                frame_weights.append(weights)
+                group_weights.append(phase_weights[state] / phase_total * mass / sum(source_masses))
+                states.append(state)
+                intents.append(intent)
+                names.append(f"{state}/{intent}/" + ("+".join(sources_in_group) if source_weights else "*"))
+    return SemanticRelationSampling(
+        np.unique(np.concatenate(groups)),
+        groups,
+        group_weights,
+        states,
+        intents,
+        names,
+        frame_weights,
+        np.asarray(episode_from_indices),
+    )
+
+
+def semantic_pair_probabilities(plan, state, intent, absolute_frames):
+    result = np.zeros(len(absolute_frames), dtype=np.float64)
+    for phase, goal, frames, weights, mass in zip(
+        plan.states, plan.intents, plan.frame_groups, plan.frame_weights, plan.group_weights, strict=True
+    ):
+        if (phase, goal) != (state, intent):
+            continue
+        positions = np.searchsorted(frames, absolute_frames)
+        safe = np.minimum(positions, len(frames) - 1)
+        present = (positions < len(frames)) & (frames[safe] == absolute_frames)
+        result[present] += mass * weights[safe[present]] / weights.sum()
+    return result
+
+
+def _relation_status_priors(catalog, plan, horizon):
+    result = {"task_complete": 0.0, "task_blocked": 0.0}
+    for intent, frames, weights, mass in zip(
+        plan.intents, plan.frame_groups, plan.frame_weights, plan.group_weights, strict=True
+    ):
+        episodes = np.searchsorted(plan.episode_from_indices, frames, side="right") - 1
+        for episode in np.unique(episodes):
+            selected = episodes == episode
+            local = frames[selected] - plan.episode_from_indices[episode]
+            probabilities = mass * weights[selected] / weights.sum()
+            covered = np.zeros(len(local), dtype=np.int64)
+            for view in catalog.episodes[int(episode)]:
+                if view.canonical_intent != intent:
+                    continue
+                mask = (
+                    np.ones(len(local), dtype=bool)
+                    if view.frame_start is None
+                    else (local >= view.frame_start) & (local < view.frame_stop)
+                )
+                covered += mask
+                if view.status == "complete":
+                    fraction = np.ones(mask.sum())
+                elif view.completion_frame is not None:
+                    distance = np.maximum(0, view.completion_frame - local[mask])
+                    first = (
+                        distance + catalog.action_stride_dataset_frames - 1
+                    ) // catalog.action_stride_dataset_frames
+                    fraction = 1.0 - np.minimum(first, horizon) / horizon
+                else:
+                    fraction = np.zeros(mask.sum())
+                result["task_complete"] += float(np.dot(probabilities[mask], fraction))
+                if view.status == "blocked":
+                    result["task_blocked"] += float(probabilities[mask].sum())
+            if not np.all(covered == 1):
+                raise ValueError(
+                    "Relation sampling plan must identify exactly one view per frame/instruction"
+                )
+    return result
 
 
 def _view_kind_weight(view_kind_weights: dict[str, float] | None, view_kind: str) -> float:
@@ -429,6 +728,7 @@ def apply_semantic_views_to_batch(
     if not isinstance(actions, torch.Tensor) or actions.ndim != 3:
         raise ValueError("semantic views require a batched temporal action tensor")
     tasks = list(batch.get("task", [""] * len(episode_values)))
+    sampled_intents = batch.pop("semantic_sampling_intent", None)
     blocked = torch.zeros(actions.shape[:2], dtype=actions.dtype, device=actions.device)
     counts = {"active": 0, "complete": 0, "blocked": 0, "hold": 0}
     semantic_names: list[str] = []
@@ -463,7 +763,12 @@ def apply_semantic_views_to_batch(
                 "semantic-view sidecar has no enabled state-instruction relation for "
                 f"episode={int(episode)}, frame={int(frame)}"
             )
-        views = tuple(view for view in views if semantic_view_start_allowed(catalog, view, int(episode), int(frame)))
+        views = tuple(
+            view
+            for view in views
+            if semantic_view_start_allowed(catalog, view, int(episode), int(frame))
+            and (sampled_intents is None or view.canonical_intent == sampled_intents[row])
+        )
         if not views:
             raise ValueError(
                 f"Sampler selected an excluded incomplete static start: episode={episode}, frame={frame}"
@@ -528,10 +833,13 @@ def semantic_status_priors(
     phases: list[str] | None = None,
     phase_weights: dict[str, float] | None = None,
     source_weights: dict[str, float] | None = None,
+    relation_sampling: SemanticRelationSampling | None = None,
 ) -> dict[str, float]:
     """Return expected per-action-element status priors under view sampling."""
     if action_horizon < 1:
         raise ValueError("action_horizon must be positive")
+    if relation_sampling is not None:
+        return _relation_status_priors(catalog, relation_sampling, action_horizon)
     group_expected: dict[tuple[str, str], dict[str, float]] = {}
     group_frames: dict[tuple[str, str], int] = {}
     for episode, length in episode_lengths.items():
@@ -562,18 +870,16 @@ def semantic_status_priors(
                     for view in views
                     if semantic_view_matches_relation(view, state, state_instruction_matrix)
                 ]
-                if not views:
-                    raise ValueError(
-                        "semantic state-instruction matrix requires at least one view at "
-                        f"episode={episode}, frame={frame}"
-                    )
                 weights = [view.weight for view in views]
             else:
                 weights = [
                     view.weight * _view_kind_weight(view_kind_weights, view.view_kind) for view in views
                 ]
-            allowed = [(view, weight) for view, weight in zip(views, weights, strict=True)
-                       if semantic_view_start_allowed(catalog, view, episode, frame)]
+            allowed = [
+                (view, weight)
+                for view, weight in zip(views, weights, strict=True)
+                if semantic_view_start_allowed(catalog, view, episode, frame)
+            ]
             if not allowed:
                 continue
             views, weights = zip(*allowed, strict=True)

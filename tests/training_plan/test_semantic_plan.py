@@ -9,9 +9,7 @@ MODULE_PATH = REPO_ROOT / "training_plan/semantic_plan.py"
 PRESETS_PATH = REPO_ROOT / "training_plan/semantic_training_presets.json"
 JOBS_PATH = REPO_ROOT / "training_plan/training_jobs.json"
 OBJECT_GRASP_JOBS_PATH = REPO_ROOT / "training_plan/object_grasp_training_jobs.json"
-ALL_SCENES_SIMULATION_JOBS_PATH = (
-    REPO_ROOT / "training_plan/all_scenes_simulation_fork_jobs.json"
-)
+ALL_SCENES_SIMULATION_JOBS_PATH = REPO_ROOT / "training_plan/all_scenes_simulation_fork_jobs.json"
 SPEC = importlib.util.spec_from_file_location("semantic_plan", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 semantic_plan = importlib.util.module_from_spec(SPEC)
@@ -79,6 +77,7 @@ def test_stage1_contract_is_explicit_and_validates_sidecar(tmp_path):
     task = semantic_plan.resolve_task(matrix, "all_scenes_stage1_full_mem")
     assert task["training_preset"] == "stage1_only"
     assert task["train_steps"] == 100_000
+    assert task["memory_mode"] == "full_mem"
     assert semantic_plan.state_weights(matrix, "all_scenes_stage1_full_mem") == {"approach": 1.0}
     assert semantic_plan.selected_matrix(matrix, "all_scenes_stage1_full_mem") == {
         "approach": {
@@ -96,9 +95,26 @@ def test_stage1_contract_is_explicit_and_validates_sidecar(tmp_path):
     ) == {"episodes": 1, "segments": 1, "frames": 10}
 
 
+def test_all_maintained_jobs_share_one_runtime_profile():
+    for path in (REPO_ROOT / "training_plan").glob("*jobs.json"):
+        plan = semantic_plan.load_plan(PRESETS_PATH, path)
+        for task_id, raw in plan["tasks"].items():
+            assert "memory_mode" not in raw
+            assert semantic_plan.resolve_task(plan, task_id)["memory_mode"] == "full_mem"
+
+
+def test_per_task_memory_drift_is_rejected(tmp_path):
+    payload = json.loads(JOBS_PATH.read_text())
+    next(iter(payload["jobs"].values()))["memory_mode"] = "image_mem"
+    path = tmp_path / "jobs.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="Per-task memory_mode"):
+        semantic_plan.load_plan(PRESETS_PATH, path)
+
+
 def test_stage1_contract_rejects_wrong_language(tmp_path):
     matrix = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
-    with pytest.raises(ValueError, match="every configured state-instruction relation exactly once"):
+    with pytest.raises(ValueError, match="no sidecar coverage"):
         semantic_plan.validate_sidecar(
             matrix,
             "all_scenes_stage1_full_mem",
@@ -106,11 +122,77 @@ def test_stage1_contract_rejects_wrong_language(tmp_path):
         )
 
 
+def test_three_goal_matrix_is_an_allowlist_not_a_per_episode_cartesian_requirement(tmp_path):
+    plan = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
+    sidecar = _sidecar(tmp_path)
+    sample = json.loads(sidecar.read_text())
+    sample["episodes"] = {}
+    sample["intents"] = {
+        goal: {"canonical_intent": goal, "instructions": [goal]}
+        for goal in ("goal_approach", "goal_open", "goal_enter")
+    }
+    segments = [
+        {"phase": phase, "frame_start": 10 * index, "frame_stop": 10 * (index + 1)}
+        for index, phase in enumerate(("approach", "handle_press", "traversal"))
+    ]
+    views = []
+    for goal, stop in (("goal_approach", 10), ("goal_open", 20), ("goal_enter", 30)):
+        views.append(
+            {
+                "intent_id": goal,
+                "frame_start": 0,
+                "frame_stop": stop,
+                "completion_frame": stop - 2,
+                "status": "active",
+                "action_supervision": "demonstrated",
+            }
+        )
+        if stop < 30:
+            views.append(
+                {
+                    "intent_id": goal,
+                    "frame_start": stop,
+                    "frame_stop": 30,
+                    "status": "complete",
+                    "action_supervision": "hold",
+                }
+            )
+    sample["episodes"]["0"] = {"segments": segments, "views": views}
+    sample["episodes"]["1"] = {
+        "segments": [{"phase": "handle_press", "frame_start": 0, "frame_stop": 10}],
+        "views": [
+            {
+                "intent_id": "goal_open",
+                "frame_start": 0,
+                "frame_stop": 10,
+                "completion_frame": 8,
+                "status": "active",
+                "action_supervision": "demonstrated",
+            }
+        ],
+    }
+    sidecar.write_text(json.dumps(sample))
+    assert semantic_plan.validate_sidecar(plan, "staff1_goal_conditioned_full_mem", sidecar)["episodes"] == 2
+    sample["episodes"]["1"]["views"].append(dict(sample["episodes"]["1"]["views"][0]))
+    sidecar.write_text(json.dumps(sample))
+    with pytest.raises(ValueError, match="duplicate"):
+        semantic_plan.validate_sidecar(plan, "staff1_goal_conditioned_full_mem", sidecar)
+
+
+def test_legacy_whole_episode_goal_sidecar_is_rejected_before_training(tmp_path):
+    plan = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
+    path = _sidecar(tmp_path)
+    sample = json.loads(path.read_text())
+    sample["provenance"] = {"builder": "build_goal_conditioned_semantic_views.py", "retained_episodes": 1068}
+    path.write_text(json.dumps(sample))
+    with pytest.raises(ValueError, match="Legacy goal sidecar"):
+        semantic_plan.validate_sidecar(plan, "all_scenes_stage1_full_mem", path)
+
+
 def test_inline_task_contract_is_equivalent_to_preset(tmp_path):
     payload = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
     payload["tasks"]["inline_stage1"] = {
         "dataset_family": "staff1",
-        "memory_mode": "standard",
         "resources": {
             "node": "f",
             "gpu_ids": [0, 1, 2, 3],
@@ -162,7 +244,6 @@ def test_task_cannot_mix_preset_and_inline_matrix(tmp_path):
     payload = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
     payload["tasks"]["invalid"] = {
         "dataset_family": "staff1",
-        "memory_mode": "standard",
         "resources": {
             "node": "f",
             "gpu_ids": [0, 1, 2, 3],
@@ -209,16 +290,17 @@ def test_two_gpu_task_is_valid():
     assert task["train_steps"] == 70_000
 
 
-def test_object_grasp_resume_contract_is_explicit():
+def test_object_grasp_uses_shared_full_mem_without_implicit_historical_resume():
     plan = semantic_plan.load_plan(PRESETS_PATH, OBJECT_GRASP_JOBS_PATH)
-    task = semantic_plan.resolve_task(plan, "staff3_object_grasp_image_mem")
+    task = semantic_plan.resolve_task(plan, "staff3_object_grasp_full_mem")
     assert task["dataset_family"] == "staff3_grasp"
-    assert task["memory_mode"] == "image_mem"
+    assert task["memory_mode"] == "full_mem"
     assert task["train_steps"] == 50_000
-    assert task["allow_resume_semantic_adoption"] is True
-    assert task["allow_resume_artifact_adoption"] is True
+    assert "allow_resume_semantic_adoption" not in task
+    assert "allow_resume_artifact_adoption" not in task
+    assert "run_dir_name" not in task
     assert task["training_preset"] == "grasp"
-    assert semantic_plan.selected_matrix(plan, "staff3_object_grasp_image_mem") == {
+    assert semantic_plan.selected_matrix(plan, "staff3_object_grasp_full_mem") == {
         "object_grasp": {
             "object_grasp": {
                 "status": "active",
@@ -236,10 +318,11 @@ def test_object_grasp_resume_contract_is_explicit():
 def test_grasp_tasks_share_the_named_preset_and_validate_grasp_views(tmp_path, jobs_file):
     plan = semantic_plan.load_plan(PRESETS_PATH, REPO_ROOT / "training_plan" / jobs_file)
     task_id, task = next(iter(plan["tasks"].items()))
+    task = semantic_plan.resolve_task(plan, task_id)
     assert task["training_preset"] == "grasp"
     assert "state_weights" not in task and "state_instruction_matrix" not in task
     assert task["dataset_family"] == "staff3_grasp"
-    assert task["memory_mode"] == "image_mem"
+    assert task["memory_mode"] == "full_mem"
     assert task["train_steps"] == 50_000
     assert task["resources"] == {
         "node": "wb5",
@@ -271,38 +354,62 @@ def test_pull_presets_use_separate_recordings_with_matching_phase_language(
     tmp_path, preset, reference, selected_segments
 ):
     jobs = tmp_path / "pull_jobs.json"
-    jobs.write_text(json.dumps({
-        "format": "lerobot.training_jobs", "version": 1,
-        "jobs": {"pull_test": {
-            "dataset_family": "pull_door", "memory_mode": "full_mem",
-            "training_preset": preset,
-            "resources": {"node": "f", "gpu_ids": [0, 1, 2, 3], "main_process_port": 29500},
-        }},
-    }))
+    jobs.write_text(
+        json.dumps(
+            {
+                "format": "lerobot.training_jobs",
+                "version": 1,
+                "jobs": {
+                    "pull_test": {
+                        "dataset_family": "pull_door",
+                        "training_preset": preset,
+                        "resources": {"node": "f", "gpu_ids": [0, 1, 2, 3], "main_process_port": 29500},
+                    }
+                },
+            }
+        )
+    )
     plan = semantic_plan.load_plan(PRESETS_PATH, jobs)
     assert semantic_plan.resolve_task(plan, "pull_test")["dataset_family"] == "pull_door"
     assert plan["training_presets"][preset] == plan["training_presets"][reference]
     intents, episodes = {}, {}
-    for index, (phase, goal, instruction) in enumerate([
-        ("approach", "goal_approach", "Approach the door."),
-        ("handle_press", "goal_open", "Pull the door open toward yourself."),
-        ("traversal", "goal_enter", "Pull open the door and walk inside."),
-    ]):
+    for index, (phase, goal, instruction) in enumerate(
+        [
+            ("approach", "goal_approach", "Approach the door."),
+            ("handle_press", "goal_open", "Pull the door open toward yourself."),
+            ("traversal", "goal_enter", "Pull open the door and walk inside."),
+        ]
+    ):
         intents[goal] = {"canonical_intent": goal, "instructions": [instruction]}
         episodes[str(index)] = {
             "source_path": f"/pull/independent_recording_{index}.bag",
             "segments": [{"phase": phase, "frame_start": 0, "frame_stop": 10}],
-            "views": [{
-                "intent_id": goal, "frame_start": 0, "frame_stop": 10, "completion_frame": 8,
-                "status": "active", "action_supervision": "demonstrated",
-            }],
+            "views": [
+                {
+                    "intent_id": goal,
+                    "frame_start": 0,
+                    "frame_stop": 10,
+                    "completion_frame": 8,
+                    "status": "active",
+                    "action_supervision": "demonstrated",
+                }
+            ],
         }
     sidecar = tmp_path / "pull_views.json"
-    sidecar.write_text(json.dumps({
-        "format": "lerobot.semantic_views", "version": 1, "intents": intents, "episodes": episodes,
-    }))
+    sidecar.write_text(
+        json.dumps(
+            {
+                "format": "lerobot.semantic_views",
+                "version": 1,
+                "intents": intents,
+                "episodes": episodes,
+            }
+        )
+    )
     assert semantic_plan.validate_sidecar(plan, "pull_test", sidecar) == {
-        "episodes": 3, "segments": selected_segments, "frames": 10 * selected_segments,
+        "episodes": 3,
+        "segments": selected_segments,
+        "frames": 10 * selected_segments,
     }
     if preset == "pull_joint":
         # A missing post-handle recording cannot silently become joint coverage.

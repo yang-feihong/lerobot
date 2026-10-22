@@ -28,6 +28,7 @@ from lerobot.configs import (
     DEPTH_METER_UNIT,
     DepthEncoderConfig,
 )
+from lerobot.utils.constants import ACTION
 
 from .dataset_metadata import LeRobotDatasetMetadata
 from .depth_utils import MM_PER_METRE, dequantize_depth
@@ -103,6 +104,8 @@ class DatasetReader:
         self._image_source = image_source
         self._random_history_sampling = random_history_sampling
         self._random_history_rng: Random | None = None
+        self._valid_frame_ranges: dict[int, tuple[tuple[int, int], ...]] | None = None
+        self._semantic_catalog = None
         self._paired_image_source = None
         if image_source != "real":
             if sim_image_manifest is None or sim_image_root is None:
@@ -237,21 +240,45 @@ class DatasetReader:
         fpaths = list(set(fpaths))
         return fpaths
 
+    def set_valid_frame_ranges(self, ranges: dict[int, tuple[tuple[int, int], ...]], *, catalog=None) -> None:
+        """Set audited physical components once, before workers and sampling start."""
+        self._valid_frame_ranges = ranges
+        self._semantic_catalog = catalog
+
     def _get_query_indices(
-        self, abs_idx: int, ep_idx: int
+        self, abs_idx: int, ep_idx: int, *, semantic_intent: str | None = None
     ) -> tuple[dict[str, list[int]], dict[str, torch.Tensor]]:
         """Compute query indices for delta timestamps."""
         ep = self._meta.episodes[ep_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
         delta_indices = self.delta_indices
+        valid_start, valid_stop = ep_start, ep_end
+        if self._valid_frame_ranges is not None:
+            components = [
+                (ep_start + start, ep_start + stop)
+                for start, stop in self._valid_frame_ranges[ep_idx]
+                if ep_start + start <= abs_idx < ep_start + stop
+            ]
+            if len(components) != 1:
+                raise ValueError(f"Sample anchor is outside valid physical stages: {ep_idx}, {abs_idx}")
+            valid_start, valid_stop = components[0]
+        if self._semantic_catalog is not None:
+            from .semantic_views import semantic_sample_views
+
+            views = semantic_sample_views(self._semantic_catalog, ep_idx, abs_idx - ep_start)
+            if not any(semantic_intent is None or view.canonical_intent == semantic_intent for view in views):
+                raise ValueError(
+                    f"No legal instruction window across invalid physical stages: {ep_idx}, {abs_idx}"
+                )
         if self._random_history_sampling is not None:
             if self._random_history_rng is None:
                 worker_info = torch.utils.data.get_worker_info()
                 worker_seed = torch.initial_seed() if worker_info is None else worker_info.seed
                 self._random_history_rng = Random(worker_seed ^ self._random_history_sampling.seed)
             sampled_indices = self._random_history_sampling.sample_delta_indices(
-                self._random_history_rng
+                self._random_history_rng,
+                max_history_frames=None if valid_start == ep_start else abs_idx - valid_start,
             )
             delta_indices = dict(self.delta_indices)
             for key in self._random_history_sampling.keys:
@@ -263,6 +290,16 @@ class DatasetReader:
             key: [max(ep_start, min(ep_end - 1, abs_idx + delta)) for delta in delta_idx]
             for key, delta_idx in delta_indices.items()
         }
+        if self._semantic_catalog is not None and ACTION in query_indices:
+            # Eligibility has proved that any target beyond this physical
+            # component is a generated semantic hold, never an expert action.
+            query_indices[ACTION] = [min(index, valid_stop - 1) for index in query_indices[ACTION]]
+        if any(
+            index < valid_start or index >= valid_stop
+            for indices in query_indices.values()
+            for index in indices
+        ):
+            raise ValueError(f"Temporal query crosses an invalid physical stage: {ep_idx}, {abs_idx}")
         padding = {
             f"{key}_is_pad": torch.BoolTensor(
                 [(abs_idx + delta < ep_start) | (abs_idx + delta >= ep_end) for delta in delta_idx]
@@ -357,7 +394,7 @@ class DatasetReader:
             futures = [pool.submit(_decode_single, k, ts) for k, ts in items]
             return dict(f.result() for f in futures)
 
-    def get_item(self, idx) -> dict:
+    def get_item(self, idx, *, semantic_intent: str | None = None) -> dict:
         """Core __getitem__ logic. Assumes hf_dataset is loaded.
 
         ``idx`` is a *relative* index into the (possibly episode-filtered)
@@ -370,7 +407,7 @@ class DatasetReader:
 
         query_indices = None
         if self.delta_indices is not None:
-            query_indices, padding = self._get_query_indices(abs_idx, ep_idx)
+            query_indices, padding = self._get_query_indices(abs_idx, ep_idx, semantic_intent=semantic_intent)
             query_result = self._query_hf_dataset(query_indices)
             item = {**item, **padding}
             for key, val in query_result.items():

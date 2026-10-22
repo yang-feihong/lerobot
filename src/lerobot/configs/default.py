@@ -49,7 +49,7 @@ class DatasetConfig:
     # Has no effect on datasets without depth cameras.
     depth_output_unit: str = DEFAULT_DEPTH_UNIT
     streaming: bool = False
-    # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
+    # Hash-threshold probability per immutable recording group (0.0 = disabled).
     eval_split: float = 0.0
     # Optional JSON mapping episode_index to multiple natural-language task variants.
     # If None, training auto-detects '<dataset.root>/meta/task_variants.json' when present.

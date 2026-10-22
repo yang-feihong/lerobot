@@ -2,13 +2,9 @@
   "format": "lerobot.training_jobs",
   "version": 1,
   "jobs": {
-    "staff3_object_grasp_image_mem": {
+    "staff3_object_grasp_full_mem": {
       "dataset_family": "staff3_grasp",
-      "memory_mode": "image_mem",
       "train_steps": 50000,
-      "run_dir_name": "20261016_155152_mem_pi05_b2_z1_vla_object_grasp_staff3_arm_mode_complete",
-      "allow_resume_semantic_adoption": true,
-      "allow_resume_artifact_adoption": true,
       "training_preset": "grasp",
       "resources": {
         "node": "wb5",

@@ -44,11 +44,11 @@ large_files=(
 )
 
 hash_local_tree() {
-  (cd "$1" && find . -type f -print0 | sort -z | xargs -0 sha256sum)
+  (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum)
 }
 
 hash_remote_tree() {
-  "${ssh_base[@]}" "$1" "cd '$2' && find . -type f -print0 | sort -z | xargs -0 sha256sum"
+  "${ssh_base[@]}" "$1" "cd '$2' && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum"
 }
 
 copy_large_pull() {

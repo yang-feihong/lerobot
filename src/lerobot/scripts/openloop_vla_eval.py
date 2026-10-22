@@ -31,9 +31,9 @@ from tqdm import tqdm
 from lerobot.configs import PreTrainedConfig
 from lerobot.datasets import LeRobotDataset
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+from lerobot.datasets.episode_split import SPLIT_POLICY, load_recording_ids
 from lerobot.datasets.factory import (
     resolve_delta_timestamps,
-    semantic_source_split_keys,
     split_episode_indices,
 )
 from lerobot.datasets.semantic_views import apply_semantic_views_to_batch, load_semantic_views
@@ -165,6 +165,7 @@ def _reduce_metric_sums(
 
 def _standard_b2_metrics(metric_sums: dict[str, tuple[float, int]]) -> dict[str, float]:
     """Return the one canonical seven-column B2 trajectory metric set in SI units."""
+
     def mean(name: str) -> float:
         value_sum, count = metric_sums[name]
         if count <= 0:
@@ -570,16 +571,13 @@ def _split_episodes(
         if candidate.is_file():
             semantic_views_path = candidate
 
-    stratum_by_episode = None
-    split_strategy = "task"
+    catalog = None
+    split_strategy = SPLIT_POLICY
     if semantic_views_path is not None:
         if not semantic_views_path.is_file():
             raise FileNotFoundError(f"Semantic views file does not exist: {semantic_views_path}")
         catalog = load_semantic_views(semantic_views_path)
-        if (
-            expected_semantic_views_sha256 is not None
-            and catalog.sha256 != expected_semantic_views_sha256
-        ):
+        if expected_semantic_views_sha256 is not None and catalog.sha256 != expected_semantic_views_sha256:
             raise ValueError(
                 "Evaluation semantic-view sidecar differs from the checkpoint used for training: "
                 f"expected={expected_semantic_views_sha256}, actual={catalog.sha256}, "
@@ -587,14 +585,13 @@ def _split_episodes(
             )
         if catalog.selected_episodes is not None:
             all_episodes = list(catalog.selected_episodes)
-        stratum_by_episode = semantic_source_split_keys(catalog, all_episodes)
-        split_strategy = "semantic_source"
 
     train_episodes, eval_episodes = split_episode_indices(
         episode_indices=all_episodes,
-        episode_tasks=meta.episodes["tasks"],
+        recording_id_by_episode=load_recording_ids(
+            Path(dataset_root) if dataset_root is not None else meta.root, all_episodes, catalog
+        ),
         eval_split=eval_split,
-        stratum_by_episode=stratum_by_episode,
     )
     if split == "train":
         return train_episodes, split_strategy
@@ -620,12 +617,9 @@ def _semantic_eligible_local_indices(
     if not selected_phases:
         return set(range(len(episode_indices)))
     eligible: set[int] = set()
-    for local_index, (episode, frame) in enumerate(
-        zip(episode_indices, frame_indices, strict=True)
-    ):
+    for local_index, (episode, frame) in enumerate(zip(episode_indices, frame_indices, strict=True)):
         if any(
-            segment.phase in selected_phases
-            and segment.frame_start <= int(frame) < segment.frame_stop
+            segment.phase in selected_phases and segment.frame_start <= int(frame) < segment.frame_stop
             for segment in catalog.segments.get(int(episode), ())
         ):
             eligible.add(local_index)
@@ -647,23 +641,18 @@ def _semantic_completion_offset_local_indices(
         candidates = {
             int(view.completion_frame)
             for view in catalog.episodes.get(episode, ())
-            if view.canonical_intent == goal
-            and view.status == "active"
-            and view.completion_frame is not None
+            if view.canonical_intent == goal and view.status == "active" and view.completion_frame is not None
         }
         if len(candidates) > 1:
             raise ValueError(
-                f"Episode {episode} has ambiguous completion frames for {goal!r}: "
-                f"{sorted(candidates)}"
+                f"Episode {episode} has ambiguous completion frames for {goal!r}: {sorted(candidates)}"
             )
         if candidates:
             completion_by_episode[episode] = next(iter(candidates))
 
     return {
         local_index
-        for local_index, (episode, frame) in enumerate(
-            zip(episode_indices, frame_indices, strict=True)
-        )
+        for local_index, (episode, frame) in enumerate(zip(episode_indices, frame_indices, strict=True))
         if int(episode) in completion_by_episode
         and int(frame) - completion_by_episode[int(episode)] in requested_offsets
     }
@@ -674,11 +663,7 @@ def _semantic_matrix_for_goal(
 ) -> dict[str, dict[str, dict[str, str]]]:
     if goal is None:
         return matrix
-    filtered = {
-        state: {goal: relations[goal]}
-        for state, relations in matrix.items()
-        if goal in relations
-    }
+    filtered = {state: {goal: relations[goal]} for state, relations in matrix.items() if goal in relations}
     if not filtered:
         available = sorted({candidate for relations in matrix.values() for candidate in relations})
         raise ValueError(f"Unknown semantic goal {goal!r}; available goals: {available}")
@@ -806,16 +791,8 @@ def _compute_metrics(
         row[f"rmse/{name}"] = float(rmse[i])
         if name not in discrete_action_names:
             continue
-        expert_true = (
-            expert[:, i] < 0
-            if name == "gripper_target"
-            else expert[:, i] > discrete_threshold
-        )
-        pred_true = (
-            pred[:, i] < 0
-            if name == "gripper_target"
-            else pred[:, i] > discrete_threshold
-        )
+        expert_true = expert[:, i] < 0 if name == "gripper_target" else expert[:, i] > discrete_threshold
+        pred_true = pred[:, i] < 0 if name == "gripper_target" else pred[:, i] > discrete_threshold
         true_positive = int(np.count_nonzero(expert_true & pred_true))
         predicted_positive = int(np.count_nonzero(pred_true))
         expected_positive = int(np.count_nonzero(expert_true))
@@ -1411,9 +1388,7 @@ def main() -> None:
     policy_path = _resolve_policy_path(args.policy_path)
     train_config_path = policy_path / "train_config.json"
     train_config_document = (
-        json.loads(train_config_path.read_text(encoding="utf-8"))
-        if train_config_path.is_file()
-        else {}
+        json.loads(train_config_path.read_text(encoding="utf-8")) if train_config_path.is_file() else {}
     )
     checkpoint_dataset_config = train_config_document.get("dataset", {})
     if args.output_dir is None:
@@ -1524,15 +1499,23 @@ def main() -> None:
         args.max_chunk_plots_per_episode = 0 if explicit_episode_selection else 20
     split_strategy = "explicit_episodes"
     if episodes is None:
+        if args.split in {"train", "eval"}:
+            split_path = policy_path / "dataset_split.json"
+            if not split_path.is_file():
+                raise ValueError(
+                    "Checkpoint has no recording_hash_v1 split manifest; cannot claim held-out "
+                    "evaluation. Use explicit --episodes with the original experiment's split."
+                )
+            saved_split = json.loads(split_path.read_text())
+            if saved_split["policy"] != SPLIT_POLICY or saved_split["eval_split"] != args.eval_split:
+                raise ValueError("Evaluation split policy/fraction differs from the checkpoint")
         episodes, split_strategy = _split_episodes(
             meta,
             args.split,
             args.eval_split,
             dataset_root=Path(args.dataset_root).expanduser(),
             semantic_views_path=semantic_views_path,
-            expected_semantic_views_sha256=getattr(
-                policy_cfg, "semantic_view_manifest_sha256", None
-            ),
+            expected_semantic_views_sha256=getattr(policy_cfg, "semantic_view_manifest_sha256", None),
         )
     episodes = _limit_episodes(episodes, args.max_episodes)
     if not episodes:
@@ -1639,9 +1622,7 @@ def main() -> None:
         )
         sampled_indices = [index for index in sampled_indices if index in semantic_eligible]
         if not sampled_indices:
-            raise ValueError(
-                f"No sampled frames remain in semantic phases {semantic_phases}"
-            )
+            raise ValueError(f"No sampled frames remain in semantic phases {semantic_phases}")
     if args.semantic_completion_offset:
         if semantic_views is None:
             raise ValueError("--semantic-completion-offset requires a semantic-view sidecar")
@@ -1894,9 +1875,7 @@ def main() -> None:
             if args.deterministic_flow_noise:
                 max_action_dim = getattr(policy_cfg, "max_action_dim", None)
                 if max_action_dim is None:
-                    raise ValueError(
-                        "--deterministic-flow-noise requires a policy with max_action_dim"
-                    )
+                    raise ValueError("--deterministic-flow-noise requires a policy with max_action_dim")
                 prediction_kwargs["noise"] = _deterministic_flow_noise(
                     episode_indices=[int(value) for value in batch_episode_indices],
                     frame_indices=[int(value) for value in batch_frame_indices],

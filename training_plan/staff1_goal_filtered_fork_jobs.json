@@ -1,0 +1,17 @@
+{
+  "format": "lerobot.training_jobs",
+  "version": 1,
+  "jobs": {
+    "staff1_goal_conditioned_filtered_full_mem": {
+      "dataset_family": "staff1",
+      "training_preset": "three_goal_conditioned",
+      "semantic_views_file": "semantic_views_three_goal_conditioned.json",
+      "train_steps": 100000,
+      "resources": {
+        "node": "wb6",
+        "gpu_ids": [0, 1, 2, 3],
+        "main_process_port": 29500
+      }
+    }
+  }
+}

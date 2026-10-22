@@ -4,7 +4,33 @@
 维护在 `training_plan/artifacts.lock`。入口不读取隐藏的机器默认值，也不依赖
 远程工作区的未提交修改。
 
-## 相机顺序契约
+## 稳定训练/验证划分（recording_hash_v1）
+
+训练和开环评估共用 `datasets/episode_split.py`，不保留按任务/数据来源末尾截取的旧算法。
+分组单位是不可变的原始录制身份：优先语义 sidecar 的 `recording_id`，否则使用
+标注中保留的原始 `source_path`。该路径是采集 provenance，不是当前数据集挂载位置；
+搬迁数据不应改写它。同一录制的不同阶段、clean/converted 副本及语义视图必须保留同一身份。
+不要用 episode 编号、basename、语言、有效阶段、数据集目录或追加位置代替录制身份。
+没有语义侧车的数据必须显式提供 `meta/episode_split_groups.json`：
+
+```json
+{"format":"lerobot.episode_split_groups","version":1,
+ "recording_ids":{"0":"robot/session/immutable-recording-uuid"}}
+```
+
+固定版本命名空间 + 录制身份经 SHA256 得到均匀数，低于 `eval_split` 的整组进入验证。
+新增、重排、重编号、合并、筛掉坏阶段、修改语言都不改变已有录制的归属。
+不把物体或阶段标签加入身份 hash，避免补标注导致原样本换边。
+这避免采集顺序与物体/场景分布系统性关联，给各物体、阶段、批次同样的验证概率；
+不声称有限小样本一定精确 90/10。稀有分组需要审查覆盖和比例，不能通过挪动已有样本
+或挑选更好看的 seed 强行配额。无训练/验证录制时明确报错，而不是暗中换边。
+
+实际录制身份、episode 映射和两侧列表保存为输出及每个 checkpoint 的 `dataset_split.json`。
+普通 resume 校验协议、比例和录制成员，变化必须显式 fork 更新数据集；
+老 checkpoint 没有新协议凭据时，不能自动声称其新 hash 验证集是历史 held-out 数据。
+历史实验诊断使用其原始代码快照/明确保存的 episode 列表，不新增旧切分算法兼容分支。
+
+## 相机模型槽位
 
 新训练统一将机身 `observation.images.base_0_rgb` 放在腕部相机之前，其余相机按 key
 确定性排序，空相机放最后；不继承数据集 JSON 对象的插入顺序。
@@ -19,7 +45,8 @@ portable artifact 路径重写保留 JSON key 顺序；模型执行顺序另由�
 `TRAINING_JOBS_FILE` 可选择本目录维护的 `object_grasp_training_jobs.json`、
 `object_grasp_camera_fixed_jobs.json` 或
 `all_scenes_simulation_fork_jobs.json`，支持 `staff3_grasp`、`all_scenes_simulation` 数据源
-及仅图像历史的 `image_mem` 模式。`resume-task` / `resume-dry-run-task` 可额外传明确的
+。正式任务共用唯一 `training_profile.json`，当前为 full MEM；任务文件禁止覆盖运行模式。
+`resume-task` / `resume-dry-run-task` 可额外传明确的
 checkpoint 路径；`run_dir_name` 固定原 run，避免误选最新同名任务。
 历史任务语义或 artifact 身份的接纳必须显式设置对应 `allow_resume_*_adoption`，
 仍校验动作、状态和记忆协议。`sync_full_checkpoint.sh` 与
@@ -59,7 +86,13 @@ MEM、sidecar、训练步数、机器/GPU；共享参数在 `.env`，内容身�
 
 `grasp` 定义 `object_grasp × object_grasp` 的 1×1 矩阵，使用 demonstrated 专家动作和
 `goal_end` 完成点；两份正式 grasp 任务均引用 `"training_preset": "grasp"`。
-数据来源 Staff3、`image_mem` 和 GPU 分配属于任务配置，不写入 preset。
+数据来源 Staff3 和 GPU 分配属于任务配置，不写入 preset。grasp 与开门使用同一
+`training_profile.json`：图像历史 1–6 帧、连续状态历史 13 帧，禁止任务级 `memory_mode`。
+旧 grasp 的 image-MEM checkpoint 保持历史身份，不能无条件 resume 成 full MEM。
+实际模型创建并应用 PEFT 后、任何 optimizer update 前，统一入口核验全部模型配置、
+共享训练参数、数据处理配置和 adapter 参数名/形状指纹；只有任务语义、数据身份及
+数据相关标签比例等显式列出的差异可以保留。失败直接退出，不会继续训练。
+输出及 checkpoint 的 `training_profile_audit.json` 保存核验结果。
 未来 grasp 与开门混合训练同样通过数据/sidecar 和 preset/任务配置组织；需先准备兼容的
 混合数据和采样语义，本次不新增该混合方案。
 
@@ -96,16 +129,50 @@ MEM、sidecar、训练步数、机器/GPU；共享参数在 `.env`，内容身�
 `three_goal_plus_full` 保留 `three_goal_conditioned` 的全部关系，并在三个物理状态中
 加入 `full_episode_command`。完整流程语言来自同一 episode 的四档独立标注；在
 approach/handle_press 中以 `future_goal_end` 延续到入室完成点，在 traversal 中使用
-`goal_end`。各状态中四种意图默认等概率，四档语言在选中意图内采样，不增加物理帧权重。
+`goal_end`。默认按允许的状态×指令组合等权采样，四档语言在选中组合内采样。
+
+### 所有 preset 共用的采样规则
+
+先选择合法的“物理状态×指令”池，再在池内采样物理帧；sampler 选中的指令会随索引
+传到 batch，语言物化不再重新抽另一个指令。默认 N 个组合各占 1/N：
+`three_goal_conditioned` 为 9×1/9，`three_stage_joint`/`pull_joint` 为 3×1/3，
+`three_goal_plus_full` 为 12×1/12，单阶段与 grasp 为 1×1。不同阶段时长、episode 数、
+可用指令数量或语言改写数量，不改变组合的目标概率；每 epoch 配额仅有整数取整差异。
+`state_weights` 是组合权重的显式状态系数，默认全为 1；`semantic_source_weights` 如配置，
+只调整各组合内部的数据来源比例。某个配置组合在整个训练集中没有合法样本时明确报错，
+不虚构标签，也不静默把概率分给其他组合。
+
+不要求整个 episode 或三个 goal 全部有效：保留独立有效的物理阶段和已有语言关系。
+独立 Stage2 可加入有依据的 Approach/complete、Open/active，不补造 Enter 完成点。
+`stage_boundaries.json` 是物理有效性依据，语言缺失不等于该阶段的观测无效。
+只有当前样本实际请求的相机/MEM、state/action 历史及未来动作窗口涉及的物理阶段需要有效；
+相邻有效阶段可以跨越，无效间隔不能跨越。随机 MEM 间隔在合法历史范围内采样，
+不使用最大可能历史长度一刀切；固定窗口不足的边界样本不进入池。
+目标已完成后的 hold 是生成的监督，不再读取无效阶段的未来专家动作。
+标签先验按同一组合采样分布计算，归一化统计遍历合法指令配对而非只取第一条指令。
 
 Semantic 训练默认排除“当前指令未 complete，且动作首帧 B2 三维速度精确为 0、
 机械臂 inactive”的帧×指令配对。只看首帧，不检查夹爪、reset 或后续是否运动；
 complete 依当前指令的完成边界判定，不使用其他阶段的原始 complete 标记。
 同一物理帧可保留 Open/complete 而排除 Enter/未完成；没有合法指令的物理帧不会进入
-采样池。阶段权重保持不变，其余合法配对重新归一化，验证集不做此过滤。
+采样池。组合的目标权重保持不变，只在各组合的合法配对中重采样。
+验证集不做这项首帧静止过滤，但仍检查物理窗口合法性。
 配置保存为 `dataset.semantic_exclude_incomplete_static_starts=true`；启动脚本支持
 `--exclude-incomplete-static-starts=false` 以复现旧规则。旧 checkpoint resume 若因此
 改变标签比例，仍须显式使用原有“更新数据集”续训入口，不绕过一致性校验。
+
+Staff1 三目标筛选版分支任务维护在 `staff1_goal_filtered_fork_jobs.json`：wholebody6
+四卡、full MEM、`three_goal_conditioned`，从与 `20261015_180800` 相同的
+`20261008_105154_mem_pi05_b2_z1_vla_training_job_staff1_joint_full_mem_arm_mode_complete/checkpoints/050000`
+完整恢复点训练到 100000。使用 `TRAINING_JOBS_FILE` 选择该计划，通过
+`cluster.sh fork-dry-run-task` / `fork-task staff1_goal_conditioned_filtered_full_mem CHECKPOINT`
+执行，建立新 W&B run 和输出目录，保留 optimizer/scheduler，不覆盖历史 run。
+筛选开关沿用当前 `DatasetConfig` 的 true 默认值；启动后核对实际保存配置。
+2026-10-21 已从统一 `training/staff1/meta/semantic_views.json` 重建专用 goal sidecar，
+保留 2284 个有有效阶段的 episode（含 1064 个独立 Stage2）；当时已启动任务的旧划分
+为 2055 条训练、229 条验证，九个组合各占 1/9。新任务改用下面的 recording_hash_v1，
+不会通过修改本地代码改变已运行的远程快照。
+旧的“全部 goal 齐全”侧车会被 preflight 拒绝。远程启动仍必须通过上述统一入口验收。
 
 新任务同时指定以下两个字段（不会自动更换现有任务的 sidecar）：
 
@@ -126,10 +193,11 @@ python3 ../data_postprocessing/lerobot/build_goal_conditioned_semantic_views.py 
   --output DATASET/meta/semantic_views_three_goal_plus_full.json
 ```
 
-构建器精确匹配 `episode.source_path` 和标注 `video_path`；只保留三目标覆盖完整且有
-完整流程标注的 episode。它复用同一 episode 的 `goal_enter` 区间和完成边界，但保留
+构建器精确匹配 `episode.source_path` 和标注 `video_path`；逐阶段保留可用的 goal，
+不要求三个 goal 或全流程标注齐全。完整流程指令复用同一 episode 的 `goal_enter` 区间和完成边界，但保留
 完整流程自身的语言，不从其他 episode 或 `goal_enter` 语言补缺。原始 sidecar 和视频
-均不改写。sidecar 缺少新关系时，统一入口的逐帧矩阵校验会拒绝启动。
+均不改写。输入必须是当前训练根目录的 canonical sidecar，不应只输入 cleaned Staff1
+完整录制而遗漏统一集中的独立 Stage2。旧构建策略或 canonical 来源哈希不匹配时拒绝启动。
 
 单次任务支持两种互斥、等价的配置形式。使用快捷配置时，在
 `training_jobs.json` 中只引用名称：
@@ -137,7 +205,6 @@ python3 ../data_postprocessing/lerobot/build_goal_conditioned_semantic_views.py 
 ```json
 {
   "dataset_family": "staff1",
-  "memory_mode": "full_mem",
   "training_preset": "stage1_only",
   "resources": {
     "node": "f",
@@ -157,7 +224,6 @@ python3 ../data_postprocessing/lerobot/build_goal_conditioned_semantic_views.py 
 ```json
 {
   "dataset_family": "staff1",
-  "memory_mode": "full_mem",
   "resources": {
     "node": "f",
     "gpu_ids": [0, 1, 2, 3],
@@ -183,8 +249,9 @@ python3 ../data_postprocessing/lerobot/build_goal_conditioned_semantic_views.py 
 数据侧的全部候选语言视图仍由数据集的 `meta/semantic_views.json` 提供；训练矩阵是
 其严格的运行时白名单。运行时直接按照“物理状态 × 规范化语言意图”选择视图，不使用
 任何视图分类简称。`launch.sh` 在开始训练前会逐 episode 校验
-sidecar，要求所选状态每一帧恰好对应一个矩阵允许的语言关系；该关系缺失、重复，
-或其状态、监督方式、完成边界不一致都会直接报错。sidecar 中未被矩阵选择的其他候选
+sidecar；每个已有关系的状态、监督方式和完成点必须匹配，重复监督直接报错。
+允许某条 episode 缺少部分关系，只采其合法配对；全局配置组合没有监督则报错。
+sidecar 中未被矩阵选择的其他候选
 语言不会进入训练。
 
 查看某个任务的完整语义而不启动训练：

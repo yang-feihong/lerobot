@@ -35,9 +35,7 @@ from lerobot.scripts.openloop_vla_eval import (
 def test_semantic_openloop_uses_training_phase_boundaries_and_goal_relation():
     segment = SimpleNamespace(phase="traversal", frame_start=10, frame_stop=20)
     catalog = SimpleNamespace(segments={3: (segment,), 4: (segment,)})
-    assert _semantic_eligible_local_indices(
-        [3, 3, 3, 4], [9, 10, 19, 20], catalog, ["traversal"]
-    ) == {1, 2}
+    assert _semantic_eligible_local_indices([3, 3, 3, 4], [9, 10, 19, 20], catalog, ["traversal"]) == {1, 2}
 
     matrix = {
         "approach": {"goal_open": {"status": "active"}, "goal_enter": {"status": "active"}},
@@ -59,9 +57,7 @@ def test_semantic_openloop_selects_exact_completion_offsets():
             completion_frame=completion,
         )
 
-    catalog = SimpleNamespace(
-        episodes={0: (view("goal_approach", 100),), 1: (view("goal_approach", 50),)}
-    )
+    catalog = SimpleNamespace(episodes={0: (view("goal_approach", 100),), 1: (view("goal_approach", 50),)})
     assert _semantic_completion_offset_local_indices(
         [0, 0, 0, 1, 1],
         [74, 75, 100, 25, 49],
@@ -77,18 +73,28 @@ def test_openloop_frame_limit_spans_each_episode_instead_of_only_its_start():
     assert _limit_indices_evenly_per_episode(indices, episodes, 3) == [0, 2, 5, 6, 8, 11]
 
 
-def test_openloop_train_eval_split_matches_training_task_strata():
+def test_openloop_train_eval_split_uses_explicit_recording_groups(tmp_path):
+    (tmp_path / "meta").mkdir()
+    (tmp_path / "meta/episode_split_groups.json").write_text(
+        json.dumps(
+            {
+                "format": "lerobot.episode_split_groups",
+                "version": 1,
+                "recording_ids": {str(i): f"recording-{i}" for i in range(6)},
+            }
+        )
+    )
     meta = SimpleNamespace(
         total_episodes=6,
         episodes={"tasks": [["a"], ["a"], ["a"], ["b"], ["b"], ["b"]]},
     )
 
-    train, strategy = _split_episodes(meta, "train", 0.2)
-    held_out, held_out_strategy = _split_episodes(meta, "eval", 0.2)
+    train, strategy = _split_episodes(meta, "train", 0.2, dataset_root=tmp_path)
+    held_out, held_out_strategy = _split_episodes(meta, "eval", 0.2, dataset_root=tmp_path)
 
-    assert strategy == held_out_strategy == "task"
-    assert train == [0, 1, 3, 4]
-    assert held_out == [2, 5]
+    assert strategy == held_out_strategy == "recording_hash_v1"
+    assert set(train).isdisjoint(held_out)
+    assert sorted(train + held_out) == list(range(6))
 
 
 def test_openloop_split_auto_detects_semantic_physical_sources(tmp_path):
@@ -103,6 +109,7 @@ def test_openloop_split_auto_detects_semantic_physical_sources(tmp_path):
                 "intents": {"go": {"instructions": ["Go."]}},
                 "episodes": {
                     str(index): {
+                        "recording_id": f"recording-{index}",
                         "segments": [
                             {
                                 "phase": "approach",
@@ -133,9 +140,9 @@ def test_openloop_split_auto_detects_semantic_physical_sources(tmp_path):
     train, strategy = _split_episodes(meta, "train", 0.1, dataset_root=tmp_path)
     held_out, held_out_strategy = _split_episodes(meta, "eval", 0.1, dataset_root=tmp_path)
 
-    assert strategy == held_out_strategy == "semantic_source"
-    assert train == [0, 2]
-    assert held_out == [1, 3]
+    assert strategy == held_out_strategy == "recording_hash_v1"
+    assert set(train).isdisjoint(held_out)
+    assert sorted(train + held_out) == [0, 1, 2, 3]
 
     with pytest.raises(ValueError, match="differs from the checkpoint"):
         _split_episodes(

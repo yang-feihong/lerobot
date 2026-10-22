@@ -1068,6 +1068,7 @@ train_args=(
   --max_eval_samples="$max_eval_samples" \
   --physical_eval_samples="$physical_eval_samples" \
   --env_eval_freq=0 \
+  --eval.batch_size=50 \
   --save_checkpoint=true \
   --save_freq="$save_freq" \
   --keep_last_checkpoints="$keep_last_checkpoints" \

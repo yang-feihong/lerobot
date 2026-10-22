@@ -528,6 +528,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if reader.hf_dataset is None:
             # One-shot load after finalize()
             reader.load_and_activate()
+        if isinstance(idx, tuple):
+            frame_index, intent = idx
+            item = reader.get_item(frame_index, semantic_intent=intent)
+            item["semantic_sampling_intent"] = intent
+            return item
         return reader.get_item(idx)
 
     def select_columns(self, column_names: str | list[str]):

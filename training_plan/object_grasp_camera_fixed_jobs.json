@@ -2,9 +2,8 @@
   "format": "lerobot.training_jobs",
   "version": 1,
   "jobs": {
-    "staff3_object_grasp_image_mem_camera_fixed_0_to_50k": {
+    "staff3_object_grasp_full_mem_0_to_50k": {
       "dataset_family": "staff3_grasp",
-      "memory_mode": "image_mem",
       "train_steps": 50000,
       "training_preset": "grasp",
       "resources": {
