@@ -1,9 +1,8 @@
 #!/usr/bin/env python
-"""Serve asynchronous PI0.5 RTC chunks to the visual-wholebody simulator.
+"""Source-agnostic HTTP/NPZ PI0.5 inference: complete inputs to action chunks.
 
-The simulator is the clock authority.  Observations carry a monotonically
-increasing 50 Hz simulation step and the currently executing chunk/index.
-Inference always consumes the newest observation and never blocks simulation.
+Supports direct request/response and latest-only asynchronous submissions.
+Source acquisition, history selection and execution clocks belong to callers.
 """
 
 from __future__ import annotations
@@ -23,6 +22,7 @@ from io import BytesIO
 from pathlib import Path
 from threading import Condition, Event, Lock, Thread
 from urllib.parse import parse_qs, urlparse
+from zipfile import BadZipFile
 
 import cv2
 import numpy as np
@@ -46,15 +46,8 @@ from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.utils import init_logging
 
 LOG = logging.getLogger("pi05_vla_server")
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 B2_POSE_DELTA_CONTROL_MODES = ("differentiate", "se2_feedback")
-B2_FEEDBACK_LOOKAHEAD_STEPS = 5
-B2_FEEDBACK_POSITION_GAIN = 2.0
-B2_FEEDBACK_YAW_GAIN = 2.5
-B2_FEEDBACK_MAX_LINEAR_SPEED = 0.6
-B2_FEEDBACK_MAX_YAW_RATE = 0.8
-B2_FEEDBACK_MAX_LINEAR_ACCELERATION = 1.5
-B2_FEEDBACK_MAX_YAW_ACCELERATION = 2.0
 EXECUTION_ACTION_PREFIX_NAMES = (
     "b2_vx",
     "b2_vy",
@@ -124,87 +117,6 @@ def _rtc_reanchor_group_is_well_conditioned(
     )
     scales = torch.abs((upper - lower).index_select(0, indices))
     return bool(torch.all(torch.isfinite(scales) & (scales > normalizer.eps)).item())
-
-
-def _wrap_angle(value: float) -> float:
-    return math.atan2(math.sin(value), math.cos(value))
-
-
-def _relative_se2_target_to_world(relative_pose: np.ndarray, anchor: np.ndarray) -> np.ndarray:
-    if relative_pose.shape != (3,) or anchor.shape != (3,):
-        raise ValueError("SE(2) target and anchor must both have shape (3,)")
-    anchor_cos = math.cos(float(anchor[2]))
-    anchor_sin = math.sin(float(anchor[2]))
-    return np.asarray(
-        (
-            anchor[0] + anchor_cos * relative_pose[0] - anchor_sin * relative_pose[1],
-            anchor[1] + anchor_sin * relative_pose[0] + anchor_cos * relative_pose[1],
-            _wrap_angle(float(anchor[2] + relative_pose[2])),
-        ),
-        dtype=np.float64,
-    )
-
-
-class SE2TrajectoryController:
-    def __init__(self, control_frequency_hz: float):
-        self.control_frequency_hz = float(control_frequency_hz)
-        self._control_epoch: int | None = None
-        self._last_step = -1
-        self._last_command = np.zeros(3, dtype=np.float64)
-
-    def command(
-        self,
-        *,
-        control_epoch: int,
-        sim_step: int,
-        actual_pose: np.ndarray,
-        target_pose: np.ndarray | None,
-    ) -> np.ndarray:
-        if actual_pose.shape != (3,) or not np.isfinite(actual_pose).all():
-            raise ValueError(f"Invalid B2 actual pose: {actual_pose}")
-        if target_pose is None:
-            requested = np.zeros(3, dtype=np.float64)
-        else:
-            if target_pose.shape != (3,) or not np.isfinite(target_pose).all():
-                raise ValueError(f"Invalid B2 target pose: {target_pose}")
-            world_error = target_pose[:2] - actual_pose[:2]
-            yaw_cos = math.cos(float(actual_pose[2]))
-            yaw_sin = math.sin(float(actual_pose[2]))
-            body_error = np.asarray(
-                (
-                    yaw_cos * world_error[0] + yaw_sin * world_error[1],
-                    -yaw_sin * world_error[0] + yaw_cos * world_error[1],
-                )
-            )
-            requested = np.asarray(
-                (
-                    B2_FEEDBACK_POSITION_GAIN * body_error[0],
-                    B2_FEEDBACK_POSITION_GAIN * body_error[1],
-                    B2_FEEDBACK_YAW_GAIN * _wrap_angle(float(target_pose[2] - actual_pose[2])),
-                ),
-                dtype=np.float64,
-            )
-            requested[:2] = np.clip(
-                requested[:2], -B2_FEEDBACK_MAX_LINEAR_SPEED, B2_FEEDBACK_MAX_LINEAR_SPEED
-            )
-            requested[2] = np.clip(requested[2], -B2_FEEDBACK_MAX_YAW_RATE, B2_FEEDBACK_MAX_YAW_RATE)
-
-        if self._control_epoch != control_epoch or sim_step <= self._last_step:
-            self._control_epoch = control_epoch
-            self._last_step = sim_step - 1
-            self._last_command.fill(0.0)
-        step_delta = sim_step - self._last_step
-        max_change = np.asarray(
-            (
-                B2_FEEDBACK_MAX_LINEAR_ACCELERATION,
-                B2_FEEDBACK_MAX_LINEAR_ACCELERATION,
-                B2_FEEDBACK_MAX_YAW_ACCELERATION,
-            )
-        ) * (step_delta / self.control_frequency_hz)
-        command = self._last_command + np.clip(requested - self._last_command, -max_change, max_change)
-        self._last_step = sim_step
-        self._last_command = command
-        return command.copy()
 
 
 def _reanchor_b2_pose_delta(
@@ -503,19 +415,6 @@ class CheckpointContract:
     gripper_target_representation: str
     gripper_negative_value: float
     gripper_nonnegative_value: float
-
-
-@dataclass(frozen=True)
-class MemoryObservation:
-    """One exact low-level telemetry sample from the 50 Hz simulator clock."""
-
-    sim_step: int
-    state: np.ndarray
-    state_names: tuple[str, ...]
-    active_sequence: int
-    active_index: int
-    executed_b2_command: np.ndarray
-    executed_ee_target: np.ndarray
 
 
 def _feature_shape(feature: object) -> tuple[int, ...]:
@@ -841,32 +740,6 @@ def _decode_jpeg(encoded: np.ndarray, name: str) -> np.ndarray:
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
-def decode_image_packet(payload: bytes) -> ImagePacket:
-    """Decode one independently streamed semantic base/wrist camera pair."""
-    with np.load(BytesIO(payload), allow_pickle=False) as packet:
-        version = int(packet["protocol_version"].item())
-        if version != PROTOCOL_VERSION:
-            raise ValueError(f"Protocol version {version} != {PROTOCOL_VERSION}")
-        base_jpeg = np.asarray(packet["base_jpeg"], dtype=np.uint8).reshape(-1)
-        wrist_jpeg = np.asarray(packet["wrist_jpeg"], dtype=np.uint8).reshape(-1)
-        if base_jpeg.size == 0 or wrist_jpeg.size == 0:
-            raise ValueError("Image stream packet contains an empty JPEG")
-        base_capture_ns = int(packet["base_capture_ns"].item())
-        wrist_capture_ns = int(packet["wrist_capture_ns"].item())
-        if base_capture_ns <= 0 or wrist_capture_ns <= 0:
-            raise ValueError("Image stream packet has invalid capture timestamps")
-        return ImagePacket(
-            base_jpeg=base_jpeg,
-            wrist_jpeg=wrist_jpeg,
-            base_capture_ns=base_capture_ns,
-            wrist_capture_ns=wrist_capture_ns,
-            capture_ns=max(base_capture_ns, wrist_capture_ns),
-            encoded_ns=int(packet["encoded_ns"].item()) if "encoded_ns" in packet else -1,
-            server_received_ns=time.monotonic_ns(),
-            sim_step=None,
-        )
-
-
 def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> ObservationPacket:
     with np.load(BytesIO(payload), allow_pickle=False) as packet:
         version = int(packet["protocol_version"].item())
@@ -897,59 +770,23 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
             state_anchor = state[[state_index[name] for name in EE_STATE_NAMES]]
             if not np.array_equal(actual_ee_state, state_anchor):
                 raise ValueError("Actual EE anchor disagrees with the named observation.state channels")
-        history_sim_steps = np.asarray(packet["history_sim_steps"], dtype=np.int64).reshape(-1)
-        history_states = np.asarray(packet["history_states"], dtype=np.float32)
-        history_active_sequences = np.asarray(packet["history_active_sequences"], dtype=np.int64).reshape(-1)
-        history_active_indices = np.asarray(packet["history_active_indices"], dtype=np.int64).reshape(-1)
-        history_executed_b2_commands = np.asarray(packet["history_executed_b2_commands"], dtype=np.float32)
-        history_executed_ee_targets = np.asarray(packet["history_executed_ee_targets"], dtype=np.float32)
-        history_count = len(history_sim_steps)
-        expected_shapes = (
-            history_states.shape == (history_count, state.size)
-            and history_active_sequences.shape == (history_count,)
-            and history_active_indices.shape == (history_count,)
-            and history_executed_b2_commands.shape == (history_count, 3)
-            and history_executed_ee_targets.shape == (history_count, len(EE_POSE_ACTION_NAMES))
-        )
-        if history_count == 0 or not expected_shapes:
-            raise ValueError(
-                "Invalid 50 Hz telemetry history shapes: "
-                f"steps={history_sim_steps.shape}, states={history_states.shape}, "
-                f"sequences={history_active_sequences.shape}, indices={history_active_indices.shape}, "
-                f"b2={history_executed_b2_commands.shape}, ee={history_executed_ee_targets.shape}"
-            )
-        if np.any(np.diff(history_sim_steps) != 1):
-            raise ValueError("50 Hz telemetry history must contain consecutive simulation steps")
-        if (
-            not np.isfinite(history_states).all()
-            or not np.isfinite(history_executed_b2_commands).all()
-            or not np.isfinite(history_executed_ee_targets).all()
-            or np.any(history_active_indices < 0)
-        ):
-            raise ValueError("50 Hz telemetry history contains invalid values")
+        if any(key.startswith("history_") for key in packet.files):
+            raise ValueError("Raw sensor histories are not model inputs; assemble them in the deployment adapter")
+        prepared_state = np.asarray(packet["model_state"], dtype=np.float32)
+        prepared_pad = np.asarray(packet["model_state_is_pad"])
+        if (prepared_state.ndim != 2 or not np.isfinite(prepared_state).all()
+                or prepared_pad.dtype != np.bool_ or prepared_pad.shape != prepared_state.shape[:1]):
+            raise ValueError("Invalid prepared state window")
         sim_step = int(packet["sim_step"].item())
         active_sequence = int(packet["active_sequence"].item())
         active_index = int(packet["active_index"].item())
-        if (
-            history_sim_steps[-1] != sim_step
-            or history_active_sequences[-1] != active_sequence
-            or history_active_indices[-1] != active_index
-            or not np.array_equal(history_states[-1], state)
-            or not np.array_equal(history_executed_ee_targets[-1], executed_ee_target)
-        ):
-            raise ValueError("Current observation does not match the final 50 Hz telemetry sample")
-        telemetry_history = tuple(
-            MemoryObservation(
-                sim_step=int(history_sim_steps[index]),
-                state=history_states[index].copy(),
-                state_names=state_names,
-                active_sequence=int(history_active_sequences[index]),
-                active_index=int(history_active_indices[index]),
-                executed_b2_command=history_executed_b2_commands[index].copy(),
-                executed_ee_target=history_executed_ee_targets[index].copy(),
-            )
-            for index in range(history_count)
-        )
+        delay_steps = int(packet["rtc_inference_delay_steps"].item())
+        source_rate = float(packet["source_steps_per_wall_second"].item())
+        if delay_steps < 0 or not math.isfinite(source_rate) or source_rate <= 0:
+            raise ValueError("Invalid adapter-supplied RTC delay/source rate")
+        scheduling_mode = str(packet["chunk_scheduling_mode"].item()) if "chunk_scheduling_mode" in packet else None
+        if scheduling_mode is not None and scheduling_mode not in CHUNK_SCHEDULING_MODES:
+            raise ValueError("Invalid request scheduling mode")
         return ObservationPacket(
             control_epoch=int(packet["control_epoch"].item()),
             sim_step=sim_step,
@@ -972,16 +809,21 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
             executed_ee_target=executed_ee_target,
             executed_ee_target_names=executed_ee_target_names,
             actual_ee_state=actual_ee_state,
-            telemetry_history=telemetry_history,
+            input_schema=str(packet["model_input_schema"].item()),
+            prepared_state=prepared_state,
+            prepared_state_is_pad=prepared_pad,
+            prepared_action_history=np.asarray(packet["model_action_history"], dtype=np.float32)
+            if "model_action_history" in packet else None,
+            prepared_action_history_is_pad=np.asarray(packet["model_action_history_is_pad"])
+            if "model_action_history_is_pad" in packet else None,
+            inference_delay_steps=delay_steps,
+            source_steps_per_wall_second=source_rate,
             diagnostic_flow_seed=(
                 int(packet["diagnostic_flow_seed"].item()) if "diagnostic_flow_seed" in packet else None
             ),
             server_received_ns=time.monotonic_ns(),
-            recorded_image_history=(
-                np.asarray(packet["model_image_history"], dtype=np.uint8).tobytes()
-                if "model_image_history" in packet and packet["model_image_history"].size
-                else None
-            ),
+            model_image_history=np.asarray(packet["model_image_history"], dtype=np.uint8).tobytes(),
+            scheduling_mode=scheduling_mode,
         )
 
 
@@ -1059,13 +901,20 @@ class ObservationPacket:
     executed_ee_target: np.ndarray
     executed_ee_target_names: tuple[str, ...]
     actual_ee_state: np.ndarray
-    telemetry_history: tuple[MemoryObservation, ...]
+    input_schema: str
+    prepared_state: np.ndarray
+    prepared_state_is_pad: np.ndarray
+    prepared_action_history: np.ndarray | None
+    prepared_action_history_is_pad: np.ndarray | None
+    inference_delay_steps: int
+    source_steps_per_wall_second: float
     # Optional and intentionally absent from production packets. It lets
     # open-loop counterfactuals reuse identical flow noise, so a modality swap
     # is not confounded by a fresh stochastic sample.
     diagnostic_flow_seed: int | None
     server_received_ns: int
-    recorded_image_history: bytes | None = None
+    model_image_history: bytes
+    scheduling_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1104,28 +953,6 @@ class _RecordedImageBatch(dict):
     """Keep recording data outside the dictionary passed to the model processors."""
 
     model_image_history: bytes
-
-
-def _encode_model_image_history(packet, records, is_pad, base_key, wrist_key) -> bytes:
-    arrays = {
-        "format_version": np.int64(1),
-        "source_step": np.int64(packet.sim_step),
-        "base_camera_key": np.asarray(base_key),
-        "wrist_camera_key": np.asarray(wrist_key),
-        "is_pad": is_pad.detach().cpu().numpy().reshape(-1),
-    }
-    for field in ("capture_ns", "base_capture_ns", "wrist_capture_ns", "encoded_ns", "server_received_ns", "sim_step"):
-        arrays[field] = np.asarray(
-            [getattr(record, field, -1) if getattr(record, field, -1) is not None else -1 for record in records],
-            dtype=np.int64,
-        )
-    for index, record in enumerate(records):
-        arrays[f"base_jpeg_{index}"] = np.asarray(record.base_jpeg, dtype=np.uint8)
-        arrays[f"wrist_jpeg_{index}"] = np.asarray(record.wrist_jpeg, dtype=np.uint8)
-    output = BytesIO()
-    # JPEGs are already compressed. Avoid CPU-heavy recompression in the inference path.
-    np.savez(output, **arrays)
-    return output.getvalue()
 
 
 def _decode_model_image_history(payload, *, source_step, count, base_key, wrist_key):
@@ -1200,22 +1027,12 @@ class RolloutRecorder:
                 executed_ee_target=packet.executed_ee_target,
                 executed_ee_target_names=np.asarray(packet.executed_ee_target_names, dtype=np.str_),
                 actual_ee_state=packet.actual_ee_state,
-                history_sim_steps=np.asarray(
-                    [record.sim_step for record in packet.telemetry_history], dtype=np.int64
-                ),
-                history_states=np.stack([record.state for record in packet.telemetry_history]),
-                history_active_sequences=np.asarray(
-                    [record.active_sequence for record in packet.telemetry_history], dtype=np.int64
-                ),
-                history_active_indices=np.asarray(
-                    [record.active_index for record in packet.telemetry_history], dtype=np.int64
-                ),
-                history_executed_b2_commands=np.stack(
-                    [record.executed_b2_command for record in packet.telemetry_history]
-                ),
-                history_executed_ee_targets=np.stack(
-                    [record.executed_ee_target for record in packet.telemetry_history]
-                ),
+                model_input_schema=np.asarray(packet.input_schema),
+                model_state=packet.prepared_state,
+                model_state_is_pad=packet.prepared_state_is_pad,
+                model_action_history=packet.prepared_action_history if packet.prepared_action_history is not None else np.empty((0, 0), dtype=np.float32),
+                model_action_history_is_pad=packet.prepared_action_history_is_pad if packet.prepared_action_history_is_pad is not None else np.empty(0, dtype=np.bool_),
+                model_image_history=np.frombuffer(packet.model_image_history, dtype=np.uint8),
                 server_received_ns=np.asarray(packet.server_received_ns),
             )
             prompt_path = self.root / "prompt.txt"
@@ -1227,8 +1044,7 @@ class RolloutRecorder:
             active_sequence=packet.active_sequence,
             active_index=packet.active_index,
             control_epoch=packet.control_epoch,
-            telemetry_history_first_step=packet.telemetry_history[0].sim_step,
-            telemetry_history_count=len(packet.telemetry_history),
+            prepared_state_frames=len(packet.prepared_state),
             transport_ms=(packet.server_received_ns - packet.encoded_ns) / 1e6
             if packet.encoded_ns >= 0
             else None,
@@ -1291,6 +1107,10 @@ class RolloutRecorder:
             velocity_smoothing_transition_step=record.velocity_smoothing_transition_step,
             sim_steps_per_wall_second=record.sim_steps_per_wall_second,
         )
+
+
+class InferenceBusyError(RuntimeError):
+    pass
 
 
 class AsyncRTCPolicy:
@@ -1406,9 +1226,6 @@ class AsyncRTCPolicy:
         self.source_action_names = contract.source_action_names
         self.mem_enabled = bool(config.mem_vit_enabled)
         self.mem_image_num_frames = int(config.mem_vit_num_frames) if self.mem_enabled else 1
-        self.mem_image_stride = max(
-            1, round(float(config.mem_vit_frame_interval_seconds or 0.0) * self.low_level_hz)
-        )
         self.mem_image_interval_ns = max(1, round(float(config.mem_vit_frame_interval_seconds or 0.0) * 1e9))
         self.continuous_state_enabled = config.state_action_encoding == "continuous"
         self.state_num_frames = int(config.state_num_frames) if self.continuous_state_enabled else 1
@@ -1429,17 +1246,9 @@ class AsyncRTCPolicy:
                 }
             }
         )
-        max_history_steps = max(
-            (self.mem_image_num_frames - 1) * self.mem_image_stride,
-            (self.state_num_frames - 1) * self.state_history_stride,
-        )
-        self._observation_history: deque[MemoryObservation] = deque(maxlen=max_history_steps + 2)
-        # Camera history is populated independently from inference requests.
-        # At the deployment 4 Hz camera clock, 512 pairs retain >2 minutes.
-        self._image_history: deque[ImagePacket] = deque(maxlen=512)
-
         self._mailbox_condition = Condition()
         self._model_lock = Lock()
+        self._request_gate = Lock()
         self._mailbox: ObservationPacket | None = None
         self._mailbox_version = 0
         self._last_inferred_version = 0
@@ -1447,9 +1256,6 @@ class AsyncRTCPolicy:
         self._records: dict[int, ActionRecord] = {}
         self._latest_record: ActionRecord | None = None
         self._next_sequence = 1
-        self._latencies: deque[float] = deque(maxlen=args.rtc_latency_window)
-        self._sim_rates: deque[float] = deque(maxlen=args.rtc_latency_window)
-        self._previous_observation_clock: tuple[int, int] | None = None
         self._control_epoch: int | None = None
         self._task_complete_latched = False
         self._stop = Event()
@@ -1461,8 +1267,6 @@ class AsyncRTCPolicy:
         self._last_error_traceback: str | None = None
         self._inference_count = 0
         self._warmup_inferences = int(args.warmup_inferences)
-        self._b2_controller = SE2TrajectoryController(self.low_level_hz)
-        self._b2_controller_lock = Lock()
         b2_rtc_reanchor, ee_rtc_reanchor, _, _ = self._rtc_reanchor_status()
         if self.b2_action_representation == "pose_delta" and not b2_rtc_reanchor:
             LOG.warning(
@@ -1547,15 +1351,10 @@ class AsyncRTCPolicy:
     def _reset_runtime_after_model_switch(self) -> None:
         with self._mailbox_condition:
             self._mailbox = None
-            self._observation_history.clear()
-            self._image_history.clear()
-            self._previous_observation_clock = None
             self._last_inferred_version = self._mailbox_version
         with self._records_lock:
             self._records.clear()
             self._latest_record = None
-        self._latencies.clear()
-        self._sim_rates.clear()
         self._control_epoch = None
         self._task_complete_latched = False
         self._last_error = None
@@ -1760,7 +1559,7 @@ class AsyncRTCPolicy:
             self._mailbox_condition.notify_all()
         self._worker.join(timeout=5.0)
 
-    def submit(self, packet: ObservationPacket) -> None:
+    def submit(self, packet: ObservationPacket, *, enqueue: bool = True) -> None:
         executed_completion = False
         if self.stop_on_model_task_complete and packet.active_sequence >= 0 and packet.active_index > 0:
             with self._records_lock:
@@ -1775,128 +1574,51 @@ class AsyncRTCPolicy:
             if epoch_reset:
                 self._task_complete_latched = False
                 self._mailbox = None
-                self._observation_history.clear()
-                self._image_history.clear()
-                self._previous_observation_clock = None
             if executed_completion:
                 self._task_complete_latched = True
             self._control_epoch = packet.control_epoch
-            if self._mailbox is not None and packet.sim_step < self._mailbox.sim_step:
-                return
-            if self._previous_observation_clock is not None:
-                previous_step, previous_ns = self._previous_observation_clock
-                step_delta = packet.sim_step - previous_step
-                wall_delta_s = (packet.server_received_ns - previous_ns) / 1e9
-                if step_delta > 0 and wall_delta_s > 0:
-                    self._sim_rates.append(step_delta / wall_delta_s)
-            self._previous_observation_clock = (packet.sim_step, packet.server_received_ns)
-            last_history_step = self._observation_history[-1].sim_step if self._observation_history else -1
-            new_records = tuple(
-                record for record in packet.telemetry_history if record.sim_step > last_history_step
-            )
-            if new_records and last_history_step >= 0 and new_records[0].sim_step != last_history_step + 1:
-                raise ValueError(
-                    "Gap in simulator 50 Hz telemetry history: "
-                    f"last={last_history_step}, next={new_records[0].sim_step}"
-                )
-            self._observation_history.extend(new_records)
-            if not self._observation_history or self._observation_history[-1].sim_step != packet.sim_step:
-                raise ValueError(f"Telemetry history did not reach current step {packet.sim_step}")
-            # The inference observation is also a guaranteed current camera
-            # sample. This initializes a new episode with one valid frame and
-            # keeps legacy/simulation clients functional when no independent
-            # image stream is available.
-            image_capture_ns = int(getattr(packet, "capture_finished_ns", -1))
-            if image_capture_ns <= 0:
-                image_capture_ns = int(packet.server_received_ns)
-            current_image = ImagePacket(
-                base_jpeg=packet.base_jpeg,
-                wrist_jpeg=packet.wrist_jpeg,
-                base_capture_ns=image_capture_ns,
-                wrist_capture_ns=image_capture_ns,
-                capture_ns=image_capture_ns,
-                encoded_ns=int(getattr(packet, "encoded_ns", -1)),
-                server_received_ns=packet.server_received_ns,
-                sim_step=packet.sim_step,
-            )
-            if not self._image_history or current_image.capture_ns > self._image_history[-1].capture_ns:
-                self._image_history.append(current_image)
-            self._mailbox = packet
-            self._mailbox_version += 1
-            self._mailbox_condition.notify()
+            if enqueue:
+                if self._mailbox is not None and packet.sim_step < self._mailbox.sim_step:
+                    return
+                self._mailbox = packet
+                self._mailbox_version += 1
+                self._mailbox_condition.notify()
         self.recorder.observation(packet)
 
-    def submit_images(self, packet: ImagePacket) -> None:
-        """Append camera frames without triggering model inference."""
-        with self._mailbox_condition:
-            if self._image_history and packet.capture_ns <= self._image_history[-1].capture_ns:
-                # Delayed duplicate/out-of-order image packets are harmless;
-                # dropping them preserves a strictly monotonic camera clock.
-                return
-            self._image_history.append(packet)
+    def _publish_record(self, record: ActionRecord) -> None:
+        with self._records_lock:
+            self._records[record.sequence] = record
+            if self._latest_record is None or record.sequence > self._latest_record.sequence:
+                self._latest_record = record
+            while len(self._records) > 16:
+                self._records.pop(min(self._records))
+            self._inference_count += 1
+        self._last_error = None
+        self._last_error_traceback = None
+        self.recorder.action(record)
+
+    def infer_request(self, packet: ObservationPacket) -> ActionRecord:
+        # A request/response call must never be replaced by the RTC mailbox.
+        # Bound admission instead of building an unbounded HTTP inference queue.
+        if not self._request_gate.acquire(blocking=False):
+            raise InferenceBusyError("Another request/response inference is in progress")
+        try:
+            with self._model_lock:
+                self.submit(packet, enqueue=False)
+                record = self._infer_unlocked(packet)
+                self._publish_record(record)
+                return record
+        finally:
+            self._request_gate.release()
 
     def latest_after(self, sequence: int) -> ActionRecord | None:
         with self._records_lock:
             record = self._latest_record
             return record if record is not None and record.sequence > sequence else None
 
-    def b2_feedback_control(
-        self,
-        *,
-        control_epoch: int,
-        sim_step: int,
-        sequence: int,
-        action_index: int,
-        actual_pose: np.ndarray,
-    ) -> dict[str, object]:
-        if self.b2_execution_mode != "se2_feedback":
-            raise ValueError("B2 SE(2) feedback is not enabled")
-        with self._records_lock:
-            record = self._records.get(sequence)
-        target_index = -1
-        target_pose = None
-        if record is not None:
-            if record.control_epoch != control_epoch:
-                raise ValueError(
-                    f"B2 control epoch mismatch: record={record.control_epoch}, request={control_epoch}"
-                )
-            if record.b2_reference is None:
-                raise RuntimeError("SE(2) feedback record has no B2 reference trajectory")
-            target_index = min(
-                max(action_index, 0) + B2_FEEDBACK_LOOKAHEAD_STEPS,
-                len(record.b2_reference) - 1,
-            )
-            target_pose = _relative_se2_target_to_world(
-                record.b2_reference[target_index].numpy().astype(np.float64, copy=False),
-                record.b2_anchor.astype(np.float64, copy=False),
-            )
-        with self._b2_controller_lock:
-            command = self._b2_controller.command(
-                control_epoch=control_epoch,
-                sim_step=sim_step,
-                actual_pose=actual_pose,
-                target_pose=target_pose,
-            )
-        return {
-            "control_epoch": control_epoch,
-            "sim_step": sim_step,
-            "sequence": sequence,
-            "action_index": action_index,
-            "target_index": target_index,
-            "target_pose": actual_pose.tolist() if target_pose is None else target_pose.tolist(),
-            "command": command.tolist(),
-        }
-
     def health(self) -> dict[str, object]:
         with self._records_lock:
             latest = self._latest_record
-        with self._mailbox_condition:
-            image_capture_ns = [record.capture_ns for record in self._image_history]
-        recent_image_capture_ns = image_capture_ns[-9:]
-        recent_image_intervals_s = [
-            (right - left) / 1e9
-            for left, right in zip(recent_image_capture_ns[:-1], recent_image_capture_ns[1:], strict=True)
-        ]
         return {
             "ok": self._worker.is_alive() and self._last_error is None,
             "protocol_version": PROTOCOL_VERSION,
@@ -1913,9 +1635,6 @@ class AsyncRTCPolicy:
             "training_rtc_max_delay": self.training_rtc_max_delay,
             "last_error": self._last_error,
             "last_error_traceback": self._last_error_traceback,
-            "image_history_count": len(image_capture_ns),
-            "image_history_latest_capture_ns": image_capture_ns[-1] if image_capture_ns else None,
-            "image_history_recent_intervals_s": recent_image_intervals_s,
         }
 
     def set_chunk_scheduling_mode(self, mode: str) -> dict[str, object]:
@@ -2080,15 +1799,6 @@ class AsyncRTCPolicy:
         padded[: len(prefix)] = prefix
         return padded
 
-    def _estimated_delay(self) -> tuple[int, float]:
-        if self.chunk_scheduling_mode == "SYNC":
-            return 0, self.low_level_hz
-        with self._mailbox_condition:
-            sim_rate = max(self._sim_rates) if self._sim_rates else self.low_level_hz
-        if not self._latencies:
-            return 0, sim_rate
-        return int(math.ceil(max(self._latencies) * sim_rate)), sim_rate
-
     def _rtc_conditioning(self, packet: ObservationPacket, inference_delay_steps: int) -> dict[str, object]:
         if self.chunk_scheduling_mode == "SYNC":
             return {}
@@ -2110,193 +1820,61 @@ class AsyncRTCPolicy:
                 )
         return {"inference_delay": delay, "prev_chunk_left_over": prefix}
 
-    @staticmethod
-    def _sample_memory_records(
-        history: tuple[MemoryObservation, ...], current_step: int, *, count: int, stride: int
-    ) -> tuple[list[MemoryObservation], torch.Tensor]:
-        if not history:
-            raise ValueError("Observation memory is empty")
-        records: list[MemoryObservation] = []
-        is_pad: list[bool] = []
-        first_step = history[0].sim_step
-        for slot in range(count):
-            target_step = current_step - (count - 1 - slot) * stride
-            if target_step < first_step:
-                records.append(history[0])
-                is_pad.append(True)
-                continue
-            record = next(
-                (candidate for candidate in reversed(history) if candidate.sim_step == target_step),
-                None,
-            )
-            if record is None:
-                raise ValueError(f"Missing exact 50 Hz telemetry sample for sim_step={target_step}")
-            records.append(record)
-            is_pad.append(False)
-        return records, torch.tensor(is_pad, dtype=torch.bool).unsqueeze(0)
+    def input_spec(self) -> dict[str, object]:
+        spec = {
+            "protocol_version": PROTOCOL_VERSION, "model_input_format": 1,
+            "source_state_names": list(self.source_state_names),
+            "selected_state_names": list(self.selected_state_names),
+            "base_camera_key": self.base_camera_key, "wrist_camera_key": self.wrist_camera_key,
+            "image_num_frames": self.mem_image_num_frames,
+            "image_interval_ns": self.mem_image_interval_ns,
+            "state_num_frames": self.state_num_frames,
+            "state_stride_steps": self.state_history_stride,
+            "control_frequency_hz": self.low_level_hz,
+            "action_history_enabled": self.action_history_enabled,
+            "action_history_names": [self.source_action_names[index] for index in self.action_history_indices],
+        }
+        spec["schema_id"] = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
+        return spec
 
-    @staticmethod
-    def _sample_image_records(
-        history: tuple[ImagePacket, ...],
-        current_capture_ns: int,
-        *,
-        current_step: int,
-        count: int,
-        interval_ns: int,
-        stride: int,
-    ) -> tuple[list[ImagePacket], torch.Tensor]:
-        if not history:
-            raise ValueError("Image observation memory is empty")
-        records: list[ImagePacket] = []
-        is_pad: list[bool] = []
-        eligible_history = tuple(record for record in history if record.capture_ns <= current_capture_ns)
-        if not eligible_history:
-            raise ValueError("Image observation memory has no frame at or before the inference time")
-        use_capture_clock = any(record.sim_step is None for record in eligible_history)
-        first_ns = eligible_history[0].capture_ns
-        stepped_history = tuple(record for record in eligible_history if record.sim_step is not None)
-        for slot in range(count):
-            if not use_capture_clock:
-                target_step = current_step - (count - 1 - slot) * stride
-                first_step = int(stepped_history[0].sim_step)
-                if target_step < first_step:
-                    records.append(stepped_history[0])
-                    is_pad.append(True)
-                    continue
-                records.append(
-                    min(stepped_history, key=lambda candidate: abs(int(candidate.sim_step) - target_step))
-                )
-                is_pad.append(False)
-                continue
-            target_ns = current_capture_ns - (count - 1 - slot) * interval_ns
-            if target_ns < first_ns:
-                records.append(eligible_history[0])
-                is_pad.append(True)
-                continue
-            # Select the true nearest 4 Hz camera sample. With a nominal 0.5 s
-            # interval this normally chooses every other frame; small camera
-            # scheduling jitter is retained rather than synthesized away.
-            record = min(
-                eligible_history,
-                key=lambda candidate: abs(candidate.capture_ns - target_ns),
-            )
-            records.append(record)
-            is_pad.append(False)
-        return records, torch.tensor(is_pad, dtype=torch.bool).unsqueeze(0)
-
-    def _source_state(self, record: MemoryObservation) -> torch.Tensor:
-        indices = {name: index for index, name in enumerate(record.state_names)}
-        missing = tuple(name for name in self.selected_state_names if name not in indices)
-        if missing:
-            raise ValueError(f"Simulator observation is missing model state fields: {missing}")
-        source = torch.zeros(len(self.source_state_names), dtype=torch.float32)
-        source_indices = {name: index for index, name in enumerate(self.source_state_names)}
-        for name, record_index in indices.items():
-            source_index = source_indices.get(name)
-            if source_index is not None:
-                source[source_index] = float(record.state[record_index])
-        return source
-
-    def _executed_source_action(self, record: MemoryObservation) -> torch.Tensor | None:
-        if record.active_sequence < 0:
-            return None
-        with self._records_lock:
-            action_record = self._records.get(record.active_sequence)
-        if action_record is None or record.active_index <= 0 or len(action_record.processed) == 0:
-            return None
-        executed_index = min(record.active_index, len(action_record.processed)) - 1
-        executed = action_record.processed[executed_index]
-        columns = {name: executed[index] for index, name in enumerate(action_record.action_names)}
-        if action_record.b2_execution_mode == "se2_feedback":
-            columns.update(
-                zip(
-                    B2_EXECUTION_VELOCITY_NAMES,
-                    torch.from_numpy(record.executed_b2_command),
-                    strict=True,
-                )
-            )
-        columns["arm_teleop_inactive"] = 1.0 - columns["arm_active"]
-        columns.update(zip(EE_POSE_ACTION_NAMES, torch.from_numpy(record.executed_ee_target), strict=True))
-        try:
-            source = torch.stack([columns[name] for name in self.source_action_names])
-        except KeyError as exc:
-            raise ValueError(f"Cannot reconstruct historical source action {exc.args[0]!r}") from exc
-        return source[list(self.action_history_indices)]
+    def validate_input(self, packet: ObservationPacket) -> None:
+        spec = self.input_spec()
+        if packet.input_schema != spec["schema_id"]:
+            raise ValueError("Prepared input contract differs from the loaded model")
+        if packet.prepared_state.shape != (self.state_num_frames, len(self.source_state_names)):
+            raise ValueError("Prepared state window does not match model shape")
+        if self.action_history_enabled:
+            actions, pad = packet.prepared_action_history, packet.prepared_action_history_is_pad
+            expected = (self.state_num_frames - 1, len(self.action_history_indices))
+            if (actions is None or actions.shape != expected or not np.isfinite(actions).all()
+                    or pad is None or pad.dtype != np.bool_ or pad.shape != expected[:1]):
+                raise ValueError("Prepared action history does not match model shape")
+        _decode_model_image_history(packet.model_image_history, source_step=packet.sim_step,
+            count=self.mem_image_num_frames, base_key=self.base_camera_key, wrist_key=self.wrist_camera_key)
 
     def _make_batch(self, packet: ObservationPacket) -> dict[str, object]:
-        with self._mailbox_condition:
-            history = tuple(self._observation_history)
-            image_history = tuple(self._image_history)
-
-        state_records, state_pad = self._sample_memory_records(
-            history,
-            packet.sim_step,
-            count=self.state_num_frames,
-            stride=self.state_history_stride,
-        )
-        state = torch.stack([self._source_state(record) for record in state_records]).unsqueeze(0)
-        batch: dict[str, object] = _RecordedImageBatch({
-            OBS_STATE: state,
-            f"{OBS_STATE}_is_pad": state_pad,
+        self.validate_input(packet)
+        batch = _RecordedImageBatch({
+            OBS_STATE: torch.from_numpy(packet.prepared_state.copy()).unsqueeze(0),
+            f"{OBS_STATE}_is_pad": torch.from_numpy(packet.prepared_state_is_pad.copy()).unsqueeze(0),
+            "task": [packet.task],
         })
-
-        if getattr(packet, "recorded_image_history", None):
-            image_records, image_pad = _decode_model_image_history(
-                packet.recorded_image_history,
-                source_step=packet.sim_step,
-                count=self.mem_image_num_frames,
-                base_key=self.base_camera_key,
-                wrist_key=self.wrist_camera_key,
-            )
-        else:
-            image_records, image_pad = self._sample_image_records(
-                image_history,
-                packet.capture_finished_ns,
-                current_step=packet.sim_step,
-                count=self.mem_image_num_frames,
-                interval_ns=self.mem_image_interval_ns,
-                stride=self.mem_image_stride,
-            )
-        batch.model_image_history = getattr(packet, "recorded_image_history", None) or _encode_model_image_history(
-            packet, image_records, image_pad, self.base_camera_key, self.wrist_camera_key
+        image_records, image_pad = _decode_model_image_history(
+            packet.model_image_history, source_step=packet.sim_step,
+            count=self.mem_image_num_frames, base_key=self.base_camera_key, wrist_key=self.wrist_camera_key,
         )
-        encoded_images = {
-            self.base_camera_key: [record.base_jpeg for record in image_records],
-            self.wrist_camera_key: [record.wrist_jpeg for record in image_records],
-        }
-        for key, encoded_window in encoded_images.items():
-            image_window = torch.stack(
-                [
-                    torch.from_numpy(np.ascontiguousarray(_decode_jpeg(encoded, key)))
-                    .permute(2, 0, 1)
-                    .to(dtype=torch.float32)
-                    .div_(255.0)
-                    for encoded in encoded_window
-                ]
-            ).unsqueeze(0)
+        batch.model_image_history = packet.model_image_history
+        for key, role in ((self.base_camera_key, "base_jpeg"), (self.wrist_camera_key, "wrist_jpeg")):
+            image_window = torch.stack([
+                torch.from_numpy(np.ascontiguousarray(_decode_jpeg(getattr(record, role), key)))
+                .permute(2, 0, 1).to(torch.float32).div_(255.0) for record in image_records
+            ]).unsqueeze(0)
             batch[key] = image_window if self.mem_enabled else image_window[:, -1]
             batch[f"{key}_is_pad"] = image_pad if self.mem_enabled else image_pad[:, -1]
-
         if self.action_history_enabled:
-            action_count = self.state_num_frames - 1
-            action_records, action_pad = self._sample_memory_records(
-                history,
-                packet.sim_step - self.state_history_stride,
-                count=action_count,
-                stride=self.state_history_stride,
-            )
-            action_dim = len(self.action_history_indices)
-            action_values = []
-            for index, record in enumerate(action_records):
-                action = self._executed_source_action(record)
-                if action is None:
-                    action = torch.zeros(action_dim, dtype=torch.float32)
-                    action_pad[0, index] = True
-                action_values.append(action)
-            batch[OBS_ACTION_HISTORY] = torch.stack(action_values).unsqueeze(0)
-            batch[f"{OBS_ACTION_HISTORY}_is_pad"] = action_pad
-
-        batch["task"] = [packet.task]
+            actions, pad = packet.prepared_action_history, packet.prepared_action_history_is_pad
+            batch[OBS_ACTION_HISTORY] = torch.from_numpy(actions.copy()).unsqueeze(0)
+            batch[f"{OBS_ACTION_HISTORY}_is_pad"] = torch.from_numpy(pad.copy()).unsqueeze(0)
         return batch
 
     @staticmethod
@@ -2331,13 +1909,18 @@ class AsyncRTCPolicy:
             return self._infer_unlocked(packet)
 
     def _infer_unlocked(self, packet: ObservationPacket) -> ActionRecord:
+        # Adopt request context inside the inference lock, never from a global
+        # management switch racing an already-running prediction.
+        if packet.scheduling_mode is not None and packet.scheduling_mode != self.chunk_scheduling_mode:
+            self.set_chunk_scheduling_mode(packet.scheduling_mode)
         started_ns = time.monotonic_ns()
         started = time.perf_counter()
         raw_batch = self._make_batch(packet)
         model_image_history = getattr(raw_batch, "model_image_history", None)
         batch = self.preprocessor(raw_batch)
         preprocessed = time.perf_counter()
-        inference_delay_steps, sim_rate = self._estimated_delay()
+        inference_delay_steps = 0 if self.chunk_scheduling_mode == "SYNC" else packet.inference_delay_steps
+        sim_rate = packet.source_steps_per_wall_second
         conditioning = self._rtc_conditioning(packet, inference_delay_steps)
         diagnostic_flow_seed = getattr(packet, "diagnostic_flow_seed", None)
         if diagnostic_flow_seed is not None:
@@ -2412,7 +1995,6 @@ class AsyncRTCPolicy:
             raise ValueError(
                 f"Processed action shape {tuple(processed.shape)} does not match names {self.action_names}"
             )
-        self._latencies.append(elapsed)
         record = ActionRecord(
             sequence=self._next_sequence,
             source_step=packet.sim_step,
@@ -2482,16 +2064,8 @@ class AsyncRTCPolicy:
                 continue
             try:
                 record = self._infer(packet)
-                with self._records_lock:
-                    self._records[record.sequence] = record
-                    self._latest_record = record
-                    while len(self._records) > 16:
-                        self._records.pop(min(self._records))
+                self._publish_record(record)
                 self._last_inferred_version = version
-                self._inference_count += 1
-                self._last_error = None
-                self._last_error_traceback = None
-                self.recorder.action(record)
                 LOG.info(
                     "chunk=%d obs_step=%d latency=%.3fs delay=%d actions=%s",
                     record.sequence,
@@ -2539,7 +2113,24 @@ class VLARequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _error(self, status: int, code: str, message: str) -> None:
+        self._write_json(status, {"error": {"code": code, "message": message}})
+
+    def _write_actions(self, record: ActionRecord) -> None:
+        payload = encode_action_packet(record)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/x-npz")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -2556,18 +2147,6 @@ class VLARequestHandler(BaseHTTPRequestHandler):
                 LOG.exception("Checkpoint hot swap failed")
                 self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
-        if path == "/v1/chunk-scheduling-mode":
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                if length <= 0 or length > 4096:
-                    raise ValueError(f"Invalid Content-Length: {length}")
-                request_value = json.loads(self.rfile.read(length))
-                result = self.engine.set_chunk_scheduling_mode(str(request_value["mode"]).upper())
-                self._write_json(HTTPStatus.OK, result)
-            except Exception as exc:
-                LOG.warning("Rejected chunk scheduling mode: %s", exc)
-                self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-            return
         if path == "/v1/task-complete-termination":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -2582,78 +2161,76 @@ class VLARequestHandler(BaseHTTPRequestHandler):
                 LOG.warning("Rejected task-complete termination setting: %s", exc)
                 self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
-        if path == "/v1/images":
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                if length <= 0 or length > self.max_payload_bytes:
-                    raise ValueError(f"Invalid Content-Length: {length}")
-                packet = decode_image_packet(self.rfile.read(length))
-                self.engine.submit_images(packet)
-                self._write_json(
-                    HTTPStatus.ACCEPTED,
-                    {"accepted_capture_ns": packet.capture_ns},
-                )
-            except Exception as exc:
-                LOG.warning("Rejected image stream packet: %s", exc)
-                self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        if path not in {"/v1/observations", "/v1/infer"}:
+            self._error(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint")
             return
-        if path == "/v1/b2-control":
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                if length <= 0 or length > 4096:
-                    raise ValueError(f"Invalid Content-Length: {length}")
-                request_value = json.loads(self.rfile.read(length))
-                result = self.engine.b2_feedback_control(
-                    control_epoch=int(request_value["control_epoch"]),
-                    sim_step=int(request_value["sim_step"]),
-                    sequence=int(request_value["sequence"]),
-                    action_index=int(request_value["action_index"]),
-                    actual_pose=np.asarray(request_value["actual_pose"], dtype=np.float64),
-                )
-                self._write_json(HTTPStatus.OK, result)
-            except Exception as exc:
-                LOG.warning("Rejected B2 feedback state: %s", exc)
-                self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-            return
-        if path != "/v1/observations":
-            self.send_error(HTTPStatus.NOT_FOUND)
+        if self.headers.get_content_type() != "application/x-npz":
+            self._error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type", "Use application/x-npz")
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > self.max_payload_bytes:
+            if length > self.max_payload_bytes:
+                self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "payload_too_large", "Request exceeds max_payload_bytes")
+                return
+            if length <= 0:
                 raise ValueError(f"Invalid Content-Length: {length}")
             packet = decode_observation_packet(self.rfile.read(length))
-            self.engine.submit(packet)
-            self._write_json(HTTPStatus.ACCEPTED, {"accepted_step": packet.sim_step})
-        except Exception as exc:
+            if packet.input_schema != self.engine.input_spec()["schema_id"]:
+                self._error(HTTPStatus.CONFLICT, "schema_mismatch", "Refresh /v1/input-spec and reassemble the input")
+                return
+            self.engine.validate_input(packet)
+            if path == "/v1/infer":
+                self._write_actions(self.engine.infer_request(packet))
+            else:
+                self.engine.submit(packet)
+                self._write_json(HTTPStatus.ACCEPTED, {"accepted_step": packet.sim_step, "control_epoch": packet.control_epoch})
+        except InferenceBusyError as exc:
+            self._error(HTTPStatus.TOO_MANY_REQUESTS, "inference_busy", str(exc))
+        except (ValueError, KeyError, TypeError, OSError, EOFError, BadZipFile) as exc:
             LOG.warning("Rejected observation: %s", exc)
-            self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            self._error(HTTPStatus.BAD_REQUEST, "invalid_input", str(exc))
+        except Exception:
+            LOG.exception("Inference request failed")
+            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "inference_failed", "See model worker logs")
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/v1/input-spec":
+            self._write_json(HTTPStatus.OK, self.engine.input_spec())
+            return
+        if parsed.path == "/v1/schema":
+            self._write_json(HTTPStatus.OK, {
+                "api_version": 1, "protocol_version": PROTOCOL_VERSION,
+                "content_type": "application/x-npz", "max_payload_bytes": self.max_payload_bytes,
+                "input": self.engine.input_spec(),
+                "output": {"chunk_size": self.engine.policy.config.chunk_size,
+                           "action_names": list(self.engine.action_names),
+                           "model_action_names": list(self.engine.model_action_names),
+                           "b2_execution_mode": self.engine.b2_execution_mode,
+                           "z1_action_representation": self.engine.z1_action_representation,
+                           "ee_pose_names": list(EE_POSE_ACTION_NAMES)},
+                "endpoints": {"infer": "/v1/infer", "submit": "/v1/observations", "poll": "/v1/actions"},
+                "concurrency": "one execution session per worker port; one in-flight /v1/infer; busy returns 429",
+            })
+            return
         if parsed.path == "/healthz":
             health = self.engine.health()
             self._write_json(HTTPStatus.OK if health["ok"] else HTTPStatus.SERVICE_UNAVAILABLE, health)
             return
         if parsed.path != "/v1/actions":
-            self.send_error(HTTPStatus.NOT_FOUND)
+            self._error(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint")
             return
         try:
             after = int(parse_qs(parsed.query).get("after", ["0"])[0])
         except ValueError:
-            self._write_json(HTTPStatus.BAD_REQUEST, {"error": "after must be an integer"})
+            self._error(HTTPStatus.BAD_REQUEST, "invalid_cursor", "after must be an integer")
             return
         record = self.engine.latest_after(after)
         if record is None:
             self.send_response(HTTPStatus.NO_CONTENT)
             self.end_headers()
             return
-        payload = encode_action_packet(record)
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "application/x-npz")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+        self._write_actions(record)
 
 
 def parse_args() -> argparse.Namespace:
@@ -2676,12 +2253,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-inferences", type=int, default=1)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument(
-        "--high-level-hz",
-        type=float,
-        default=4.0,
-        help="Declared observation input frequency; inference itself is never rate-limited.",
-    )
     parser.add_argument("--low-level-hz", type=float, default=50.0)
     parser.add_argument(
         "--chunk-scheduling-mode",
@@ -2700,16 +2271,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rtc-schedule", choices=[item.value for item in RTCAttentionSchedule], default="EXP"
     )
-    parser.add_argument("--rtc-latency-window", type=int, default=10)
     parser.add_argument("--max-payload-mb", type=float, default=12.0)
     parser.add_argument("--rollout-dir", default="")
     args = parser.parse_args()
-    if args.high_level_hz <= 0 or args.low_level_hz <= 0:
-        parser.error("both frequencies must be positive")
+    if args.low_level_hz <= 0:
+        parser.error("low-level-hz must be positive")
     if args.b2_velocity_smoothing_time_constant_s < 0:
         parser.error("b2-velocity-smoothing-time-constant-s must be non-negative")
-    if args.rtc_execution_horizon <= 0 or args.rtc_latency_window <= 0:
-        parser.error("RTC horizon/window must be positive")
+    if args.rtc_execution_horizon <= 0:
+        parser.error("RTC horizon must be positive")
     if args.num_inference_steps is not None and args.num_inference_steps <= 0:
         parser.error("num-inference-steps must be positive")
     if args.warmup_inferences < 0:

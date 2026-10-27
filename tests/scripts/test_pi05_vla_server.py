@@ -31,8 +31,6 @@ from lerobot.scripts.pi05_vla_server import (
     ActionRecord,
     AsyncRTCPolicy,
     ImagePacket,
-    MemoryObservation,
-    SE2TrajectoryController,
     _apply_completion_stop,
     _b2_velocity_smoothing_transition_step,
     _camera_bindings,
@@ -45,7 +43,6 @@ from lerobot.scripts.pi05_vla_server import (
     _rtc_enabled_for_chunk_scheduling,
     _smooth_b2_execution_velocity,
     _to_execution_actions,
-    decode_image_packet,
     decode_observation_packet,
     encode_action_packet,
     execution_action_names,
@@ -57,46 +54,94 @@ from lerobot.scripts.pi05_vla_server import (
 EXECUTION_ACTION_NAMES = execution_action_names("ee_delta")
 
 
-def test_recorded_image_history_reproduces_selected_tensors_and_padding():
-    from PIL import Image
+def _complete_packet(**changes):
+    jpeg = __import__("cv2").imencode(".jpg", np.zeros((4, 4, 3), dtype=np.uint8))[1]
+    data = dict(protocol_version=np.int64(PROTOCOL_VERSION), control_epoch=np.int64(7),
+        sim_step=np.int64(12), active_sequence=np.int64(-1), active_index=np.int64(0),
+        task=np.asarray("test"), state=np.zeros(2, dtype=np.float32),
+        state_names=np.asarray(["state_a", "state_b"]),
+        executed_ee_target=np.zeros(len(EE_POSE_ACTION_NAMES), dtype=np.float32),
+        executed_ee_target_names=np.asarray(EE_POSE_ACTION_NAMES),
+        actual_ee_state=np.zeros(len(EE_POSE_ACTION_NAMES), dtype=np.float32),
+        base_jpeg=jpeg, wrist_jpeg=jpeg, model_input_schema=np.asarray("test"),
+        model_state=np.zeros((3, 2), dtype=np.float32), model_state_is_pad=np.array([True, False, False]),
+        rtc_inference_delay_steps=np.int64(2), source_steps_per_wall_second=np.float64(5),
+        model_image_history=np.zeros(0, dtype=np.uint8))
+    data.update(changes)
+    output = BytesIO()
+    np.savez(output, **data)
+    return output.getvalue()
 
-    def image_packet(step, color):
-        images = []
-        for value in (color, 255 - color):
-            buf = BytesIO()
-            Image.fromarray(np.full((8, 8, 3), value, dtype=np.uint8)).save(buf, format="JPEG")
-            images.append(np.frombuffer(buf.getvalue(), dtype=np.uint8))
-        return ImagePacket(images[0], images[1], step, step, step, step, step, step)
 
+def test_complete_packet_decoder_has_no_raw_stream_history():
+    packet = decode_observation_packet(_complete_packet())
+    assert packet.prepared_state.shape == (3, 2)
+    assert packet.prepared_state_is_pad.tolist() == [True, False, False]
+    assert packet.inference_delay_steps == 2
+    assert packet.source_steps_per_wall_second == 5
+    assert not hasattr(packet, "telemetry_history")
+    with pytest.raises(ValueError, match="Raw sensor histories"):
+        decode_observation_packet(_complete_packet(history_states=np.zeros((3, 2))))
+
+
+@pytest.mark.parametrize("mode", ["SYNC", "RTC"])
+def test_worker_decodes_request_scoped_scheduling_mode(mode):
+    packet = decode_observation_packet(_complete_packet(chunk_scheduling_mode=np.asarray(mode)))
+    assert packet.scheduling_mode == mode
+    with pytest.raises(ValueError, match="request scheduling mode"):
+        decode_observation_packet(_complete_packet(chunk_scheduling_mode=np.asarray("invalid")))
+
+
+@pytest.mark.parametrize("changes", [
+    {"model_state_is_pad": np.zeros(3, dtype=np.float32)},
+    {"model_state_is_pad": np.zeros(2, dtype=np.bool_)},
+    {"model_state": np.full((3, 2), np.nan)},
+    {"rtc_inference_delay_steps": np.int64(-1)},
+    {"source_steps_per_wall_second": np.float64(0)},
+    {"source_steps_per_wall_second": np.float64(np.inf)},
+])
+def test_complete_packet_rejects_invalid_window_and_rtc_conditions(changes):
+    with pytest.raises(ValueError):
+        decode_observation_packet(_complete_packet(**changes))
+
+
+def _prepared_images(base_key, wrist_key, frames, steps, pad, source_step):
+    data = {"format_version": np.int64(1), "source_step": np.int64(source_step),
+            "base_camera_key": np.asarray(base_key), "wrist_camera_key": np.asarray(wrist_key),
+            "is_pad": np.asarray(pad, dtype=np.bool_)}
+    for field in ("capture_ns", "base_capture_ns", "wrist_capture_ns", "encoded_ns", "server_received_ns", "sim_step"):
+        data[field] = np.asarray(steps, dtype=np.int64)
+    for index, (base, wrist) in enumerate(frames):
+        data[f"base_jpeg_{index}"] = base
+        data[f"wrist_jpeg_{index}"] = wrist
+    output = BytesIO()
+    np.savez(output, **data)
+    return output.getvalue()
+
+
+def test_prepared_image_window_is_consumed_without_sampling_or_cache():
+    import cv2
+    base = [cv2.imencode(".jpg", np.full((8, 8, 3), color, dtype=np.uint8))[1] for color in (10, 80)]
     engine = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
-    engine._mailbox_condition = Lock()
-    engine._observation_history = [SimpleNamespace()]
-    engine._image_history = [image_packet(0, 10), image_packet(5, 80), image_packet(10, 150)]
-    engine.state_num_frames = engine.state_history_stride = 1
+    engine.state_num_frames = 1
+    engine.source_state_names = ("state",)
     engine.mem_image_num_frames = 3
-    engine.mem_image_stride = engine.mem_image_interval_ns = 5
     engine.mem_enabled = True
     engine.action_history_enabled = False
     engine.base_camera_key = "observation.images.base_0_rgb"
     engine.wrist_camera_key = "observation.images.left_wrist_0_rgb"
-    engine._source_state = lambda _: torch.zeros(1)
-    engine._sample_memory_records = lambda *a, **kw: ([SimpleNamespace()], torch.zeros(1, 1, dtype=torch.bool))
-    packet = SimpleNamespace(sim_step=5, capture_finished_ns=5, task="Open the door.")
-    live = engine._make_batch(packet)
-    snapshot = live.model_image_history
-    # A different/empty live camera cache must have no effect on recorded replay.
-    engine._image_history = []
-    packet.recorded_image_history = snapshot
-    replay = engine._make_batch(packet)
-    assert replay.model_image_history == snapshot
-    for key in (engine.base_camera_key, engine.wrist_camera_key):
-        assert torch.equal(live[key], replay[key])
-        assert torch.equal(live[key + "_is_pad"], replay[key + "_is_pad"])
-        assert replay[key + "_is_pad"].tolist() == [[True, False, False]]
-    assert "model_image_history" not in live  # not a model/processor feature
-    with np.load(BytesIO(snapshot), allow_pickle=False) as recorded:
-        assert recorded["sim_step"].tolist() == [0, 0, 5]
-        np.testing.assert_array_equal(recorded["base_jpeg_2"], image_packet(5, 80).base_jpeg)
+    engine.input_spec = lambda: {"schema_id": "test"}
+    snapshot = _prepared_images(engine.base_camera_key, engine.wrist_camera_key,
+        [(base[0], base[0]), (base[0], base[0]), (base[1], base[1])], [0, 0, 5], [True, False, False], 5)
+    packet = SimpleNamespace(sim_step=5, task="Open the door.", input_schema="test",
+        prepared_state=np.zeros((1, 1), dtype=np.float32), prepared_state_is_pad=np.zeros(1, dtype=np.bool_),
+        model_image_history=snapshot)
+    batch = engine._make_batch(packet)
+    assert batch.model_image_history == snapshot
+    assert batch[engine.base_camera_key + "_is_pad"].tolist() == [[True, False, False]]
+    assert batch[engine.base_camera_key].shape == (1, 3, 3, 8, 8)
+    assert not hasattr(engine, "_image_history")
+    assert not hasattr(engine, "_observation_history")
     for changes in ({"source_step": 6}, {"count": 2}, {"wrist_key": "wrong"}):
         args = dict(source_step=5, count=3, base_key=engine.base_camera_key, wrist_key=engine.wrist_camera_key)
         args.update(changes)
@@ -106,119 +151,40 @@ def test_recorded_image_history_reproduces_selected_tensors_and_padding():
 
 @pytest.mark.parametrize("wrist_first", [False, True])
 def test_real_robot_jpeg_roles_reach_metadata_model_slots(wrist_first):
-    from PIL import Image
-
+    import cv2
     from lerobot.policies.pi05.modeling_pi05 import PI05Policy
-
     base_key = "observation.images.base_0_rgb"
     wrist_key = "observation.images.left_wrist_0_rgb"
     keys = [wrist_key, base_key] if wrist_first else [base_key, wrist_key]
-
-    def jpeg(value):
-        buffer = BytesIO()
-        Image.fromarray(np.full((224, 224, 3), value, dtype=np.uint8)).save(buffer, format="JPEG")
-        return np.frombuffer(buffer.getvalue(), dtype=np.uint8)
-
-    record = SimpleNamespace(base_jpeg=jpeg(0), wrist_jpeg=jpeg(255))
+    jpeg = lambda value: cv2.imencode(".jpg", np.full((224, 224, 3), value, dtype=np.uint8))[1]
     engine = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
-    engine._mailbox_condition = Lock()
-    engine._observation_history = [record]
-    engine._image_history = [record]
-    engine.state_num_frames = engine.state_history_stride = 1
-    engine.mem_image_num_frames = engine.mem_image_stride = 1
-    engine.mem_image_interval_ns = 1
+    engine.state_num_frames = 1
+    engine.source_state_names = ("state",)
+    engine.mem_image_num_frames = 1
     engine.mem_enabled = engine.action_history_enabled = False
     engine.base_camera_key, engine.wrist_camera_key = _camera_bindings(tuple(keys))
-    engine._source_state = lambda _: torch.zeros(1)
-    def samples(*args, **kwargs):
-        return [record], torch.zeros(1, 1, dtype=torch.bool)
-
-    engine._sample_memory_records = engine._sample_image_records = samples
-    packet = SimpleNamespace(sim_step=0, capture_finished_ns=1, task="test")
+    engine.input_spec = lambda: {"schema_id": "test"}
+    packet = SimpleNamespace(sim_step=0, task="test", input_schema="test",
+        prepared_state=np.zeros((1, 1), dtype=np.float32), prepared_state_is_pad=np.zeros(1, dtype=np.bool_),
+        model_image_history=_prepared_images(base_key, wrist_key, [(jpeg(0), jpeg(255))], [0], [False], 0))
     batch = engine._make_batch(packet)
-
     policy = PI05Policy.__new__(PI05Policy)
     torch.nn.Module.__init__(policy)
     policy.register_parameter("dummy", torch.nn.Parameter(torch.zeros(1)))
-    policy.config = PI05Config(
-        device="cpu", dataset_camera_keys=keys,
-        input_features={key: PolicyFeature(FeatureType.VISUAL, (3, 224, 224)) for key in reversed(keys)},
-    )
+    policy.config = PI05Config(device="cpu", dataset_camera_keys=keys,
+        input_features={key: PolicyFeature(FeatureType.VISUAL, (3, 224, 224)) for key in reversed(keys)})
     images, _, _ = policy._preprocess_images(batch)
-    assert [image.mean().item() for image in images] == [
-        1.0 if key == wrist_key else -1.0 for key in keys
-    ]
+    assert [image.mean().item() for image in images] == [1.0 if key == wrist_key else -1.0 for key in keys]
 
 
-def _image_packet(capture_ns: int) -> ImagePacket:
-    encoded = np.asarray([1, 2, 3], dtype=np.uint8)
-    return ImagePacket(
-        base_jpeg=encoded,
-        wrist_jpeg=encoded,
-        base_capture_ns=capture_ns,
-        wrist_capture_ns=capture_ns,
-        capture_ns=capture_ns,
-        encoded_ns=capture_ns,
-        server_received_ns=capture_ns,
-        sim_step=None,
-    )
 
 
-def test_image_history_uses_true_half_second_camera_timestamps() -> None:
-    # The deployment camera clock is 4 Hz with small timestamp jitter,
-    # independent of any inference/chunk schedule. A 0.5 s MEM interval is
-    # therefore every other camera frame.
-    start = 10_000_000_000
-    captures = [start + index * 250_000_000 + (index % 3 - 1) * 5_000_000 for index in range(20)]
-    history = tuple(_image_packet(value) for value in captures)
-    current = captures[-1]
-
-    records, is_pad = AsyncRTCPolicy._sample_image_records(
-        history,
-        current,
-        current_step=99,
-        count=6,
-        interval_ns=500_000_000,
-        stride=25,
-    )
-
-    assert not bool(is_pad.any())
-    selected = np.asarray([record.capture_ns for record in records])
-    intervals = np.diff(selected) / 1e9
-    np.testing.assert_allclose(intervals, np.full(5, 0.5), atol=0.015)
-    assert len(set(selected.tolist())) == 6
 
 
-def test_image_history_pads_only_before_session_history() -> None:
-    history = tuple(_image_packet(1_000_000_000 + index * 100_000_000) for index in range(11))
-    records, is_pad = AsyncRTCPolicy._sample_image_records(
-        history,
-        2_000_000_000,
-        current_step=50,
-        count=6,
-        interval_ns=500_000_000,
-        stride=25,
-    )
-    assert is_pad.tolist() == [[True, True, True, False, False, False]]
-    assert records[-1].capture_ns == 2_000_000_000
 
 
-def test_image_stream_packet_round_trip() -> None:
-    ok, jpeg = __import__("cv2").imencode(".jpg", np.zeros((4, 4, 3), dtype=np.uint8))
-    assert ok
-    body = BytesIO()
-    np.savez(
-        body,
-        protocol_version=np.asarray(PROTOCOL_VERSION),
-        base_capture_ns=np.asarray(123_000_000),
-        wrist_capture_ns=np.asarray(124_000_000),
-        encoded_ns=np.asarray(125_000_000),
-        base_jpeg=jpeg,
-        wrist_jpeg=jpeg,
-    )
-    packet = decode_image_packet(body.getvalue())
-    assert packet.capture_ns == 124_000_000
-    np.testing.assert_array_equal(packet.base_jpeg, jpeg)
+
+
 
 
 def test_start_runs_compile_warmup_on_the_inference_worker() -> None:
@@ -650,75 +616,10 @@ def test_b2_rtc_pose_delta_prefix_is_reexpressed_in_new_inference_frame() -> Non
     torch.testing.assert_close(rebased[:, 2], torch.tensor([0.1, 0.2]), atol=1e-6, rtol=0)
 
 
-def test_se2_feedback_tracks_world_target_in_actual_body_frame_with_rate_limits() -> None:
-    controller = SE2TrajectoryController(50.0)
-    actual = np.asarray([3.5, 19.5, np.pi], dtype=np.float64)
-    target = np.asarray([3.0, 19.5, np.pi], dtype=np.float64)
-    commands = []
-
-    for sim_step in range(50):
-        command = controller.command(
-            control_epoch=0,
-            sim_step=sim_step,
-            actual_pose=actual,
-            target_pose=target,
-        )
-        commands.append(command)
-        actual[0] += np.cos(actual[2]) * command[0] / 50.0
-        actual[1] += np.sin(actual[2]) * command[0] / 50.0
-        actual[2] += command[2] / 50.0
-
-    commands = np.stack(commands)
-    assert commands[0, 0] == pytest.approx(0.03)
-    assert np.abs(np.diff(commands[:, :2], axis=0)).max() <= 1.5 / 50.0 + 1e-9
-    assert np.abs(np.diff(commands[:, 2], axis=0)).max() <= 2.0 / 50.0 + 1e-9
-    assert actual[0] < 3.5
 
 
-def test_se2_feedback_resets_rate_limiter_on_control_epoch_change() -> None:
-    controller = SE2TrajectoryController(50.0)
-    actual = np.zeros(3, dtype=np.float64)
-    target = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
-    controller.command(control_epoch=0, sim_step=100, actual_pose=actual, target_pose=target)
-    command = controller.command(
-        control_epoch=1,
-        sim_step=100,
-        actual_pose=actual,
-        target_pose=None,
-    )
-
-    np.testing.assert_array_equal(command, np.zeros(3))
 
 
-def test_server_tracks_rtc_indexed_anchor_trajectory() -> None:
-    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
-    policy.b2_execution_mode = "se2_feedback"
-    policy._records_lock = Lock()
-    policy._b2_controller_lock = Lock()
-    policy._b2_controller = SE2TrajectoryController(50.0)
-    reference = torch.zeros((50, 3), dtype=torch.float32)
-    reference[:, 0] = torch.linspace(0.01, 0.50, 50)
-    policy._records = {
-        4: SimpleNamespace(
-            sequence=4,
-            control_epoch=2,
-            b2_reference=reference,
-            b2_anchor=np.asarray([3.5, 19.5, np.pi], dtype=np.float32),
-            processed=torch.zeros((50, len(EXECUTION_ACTION_NAMES))),
-        )
-    }
-
-    result = policy.b2_feedback_control(
-        control_epoch=2,
-        sim_step=10,
-        sequence=4,
-        action_index=3,
-        actual_pose=np.asarray([3.5, 19.5, np.pi], dtype=np.float64),
-    )
-
-    assert result["target_index"] == 8
-    assert result["target_pose"][0] < 3.5
-    assert result["command"][0] == pytest.approx(0.03)
 
 
 def test_z1_state_delta_rtc_prefix_is_reexpressed_from_current_actual_state() -> None:
@@ -999,17 +900,26 @@ def test_continuous_ee_schema_defaults_missing_arm_modes_to_active() -> None:
     ],
 )
 @pytest.mark.parametrize("rtc_mode", ["inference", "training"])
+@pytest.mark.parametrize("scheduling_mode", ["RTC", "SYNC"])
 def test_infer_records_model_action_names_and_source_step_anchor(
     z1_representation: str,
     expected_anchor_kind: str,
     expected_anchor: np.ndarray,
     rtc_mode: str,
+    scheduling_mode: str,
 ) -> None:
     model_names = (*B2_EXECUTION_VELOCITY_NAMES, *EE_DELTA_ACTION_NAMES, "gripper_target")
     policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
     policy._model_lock = Lock()
-    policy.chunk_scheduling_mode = "RTC"
+    policy.chunk_scheduling_mode = "SYNC" if scheduling_mode == "RTC" else "RTC"
     policy.rtc_config = RTCConfig(mode=rtc_mode)
+    apply_mode = policy.set_chunk_scheduling_mode
+
+    def locked_mode_switch(mode):
+        assert policy._model_lock.locked()
+        return apply_mode(mode)
+
+    policy.set_chunk_scheduling_mode = locked_mode_switch
     policy.training_rtc_max_delay = 4
     policy.preprocessor = lambda batch: batch
     policy.postprocessor = lambda actions: actions
@@ -1024,7 +934,6 @@ def test_infer_records_model_action_names_and_source_step_anchor(
     raw_batch.model_image_history = b"selected-image-window"
     policy._make_batch = lambda _packet: raw_batch
     policy._previous_prefix = lambda _packet: None
-    policy._estimated_delay = lambda: (7, 50.0)
     policy._b2_velocity_filter_context = lambda _packet: (torch.zeros(3), None)
     policy.postprocessed_action_names = model_names
     policy.model_action_names = model_names
@@ -1041,14 +950,16 @@ def test_infer_records_model_action_names_and_source_step_anchor(
     policy._task_complete_latched = False
     policy.b2_velocity_smoothing_time_constant_s = 0.0
     policy.low_level_hz = 50.0
-    policy._latencies = []
     policy._next_sequence = 1
 
     record = policy._infer(
         SimpleNamespace(
+            scheduling_mode=scheduling_mode,
             control_epoch=3,
             sim_step=25,
             server_received_ns=0,
+            inference_delay_steps=7,
+            source_steps_per_wall_second=50.0,
             executed_ee_target=np.zeros(9, dtype=np.float32),
             actual_ee_state=np.ones(9, dtype=np.float32),
             state_names=B2_GLOBAL_POSE_NAMES,
@@ -1069,11 +980,13 @@ def test_infer_records_model_action_names_and_source_step_anchor(
     assert record.b2_anchor_kind == "actual_world_pose"
     np.testing.assert_allclose(record.b2_anchor, [1.0, 2.0, 0.3])
     assert record.rtc_mode == rtc_mode
-    assert record.inference_delay_steps == 7
-    assert len(policy._latencies) == 1
+    assert policy.chunk_scheduling_mode == scheduling_mode
+    assert policy.rtc_config.enabled == (scheduling_mode == "RTC")
+    assert record.inference_delay_steps == (7 if scheduling_mode == "RTC" else 0)
     assert policy._next_sequence == 2
-    conditioning_delay = 7 if rtc_mode == "inference" else 0
-    assert predict_calls == [{"inference_delay": conditioning_delay, "prev_chunk_left_over": None}]
+    conditioning_delay = 7 if rtc_mode == "inference" and scheduling_mode == "RTC" else 0
+    expected_conditioning = {"inference_delay": conditioning_delay, "prev_chunk_left_over": None} if scheduling_mode == "RTC" else {}
+    assert predict_calls == [expected_conditioning]
     assert record.rtc_conditioning_delay_steps == conditioning_delay
 
 
@@ -1095,95 +1008,145 @@ def test_completion_stops_motion_at_the_first_true_row() -> None:
     assert stopped[:, EXECUTION_ACTION_NAMES.index("task_complete")].tolist() == [0.0, 1.0, 1.0, 1.0]
 
 
-def test_server_latches_an_executed_completion_until_sim_step_resets() -> None:
+def _completion_engine(enabled):
     policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
     policy._records_lock = Lock()
     policy._mailbox_condition = __import__("threading").Condition()
-    policy._observation_history = __import__("collections").deque(maxlen=4)
-    policy._image_history = __import__("collections").deque(maxlen=4)
-    policy._records = {}
-    policy._mailbox = None
-    policy._mailbox_version = 0
-    policy._previous_observation_clock = None
-    policy._control_epoch = None
-    policy._task_complete_latched = False
-    policy.stop_on_model_task_complete = True
-    policy.recorder = SimpleNamespace(observation=lambda _: None)
-    actions = torch.zeros((3, len(EXECUTION_ACTION_NAMES)))
-    actions[1, EXECUTION_ACTION_NAMES.index("task_complete")] = 1.0
-    policy._records[4] = SimpleNamespace(processed=actions, action_names=EXECUTION_ACTION_NAMES)
-
-    def packet(step: int, active_index: int, control_epoch: int = 0) -> SimpleNamespace:
-        telemetry = MemoryObservation(
-            sim_step=step,
-            active_sequence=4,
-            active_index=active_index,
-            executed_b2_command=np.zeros(3, dtype=np.float32),
-            state=np.zeros(1, dtype=np.float32),
-            state_names=("state",),
-            executed_ee_target=np.zeros(9, dtype=np.float32),
-        )
-        return SimpleNamespace(
-            control_epoch=control_epoch,
-            sim_step=step,
-            active_sequence=4,
-            active_index=active_index,
-            telemetry_history=(telemetry,),
-            base_jpeg=np.zeros(1, dtype=np.uint8),
-            wrist_jpeg=np.zeros(1, dtype=np.uint8),
-            server_received_ns=step + 1,
-        )
-
-    policy.submit(packet(10, 2))
-    assert policy._task_complete_latched is True
-    policy.submit(packet(9, 0))
-    assert policy._task_complete_latched is True
-    assert policy._mailbox.sim_step == 10
-    policy.submit(packet(11, 0, control_epoch=1))
-    assert policy._task_complete_latched is False
-    assert policy._mailbox.sim_step == 11
-    assert [record.sim_step for record in policy._observation_history] == [11]
-
-
-def test_server_does_not_latch_completion_when_model_stop_is_disabled() -> None:
-    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
-    policy._records_lock = Lock()
-    policy._mailbox_condition = __import__("threading").Condition()
-    policy._observation_history = __import__("collections").deque(maxlen=4)
-    policy._image_history = __import__("collections").deque(maxlen=4)
     actions = torch.zeros((3, len(EXECUTION_ACTION_NAMES)))
     actions[1, EXECUTION_ACTION_NAMES.index("task_complete")] = 1.0
     policy._records = {4: SimpleNamespace(processed=actions, action_names=EXECUTION_ACTION_NAMES)}
     policy._mailbox = None
     policy._mailbox_version = 0
-    policy._previous_observation_clock = None
     policy._control_epoch = None
     policy._task_complete_latched = False
-    policy.stop_on_model_task_complete = False
+    policy.stop_on_model_task_complete = enabled
     policy.recorder = SimpleNamespace(observation=lambda _: None)
-    telemetry = MemoryObservation(
-        sim_step=10,
-        active_sequence=4,
-        active_index=2,
-        executed_b2_command=np.zeros(3, dtype=np.float32),
-        state=np.zeros(1, dtype=np.float32),
-        state_names=("state",),
-        executed_ee_target=np.zeros(9, dtype=np.float32),
-    )
-    packet = SimpleNamespace(
-        control_epoch=0,
-        sim_step=10,
-        active_sequence=4,
-        active_index=2,
-        telemetry_history=(telemetry,),
-        base_jpeg=np.zeros(1, dtype=np.uint8),
-        wrist_jpeg=np.zeros(1, dtype=np.uint8),
-        server_received_ns=11,
-    )
+    return policy
 
-    policy.submit(packet)
 
-    assert policy._task_complete_latched is False
+def test_server_latches_an_executed_completion_until_sim_step_resets():
+    policy = _completion_engine(True)
+    def packet(step, index, epoch=0):
+        return SimpleNamespace(sim_step=step, active_sequence=4, active_index=index, control_epoch=epoch)
+    policy.submit(packet(10, 2))
+    assert policy._task_complete_latched
+    policy.submit(packet(9, 0))
+    assert policy._task_complete_latched
+    assert policy._mailbox.sim_step == 10
+    policy.submit(packet(11, 0, 1))
+    assert not policy._task_complete_latched
+    assert policy._mailbox.sim_step == 11
+    assert not hasattr(policy, "_observation_history")
+    assert not hasattr(policy, "_image_history")
+
+
+def test_server_does_not_latch_completion_when_model_stop_is_disabled():
+    policy = _completion_engine(False)
+    policy.submit(SimpleNamespace(control_epoch=0, sim_step=10, active_sequence=4, active_index=2))
+    assert not policy._task_complete_latched
+
+
+def test_direct_inference_is_not_enqueued_and_preserves_completion_context():
+    from lerobot.scripts.pi05_vla_server import InferenceBusyError
+    policy = _completion_engine(True)
+    policy._request_gate = Lock()
+    policy._model_lock = Lock()
+    policy._latest_record = None
+    policy._inference_count = 0
+    policy.recorder.action = lambda _: None
+    policy._infer_unlocked = lambda p: SimpleNamespace(sequence=5, control_epoch=p.control_epoch)
+    packet = SimpleNamespace(control_epoch=0, sim_step=10, active_sequence=4, active_index=2)
+    record = policy.infer_request(packet)
+    assert policy._task_complete_latched
+    assert policy._mailbox is None
+    assert policy._mailbox_version == 0
+    assert policy.latest_after(4) is record
+    assert policy._inference_count == 1
+    policy._request_gate.acquire()
+    try:
+        with pytest.raises(InferenceBusyError):
+            policy.infer_request(packet)
+    finally:
+        policy._request_gate.release()
+
+
+@pytest.fixture
+def model_http(monkeypatch):
+    from http.server import ThreadingHTTPServer
+    from unittest.mock import Mock
+    import lerobot.scripts.pi05_vla_server as server_module
+    server = ThreadingHTTPServer(("127.0.0.1", 0), server_module.VLARequestHandler)
+    server.max_payload_bytes = 1024 * 1024
+    server.engine = Mock()
+    server.engine.input_spec.return_value = {"schema_id": "test"}
+    server.engine.latest_after.return_value = None
+    server.engine.policy = SimpleNamespace(config=SimpleNamespace(chunk_size=50))
+    server.engine.action_names = EXECUTION_ACTION_NAMES
+    server.engine.model_action_names = ("b2_delta_x",)
+    server.engine.b2_execution_mode = "se2_feedback"
+    server.engine.z1_action_representation = "ee_state_delta"
+    server.engine.infer_request.side_effect = lambda packet: packet
+    monkeypatch.setattr(server_module, "encode_action_packet", lambda p: _complete_packet(control_epoch=np.int64(p.control_epoch)))
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", server.engine
+    server.shutdown()
+    server.server_close()
+    thread.join()
+
+
+def test_http_direct_inference_and_async_submission_share_complete_packet(model_http):
+    from urllib import request
+    url, engine = model_http
+    for path, status in (("/v1/infer", 200), ("/v1/observations", 202)):
+        req = request.Request(url + path, data=_complete_packet(), headers={"Content-Type": "application/x-npz"})
+        with request.urlopen(req) as response:
+            assert response.status == status
+            if status == 200:
+                assert response.headers.get_content_type() == "application/x-npz"
+            else:
+                assert json.load(response) == {"accepted_step": 12, "control_epoch": 7}
+    engine.infer_request.assert_called_once()
+    engine.submit.assert_called_once()
+    with request.urlopen(url + "/v1/actions?after=0") as response:
+        assert response.status == 204
+    with request.urlopen(url + "/v1/schema") as response:
+        schema = json.load(response)
+        assert schema["protocol_version"] == PROTOCOL_VERSION
+        assert schema["output"]["chunk_size"] == 50
+        assert schema["output"]["action_names"] == list(EXECUTION_ACTION_NAMES)
+        assert schema["endpoints"]["infer"] == "/v1/infer"
+
+
+@pytest.mark.parametrize("path,body,content_type,status,code", [
+    ("/v1/infer", b"bad", "application/json", 415, "unsupported_media_type"),
+    ("/v1/infer", b"bad", "application/x-npz", 400, "invalid_input"),
+    ("/v1/infer", b"x" * (1024 * 1024 + 1), "application/x-npz", 413, "payload_too_large"),
+    ("/unknown", b"x", "application/x-npz", 404, "not_found"),
+])
+def test_http_errors_have_machine_readable_codes(model_http, path, body, content_type, status, code):
+    from urllib import request, error
+    url, _ = model_http
+    req = request.Request(url + path, data=body, headers={"Content-Type": content_type})
+    with pytest.raises(error.HTTPError) as caught:
+        request.urlopen(req)
+    assert caught.value.code == status
+    assert json.load(caught.value)["error"]["code"] == code
+
+
+def test_http_schema_conflict_and_busy(model_http):
+    from urllib import request, error
+    from lerobot.scripts.pi05_vla_server import InferenceBusyError
+    url, engine = model_http
+    for schema, exception, status, code in (("other", None, 409, "schema_mismatch"),
+            ("test", InferenceBusyError("busy"), 429, "inference_busy")):
+        engine.infer_request.side_effect = exception
+        req = request.Request(url + "/v1/infer", data=_complete_packet(model_input_schema=np.asarray(schema)),
+            headers={"Content-Type": "application/x-npz"})
+        with pytest.raises(error.HTTPError) as caught:
+            request.urlopen(req)
+        assert caught.value.code == status
+        assert json.load(caught.value)["error"]["code"] == code
 
 
 def test_ee_delta_is_forwarded_with_an_explicit_low_level_schema() -> None:
@@ -1312,7 +1275,7 @@ def test_sync_server_disables_rtc_prefix_delay_and_previous_velocity_context() -
 
     assert not _rtc_enabled_for_chunk_scheduling("SYNC")
     assert policy._previous_prefix(packet) is None
-    assert policy._estimated_delay() == (0, 50.0)
+    assert policy._rtc_conditioning(packet, 99) == {}
     anchor, prefix = policy._b2_velocity_filter_context(packet)
     torch.testing.assert_close(anchor, torch.zeros(3))
     assert prefix is None
@@ -1374,8 +1337,6 @@ def test_rtc_server_keeps_prefix_and_measured_delay_behavior() -> None:
     policy._records_lock = Lock()
     policy._records = {7: SimpleNamespace(original=torch.arange(12).reshape(4, 3).float())}
     policy._mailbox_condition = Lock()
-    policy._sim_rates = [50.0]
-    policy._latencies = [0.21]
     packet = SimpleNamespace(active_sequence=7, active_index=1)
 
     assert _rtc_enabled_for_chunk_scheduling("RTC")
@@ -1383,34 +1344,11 @@ def test_rtc_server_keeps_prefix_and_measured_delay_behavior() -> None:
         policy._previous_prefix(packet),
         torch.tensor([[3.0, 4.0, 5.0], [6.0, 7.0, 8.0]]),
     )
-    assert policy._estimated_delay() == (11, 50.0)
+    assert policy._rtc_conditioning(packet, 11)["inference_delay"] == 11
 
 
-def test_source_state_requires_model_fields_but_not_unused_dataset_storage_fields() -> None:
-    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
-    policy.source_state_names = ("arm_q_1", "unused_ee_label", "b2_body_height")
-    policy.selected_state_names = ("arm_q_1", "b2_body_height")
-    record = SimpleNamespace(
-        state_names=("b2_body_height", "arm_q_1"),
-        state=np.asarray([0.48, 0.25], dtype=np.float32),
-    )
-
-    source = policy._source_state(record)
-
-    torch.testing.assert_close(source, torch.tensor([0.25, 0.0, 0.48]))
 
 
-def test_source_state_rejects_missing_model_field() -> None:
-    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
-    policy.source_state_names = ("arm_q_1", "unused_ee_label", "b2_body_height")
-    policy.selected_state_names = ("arm_q_1", "b2_body_height")
-    record = SimpleNamespace(
-        state_names=("arm_q_1",),
-        state=np.asarray([0.25], dtype=np.float32),
-    )
-
-    with pytest.raises(ValueError, match="missing model state fields.*b2_body_height"):
-        policy._source_state(record)
 
 
 def test_first_chunk_smoothing_does_not_fill_cold_start_delay_with_zeros() -> None:
@@ -1418,62 +1356,8 @@ def test_first_chunk_smoothing_does_not_fill_cold_start_delay_with_zeros() -> No
     assert _b2_velocity_smoothing_transition_step(12, torch.zeros(5, 3)) == 12
 
 
-def test_action_history_uses_last_executed_row_and_low_level_ee_target_feedback() -> None:
-    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
-    policy._records_lock = Lock()
-    names = execution_action_names("ee_delta")
-    processed = torch.zeros((3, len(names)))
-    processed[:, names.index("b2_vx")] = torch.tensor([10.0, 20.0, 30.0])
-    processed[:, names.index("arm_active")] = 1.0
-    policy._records = {
-        4: SimpleNamespace(
-            processed=processed,
-            action_names=names,
-            b2_execution_mode="velocity_chunk",
-        )
-    }
-    policy.source_action_names = ("b2_vx", "height_invariant_ee_x")
-    policy.action_history_indices = (0, 1)
-    ee_target = np.zeros(9, dtype=np.float32)
-    ee_target[-3] = 0.42
-    observation = SimpleNamespace(
-        active_sequence=4,
-        active_index=2,
-        executed_ee_target=ee_target,
-    )
-
-    history = policy._executed_source_action(observation)
-
-    torch.testing.assert_close(history, torch.tensor([20.0, 0.42]))
 
 
-def test_feedback_action_history_uses_low_level_executed_b2_command() -> None:
-    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
-    policy._records_lock = Lock()
-    names = execution_action_names("ee_delta")
-    processed = torch.zeros((3, len(names)))
-    processed[:, names.index("b2_vx")] = 20.0
-    processed[:, names.index("arm_active")] = 1.0
-    policy._records = {
-        4: SimpleNamespace(
-            sequence=4,
-            processed=processed,
-            action_names=names,
-            b2_execution_mode="se2_feedback",
-        )
-    }
-    policy.source_action_names = ("b2_vx", "b2_vy", "b2_omega_z")
-    policy.action_history_indices = (0, 1, 2)
-    observation = SimpleNamespace(
-        active_sequence=4,
-        active_index=2,
-        executed_b2_command=np.asarray([0.2, -0.1, 0.3], dtype=np.float32),
-        executed_ee_target=np.zeros(9, dtype=np.float32),
-    )
-
-    history = policy._executed_source_action(observation)
-
-    torch.testing.assert_close(history, torch.tensor([0.2, -0.1, 0.3]))
 
 
 def test_rtc_skipped_prefix_keeps_previous_plan_and_delays_new_transition() -> None:
@@ -1532,80 +1416,3 @@ def test_se2_increment_decode_and_velocity_modes_share_identical_execution_smoot
     )
 
     torch.testing.assert_close(trajectory_result, direct_result, atol=1e-6, rtol=1e-6)
-
-
-def test_memory_sampling_is_right_aligned_and_marks_episode_start_padding() -> None:
-    history = tuple(
-        MemoryObservation(
-            sim_step=step,
-            state=np.asarray([step], dtype=np.float32),
-            state_names=("state",),
-            active_sequence=-1,
-            active_index=0,
-            executed_b2_command=np.zeros(3, dtype=np.float32),
-            executed_ee_target=np.zeros(9, dtype=np.float32),
-        )
-        for step in range(10, 21)
-    )
-
-    records, is_pad = AsyncRTCPolicy._sample_memory_records(history, current_step=20, count=6, stride=5)
-
-    assert [record.sim_step for record in records] == [10, 10, 10, 10, 15, 20]
-    assert is_pad.tolist() == [[True, True, True, False, False, False]]
-
-
-def test_memory_sampling_rejects_a_missing_50hz_sample() -> None:
-    history = tuple(
-        MemoryObservation(
-            sim_step=step,
-            state=np.asarray([step], dtype=np.float32),
-            state_names=("state",),
-            active_sequence=-1,
-            active_index=0,
-            executed_b2_command=np.zeros(3, dtype=np.float32),
-            executed_ee_target=np.zeros(9, dtype=np.float32),
-        )
-        for step in (10, 11, 12, 14)
-    )
-
-    with pytest.raises(ValueError, match="Missing exact 50 Hz telemetry sample"):
-        AsyncRTCPolicy._sample_memory_records(history, current_step=14, count=2, stride=1)
-
-
-def test_protocol_v6_decodes_consecutive_50hz_telemetry_history() -> None:
-    state_names = ("state_a", "state_b")
-    states = np.asarray([[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]], dtype=np.float32)
-    ee_targets = np.zeros((3, len(EE_POSE_ACTION_NAMES)), dtype=np.float32)
-    b2_commands = np.asarray([[0.1, 0.0, 0.0], [0.2, -0.1, 0.0], [0.3, -0.1, 0.2]], dtype=np.float32)
-    ok, jpeg = __import__("cv2").imencode(".jpg", np.zeros((4, 4, 3), dtype=np.uint8))
-    assert ok
-    body = BytesIO()
-    np.savez(
-        body,
-        protocol_version=np.asarray(PROTOCOL_VERSION),
-        control_epoch=np.asarray(7),
-        sim_step=np.asarray(12),
-        active_sequence=np.asarray(3),
-        active_index=np.asarray(2),
-        task=np.asarray("test"),
-        state=states[-1],
-        state_names=np.asarray(state_names),
-        executed_ee_target=ee_targets[-1],
-        executed_ee_target_names=np.asarray(EE_POSE_ACTION_NAMES),
-        actual_ee_state=ee_targets[-1],
-        history_sim_steps=np.asarray([10, 11, 12]),
-        history_states=states,
-        history_active_sequences=np.asarray([2, 3, 3]),
-        history_active_indices=np.asarray([12, 1, 2]),
-        history_executed_b2_commands=b2_commands,
-        history_executed_ee_targets=ee_targets,
-        base_jpeg=jpeg,
-        wrist_jpeg=jpeg,
-    )
-
-    packet = decode_observation_packet(body.getvalue())
-
-    assert packet.control_epoch == 7
-    assert [record.sim_step for record in packet.telemetry_history] == [10, 11, 12]
-    np.testing.assert_array_equal(packet.telemetry_history[-1].state, states[-1])
-    np.testing.assert_array_equal(packet.telemetry_history[-1].executed_b2_command, b2_commands[-1])
