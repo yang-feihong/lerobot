@@ -180,6 +180,105 @@ def test_deployment_memory_plans_preserve_fixed_shapes_while_masking_startup_pad
     assert action_mask.tolist() == [[False] * 12]
 
 
+def test_random_state_history_samples_visible_suffix_per_example_reproducibly():
+    policy = PI05Policy.__new__(PI05Policy)
+    batch = {OBS_STATE: torch.arange(1024 * 13 * 4).reshape(1024, 13, 4)}
+
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(17)
+        window, lengths, mask = policy._fixed_memory_window_plan(
+            batch, key=OBS_STATE, max_frames=13, randomize=True
+        )
+        torch.manual_seed(17)
+        repeated = policy._fixed_memory_window_plan(batch, key=OBS_STATE, max_frames=13, randomize=True)
+
+    assert set(lengths.tolist()) == set(range(1, 14))
+    assert window == repeated[0] == 13
+    assert torch.equal(lengths, repeated[1])
+    assert torch.equal(mask, repeated[2])
+    assert torch.equal(mask.sum(dim=1), lengths)
+    assert mask[:, -1].all()
+    positions = torch.arange(window)[None, :]
+    assert torch.equal(mask, positions >= window - lengths[:, None])
+
+
+def test_random_state_history_respects_real_padding_and_keeps_current_state():
+    policy = PI05Policy.__new__(PI05Policy)
+    policy.config = SimpleNamespace(state_action_encoding="continuous")
+    available = torch.tensor([1, 2, 4, 7, 13] * 64)
+    original_valid = torch.arange(13)[None, :] >= 13 - available[:, None]
+    batch = {
+        OBS_STATE: torch.arange(available.numel() * 13 * 4).reshape(-1, 13, 4),
+        f"{OBS_STATE}_is_pad": ~original_valid,
+    }
+
+    window, lengths, mask = policy._fixed_memory_window_plan(
+        batch, key=OBS_STATE, max_frames=13, randomize=True
+    )
+
+    assert (lengths >= 1).all()
+    assert (lengths <= available).all()
+    assert (lengths[available == 1] == 1).all()
+    assert not (mask & ~original_valid[:, -window:]).any()
+    assert torch.equal(mask.sum(dim=1), lengths)
+    assert mask[:, -1].all()
+    # Cropping only removes old frames; the actual current state is unchanged.
+    state = policy._prepare_state_history(batch, window)
+    assert torch.equal(state[:, -1], batch[OBS_STATE][:, -1])
+
+
+@pytest.mark.parametrize(
+    "entrypoint,training", [("forward", False), ("forward", True), ("predict_action_chunk", True)]
+)
+def test_state_history_randomization_is_training_only(monkeypatch, entrypoint, training):
+    policy = PI05Policy.__new__(PI05Policy)
+    torch.nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(state_action_encoding="continuous", state_num_frames=13)
+    policy.train(training)
+    batch = {OBS_STATE: torch.zeros(2, 13, 4)}
+    calls = []
+    original_plan = policy._fixed_memory_window_plan
+
+    def record_plan(batch, **kwargs):
+        calls.append(kwargs)
+        return original_plan(batch, **kwargs)
+
+    class InputsPreparedError(Exception):
+        pass
+
+    def stop_after_planning(*args, **kwargs):
+        raise InputsPreparedError
+
+    monkeypatch.setattr(policy, "_fixed_memory_window_plan", record_plan)
+    monkeypatch.setattr(policy, "_mem_vit_window_plan", lambda *args, **kwargs: (1, None, None))
+    monkeypatch.setattr(policy, "_preprocess_images", stop_after_planning)
+    with pytest.raises(InputsPreparedError):
+        getattr(policy, entrypoint)(batch)
+    expected = {"key": OBS_STATE, "max_frames": 13}
+    if entrypoint == "forward":
+        expected["randomize"] = training
+    else:
+        expected["preserve_input_window"] = True
+    assert calls == [expected]
+
+
+def test_memory_history_default_remains_deterministic_without_consuming_rng():
+    policy = PI05Policy.__new__(PI05Policy)
+    batch = {
+        OBS_STATE: torch.zeros(2, 13, 4),
+        OBS_ACTION_HISTORY: torch.zeros(2, 12, 3),
+    }
+    rng_before = torch.random.get_rng_state()
+    for key, max_frames, allow_empty in [(OBS_STATE, 13, False), (OBS_ACTION_HISTORY, 12, True)]:
+        window, lengths, mask = policy._fixed_memory_window_plan(
+            batch, key=key, max_frames=max_frames, allow_empty=allow_empty
+        )
+        assert window == max_frames
+        assert lengths.tolist() == [max_frames, max_frames]
+        assert mask.all()
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+
+
 def test_continuous_state_and_action_history_do_not_require_mem_vit():
     image_key = "observation.images.base"
     config = SimpleNamespace(

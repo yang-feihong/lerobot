@@ -51,6 +51,13 @@ checkpoint 路径；`run_dir_name` 固定原 run，避免误选最新同名任�
 历史任务语义或 artifact 身份的接纳必须显式设置对应 `allow_resume_*_adoption`，
 仍校验动作、状态和记忆协议。`sync_full_checkpoint.sh` 与
 `sync_full_checkpoint_chunks.sh` 用于包括 optimizer/RNG 的完整恢复点传输并校验哈希。
+仅拉取模型与配套 metadata 使用 `sync_eval_checkpoint.sh`，支持
+`SYNC_PARALLEL_PARTS`；并行连接错峰建立，SSH 传输失败重试最多五次，
+任一分片最终失败或 SHA256 不一致均拒绝报告同步成功，保留远程原模型。
+同一 run 追加指令列须显式设置任务字段 `allow_resume_instruction_extension=true`：
+状态集合不变、原有每条关系不变，只能追加新指令；不允许删除或改写旧关系，也不放宽
+MEM、动作表示、输出结构和 artifact 身份校验。入口仍显式启用 updated-dataset 和
+updated-training-objective，重新计算采样先验与动作统计，并保存新语义侧车。
 
 ## 可迁移 checkpoint 基座
 
@@ -74,7 +81,7 @@ MEM-ViT 使用 LoRA 或 frozen 模式时，新 checkpoint 不再重复保存冻�
 - `training_plan/.env` 保存本轮任务共享的步数、batch、模型路径等运行参数。
 
 模板库目前提供 `grasp`、`stage1_only`、`stage2_only`、`stage3_only`、
-`three_stage_joint`、`three_goal_conditioned`、`three_goal_plus_full`，以及拉门专用的
+`three_stage_joint`、`three_goal_conditioned`、`three_goal_plus_full`、`external_grasp_goal_plus_full`，以及拉门专用的
 `pull_stage1`、`pull_stage2`、`pull_stage3`、`pull_joint`。
 每个快捷项自身包含完整矩阵。
 
@@ -87,7 +94,9 @@ MEM、sidecar、训练步数、机器/GPU；共享参数在 `.env`，内容身�
 `grasp` 定义 `object_grasp × object_grasp` 的 1×1 矩阵，使用 demonstrated 专家动作和
 `goal_end` 完成点；两份正式 grasp 任务均引用 `"training_preset": "grasp"`。
 数据来源 Staff3 和 GPU 分配属于任务配置，不写入 preset。grasp 与开门使用同一
-`training_profile.json`：图像历史 1–6 帧、连续状态历史 13 帧，禁止任务级 `memory_mode`。
+`training_profile.json`：图像历史 1–6 帧；连续状态历史上限 13 帧，训练时逐样本随机保留
+1–13 帧有效后缀（始终保留当前帧、不越过真实 padding），验证和部署使用全部可用历史。
+禁止任务级 `memory_mode`。
 旧 grasp 的 image-MEM checkpoint 保持历史身份，不能无条件 resume 成 full MEM。
 实际模型创建并应用 PEFT 后、任何 optimizer update 前，统一入口核验全部模型配置、
 共享训练参数、数据处理配置和 adapter 参数名/形状指纹；只有任务语义、数据身份及
@@ -133,10 +142,27 @@ approach/handle_press 中以 `future_goal_end` 延续到入室完成点，在 tr
 
 ### 所有 preset 共用的采样规则
 
+外部物体抓取使用 `"training_preset": "external_grasp_goal_plus_full"`，
+与推门 `three_goal_plus_full` 同一解析/采样/监督链路，定义 2 类状态 × 3 类指令：
+
+| 物理状态 | 靠近物体 `object_approach` | 抓取物体 `external_object_grasp` | 全流程 `full_episode_approach_grasp` |
+|---|---|---|---|
+| 靠近 `object_approach` | 专家动作，到靠近完成点 | 专家动作，延续至抓取完成点 | 专家动作，延续至全流程完成点 |
+| 抓取 `external_object_grasp` | 全段 `complete=1` + hold | 专家动作，到抓取完成点 | 专家动作，到全流程完成点 |
+
+hold 复用现有训练侧确定性保持逻辑：底盘速度为零，保持当前控制 EE 目标和夹爪开度，
+不是把绝对位姿或夹爪清零；已完成目标不继续模仿当前正在进行的抓取动作。
+状态/指令名称与数据侧抓取标注保持一致；本 preset 不改变原有筐内 `grasp` 1×1 定义。
+默认六个状态×指令池各占 1/6，四档语言在选中的池内采样。
+该模板不指定数据源/GPU，也不自动创建训练任务。正式训练需先提供通过完成语义审查、
+覆盖这六个关系的 semantic views（包括跨阶段 active 和 complete/hold 视图）；
+仅有语言标注或 stage_boundaries 不能直接替代。范围内 complete 遵守
+`../../data_postprocessing/COMPLETION_SEMANTICS.md`，不以切段事件或阶段末帧伪造完成点。
+
 先选择合法的“物理状态×指令”池，再在池内采样物理帧；sampler 选中的指令会随索引
 传到 batch，语言物化不再重新抽另一个指令。默认 N 个组合各占 1/N：
 `three_goal_conditioned` 为 9×1/9，`three_stage_joint`/`pull_joint` 为 3×1/3，
-`three_goal_plus_full` 为 12×1/12，单阶段与 grasp 为 1×1。不同阶段时长、episode 数、
+`three_goal_plus_full` 为 12×1/12，`external_grasp_goal_plus_full` 为 6×1/6，单阶段与 grasp 为 1×1。不同阶段时长、episode 数、
 可用指令数量或语言改写数量，不改变组合的目标概率；每 epoch 配额仅有整数取整差异。
 `state_weights` 是组合权重的显式状态系数，默认全为 1；`semantic_source_weights` 如配置，
 只调整各组合内部的数据来源比例。某个配置组合在整个训练集中没有合法样本时明确报错，
@@ -162,7 +188,7 @@ complete 依当前指令的完成边界判定，不使用其他阶段的原始 c
 改变标签比例，仍须显式使用原有“更新数据集”续训入口，不绕过一致性校验。
 
 Staff1 三目标筛选版分支任务维护在 `staff1_goal_filtered_fork_jobs.json`：wholebody6
-四卡、full MEM、`three_goal_conditioned`，从与 `20261015_180800` 相同的
+四卡、full MEM，最初使用 `three_goal_conditioned`，从与 `20261015_180800` 相同的
 `20261008_105154_mem_pi05_b2_z1_vla_training_job_staff1_joint_full_mem_arm_mode_complete/checkpoints/050000`
 完整恢复点训练到 100000。使用 `TRAINING_JOBS_FILE` 选择该计划，通过
 `cluster.sh fork-dry-run-task` / `fork-task staff1_goal_conditioned_filtered_full_mem CHECKPOINT`
@@ -173,6 +199,39 @@ Staff1 三目标筛选版分支任务维护在 `staff1_goal_filtered_fork_jobs.j
 为 2055 条训练、229 条验证，九个组合各占 1/9。新任务改用下面的 recording_hash_v1，
 不会通过修改本地代码改变已运行的远程快照。
 旧的“全部 goal 齐全”侧车会被 preflight 拒绝。远程启动仍必须通过上述统一入口验收。
+
+多场景实采＋仿真的跨阶段耦合任务维护在 `all_scenes_goal_mixed_jobs.json`：
+wholebody F 八卡、共享 full MEM，最初使用 `three_goal_conditioned` 从基座初始化训练至 100000，
+建立 W&B `5ic4dyp1` 和 `20261022_214058` 输出目录。使用混合集
+`all_scenes_plus_simulation_auto_open_v1` 的专用语义侧车；
+该侧车由上面的正式构建器从混合集 canonical sidecar 生成，不筛掉独立 Stage2 或部分有效阶段。
+采用 `recording_hash_v1` 划分；每卡 batch 2、梯度累积 3，
+八卡全局 batch 仍为 48。通过 `TRAINING_JOBS_FILE=training_plan/all_scenes_goal_mixed_jobs.json`
+选择任务，再执行 `cluster.sh prepare f`、`dry-run-task all_scenes_goal_mixed_full_mem` 和
+`start-task all_scenes_goal_mixed_full_mem`。
+
+2026-10-23，上述两个任务均切到 `three_goal_plus_full`，显式选择
+`semantic_views_three_goal_plus_full.json` 和 instruction-extension 许可，从各自最新完整
+checkpoint 通过 `resume-task` 继续，原 W&B run、输出目录和 100000 目标不变；
+Staff1 原 run 为 `20261021_205355` / W&B `cu9o541l`。
+12 种状态×指令组合各占 1/12。两份侧车均从 canonical 重建，分别保留 Staff1 的
+2284 条和混合集的 6236 条，不沿用要求全 goal 齐全的旧文件；其中 1088/4654 条分别具有
+同 episode 全流程语言及有效 Enter 监督（仿真 2074 条全部覆盖），其余仍保留可用三目标。
+全流程四档语言精确绑定原录制，完成点复用同 episode 的入室完成点；不补造独立 Stage2 的
+全流程指令。两条任务均采用当前统一采样、时序合法性、静止首帧筛选及 recording hash 划分。
+
+2026-10-24，Staff1 `three_goal_plus_full` 的后续目标调整为 150000，维护在
+`staff1_goal_filtered_fork_jobs.json`。等待原任务完成 100000 并保存完整恢复点后，
+通过统一 `resume-task` 从该点继续；保留原 W&B run、输出目录、12 组合和四卡资源。
+
+Staff1 三阶段联合的 100k→200k 续训维护在 `staff1_joint_resume_jobs.json`：
+wholebody2 四卡、`three_stage_joint`、共享 full MEM，恢复 `20261008_105154` 的完整 100k
+checkpoint（模型、optimizer、scheduler、RNG），沿用 W&B `3cmk2ai6` 与原 run 目录。
+数据划分和采样使用最新统一代码：`recording_hash_v1`、三个组合各 1/3、合法时序窗口和
+未 complete 静止首帧筛选。通过 `TRAINING_JOBS_FILE=training_plan/staff1_joint_resume_jobs.json`
+选择任务，用 `resume-dry-run-task` 验收后执行 `resume-task staff1_joint_full_mem CHECKPOINT`；
+统一入口显式开启 updated-dataset / updated-training-objective，不使用旧数据顺序的复现语义。
+新验证集可能包含前 100k 已训练过的录制，不能声称它是全程未见数据的独立 held-out 集。
 
 新任务同时指定以下两个字段（不会自动更换现有任务的 sidecar）：
 
@@ -311,6 +370,43 @@ bash training_plan/cluster.sh status
 正式镜像、挂载点、代码快照、任务映射和入口参数，但不会载入模型或启动训练。
 `resume-dry-run-plan` 还会逐项读取真实的最新完整 checkpoint，验证优化器状态、原
 W&B `run_id`、`resume="must"` 参数，以及续训时不会被入口默认值改写训练总步数。
+
+## Reset 目标选择（front / middle / back）
+
+新训练由统一入口默认启用 `action_predict_reset_preset=true`；原有 13D flow 动作、
+`arm_reset` gate 和 complete 语义不变。目标选择使用独立的共享候选评分头与 CE loss，
+只在语义视图物化后的有效 reset 帧计算，排除 padding 和 RTC 已知前缀。
+无 reset 的抓取片段不产生此项 loss，也不会按任务名强塞 front/back 标签。
+
+训练前在本地准备监督（正式入口，默认只审计，加 `--write` 才写入并刷新数据台账）：
+
+```bash
+bash ../data_postprocessing/lerobot/prepare_reset_presets.sh --dataset /绝对路径/数据集
+bash ../data_postprocessing/lerobot/prepare_reset_presets.sh --dataset /绝对路径/数据集 --write
+```
+
+生成器从已有 `raw_nonvisual` 的 `/arm_target_pos` 控制目标识别完整 reset 操作，
+排除启动 latched 消息，复现转换采样原点；不读 rosbag、不使用实际关节状态或任务名猜目标。
+末端命令需唯一匹配 preset（最多 0.03 rad），中断、未知目标或无法区分的切换保留为 unresolved。
+训练若实际采到未获证据支持的 reset 会报错，不回退 middle。
+`meta/reset_presets.json` 绑定转换 manifest 与 action parquet 的 SHA256；数据变化必须重新审计，
+生成器拒绝覆盖旧侧车。数据不需重转、不传视频或 raw_nonvisual；远程只需同步该侧车及原训练数据。
+checkpoint 保存侧车与 hash；普通 resume 不允许偷偷更换监督。
+
+catalog 位于模型 config 的 `reset_preset_catalog`，ID 只在该 catalog 内作类别索引，
+不进入归一化或 flow MSE。共享评分器按候选关节目标打分，候选数可扩展，参数量与 flow 维度不变。
+扩展目标仍需真实监督与训练验证，不承诺未见过的新 preset 可以零样本可靠执行。
+主线 profile 继续严格校验原参数结构，并独立校验新增选择头的六组权重。
+
+旧 checkpoint 缺少选择头时仍可加载，reset 固定使用 middle；普通 resume 保持其旧结构，
+不会静默创建随机选择头。新 checkpoint 声明有选择头却缺权重、缺 catalog 或输出非法 ID 时拒绝部署。
+推理结果通过独立 `arm_reset_preset_id` 和 checkpoint catalog 传给执行端，不改变物理动作归一化。
+切换 catalog/是否启用选择头会触发完整重载，不沿用不匹配的热切换。
+ROS `VLAWholeBodyTarget` 当前为 v3（物理工具姿态 + preset 名称及六关节目标），
+部署前需重建两侧消息与 Bridge/客户端；v1/v2 旧命令拒绝执行，不能与 v3 混用。
+旧模型没有 selector 时，由新版客户端明确选择 middle，不能靠旧版 ROS 命令兼容层实现。
+模型服务 TCP v2 统一处理历史模型的输入／输出工具轴转换，执行端不再重复补角。
+提交代码不自动重启现有服务或训练，实际部署状态须单独核验。
 
 ## 监控与 F 盘保护
 

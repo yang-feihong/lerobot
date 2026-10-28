@@ -24,7 +24,7 @@ PRESETS = json.loads(
 
 def make_plan(preset):
     matrix = PRESETS[preset]["state_instruction_matrix"]
-    lengths = [81] if len(matrix) == 1 else [11, 53, 17]
+    lengths = [81] if len(matrix) == 1 else [[11, 53, 17][i % 3] for i in range(len(matrix))]
     views, segments = [], []
     start = 0
     for (state, instructions), length in zip(matrix.items(), lengths, strict=True):

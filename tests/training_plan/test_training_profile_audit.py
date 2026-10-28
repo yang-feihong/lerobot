@@ -77,3 +77,21 @@ def test_device_backend_drift_is_still_rejected(device):
     report = compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])
     assert not report["ok"]
     assert "device" in report["differences"]["policy"]
+
+
+def test_reviewed_selector_extension_does_not_relax_the_base_contract():
+    from lerobot.utils.reset_presets import default_reset_presets
+
+    training, policy = values()
+    policy.update(
+        action_predict_reset_preset=True,
+        reset_preset_catalog=default_reset_presets(),
+        reset_preset_loss_weight=1.0,
+        reset_preset_manifest_sha256="audited-data",
+    )
+    assert compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])["ok"]
+    policy["max_action_dim"] += 1
+    assert not compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])["ok"]
+    policy["reset_preset_manifest_sha256"] = None
+    with pytest.raises(ValueError, match="provenance"):
+        compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])

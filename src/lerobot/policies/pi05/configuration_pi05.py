@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -26,6 +27,7 @@ from lerobot.optim import (
     CosineDecayWithWarmupSchedulerConfig,
 )
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from lerobot.utils.reset_presets import default_reset_presets, validate_reset_presets
 
 from ..rtc.configuration_rtc import RTCConfig, TrainingRTCConfig
 
@@ -92,6 +94,11 @@ class PI05Config(PreTrainedConfig):
     ee_delta_rotation_representation: str = "rot6d"  # "rot6d" or "rotvec"
     action_predict_arm_teleop_inactive: bool = True
     action_predict_arm_reset: bool = True
+    # False is the explicit legacy checkpoint contract: reset -> middle.
+    action_predict_reset_preset: bool = False
+    reset_preset_catalog: list[dict] = field(default_factory=default_reset_presets)
+    reset_preset_loss_weight: float = 1.0
+    reset_preset_manifest_sha256: str | None = None
     action_predict_ee_pose: bool = True
     action_predict_gripper: bool = True
     action_predict_task_complete: bool = True
@@ -240,6 +247,8 @@ class PI05Config(PreTrainedConfig):
     mem_vit_temporal_every: int = 4
     mem_vit_use_original_for_k1: bool = True
     state_action_encoding: str = "text"
+    # Maximum continuous state history. Training samples a visible suffix of
+    # 1..available frames per example; evaluation/inference keep all available.
     state_num_frames: int = 13
     state_history_frame_stride: int = 1
     state_history_frame_interval_seconds: float = 0.04
@@ -261,6 +270,11 @@ class PI05Config(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        validate_reset_presets(self.reset_preset_catalog)
+        if not math.isfinite(self.reset_preset_loss_weight) or self.reset_preset_loss_weight <= 0:
+            raise ValueError("reset_preset_loss_weight must be positive")
+        if self.action_predict_reset_preset and not self.action_predict_arm_reset:
+            raise ValueError("Reset preset selection requires the reset gate")
 
         # Validate configuration
         if self.n_action_steps > self.chunk_size:
@@ -569,6 +583,8 @@ class PI05Config(PreTrainedConfig):
                 if self.io_schema_resolved:
                     raise FileNotFoundError(f"Checkpoint is missing camera metadata: {metadata_path}")
                 return
+        elif isinstance(model_id, Path) or path.is_absolute() or str(model_id).startswith(("./", "../", "~/")):
+            raise FileNotFoundError(f"Local checkpoint directory does not exist: {model_id}")
         else:
             from huggingface_hub import hf_hub_download
             from huggingface_hub.errors import EntryNotFoundError
@@ -732,6 +748,12 @@ class PI05Config(PreTrainedConfig):
                     else None
                 ),
                 "discrete_training_mode": self.discrete_action_training_mode,
+                "reset_preset_selector": {
+                    "enabled": self.action_predict_reset_preset,
+                    "representation": "candidate_classification_v1",
+                    "catalog": self.reset_preset_catalog if self.action_predict_reset_preset else [],
+                    "legacy_default": "middle",
+                },
                 "ee_target_dataset_semantics": self.ee_target_dataset_semantics,
                 "ee_supervision_source": self.ee_supervision_source,
                 "ee_delta_supervision_mode": self.ee_delta_supervision_mode,

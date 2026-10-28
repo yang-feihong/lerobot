@@ -63,7 +63,7 @@ mapfile -t semantic_task_spec < <(
   python3 "${plan_dir}/semantic_plan.py" \
     --presets "${semantic_presets_file}" --jobs "${training_jobs_file}" resolve "${task_id}"
 )
-[[ "${#semantic_task_spec[@]}" -eq 13 ]] || {
+[[ "${#semantic_task_spec[@]}" -eq 14 ]] || {
   echo "Failed to resolve semantic task ${task_id} from ${training_jobs_file}" >&2
   exit 2
 }
@@ -80,6 +80,7 @@ task_train_steps="${semantic_task_spec[8]}"
 semantic_views_file="${semantic_task_spec[9]:-semantic_views.json}"
 allow_resume_semantic_adoption="${semantic_task_spec[10]}"
 allow_resume_artifact_adoption="${semantic_task_spec[12]}"
+allow_resume_instruction_extension="${semantic_task_spec[13]}"
 effective_train_steps="${task_train_steps:-${TRAIN_STEPS}}"
 semantic_source_weights='{}'
 
@@ -253,7 +254,7 @@ case "${command}" in
     checkpoint="$(readlink -f "${checkpoint}")"
     validate_resume_checkpoint "${checkpoint}"
     resume_config="${checkpoint}/pretrained_model/train_config.json"
-    if ! python3 - "${resume_config}" "${dataset_root}" "${semantic_phases}" "${semantic_phase_weights}" \
+    if ! PYTHONPATH="${plan_dir}${PYTHONPATH:+:${PYTHONPATH}}" python3 - "${resume_config}" "${dataset_root}" "${semantic_phases}" "${semantic_phase_weights}" \
       "${semantic_state_instruction_matrix}" "${memory_mode}" \
       "${B2_ACTION_REPRESENTATION}" "${Z1_ACTION_REPRESENTATION}" \
       "${PREDICT_TASK_COMPLETE}" "${PREDICT_TASK_BLOCKED}" "${command}" \
@@ -265,9 +266,12 @@ case "${command}" in
       "${allow_resume_artifact_adoption}" \
       "${BASE_POLICY_ARTIFACT_ID}" "${BASE_POLICY_SHA256}" \
       "${MEM_VIT_ARTIFACT_ID}" "${MEM_VIT_SHA256}" \
-      "${POLICY_TOKENIZER_ARTIFACT_ID}" "${POLICY_TOKENIZER_SHA256}" <<'PY'
+      "${POLICY_TOKENIZER_ARTIFACT_ID}" "${POLICY_TOKENIZER_SHA256}" \
+      "${allow_resume_instruction_extension}" <<'PY'
 import json
 import sys
+
+from semantic_plan import is_instruction_matrix_extension
 
 with open(sys.argv[1], encoding="utf-8") as stream:
     config = json.load(stream)
@@ -342,10 +346,14 @@ expected = {
     or (adopt_semantics and saved_semantics_are_empty),
     "dataset.semantic_phase_weights": dataset.get("semantic_phase_weights") == expected_phase_weights
     or (adopt_semantics and saved_semantics_are_empty),
-    # An explicit updated-training-objective resume may change relation details
-    # such as state_end -> goal_end, but it must remain the same state/intent task.
+    # Changed relation details require the existing explicit objective update;
+    # adding instructions additionally requires a reviewed task-level opt-in.
     "dataset.semantic_state_instruction_matrix topology": fork_mode
     or matrix_topology(saved_matrix) == matrix_topology(expected_state_instruction_matrix)
+    or (
+        sys.argv[28] == "true"
+        and is_instruction_matrix_extension(saved_matrix, expected_state_instruction_matrix)
+    )
     or (adopt_semantics and saved_semantics_are_empty),
     "policy.state_action_encoding": policy.get("state_action_encoding") == expected_encoding,
     "policy memory configuration": memory_matches(),

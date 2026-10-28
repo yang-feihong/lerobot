@@ -3,6 +3,19 @@
   "version": 1,
   "memory_mode": "full_mem",
   "global_batch_size": 48,
+  "reset_preset_selector_extension": {
+    "new_run_enabled": true,
+    "representation": "candidate_classification_v1",
+    "loss_weight": 1.0,
+    "adapter_shapes": {
+      "query.weight": [64, 1024],
+      "query.bias": [64],
+      "candidate.0.weight": [64, 12],
+      "candidate.0.bias": [64],
+      "candidate.2.weight": [64, 64],
+      "candidate.2.bias": [64]
+    }
+  },
   "reference_run": "20261008_105151_mem_pi05_b2_z1_vla_training_job_staff1_stage2_full_mem_arm_mode_complete",
   "policy": {
     "action_bool_balance_eps": 0.001,

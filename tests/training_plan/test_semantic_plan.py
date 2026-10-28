@@ -112,6 +112,71 @@ def test_per_task_memory_drift_is_rejected(tmp_path):
         semantic_plan.load_plan(PRESETS_PATH, path)
 
 
+def test_all_scenes_goal_mixed_adds_full_command_and_preserves_eight_gpu_run():
+    plan = semantic_plan.load_plan(PRESETS_PATH, REPO_ROOT / "training_plan/all_scenes_goal_mixed_jobs.json")
+    task_id = "all_scenes_goal_mixed_full_mem"
+    task = semantic_plan.resolve_task(plan, task_id)
+    assert task["dataset_family"] == "all_scenes_simulation"
+    assert task["memory_mode"] == "full_mem"
+    assert task["training_preset"] == "three_goal_plus_full"
+    assert task["semantic_views_file"] == "semantic_views_three_goal_plus_full.json"
+    assert task["train_steps"] == 100_000
+    assert task["resources"] == {
+        "node": "f",
+        "gpu_ids": list(range(8)),
+        "main_process_port": 29500,
+    }
+    matrix = semantic_plan.selected_matrix(plan, task_id)
+    assert len(matrix) == 3 and sum(map(len, matrix.values())) == 12
+    assert all(
+        set(row) == {"goal_approach", "goal_open", "goal_enter", "full_episode_command"}
+        for row in matrix.values()
+    )
+    assert task["allow_resume_instruction_extension"] is True
+    assert task["run_dir_name"].startswith("20261022_214058_")
+    assert "allow_resume_semantic_adoption" not in task
+
+
+def test_staff1_goal_plus_full_resume_targets_150k_in_original_run_on_wb6():
+    plan = semantic_plan.load_plan(
+        PRESETS_PATH, REPO_ROOT / "training_plan/staff1_goal_filtered_fork_jobs.json"
+    )
+    task = semantic_plan.resolve_task(plan, "staff1_goal_conditioned_filtered_full_mem")
+    assert task["training_preset"] == "three_goal_plus_full"
+    assert task["semantic_views_file"] == "semantic_views_three_goal_plus_full.json"
+    assert task["allow_resume_instruction_extension"] is True
+    assert task["run_dir_name"].startswith("20261021_205355_")
+    assert task["train_steps"] == 150_000
+    matrix = semantic_plan.selected_matrix(plan, "staff1_goal_conditioned_filtered_full_mem")
+    assert len(matrix) == 3 and sum(map(len, matrix.values())) == 12
+    assert all("full_episode_command" in row for row in matrix.values())
+    assert task["resources"] == {
+        "node": "wb6",
+        "gpu_ids": [0, 1, 2, 3],
+        "main_process_port": 29500,
+    }
+
+
+def test_staff1_joint_resume_keeps_run_identity_and_targets_200k_on_wb2():
+    plan = semantic_plan.load_plan(PRESETS_PATH, REPO_ROOT / "training_plan/staff1_joint_resume_jobs.json")
+    task_id = "staff1_joint_full_mem"
+    task = semantic_plan.resolve_task(plan, task_id)
+    assert task["dataset_family"] == "staff1"
+    assert task["memory_mode"] == "full_mem"
+    assert task["training_preset"] == "three_stage_joint"
+    assert task["train_steps"] == 200_000
+    assert task["run_dir_name"] == (
+        "20261008_105154_mem_pi05_b2_z1_vla_training_job_staff1_joint_full_mem_arm_mode_complete"
+    )
+    assert task["resources"] == {
+        "node": "wb2",
+        "gpu_ids": [0, 1, 2, 3],
+        "main_process_port": 29500,
+    }
+    matrix = semantic_plan.selected_matrix(plan, task_id)
+    assert len(matrix) == 3 and all(len(row) == 1 for row in matrix.values())
+
+
 def test_stage1_contract_rejects_wrong_language(tmp_path):
     matrix = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
     with pytest.raises(ValueError, match="no sidecar coverage"):

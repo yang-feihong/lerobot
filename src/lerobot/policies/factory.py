@@ -837,6 +837,8 @@ def make_policy(
             )
         if isinstance(cfg, PI05Config):
             _validate_embedded_mem_vit_weights(peft_pretrained_path, cfg)
+            from lerobot.utils.reset_presets import validate_selector_checkpoint
+            validate_selector_checkpoint(peft_pretrained_path, cfg.action_predict_reset_preset)
 
         kwargs["pretrained_name_or_path"] = peft_config.base_model_name_or_path
         if isinstance(cfg, PI05Config):

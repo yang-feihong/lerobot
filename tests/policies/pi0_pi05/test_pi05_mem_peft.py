@@ -117,6 +117,24 @@ def test_pi05_from_pretrained_does_not_return_an_unloaded_model(tiny_policy_fact
         modeling_pi05.PI05Policy.from_pretrained(tmp_path / "missing", config=config)
 
 
+@pytest.mark.parametrize("kind", ["path", "absolute_string", "relative_string"])
+def test_missing_local_checkpoint_never_attempts_hub_metadata(tiny_policy_factory, tmp_path, monkeypatch, kind):
+    config = tiny_policy_factory(mem_vit_enabled=False).config
+    model_id = tmp_path / "missing"
+    if kind == "absolute_string":
+        model_id = str(model_id)
+    elif kind == "relative_string":
+        monkeypatch.chdir(tmp_path)
+        model_id = "./missing"
+
+    def unexpected_download(**kwargs):
+        raise AssertionError("Missing local checkpoint must not access the Hub")
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", unexpected_download)
+    with pytest.raises(FileNotFoundError, match="Local checkpoint directory"):
+        config.restore_pretrained_metadata(model_id)
+
+
 @pytest.mark.parametrize(
     "mem_enabled,mode,freeze,checkpointing",
     [

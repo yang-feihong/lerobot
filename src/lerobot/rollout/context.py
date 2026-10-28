@@ -194,6 +194,9 @@ def build_rollout_context(
 
         peft_path = policy_config.pretrained_path
         peft_config = PeftConfig.from_pretrained(peft_path)
+        if policy_config.type == "pi05":
+            from lerobot.utils.reset_presets import validate_selector_checkpoint
+            validate_selector_checkpoint(peft_path, policy_config.action_predict_reset_preset)
         resolved_bases = resolve_checkpoint_bases(peft_path)
         if resolved_bases:
             peft_config.base_model_name_or_path = str(resolved_bases["policy_base"])

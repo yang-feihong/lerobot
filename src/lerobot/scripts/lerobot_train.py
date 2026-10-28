@@ -1368,6 +1368,22 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if not is_main_process:
         dataset, eval_dataset = make_train_eval_datasets(cfg)
 
+    from lerobot.datasets.reset_presets import ResetPresetCatalog
+    from lerobot.utils.reset_presets import PRESET_SIDECAR
+
+    reset_presets = None
+    if cfg.policy is not None and cfg.policy.type == "pi05" and cfg.policy.action_predict_reset_preset:
+        reset_presets = ResetPresetCatalog(dataset.root / "meta" / PRESET_SIDECAR, cfg.policy.reset_preset_catalog)
+        saved_sha = cfg.policy.reset_preset_manifest_sha256
+        if cfg.resume and saved_sha != reset_presets.sha256 and not cfg.resume_with_updated_dataset:
+            raise ValueError(
+                "Reset preset supervision changed on resume; use the explicit dataset-update workflow"
+            )
+        cfg.policy.reset_preset_manifest_sha256 = reset_presets.sha256
+        if is_main_process:
+            cfg.output_dir.mkdir(parents=True, exist_ok=True)
+            (cfg.output_dir / PRESET_SIDECAR).write_bytes(reset_presets.payload)
+
     dataset_split_manifest = None
     if cfg.dataset.eval_split > 0:
         base_episodes = (
@@ -2376,6 +2392,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 )
                 train_tracker.task_variant_applied = sum(semantic_counts.values()) - semantic_counts["hold"]
             batch = preprocessor(batch)
+            if reset_presets is not None:
+                reset_presets.attach(
+                    batch, action_names=cfg.policy.action_feature_names,
+                    fps=dataset.fps, action_dt=cfg.policy.action_dt_seconds,
+                )
             if semantic_views is not None:
                 attach_semantic_view_loss_semantics(batch, semantic_views.semantic_names)
             else:
@@ -2493,6 +2514,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         else []
                     )
                     eval_batch = preprocessor(eval_batch)
+                    if reset_presets is not None:
+                        reset_presets.attach(
+                            eval_batch, action_names=cfg.policy.action_feature_names,
+                            fps=dataset.fps, action_dt=cfg.policy.action_dt_seconds,
+                        )
                     if semantic_views is not None:
                         attach_semantic_view_loss_semantics(eval_batch, semantic_views.semantic_names)
                     else:
@@ -2720,6 +2746,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     if dataset_split_manifest is not None:
                         (checkpoint_dir / PRETRAINED_MODEL_DIR / "dataset_split.json").write_text(
                             json.dumps(dataset_split_manifest, indent=2) + "\n"
+                        )
+                    if reset_presets is not None:
+                        (checkpoint_dir / PRETRAINED_MODEL_DIR / PRESET_SIDECAR).write_bytes(
+                            reset_presets.payload
                         )
                     if profile_audit is not None:
                         (checkpoint_dir / PRETRAINED_MODEL_DIR / "training_profile_audit.json").write_text(

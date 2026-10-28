@@ -40,6 +40,21 @@
         }
       }
     },
+    "external_grasp_goal_plus_full": {
+      "state_weights": {"object_approach": 1.0, "external_object_grasp": 1.0},
+      "state_instruction_matrix": {
+        "object_approach": {
+          "object_approach": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "goal_end"},
+          "external_object_grasp": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "future_goal_end"},
+          "full_episode_approach_grasp": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "future_goal_end"}
+        },
+        "external_object_grasp": {
+          "object_approach": {"status": "complete", "action_supervision": "hold", "completion_boundary": "none"},
+          "external_object_grasp": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "goal_end"},
+          "full_episode_approach_grasp": {"status": "active", "action_supervision": "demonstrated", "completion_boundary": "goal_end"}
+        }
+      }
+    },
     "grasp": {
       "state_weights": {"object_grasp": 1.0},
       "state_instruction_matrix": {

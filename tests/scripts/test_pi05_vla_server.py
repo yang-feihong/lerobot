@@ -770,6 +770,7 @@ def test_server_loads_current_contract_for_all_representation_pairs(
     metadata_path = tmp_path / "pi05_deployment_metadata.json"
     legacy_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     legacy_metadata["action"].pop("arm_mode_encoding")
+    legacy_metadata["action"].pop("reset_preset_selector")
     metadata_path.write_text(json.dumps(legacy_metadata), encoding="utf-8")
     legacy_contract = _load_checkpoint_contract(tmp_path, config, 50.0)
     assert legacy_contract.arm_mode_encoding is None
@@ -901,12 +902,14 @@ def test_continuous_ee_schema_defaults_missing_arm_modes_to_active() -> None:
 )
 @pytest.mark.parametrize("rtc_mode", ["inference", "training"])
 @pytest.mark.parametrize("scheduling_mode", ["RTC", "SYNC"])
+@pytest.mark.parametrize("selector_enabled", [False, True])
 def test_infer_records_model_action_names_and_source_step_anchor(
     z1_representation: str,
     expected_anchor_kind: str,
     expected_anchor: np.ndarray,
     rtc_mode: str,
     scheduling_mode: str,
+    selector_enabled: bool,
 ) -> None:
     model_names = (*B2_EXECUTION_VELOCITY_NAMES, *EE_DELTA_ACTION_NAMES, "gripper_target")
     policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
@@ -927,7 +930,8 @@ def test_infer_records_model_action_names_and_source_step_anchor(
 
     def predict(_batch, **kwargs):
         predict_calls.append(kwargs)
-        return torch.zeros((1, 2, len(model_names)))
+        actions = torch.zeros((1, 2, len(model_names)))
+        return (actions, torch.tensor([[0, 2]])) if selector_enabled else actions
 
     policy.policy = SimpleNamespace(predict_action_chunk=predict)
     raw_batch = _RecordedImageBatch()
@@ -946,6 +950,10 @@ def test_infer_records_model_action_names_and_source_step_anchor(
     policy.b2_action_representation = "velocity"
     policy.b2_execution_mode = "velocity_chunk"
     policy.action_names = EXECUTION_ACTION_NAMES
+    from lerobot.utils.reset_presets import default_reset_presets
+    policy.reset_preset_catalog = default_reset_presets() if selector_enabled else None
+    if selector_enabled:
+        policy.action_names += ("arm_reset_preset_id",)
     policy.stop_on_model_task_complete = False
     policy._task_complete_latched = False
     policy.b2_velocity_smoothing_time_constant_s = 0.0
@@ -970,7 +978,10 @@ def test_infer_records_model_action_names_and_source_step_anchor(
     assert record.model_action_names == model_names
     assert record.model_image_history == raw_batch.model_image_history
     assert record.original.shape == (2, len(model_names))
-    assert record.processed.shape == (2, len(EXECUTION_ACTION_NAMES))
+    assert record.processed.shape == (2, len(policy.action_names))
+    assert record.reset_preset_catalog == policy.reset_preset_catalog
+    if selector_enabled:
+        assert record.processed[:, -1].tolist() == [0, 2]
     assert record.source_step == 25
     assert record.control_epoch == 3
     assert record.b2_execution_mode == "velocity_chunk"
@@ -986,6 +997,8 @@ def test_infer_records_model_action_names_and_source_step_anchor(
     assert policy._next_sequence == 2
     conditioning_delay = 7 if rtc_mode == "inference" and scheduling_mode == "RTC" else 0
     expected_conditioning = {"inference_delay": conditioning_delay, "prev_chunk_left_over": None} if scheduling_mode == "RTC" else {}
+    if selector_enabled:
+        expected_conditioning["return_reset_presets"] = True
     assert predict_calls == [expected_conditioning]
     assert record.rtc_conditioning_delay_steps == conditioning_delay
 

@@ -479,6 +479,8 @@ def _load_checkpoint_contract(
         int(metadata_version), action, raw_config
     )
     expected = config.deployment_metadata()
+    if "reset_preset_selector" not in action and not config.action_predict_reset_preset:
+        expected["action"].pop("reset_preset_selector")
     if "arm_mode_encoding" not in action:
         expected["action"].pop("arm_mode_encoding", None)
     saved_predict = action.get("predict", {})
@@ -668,6 +670,8 @@ def _checkpoint_hot_swap_signature(policy_path: Path) -> str:
         "action_gripper_nonnegative_value",
         "action_gripper_target_true_side",
         "action_predict_arm_reset",
+        "action_predict_reset_preset",
+        "reset_preset_catalog",
         "action_predict_arm_teleop_inactive",
         "action_predict_ee_pose",
         "action_predict_gripper",
@@ -707,6 +711,9 @@ def _checkpoint_hot_swap_signature(policy_path: Path) -> str:
         "training_rtc_config",
     }
     config = documents["config.json"]
+    config["action_predict_reset_preset"] = config.get("action_predict_reset_preset", False)
+    if not config["action_predict_reset_preset"]:
+        config.pop("reset_preset_catalog", None)
     documents["config.json"] = {key: config[key] for key in sorted(structural_config_fields) if key in config}
 
     # Adapter metadata is itself structural, except for filesystem/revision and
@@ -837,6 +844,7 @@ def encode_action_packet(record: ActionRecord) -> bytes:
         source_step=np.asarray(record.source_step, dtype=np.int64),
         inference_seconds=np.asarray(record.inference_seconds, dtype=np.float64),
         action_names=np.asarray(record.action_names, dtype=np.str_),
+        reset_preset_catalog=np.asarray(json.dumps(record.reset_preset_catalog), dtype=np.str_),
         model_action_names=np.asarray(record.model_action_names, dtype=np.str_),
         control_epoch=np.asarray(record.control_epoch, dtype=np.int64),
         b2_execution_mode=np.asarray(record.b2_execution_mode, dtype=np.str_),
@@ -947,6 +955,7 @@ class ActionRecord:
     rtc_mode: str = "inference"
     rtc_conditioning_delay_steps: int = 0
     model_image_history: bytes | None = None
+    reset_preset_catalog: list[dict] | None = None
 
 
 class _RecordedImageBatch(dict):
@@ -1063,6 +1072,7 @@ class RolloutRecorder:
                 sequence=np.asarray(record.sequence),
                 source_step=np.asarray(record.source_step),
                 action_names=np.asarray(record.action_names),
+                reset_preset_catalog=np.asarray(json.dumps(record.reset_preset_catalog)),
                 model_action_names=np.asarray(record.model_action_names),
                 control_epoch=np.asarray(record.control_epoch),
                 b2_execution_mode=np.asarray(record.b2_execution_mode),
@@ -1221,6 +1231,9 @@ class AsyncRTCPolicy:
             else "velocity_chunk"
         )
         self.action_names = execution_action_names(self.z1_action_representation)
+        self.reset_preset_catalog = config.reset_preset_catalog if config.action_predict_reset_preset else None
+        if self.reset_preset_catalog is not None:
+            self.action_names += ("arm_reset_preset_id",)
         self.source_state_names = contract.source_state_names
         self.selected_state_names = contract.selected_state_names
         self.source_action_names = contract.source_action_names
@@ -1403,6 +1416,9 @@ class AsyncRTCPolicy:
 
         from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
 
+        from lerobot.utils.reset_presets import validate_selector_checkpoint
+
+        validate_selector_checkpoint(policy_path, config.action_predict_reset_preset)
         adapter_state = load_peft_weights(str(policy_path), device="cpu")
         with self._model_lock:
             load_result = set_peft_model_state_dict(
@@ -1938,7 +1954,10 @@ class AsyncRTCPolicy:
             ).to(self.device)
         # Both RTC modes operate without autograd or tensor version counters.
         with torch.inference_mode():
-            actions = self.policy.predict_action_chunk(batch, **conditioning)
+            if self.reset_preset_catalog is not None:
+                actions, preset_ids = self.policy.predict_action_chunk(batch, return_reset_presets=True, **conditioning)
+            else:
+                actions = self.policy.predict_action_chunk(batch, **conditioning)
             original = actions.squeeze(0).detach().cpu().clone()
             b2_reference = None
             if self.b2_execution_mode == "se2_feedback":
@@ -1970,6 +1989,8 @@ class AsyncRTCPolicy:
                 self.postprocessed_action_names,
                 self.z1_action_representation,
             )
+            if self.reset_preset_catalog is not None:
+                unsmoothed = torch.cat((unsmoothed, preset_ids.squeeze(0).detach().cpu().float()[:, None]), dim=-1)
             if self.stop_on_model_task_complete:
                 if self._task_complete_latched:
                     unsmoothed[:, self.action_names.index("task_complete")] = 1.0
@@ -1996,6 +2017,7 @@ class AsyncRTCPolicy:
                 f"Processed action shape {tuple(processed.shape)} does not match names {self.action_names}"
             )
         record = ActionRecord(
+            reset_preset_catalog=self.reset_preset_catalog,
             sequence=self._next_sequence,
             source_step=packet.sim_step,
             inference_seconds=elapsed,

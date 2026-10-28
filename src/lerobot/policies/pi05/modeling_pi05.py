@@ -58,6 +58,7 @@ from lerobot.utils.constants import (
     OBS_STATE,
     OPENPI_ATTENTION_MASK_VALUE,
 )
+from lerobot.utils.reset_presets import PRESET_ID_KEY, PRESET_VALID_KEY
 
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
@@ -68,6 +69,7 @@ from ..rtc.training_rtc import (
 )
 from .b2_action_transform import EE_DELTA_VALID_KEY
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
+from .reset_preset_head import ResetPresetHead, reset_preset_loss
 
 
 def linear_chain_crf_nll(
@@ -1059,6 +1061,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
+        if config.action_predict_reset_preset:
+            self.reset_preset_head = ResetPresetHead(action_expert_config.width, config.reset_preset_catalog)
         if config.discrete_action_training_mode == "structured_temporal":
             self.arm_mode_head = nn.Linear(action_expert_config.width, 3)
             self.gripper_state_head = nn.Linear(action_expert_config.width, 2)
@@ -1564,7 +1568,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
-        if self.config.discrete_action_training_mode != "structured_temporal":
+        if self.config.discrete_action_training_mode != "structured_temporal" and not self.config.action_predict_reset_preset:
             return x_t
         _, suffix_out = self.denoise_step(
             prefix_pad_masks=prefix_pad_masks,
@@ -1573,7 +1577,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             timestep=torch.zeros(bsize, dtype=torch.float32, device=device),
             return_action_features=True,
         )
-        return x_t, self.structured_action_logits(suffix_out)
+        logits = self.structured_action_logits(suffix_out) if self.config.discrete_action_training_mode == "structured_temporal" else {}
+        if self.config.action_predict_reset_preset:
+            logits["reset_preset"] = self.reset_preset_head(suffix_out)
+        return x_t, logits
 
     def structured_action_logits(self, action_features: Tensor) -> dict[str, Tensor]:
         return {
@@ -1669,6 +1676,8 @@ class PI05Policy(PreTrainedPolicy):
             self.model.time_mlp_in,
             self.model.time_mlp_out,
         ]
+        if self.config.action_predict_reset_preset:
+            full_train_modules.append(self.model.reset_preset_head)
         if self.config.state_action_encoding == "continuous":
             full_train_modules.append(self.model.state_memory_proj)
         if self.config.action_history_enabled:
@@ -1983,6 +1992,7 @@ class PI05Policy(PreTrainedPolicy):
 
     def get_optim_params(self) -> list[dict]:
         new_module_names = [
+            "reset_preset_head",
             "state_memory_proj",
             "action_memory_proj",
             "arm_mode_head",
@@ -2088,6 +2098,7 @@ class PI05Policy(PreTrainedPolicy):
         max_frames: int,
         allow_empty: bool = False,
         preserve_input_window: bool = False,
+        randomize: bool = False,
     ) -> tuple[int, Tensor, Tensor]:
         value = batch.get(key)
         if value is None:
@@ -2102,6 +2113,11 @@ class PI05Policy(PreTrainedPolicy):
                 available = (~pad.to(device=device).bool()).sum(dim=1)
         minimum = 0 if allow_empty else 1
         lengths = available.clamp(min=minimum, max=max_frames)
+        if randomize:
+            # Sample each example's visible suffix uniformly from its real
+            # available history. State history includes the current frame, so
+            # minimum=1 always retains it; padding never becomes valid history.
+            lengths = minimum + (torch.rand(batch_size, device=device) * (lengths - minimum + 1)).long()
         window_num_frames = (
             min(int(value.shape[1]), max_frames)
             if preserve_input_window and value.ndim >= 3
@@ -2900,7 +2916,10 @@ class PI05Policy(PreTrainedPolicy):
         return self._action_queue.popleft()
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
+    def predict_action_chunk(
+        self, batch: dict[str, Tensor], *, return_reset_presets: bool = False,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
@@ -2942,7 +2961,7 @@ class PI05Policy(PreTrainedPolicy):
             kwargs["action_history"] = self._prepare_action_history(batch, action_window)
             kwargs["action_history_mask"] = action_mask
         sampled = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
-        if self.config.discrete_action_training_mode == "structured_temporal":
+        if self.config.discrete_action_training_mode == "structured_temporal" or self.config.action_predict_reset_preset:
             actions, structured_logits = sampled
         else:
             actions = sampled
@@ -2965,6 +2984,12 @@ class PI05Policy(PreTrainedPolicy):
             actions[:, :, name_to_dim["gripper_target"]] = gripper_true
             actions[:, :, name_to_dim["task_complete"]] = torch.where(complete, 1.0, -1.0)
 
+        if return_reset_presets:
+            if not self.config.action_predict_reset_preset:
+                raise ValueError("Legacy policy has no reset selector; execution must use middle")
+            if not torch.isfinite(structured_logits["reset_preset"]).all():
+                raise ValueError("Nonfinite reset selector logits; refusing to execute")
+            return actions, structured_logits["reset_preset"].argmax(dim=-1)
         return actions
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
@@ -2985,6 +3010,7 @@ class PI05Policy(PreTrainedPolicy):
                 batch,
                 key=OBS_STATE,
                 max_frames=self.config.state_num_frames,
+                randomize=self.training,
             )
             if self.config.state_action_encoding == "continuous"
             else (1, None, None)
@@ -3045,11 +3071,12 @@ class PI05Policy(PreTrainedPolicy):
             image_memory_masks=image_memory_masks,
             state_memory_mask=state_memory_mask,
             action_history_mask=action_history_mask,
-            return_action_features=self.config.discrete_action_training_mode == "structured_temporal",
+            return_action_features=self.config.discrete_action_training_mode == "structured_temporal" or self.config.action_predict_reset_preset,
         )
-        if self.config.discrete_action_training_mode == "structured_temporal":
+        if self.config.discrete_action_training_mode == "structured_temporal" or self.config.action_predict_reset_preset:
             losses, action_features = model_output
-            structured_logits = self.model.structured_action_logits(action_features)
+            if self.config.discrete_action_training_mode == "structured_temporal":
+                structured_logits = self.model.structured_action_logits(action_features)
         else:
             losses = model_output
 
@@ -3060,6 +3087,19 @@ class PI05Policy(PreTrainedPolicy):
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
         }
+        preset_loss = None
+        if self.config.action_predict_reset_preset:
+            preset_loss = reset_preset_loss(
+                self.model.reset_preset_head(action_features), batch[PRESET_ID_KEY], batch[PRESET_VALID_KEY],
+                action_is_pad, reduction,
+            ) * self.config.reset_preset_loss_weight
+            loss_dict["reset_preset_loss"] = float(preset_loss.detach().mean().cpu())
+
+        def finish_loss(value):
+            if preset_loss is not None:
+                value = value + preset_loss
+                loss_dict["loss"] = float(value.detach().mean().cpu())
+            return value, loss_dict
         if rtc_prefix_mask is not None:
             valid = ~action_is_pad
             per_dim = (losses * valid[..., None]).sum(dim=(0, 1)) / valid.sum().clamp_min(1)
@@ -3096,7 +3136,7 @@ class PI05Policy(PreTrainedPolicy):
                 batch.get(EE_DELTA_VALID_KEY),
             )
             loss_dict.update(structured_loss_dict)
-            return loss, loss_dict
+            return finish_loss(loss)
 
         if self.config.action_loss_schema == "uniform_valid":
             loss = self._uniform_valid_action_loss(
@@ -3106,7 +3146,7 @@ class PI05Policy(PreTrainedPolicy):
             )
             scalar_loss = loss.mean() if loss.ndim else loss
             loss_dict["loss"] = scalar_loss.item()
-            return loss, loss_dict
+            return finish_loss(loss)
 
         if self._use_b2_z1_gate_action_loss(original_action_dim):
             loss, gate_loss_dict = self._b2_z1_gate_action_loss(
@@ -3119,23 +3159,23 @@ class PI05Policy(PreTrainedPolicy):
                 batch.get("loss_semantic_names"),
             )
             loss_dict.update(gate_loss_dict)
-            return loss, loss_dict
+            return finish_loss(loss)
 
         if rtc_prefix_mask is not None:
             loss = self._uniform_valid_action_loss(losses, reduction, action_is_pad)
             loss_dict["loss"] = (loss.mean() if loss.ndim else loss).item()
-            return loss, loss_dict
+            return finish_loss(loss)
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
             per_sample_loss = losses.mean(dim=(1, 2))
             loss_dict["loss"] = per_sample_loss.mean().item()
-            return per_sample_loss, loss_dict
+            return finish_loss(per_sample_loss)
         else:
             # Default: return scalar mean loss
             loss = losses.mean()
             loss_dict["loss"] = loss.item()
-            return loss, loss_dict
+            return finish_loss(loss)
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0.5 VLA fine-tuning.
@@ -3157,6 +3197,8 @@ class PI05Policy(PreTrainedPolicy):
             "model.time_mlp_in",
             "model.time_mlp_out",
         ]
+        if self.config.action_predict_reset_preset:
+            modules_to_save.append("model.reset_preset_head")
         if self.config.discrete_action_training_mode == "structured_temporal":
             modules_to_save.extend(
                 [

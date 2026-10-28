@@ -93,12 +93,20 @@ else
     fi
     (
       set -o pipefail
-      env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
-        ssh -F "${CLUSTER_SSH_CONFIG}" -o ControlMaster=no "${ssh_host}" \
-        "dd if='${remote_snapshot}/pretrained_model/${largest_rel}' bs=${block_size} skip=${skip_blocks} count=${count_blocks} status=none" \
-        | dd of="${local_tmp}" bs="${block_size}" seek="${skip_blocks}" conv=notrunc status=none
+      for attempt in 1 2 3 4 5; do
+        if env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+          ssh -F "${CLUSTER_SSH_CONFIG}" -o ControlMaster=no "${ssh_host}" \
+          "dd if='${remote_snapshot}/pretrained_model/${largest_rel}' bs=${block_size} skip=${skip_blocks} count=${count_blocks} status=none" \
+          | dd of="${local_tmp}" bs="${block_size}" seek="${skip_blocks}" conv=notrunc status=none; then
+          exit 0
+        fi
+        sleep "${attempt}"
+      done
+      exit 1
     ) &
     transfer_pids+=("$!")
+    # Avoid flooding sshd's unauthenticated-connection limit on high-latency links.
+    sleep 1
   done
   transfer_failed=false
   for transfer_pid in "${transfer_pids[@]}"; do

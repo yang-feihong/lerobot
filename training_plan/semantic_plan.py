@@ -105,6 +105,7 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
             "version",
             "memory_mode",
             "global_batch_size",
+            "reset_preset_selector_extension",
             "reference_run",
             "policy",
             "training",
@@ -144,6 +145,7 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
             "semantic_views_file",
             "allow_resume_semantic_adoption",
             "allow_resume_artifact_adoption",
+            "allow_resume_instruction_extension",
             "run_dir_name",
         }
         preset_keys = common | {"training_preset"}
@@ -160,6 +162,8 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
             raise ValueError(f"task {task_id!r} allow_resume_semantic_adoption must be boolean")
         if not isinstance(task.get("allow_resume_artifact_adoption", False), bool):
             raise ValueError(f"task {task_id!r} allow_resume_artifact_adoption must be boolean")
+        if not isinstance(task.get("allow_resume_instruction_extension", False), bool):
+            raise ValueError(f"task {task_id!r} allow_resume_instruction_extension must be boolean")
         if "train_steps" in task and (not isinstance(task["train_steps"], int) or task["train_steps"] <= 0):
             raise ValueError(f"task {task_id!r} train_steps must be a positive integer")
         semantic_views_file = task.get("semantic_views_file", "semantic_views.json")
@@ -194,6 +198,18 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
                 },
             )
     return {"training_presets": presets, "tasks": tasks, "training_profile": profile}
+
+
+def is_instruction_matrix_extension(saved: dict, requested: dict) -> bool:
+    """Permit only appended instructions over the same states and unchanged old relations."""
+    if not saved or set(saved) != set(requested):
+        return False
+    added = False
+    for state, relations in saved.items():
+        if not relations or any(requested[state].get(goal) != rule for goal, rule in relations.items()):
+            return False
+        added |= bool(set(requested[state]) - set(relations))
+    return added
 
 
 def resolve_task(payload: dict[str, Any], task_id: str) -> dict[str, Any]:
@@ -375,6 +391,7 @@ def command_resolve(args: argparse.Namespace) -> None:
         "true" if task.get("allow_resume_semantic_adoption", False) else "false",
         str(task.get("run_dir_name", "")),
         "true" if task.get("allow_resume_artifact_adoption", False) else "false",
+        "true" if task.get("allow_resume_instruction_extension", False) else "false",
     )
     print("\n".join(values))
 

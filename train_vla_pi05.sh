@@ -29,6 +29,7 @@ ee_delta_rotation_representation="rotvec" # "rotvec" for new EE-delta checkpoint
 action_semantics_profile="joint_control_arm_mode_v2"
 predict_arm_teleop_inactive="true"
 predict_arm_reset="true"
+predict_reset_preset="true"
 predict_ee_pose="true"
 predict_gripper="true"
 predict_task_complete="false"
@@ -344,6 +345,7 @@ while (( $# > 0 )); do
     --action-discrete-group-weight=*) action_discrete_group_weight="${1#*=}"; action_discrete_group_weight_explicit="true" ;;
     --predict-arm-teleop-inactive=*) predict_arm_teleop_inactive="${1#*=}" ;;
     --predict-arm-reset=*) predict_arm_reset="${1#*=}" ;;
+    --predict-reset-preset=*) predict_reset_preset="${1#*=}" ;;
     --predict-ee-pose=*) predict_ee_pose="${1#*=}" ;;
     --predict-gripper=*) predict_gripper="${1#*=}" ;;
     --predict-task-complete=*)
@@ -757,6 +759,7 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.ee_delta_rotation_representation="$ee_delta_rotation_representation"
     --policy.action_predict_arm_teleop_inactive="$predict_arm_teleop_inactive"
     --policy.action_predict_arm_reset="$predict_arm_reset"
+    --policy.action_predict_reset_preset="$predict_reset_preset"
     --policy.action_predict_ee_pose="$predict_ee_pose"
     --policy.action_predict_gripper="$predict_gripper"
     --policy.action_predict_task_complete="$predict_task_complete"
