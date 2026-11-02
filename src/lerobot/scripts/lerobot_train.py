@@ -1287,6 +1287,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             cfg.dataset.semantic_state_instruction_matrix
         )
         cfg.trainable_config.semantic_view_kind_weights = dict(cfg.dataset.semantic_view_kind_weights)
+        if cfg.dataset.semantic_domain_weights:
+            from lerobot.data_domains import select_domain_episodes
+
+            cfg.dataset.episodes = select_domain_episodes(
+                semantic_views,
+                cfg.dataset.episodes if cfg.dataset.episodes is not None else sorted(semantic_views.episodes),
+                cfg.dataset.semantic_domain_weights,
+            )
 
     if isinstance(cfg.policy, PI05Config) and (
         cfg.policy.mem_vit_enabled
@@ -1373,7 +1381,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     reset_presets = None
     if cfg.policy is not None and cfg.policy.type == "pi05" and cfg.policy.action_predict_reset_preset:
-        reset_presets = ResetPresetCatalog(dataset.root / "meta" / PRESET_SIDECAR, cfg.policy.reset_preset_catalog)
+        reset_path = cfg.reset_preset_sidecar or dataset.root / "meta" / PRESET_SIDECAR
+        reset_presets = ResetPresetCatalog(
+            reset_path, cfg.policy.reset_preset_catalog, dataset_root=dataset.root,
+            unknown_target_policy=cfg.reset_preset_unknown_target_policy,
+        )
         saved_sha = cfg.policy.reset_preset_manifest_sha256
         if cfg.resume and saved_sha != reset_presets.sha256 and not cfg.resume_with_updated_dataset:
             raise ValueError(
@@ -1383,6 +1395,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         if is_main_process:
             cfg.output_dir.mkdir(parents=True, exist_ok=True)
             (cfg.output_dir / PRESET_SIDECAR).write_bytes(reset_presets.payload)
+            logging.info("Reset preset unknown target policy: %s; audited unresolved spans: %s",
+                         cfg.reset_preset_unknown_target_policy, reset_presets.unresolved)
 
     dataset_split_manifest = None
     if cfg.dataset.eval_split > 0:
@@ -1470,6 +1484,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             phase_weights=cfg.dataset.semantic_phase_weights,
             source_weights=cfg.dataset.semantic_source_weights,
             **static_args,
+            domain_weights=cfg.dataset.semantic_domain_weights,
         )
     if semantic_views is not None:
         expected_episodes = set(dataset.episodes or range(dataset.meta.total_episodes))
@@ -1488,6 +1503,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "phases": cfg.dataset.semantic_phases,
                 "phase_weights": cfg.dataset.semantic_phase_weights,
                 "source_weights": cfg.dataset.semantic_source_weights,
+                "domain_weights": cfg.dataset.semantic_domain_weights,
                 "exclude_incomplete_static_starts": cfg.dataset.semantic_exclude_incomplete_static_starts,
                 "sampling_strategy": "state_instruction_cells"
                 if relation_sampling is not None
@@ -1799,6 +1815,20 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             peft_cli_overrides = dataclasses.asdict(cfg.peft)
             policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
 
+    model_initialization = None
+    if cfg.model_init_checkpoint is not None and cfg.resume:
+        model_initialization = json.loads(
+            (cfg.checkpoint_path / PRETRAINED_MODEL_DIR / "model_initialization.json").read_text()
+        )
+    if cfg.model_init_checkpoint is not None and not cfg.resume:
+        from lerobot.common.model_initialization import initialize_model_weights
+        model_initialization = initialize_model_weights(policy, cfg.model_init_checkpoint, resume=cfg.resume)
+        if cfg.steps <= model_initialization["source_step"]:
+            raise ValueError("Training target must be greater than the model initialization step")
+        if is_main_process:
+            (cfg.output_dir / "model_initialization.json").write_text(json.dumps(model_initialization, indent=2) + "\n")
+            logging.info("Weights-only initialization: %s", model_initialization)
+
     # Wait for all processes to finish model creation before continuing
     profile_audit = None
     if "LEROBOT_TRAINING_PROFILE" in os.environ:
@@ -1898,6 +1928,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         )
 
     step = 0  # number of policy updates (forward + backward + optim)
+    if model_initialization is not None:
+        step = model_initialization["source_step"]
 
     if cfg.resume:
         # Under FSDP the optimizer state is sharded and must be loaded after `accelerator.prepare()`
@@ -2128,7 +2160,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     "right epoch/offset, but per-rank sample-exactness requires the same per-step "
                     "sampler batch size."
                 )
-            sampler_state = compute_sampler_state(step, len(sampler), ckpt_batch_size, ckpt_num_processes)
+            sampler_updates = step - (model_initialization["source_step"] if model_initialization else 0)
+            sampler_state = compute_sampler_state(sampler_updates, len(sampler), ckpt_batch_size, ckpt_num_processes)
             sampler.load_state_dict(sampler_state)
             if is_main_process:
                 logging.info(
@@ -2364,6 +2397,19 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    semantic_input_audit = None
+    if is_main_process and semantic_views is not None and cfg.dataset.semantic_state_instruction_matrix:
+        from lerobot.common.semantic_input_audit import SemanticInputAudit
+        from lerobot.processor.tokenizer_processor import TokenizerProcessorStep
+        tokenizers = [processor.input_tokenizer for processor in preprocessor.steps if isinstance(processor, TokenizerProcessorStep)]
+        if len(tokenizers) != 1:
+            raise ValueError("Semantic input audit requires one tokenizer")
+        semantic_input_audit = SemanticInputAudit(
+            semantic_views, cfg.dataset.semantic_state_instruction_matrix, tokenizers[0],
+            cfg.output_dir / "semantic_input_audit.json",
+            continuous_state_memory=cfg.policy.state_action_encoding == "continuous",
+        )
+
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         output_dict = None
@@ -2391,7 +2437,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     state_instruction_matrix=cfg.dataset.semantic_state_instruction_matrix,
                 )
                 train_tracker.task_variant_applied = sum(semantic_counts.values()) - semantic_counts["hold"]
+            selected_natural_language = list(batch["task"]) if semantic_input_audit is not None else None
             batch = preprocessor(batch)
+            if semantic_input_audit is not None:
+                semantic_input_audit.record(batch, selected_natural_language, step)
             if reset_presets is not None:
                 reset_presets.attach(
                     batch, action_names=cfg.policy.action_feature_names,
@@ -2754,6 +2803,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     if profile_audit is not None:
                         (checkpoint_dir / PRETRAINED_MODEL_DIR / "training_profile_audit.json").write_text(
                             json.dumps(profile_audit, indent=2) + "\n"
+                        )
+                    if model_initialization is not None:
+                        (checkpoint_dir / PRETRAINED_MODEL_DIR / "model_initialization.json").write_text(
+                            json.dumps(model_initialization, indent=2) + "\n"
                         )
                     update_last_checkpoint(checkpoint_dir)
 

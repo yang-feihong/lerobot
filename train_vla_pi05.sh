@@ -30,6 +30,9 @@ action_semantics_profile="joint_control_arm_mode_v2"
 predict_arm_teleop_inactive="true"
 predict_arm_reset="true"
 predict_reset_preset="true"
+model_init_checkpoint=""
+reset_preset_sidecar=""
+reset_preset_unknown_target_policy=""
 predict_ee_pose="true"
 predict_gripper="true"
 predict_task_complete="false"
@@ -139,6 +142,7 @@ semantic_view_kind_weights="{}"
 semantic_phases="[]"
 semantic_phase_weights="{}"
 semantic_source_weights="{}"
+semantic_domain_weights="{}"
 # A mixture manifest describes source membership in a losslessly merged dataset:
 # {"sources":[
 #   {"name":"stage1_stage2","weight":0.8,"episode_range":[0,1085]},
@@ -258,6 +262,7 @@ semantic_state_instruction_matrix_explicit="false"
 semantic_phases_explicit="false"
 semantic_phase_weights_explicit="false"
 semantic_source_weights_explicit="false"
+semantic_domain_weights_explicit="false"
 for argument in "$@"; do
   if [[ "$argument" == --action-semantics-profile=* ]]; then
     action_semantics_profile="${argument#*=}"
@@ -329,6 +334,9 @@ while (( $# > 0 )); do
     --peft-target-modules=*) peft_target_modules="${1#*=}" ;;
     --peft-train-active-modules-only=*) peft_train_active_modules_only="${1#*=}" ;;
     --base-policy=*) base_policy="${1#*=}" ;;
+    --model-init-checkpoint=*) model_init_checkpoint="${1#*=}" ;;
+    --reset-preset-sidecar=*) reset_preset_sidecar="${1#*=}" ;;
+    --reset-preset-unknown-target-policy=*) reset_preset_unknown_target_policy="${1#*=}" ;;
     --state-action-encoding=*) state_action_encoding="${1#*=}" ;;
     --action-history-enabled=*) action_history_enabled="${1#*=}" ;;
     --training-rtc=*) training_rtc="${1#*=}"; training_rtc_explicit="true" ;;
@@ -380,6 +388,7 @@ while (( $# > 0 )); do
     --semantic-phases=*) semantic_phases="${1#*=}"; semantic_phases_explicit="true" ;;
     --semantic-phase-weights=*) semantic_phase_weights="${1#*=}"; semantic_phase_weights_explicit="true" ;;
     --semantic-source-weights=*) semantic_source_weights="${1#*=}"; semantic_source_weights_explicit="true" ;;
+    --semantic-domain-weights=*) semantic_domain_weights="${1#*=}"; semantic_domain_weights_explicit="true" ;;
     --finetune-mode=*) finetune_mode="${1#*=}" ;;
     --dataset-repo-id=*) dataset_repo_id="${1#*=}"; dataset_repo_id_explicit="true" ;;
     --dataset-root=*) dataset_root="${1#*=}"; dataset_root_explicit="true" ;;
@@ -443,9 +452,18 @@ if [[ -n "$semantic_views_path" && ! -f "$semantic_views_path" ]]; then
   echo "Semantic-view sidecar not found: $semantic_views_path" >&2
   exit 2
 fi
-python3 - "$semantic_view_kind_weights" "$semantic_state_instruction_matrix" "$semantic_phases" "$semantic_phase_weights" "$semantic_source_weights" <<'PY'
+python3 - "$semantic_view_kind_weights" "$semantic_state_instruction_matrix" "$semantic_phases" "$semantic_phase_weights" "$semantic_source_weights" "$semantic_domain_weights" <<'PY'
 import json
 import sys
+import math
+
+domains = json.loads(sys.argv[6])
+if not isinstance(domains, dict) or set(domains) - {"simulation", "real"} or any(
+    isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in domains.values()
+) or (domains and not any(domains.values())):
+    raise SystemExit("--semantic-domain-weights requires finite non-negative simulation/real weights and positive total")
+if domains and not json.loads(sys.argv[2]):
+    raise SystemExit("--semantic-domain-weights requires a state/instruction matrix")
 
 value = json.loads(sys.argv[1])
 if not isinstance(value, dict) or any(not isinstance(k, str) or not isinstance(v, (int, float)) or v < 0 for k, v in value.items()):
@@ -890,6 +908,7 @@ if [[ -z "$resume_checkpoint" ]]; then
       --dataset.semantic_phases="$semantic_phases"
       --dataset.semantic_phase_weights="$semantic_phase_weights"
       --dataset.semantic_source_weights="$semantic_source_weights"
+      --dataset.semantic_domain_weights="$semantic_domain_weights"
     )
     if [[ -n "$semantic_view_kind_weights" && "$semantic_view_kind_weights" != "{}" ]]; then
       dataset_args+=(--dataset.semantic_view_kind_weights="$semantic_view_kind_weights")
@@ -917,6 +936,7 @@ else
   [[ "$semantic_phases_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_phases="$semantic_phases")
   [[ "$semantic_phase_weights_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_phase_weights="$semantic_phase_weights")
   [[ "$semantic_source_weights_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_source_weights="$semantic_source_weights")
+  [[ "$semantic_domain_weights_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_domain_weights="$semantic_domain_weights")
 fi
 if [[ -n "$video_backend" ]]; then
   dataset_args+=(--dataset.video_backend="$video_backend")
@@ -1047,6 +1067,10 @@ if [[ -n "$runtime_bin" ]]; then
   [[ -x "$runtime_bin/python" ]] || { echo "Missing $runtime_bin/python" >&2; exit 1; }
 fi
 
+initialization_args=()
+[[ -z "$model_init_checkpoint" ]] || initialization_args+=(--model_init_checkpoint="$model_init_checkpoint" --wandb.resume_training_run=false)
+[[ -z "$reset_preset_sidecar" ]] || initialization_args+=(--reset_preset_sidecar="$reset_preset_sidecar")
+[[ -z "$reset_preset_unknown_target_policy" ]] || initialization_args+=(--reset_preset_unknown_target_policy="$reset_preset_unknown_target_policy")
 train_args=(
   "${resume_args[@]}" \
   "${dataset_args[@]}" \
@@ -1059,6 +1083,7 @@ train_args=(
   "${policy_training_rtc_args[@]}" \
   --policy.push_to_hub=false \
   "${peft_args[@]}" \
+  "${initialization_args[@]}" \
   --output_dir="$output_dir" \
   --job_name="$job_name" \
   --seed="$seed" \

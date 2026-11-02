@@ -1,0 +1,31 @@
+{
+  "format": "lerobot.training_jobs",
+  "version": 1,
+  "jobs": {
+    "pull_joint_full_mem_50k": {
+      "data_recipe": "pull_door",
+      "dataset_artifact_id": "c24a6376c1e6f4ecbfac8ffa1179ba66bdd3452bf69be073c907bb614dd95567",
+      "training_preset": "pull_joint",
+      "reset_preset_unknown_target_policy": "mask_audited_unknown",
+      "reset_preset_sidecar": "/data/datasets/b2_z1/supervision/pull_door--c24a6376c1e6f4ecbfac8ffa1179ba66bdd3452bf69be073c907bb614dd95567/reset_presets.json",
+      "train_steps": 50000,
+      "resources": {
+        "node": "wb1",
+        "gpu_ids": [0, 1, 2, 3],
+        "main_process_port": 29512
+      }
+    },
+    "external_grasp_joint_plus_full_mem_50k": {
+      "data_recipe": "external_grasp_all_real",
+      "dataset_artifact_id": "a84f59daaec50975f5a2ed77119f43168f3712877f9ebb5f76229de9711260d2",
+      "training_preset": "external_grasp_joint_plus_full",
+      "reset_preset_sidecar": "/data/datasets/b2_z1/supervision/external_grasp_all_real--a84f59daaec50975f5a2ed77119f43168f3712877f9ebb5f76229de9711260d2/reset_presets.json",
+      "train_steps": 50000,
+      "resources": {
+        "node": "wb5",
+        "gpu_ids": [0, 1, 2, 3],
+        "main_process_port": 29512
+      }
+    }
+  }
+}

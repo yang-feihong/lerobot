@@ -12,10 +12,12 @@ import pytest
 PLAN = Path(__file__).resolve().parents[2] / "training_plan"
 PRESETS = json.loads((PLAN / "semantic_training_presets.json").read_text())["presets"]
 PROFILE = json.loads((PLAN / "training_profile.json").read_text())
-VALIDATOR = (PLAN / "launch.sh").read_text().split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+VALIDATOR = next(block.split("\nPY\n", 1)[0] for block in
+                 (PLAN / "launch.sh").read_text().split("<<'PY'\n")[1:]
+                 if "expected_phases =" in block)
 
 
-@pytest.mark.parametrize("change", ["add", "remove", "rewrite", "new_state", "memory_drift"])
+@pytest.mark.parametrize("change", ["add", "remove", "rewrite", "new_state", "memory_drift", "domain_drift"])
 @pytest.mark.parametrize("allow", [False, True])
 def test_same_run_instruction_extension_requires_opt_in_and_keeps_old_contracts(tmp_path, change, allow):
     old = copy.deepcopy(PRESETS["three_goal_conditioned"]["state_instruction_matrix"])
@@ -35,6 +37,8 @@ def test_same_run_instruction_extension_requires_opt_in_and_keeps_old_contracts(
         "semantic_phase_weights": dict.fromkeys(old, 1.0),
         "semantic_state_instruction_matrix": old,
     }
+    if change == "domain_drift":
+        dataset["semantic_domain_weights"] = {"simulation": 3, "real": 1}
     config = tmp_path / "train_config.json"
     config.write_text(json.dumps({"wandb": {"run_id": "existing-run"}, "dataset": dataset, "policy": policy}))
     args = [
@@ -71,10 +75,13 @@ def test_same_run_instruction_extension_requires_opt_in_and_keeps_old_contracts(
             )
         ],
         str(allow).lower(),
+        "{}",
     ]
     result = subprocess.run(
         [sys.executable, "-", *args],
-        input=VALIDATOR,
+        # Release receipts are independently tested in test_sync_training_release;
+        # this fixture isolates the semantic/memory/domain preflight on a fake root.
+        input="import dataset_release\ndataset_release.same_release_root = lambda saved, current: saved == current\n" + VALIDATOR,
         text=True,
         capture_output=True,
         env={**os.environ, "PYTHONPATH": str(PLAN)},

@@ -42,6 +42,7 @@ POLICY_DATA_FIELDS = {
     "semantic_view_manifest_sha256",
 }
 DATASET_IDENTITY_FIELDS = {
+    "semantic_domain_weights",
     "episodes",
     "repo_id",
     "root",
@@ -51,6 +52,9 @@ DATASET_IDENTITY_FIELDS = {
     "semantic_views_path",
 }
 RUN_FIELDS = {
+    "model_init_checkpoint",
+    "reset_preset_sidecar",
+    "reset_preset_unknown_target_policy",
     "dataset",
     "policy",
     "job_name",

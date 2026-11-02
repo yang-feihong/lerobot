@@ -3,9 +3,8 @@
   "version": 1,
   "jobs": {
     "all_scenes_goal_mixed_full_mem": {
-      "dataset_family": "all_scenes_simulation",
+      "data_recipe": "all_scenes_simulation",
       "training_preset": "three_goal_plus_full",
-      "semantic_views_file": "semantic_views_three_goal_plus_full.json",
       "allow_resume_instruction_extension": true,
       "run_dir_name": "20261022_214058_mem_pi05_b2_z1_vla_training_job_all_scenes_goal_mixed_full_mem_arm_mode_complete",
       "train_steps": 100000,

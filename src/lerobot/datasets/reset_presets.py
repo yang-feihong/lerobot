@@ -6,11 +6,20 @@ from pathlib import Path
 
 import torch
 
-from lerobot.utils.reset_presets import PRESET_ID_KEY, PRESET_VALID_KEY, validate_reset_presets
+from lerobot.utils.reset_presets import (
+    DEFAULT_RESET_UNKNOWN_TARGET_POLICY,
+    PRESET_ID_KEY,
+    PRESET_VALID_KEY,
+    validate_reset_presets,
+)
 
 
 class ResetPresetCatalog:
-    def __init__(self, path, catalog):
+    def __init__(self, path, catalog, *, dataset_root=None,
+                 unknown_target_policy=DEFAULT_RESET_UNKNOWN_TARGET_POLICY):
+        if unknown_target_policy not in {"error", "mask_audited_unknown"}:
+            raise ValueError("Invalid reset preset unknown target policy")
+        self.unknown_target_policy = unknown_target_policy
         self.path = Path(path)
         payload = self.path.read_bytes()
         self.payload = payload
@@ -22,7 +31,7 @@ class ResetPresetCatalog:
         if data["catalog"] != catalog:
             raise ValueError("Reset preset catalog differs from policy config")
         names = validate_reset_presets(catalog)
-        root = self.path.parent.parent.resolve()
+        root = Path(dataset_root).resolve() if dataset_root is not None else self.path.parent.parent.resolve()
         files = {"meta/info.json": data["info_sha256"]}
         for ep in data["episodes"]:
             evidence = data["provenance"][ep]
@@ -54,11 +63,29 @@ class ResetPresetCatalog:
             self.episodes[int(ep)] = [
                 (s["frame_start"], s["frame_stop"], names.index(s["preset"])) for s in spans
             ]
+        self.unresolved = {}
+        for ep, span in (
+            (ep, span) for ep, spans in data.get("unresolved", {}).items() for span in spans
+        ):
+            start, stop = span["frame_start"], span["frame_stop"]
+            if (
+                ep not in data["provenance"]
+                or type(start) is not int or type(stop) is not int
+                or not 0 <= start < stop <= data["provenance"][ep]["num_frames"]
+            ):
+                raise ValueError("Invalid audited unresolved reset range")
+            existing = self.unresolved.setdefault(int(ep), [])
+            if any(start < b and a < stop for a, b in existing) or any(
+                start < b and a < stop for a, b, _ in self.episodes.get(int(ep), [])
+            ):
+                raise ValueError("Overlapping audited unresolved reset range")
+            existing.append((start, stop))
 
     def attach(self, batch, *, action_names, fps, action_dt):
         actions = batch["action"]
         b, t = actions.shape[:2]
         labels = torch.full((b, t), -1, dtype=torch.long, device=actions.device)
+        audited_unknown = torch.zeros((b, t), dtype=torch.bool, device=actions.device)
         # Bool normalization uses [-1,+1]; this is the GT reset gate, not a model prediction.
         reset = actions[..., action_names.index("arm_reset")] > 0
         pad = batch.get("action_is_pad")
@@ -74,9 +101,12 @@ class ResetPresetCatalog:
             frames = torch.round(torch.arange(t, device=actions.device) * fps * action_dt).long() + int(first)
             for start, stop, target in self.episodes.get(int(ep), []):
                 labels[row, (frames >= start) & (frames < stop)] = target
-        if (reset & (labels < 0)).any():
+            if self.unknown_target_policy == "mask_audited_unknown":
+                for start, stop in self.unresolved.get(int(ep), []):
+                    audited_unknown[row] |= (frames >= start) & (frames < stop)
+        if (reset & (labels < 0) & ~audited_unknown).any():
             raise ValueError(
                 "Effective training reset has no proven preset target; prepare/audit reset_presets.json"
             )
         batch[PRESET_ID_KEY] = labels
-        batch[PRESET_VALID_KEY] = reset
+        batch[PRESET_VALID_KEY] = reset & ~audited_unknown

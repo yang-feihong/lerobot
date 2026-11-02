@@ -3,7 +3,7 @@
   "version": 1,
   "jobs": {
     "all_scenes_simulation_stage1_full_mem_100k_to_150k": {
-      "dataset_family": "all_scenes_simulation",
+      "data_recipe": "all_scenes_simulation",
       "training_preset": "stage1_only",
       "train_steps": 150000,
       "resources": {
@@ -13,7 +13,7 @@
       }
     },
     "all_scenes_simulation_stage2_full_mem_100k_to_150k": {
-      "dataset_family": "all_scenes_simulation",
+      "data_recipe": "all_scenes_simulation",
       "training_preset": "stage2_only",
       "train_steps": 150000,
       "resources": {
@@ -23,7 +23,7 @@
       }
     },
     "all_scenes_simulation_stage3_full_mem_100k_to_150k": {
-      "dataset_family": "all_scenes_simulation",
+      "data_recipe": "all_scenes_simulation",
       "training_preset": "stage3_only",
       "train_steps": 150000,
       "resources": {

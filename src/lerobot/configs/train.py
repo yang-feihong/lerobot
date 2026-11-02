@@ -28,6 +28,7 @@ from lerobot import envs
 from lerobot.optim import LRSchedulerConfig, OptimizerConfig
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR
 from lerobot.utils.hub import HubMixin, find_latest_hub_checkpoint
+from lerobot.utils.reset_presets import DEFAULT_RESET_UNKNOWN_TARGET_POLICY
 from lerobot.utils.sample_weighting import SampleWeightingConfig
 
 from . import parser
@@ -269,6 +270,10 @@ class TrainPipelineConfig(HubMixin):
     # is to use the configuration from the checkpoint, regardless of what's provided with the training
     # command at the time of resumption (CLI `--*` flags still override).
     resume: bool = False
+    # Fresh configuration/optimizer/run; only trained model tensors and the step origin are reused.
+    model_init_checkpoint: Path | None = None
+    reset_preset_sidecar: Path | None = None
+    reset_preset_unknown_target_policy: str = DEFAULT_RESET_UNKNOWN_TARGET_POLICY
     # Resume model/optimizer state while intentionally rebuilding dataset-derived
     # normalization statistics from an explicitly overridden dataset.
     resume_with_updated_dataset: bool = False
@@ -407,6 +412,14 @@ class TrainPipelineConfig(HubMixin):
             self.checkpoint_path = resolve_resume_checkpoint(config_path, self.output_dir)
             policy_dir = self.checkpoint_path / PRETRAINED_MODEL_DIR
 
+        saved_train_config = policy_dir / TRAIN_CONFIG_NAME
+        if saved_train_config.is_file() and not self.resume_with_updated_dataset:
+            saved_domains = json.loads(saved_train_config.read_text()).get("dataset", {}).get(
+                "semantic_domain_weights", {}
+            )
+            if saved_domains != self.dataset.semantic_domain_weights:
+                raise ValueError("Resume domain sampling differs from checkpoint; explicitly fork with an updated dataset policy")
+
         if self.policy is not None:
             self.policy.pretrained_path = policy_dir
             deployment_metadata = getattr(self.policy, "deployment_metadata", None)
@@ -420,6 +433,10 @@ class TrainPipelineConfig(HubMixin):
                     saved_metadata = json.load(f)
                 self.policy.restore_camera_metadata(saved_metadata)
                 current_metadata = deployment_metadata()
+                # Pre-selector checkpoints already mean reset -> middle. Match
+                # inference compatibility without enabling or initializing a head.
+                if "reset_preset_selector" not in saved_metadata["action"] and not self.policy.action_predict_reset_preset:
+                    current_metadata["action"].pop("reset_preset_selector")
                 metadata_matches = saved_metadata == current_metadata
                 task_status_extension = (
                     self.resume_with_updated_dataset

@@ -3,7 +3,7 @@
   "version": 1,
   "jobs": {
     "staff1_joint_full_mem": {
-      "dataset_family": "staff1",
+      "data_recipe": "staff1",
       "training_preset": "three_stage_joint",
       "train_steps": 200000,
       "run_dir_name": "20261008_105154_mem_pi05_b2_z1_vla_training_job_staff1_joint_full_mem_arm_mode_complete",

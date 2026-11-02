@@ -1,0 +1,18 @@
+{
+  "format": "lerobot.training_jobs",
+  "version": 1,
+  "jobs": {
+    "all_push_stage2_sim3_real1_150k_to_200k": {
+      "data_recipe": "all_push_door__d9c86ffef4ecdde83030",
+      "dataset_artifact_id": "e193513e12957d8585d28c3d9608afae4f8676fea171427cff294fdc654b8c23",
+      "training_preset": "stage2_only",
+      "domain_weights": {"simulation": 3, "real": 1},
+      "train_steps": 200000,
+      "resources": {
+        "node": "wb6",
+        "gpu_ids": [0, 1, 2, 3],
+        "main_process_port": 29518
+      }
+    }
+  }
+}

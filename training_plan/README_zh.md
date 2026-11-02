@@ -1,10 +1,75 @@
 # VLA 训练编排
 
-用户可调配置统一维护在 `training_plan/.env`；镜像、模型和数据版本的精确哈希
-维护在 `training_plan/artifacts.lock`。入口不读取隐藏的机器默认值，也不依赖
+用户可调配置统一维护在 `training_plan/.env`；镜像、模型的精确哈希
+维护在 `training_plan/artifacts.lock`，数据身份由发布物自身的 READY 凭据锁定。入口不读取隐藏的机器默认值，也不依赖
 远程工作区的未提交修改。
 
+## 数据配方与不可变发布
+
+任务用 `data_recipe` 选来源组合，用 `training_preset` 选监督矩阵，两者独立。
+配方唯一维护在 `data_postprocessing/config/pipeline_sources.json`，训练不另维护目录映射。
+每个逻辑配方只有一个 `training/<recipe>` 入口，指向 `release_history/` 中有验收凭据的不可变内容，包括单组件配方。训练解析真实内容路径并锁定；代码更新和监督 preset/权重变化不复制数据。数值、语言或阶段语义确实变化才产生历史内容版本。
+
+```bash
+bash training_plan/prepare_dataset.sh --task TASK \
+  --datasets-root /data01/yangfeihong/MEM_videos/datasets/b2_z1
+```
+
+可用 `--jobs training_plan/某计划.json` 选择维护中的计划。该入口使用数据处理容器，
+不需要 GPU、不调用标注模型：展开 preset、登记配方请求、验收全部组件和矩阵覆盖、
+用已有 merger 复用视频硬链接，最后原子发布唯一 canonical sidecar、READY 凭据及索引。
+缺失/过期组件须回数据流水线 reconcile 或补标注，不允许换路径绕过。
+已登记配方在后续标注绑定成功后自动刷新；失败时索引保持 STALE，新训练拒绝使用。
+发布后不原地更新。数值、metadata 的内容校验与接收视频的路径/大小检查写入凭据；
+这不等于每次启动重新解码/计算所有视频 SHA。
+
+`launch.sh` 按配方和展开后的 preset 自动解析 `training/releases.json` 并复验凭据与矩阵，
+仅使用发布物的 `meta/semantic_views.json`。不能手填平行 sidecar 或直接读 cleaned。
+原 `dataset_family` 只保留旧配置读取兼容，正式计划统一使用 `data_recipe`。
+远程使用前同步相应完整发布目录和生成索引，再走现有 `cluster.sh check/dry-run`；
+本地准备不自动传输数据，`cluster.sh prepare` 也不替代本地数据发布。
+
+普通 resume 从 checkpoint 的 `dataset.root` 锁定原不可变版本，不随索引换数据；
+变更配方、监督矩阵或采用新数据必须显式 fork。旧 checkpoint 指向 cleaned 或历史可变
+training 目录时不自动迁移，也不修改 checkpoint；应保留历史代码快照续跑或显式 fork。
+以下历史实验的路径、专用 sidecar 和数据数目仅为当时记录，不是现行准备步骤。
+
 ## 稳定训练/验证划分（recording_hash_v1）
+
+### 仿真 / 实采比例（训练配置，不是数据配方）
+
+同一正式发布物可重复用于任意比例，无需重建或复制数据。在 job 中增加
+`"domain_weights": {"simulation": 3, "real": 1}` 即为仿真 3:实采 1；
+也支持在 `semantic_training_presets.json` 的某个 preset 中设置同名默认值，job 显式值优先。
+`{"simulation": 1}` 为仅仿真，`{"real": 1}` 为仅实采；未写的域或权重为 0 的域不参与。
+`{}`（默认）保持历史按合法帧自然混合，不强制域比例。所有数值须有限、非负且总和为正。
+
+采样顺序是：状态×指令组合 → 来源域 → 可选 source_group → 合法帧。
+因此默认组合等权不变，3:1 是**每个组合内部**的比例，而非整个数据集 episode 数配额；
+小域会重复采样，有限 batch 允许取整误差，不承诺每个 batch 恰好 3:1。
+任一启用组合在所需域中无合法帧（包括历史过滤/窗口检查之后）就报错，不能自动改成其他比例。
+某个域根本不存在时，不应选择要求该域的混合策略。
+
+数据处理负责保存逐 episode 不可变来源证据：转换 manifest 的 `data_domain=simulation|real`；
+历史发布物无需改写：`source_type=accepted_simulation_shard` 是仿真，ROS bag 原始录制后缀
+`.bag/.bag.active` 是实采。训练加载时以 episode 编号和原始 `bag_path` 与 sidecar 精确连接并验冲突；
+不读取原始挂载、不根据目录名或网页 tag 猜测。现有发布物已具备这些字段，因此没有迁移数据实体的必要。
+
+零权重域在数据加载、hash 划分和动作统计前排除；其余录制保持原 hash 归属，不重洗牌。
+训练 complete/布尔 loss 先验使用实际联合采样质量计算。连续动作归一化仍是所选录制/合法关系的
+确定性数据统计，不随正权重比率重复物化样本。已有发布物中的 state 等固定归一化统计
+保持原发布契约，不因比例切换改写。验证沿用启用域中的 held-out 录制自然分布，
+不按训练比例重采样；跨比例对比指标时须核对验证域组成。
+运行 `semantic_view_runtime.json` 记录域策略、各组合/域实际权重及合法配对数，checkpoint config 保存策略。
+普通 resume 不允许改变域权重，调整比例应显式 fork，保持数据发布身份不变。
+
+这与 `dataset.image_source/mixed_sim_probability` 的图像替换增强完全独立，不能用图像增强概率代替录制来源比例。
+
+多场景推门 Stage2 的 150k→200k 分支续训维护在
+`all_push_stage2_resume_jobs.json`：锁定 10908 条正式发布物，使用 `stage2_only`，
+仿真∶实采为 3∶1，wholebody6 四卡。用 `fork-dry-run-task` 验收后再用
+`fork-task`，显式指定 20261019 的 `checkpoints/150000`；保留模型、优化器和训练状态，
+新建输出与 W&B run，旧模型的 reset selector 结构保持不变。
 
 训练和开环评估共用 `datasets/episode_split.py`，不保留按任务/数据来源末尾截取的旧算法。
 分组单位是不可变的原始录制身份：优先语义 sidecar 的 `recording_id`，否则使用
@@ -41,6 +106,71 @@ portable artifact 路径重写保留 JSON key 顺序；模型执行顺序另由�
 仅更新代码即可正确加载历史 checkpoint，无需修改原 checkpoint。
 
 ## 本轮编排入口
+
+### W&B 本地代理与私有反向隧道
+
+正式 `start/resume/fork` 在创建训练容器前自动调用 `wandb_proxy.py`，检查本地代理，
+建立本地 systemd 用户服务维护的 SSH 反向隧道，并实测远程 W&B API；失败则不启动训练。
+`.env` 中 `CLUSTER_WANDB_PROXY_ENABLED=true` 启用，`CLUSTER_WANDB_PROXY_LOCAL_PORT=18000`
+是本地 HTTP CONNECT 代理，`CLUSTER_WANDB_PROXY_REMOTE_PORT=18001` 是每台远程的 loopback 监听端口。
+容器使用 host 网络并注入大小写 HTTP(S)_PROXY，localhost 绕过代理；HF 仍保持离线。
+这不开放公网代理。host 网络下同一节点的 DDP 端口须唯一，现有计划校验负责检查。
+
+隧道独立于提交命令存活，SSH 每 15 秒保活，失联后退出，systemd 每 5 秒重连；
+同一节点重复提交复用服务。首次接入会对当前本地用户启用 systemd lingering，使隧道在登出后仍存活；
+若系统不允许启用则启动报错，不降级为随会话消失的后台进程。
+日志用 `journalctl --user -u lerobot-wandb-proxy-<identity>` 查看，
+`proxy-up NODE` 会显示精确服务名，也可独立补建隧道。停止服务用 `systemctl --user stop 服务名`，
+但该节点仍有训练时不要停止。服务不依赖当前终端，但依赖本地机器、代理与用户服务管理器；
+当前 transient unit 不保证本地重启后自动恢复，重启后执行 `proxy-up NODE`，无需重启已配好代理的训练。
+
+既有无代理的训练进程不能通过修改环境文件热切换。迁移使用：
+
+```bash
+TRAINING_JOBS_FILE=training_plan/原计划.json bash training_plan/cluster.sh proxy-resume-task TASK_ID
+```
+
+入口先验隧道和完整恢复点，再停止该任务，从最新完整 checkpoint 用原源码快照的
+`launch.sh resume` 恢复；配置、优化器、RNG、W&B run 和目标步数沿用，不能换成当前工作区训练实现。
+可能丢失最新 checkpoint 后尚未保存的更新（正常小于一个保存周期）。原容器日志归档至远程
+`lerobot/logs/`。原快照不能删除；此命令不触碰其他任务。普通新提交依然使用当前工作区内容快照。
+
+### 只复用已训练模型，重新建立训练配置
+
+任务可声明 `model_init_checkpoint`，再用普通 `start-task` 启动：该模式仍由统一入口创建
+当前 profile、优化器、scheduler、RNG、数据处理器和 W&B run，只加载源 checkpoint 的
+PEFT 模型 tensor；旧训练配置和优化器不加载。起点读取源 `training_step.json`，
+`train_steps` 是全局终点，例如 100k 模型到 200k 表示本轮新增 100k 次更新，学习率重新 warmup。
+输入/输出语义、基座身份和所有旧 tensor 的名称/形状/恢复值逐项核验；只允许显式新增的
+reset selector 保持新初始化，不可静默丢失旧权重。普通 `fork-task` 仍是另一种语义：继承旧配置和优化器。
+
+`dataset_artifact_id` 可显式锁定已发布版本；同一数据支持多种矩阵，训练启动独立检查所选矩阵覆盖，
+不修改原发布物、接收凭据或全局发布索引。未显式 pin 时仍要求请求与发布物严格一致。
+附加 reset 监督可通过任务的 `reset_preset_sidecar` 放在发布物之外，仍绑定数据 SHA256；
+正式生成器 `prepare_reset_presets.sh --output ... --write` 支持此方式，不破坏不可变数据。
+
+本次 Staff1 六组合八卡任务维护在 `staff1_joint_full_fresh_jobs.json`：
+`TRAINING_JOBS_FILE=training_plan/staff1_joint_full_fresh_jobs.json bash training_plan/cluster.sh dry-run-task staff1_joint_plus_full_200k`，
+验收后使用同计划的 `start-task`。训练输出保存 `model_initialization.json`、
+`training_profile_audit.json`、`semantic_view_runtime.json` 和由真实训练 batch 采集的
+`semantic_input_audit.json`（自然语言原文、tokenizer prompt、实际 token IDs 及解码结果）。
+数据传输用 `sync_training_release.py`，只发送接收凭据列出的训练文件及确实缺失的视频；
+远端相同视频须 SHA256 一致才硬链接，最终复验所有训练文件及视频内容，不传 raw_nonvisual 或诊断图片。
+可用 `--parallel-transfers 16` 分组传输；每个文件只分配一个发送端，连接错峰建立、失败有限重试，
+中断文件保留在 `.rsync-partial`，全部发送完成且 SHA256 验收通过后才发布 READY 入口。
+代码同步通过校验和及 `--link-dest` 复用同节点已发布快照，仍生成独立的内容身份和文件校验清单。
+
+拉门和外部抓取的四卡 50k 新训练维护在 `pull_external_grasp_50k_jobs.json`，分别引用
+`pull_joint`（3×1/3）与 `external_grasp_joint_plus_full`（4×1/4），共用 full-MEM profile。
+
+筐内抓取四卡 50k→100k 的权重复用任务维护在 `bin_grasp_fresh_50k_to_100k_jobs.json`，
+使用 `grasp`（1×1）与共享 full-MEM profile，在 wholebody2 运行。
+数据锁定逻辑入口 `training/bin_grasp_all_real` 当次的 READY 发布物；任务中的配方标识
+与该发布物接收凭据一致，不按目录后缀推测内容。用 `start-task bin_grasp_full_mem_50k_to_100k`
+进入：仅加载 20261022 抓取模型的 50k 权重，从全局 50k 开始，100k 为终点；
+配置、优化器、scheduler、RNG、W&B run 和输出目录全部新建，不用普通 `resume-task` 继承旧配置。
+任务固定数据 artifact 而非可重命名的发布入口；拉门仅对审计侧车列明的未知 reset 目标
+屏蔽分类 loss，保留原动作与 complete 监督。
 
 `TRAINING_JOBS_FILE` 可选择本目录维护的 `object_grasp_training_jobs.json`、
 `object_grasp_camera_fixed_jobs.json` 或
@@ -87,7 +217,7 @@ MEM-ViT 使用 LoRA 或 frozen 模式时，新 checkpoint 不再重复保存冻�
 
 后续正式训练统一按以下分层配置，由 `cluster.sh → launch.sh → train_vla_pi05.sh`
 执行：可复用的训练语义放在 preset，任务 JSON 引用 `training_preset` 并选择数据源、
-MEM、sidecar、训练步数、机器/GPU；共享参数在 `.env`，内容身份在 `artifacts.lock`。
+MEM、训练步数、机器/GPU；共享参数在 `.env`，模型/镜像身份在 `artifacts.lock`，数据身份在发布凭据。
 新训练组织方式优先新增或复用 preset，不在任务文件中重复矩阵或手工拼接训练命令。
 内联矩阵保留为兼容能力，与 preset 使用同一解析和验收链路。
 
@@ -113,10 +243,13 @@ MEM、sidecar、训练步数、机器/GPU；共享参数在 `.env`，内容身�
 | `pull_stage2` | `handle_press × goal_open` | 操作门把手；`handle_press` 沿用统一三阶段 schema 的阶段键 |
 | `pull_stage3` | `traversal × goal_enter` | 拉门通过 |
 | `pull_joint` | 上述三条关系，阶段权重 1:1:1 | 分阶段联合训练，各阶段只用对应指令 |
+| `pull_joint_plus_full` | 对应阶段目标 3 条＋全流程 command 列 3 条，共 6 条关系，各占 1/6 | 三阶段联合＋全流程；与推门 `three_stage_plus_full` 相同矩阵 |
 
-这四项均采用 demonstrated 动作和 `goal_end`。任务指定
-`"dataset_family": "pull_door"`、`"training_preset": "pull_joint"`（或某个单阶段），
-由 `.env` 的 `PULL_DOOR_DATASET_ROOT` 选择拉门训练集，仍走统一入口。
+前四项均采用 demonstrated 动作和 `goal_end`。`pull_joint_plus_full` 的全流程列在靠近/把手阶段
+使用 `future_goal_end`、通过阶段使用 `goal_end`；6 个状态×指令组合等权，不按时长或数据量混合。
+任务指定
+`"data_recipe": "pull_door"`、`"training_preset": "pull_joint"`（或某个单阶段），
+由发布索引自动选择该配方的 READY 训练集，不维护拉门专用路径变量。
 矩阵中的阶段/goal 是统一语义键，推/拉方向必须来自拉门自己的同 episode 标注及动作；
 不复用推门语言，也不将独立录制的三个阶段拼成伪全流程 episode。
 
@@ -129,16 +262,51 @@ MEM、sidecar、训练步数、机器/GPU；共享参数在 `.env`，内容身�
 统一 `training/pull_door` 已生成并验收：627 条、556489 帧，三份 cleaned 与统一集均有
 `semantic_views.json` 和四档 `task_variants.json`。语言按原始录制路径精确匹配，禁止使用
 清洗前的 episode 编号回退；1254 个视频为源数据硬链接，state/action 不变。
-正式准备入口为 `data_postprocessing/lerobot/prepare_pull_door_training.sh`（已有输出拒绝覆盖），
+正式准备入口为 `data_postprocessing/run_pipeline.sh`（共享验收及不可变发布），
 验收结果在统一集 `diagnostics/pull_door_training_audit.json`，四个 preset 及全部完成点均通过。
 本次仅准备本地数据，未新增远程任务或启动训练；选择资源后仍须执行
-`dry-run-task` 再训练。`pull_joint` 不等同于跨状态目标条件训练，本次不新增
-拉门的跨状态或全流程 command 预设。
+`dry-run-task` 再训练。`pull_joint` 不等同于跨状态目标条件训练。
+
+完整三阶段拉门录制使用后处理预设 `full_pull_door_episode`，与完整推门共享分段、清洗及完成点验收，
+标注来自同一个 episode 的三个阶段 goal＋一个拉门全流程 command，每组四档语言。
+独立采集的阶段仍使用原来的三个 pull profile，仅具有本阶段 goal，不能加入 full-command 列。
+有无效阶段时保留其他有效阶段，但不生成全流程 command；不得拼接三个独立 episode 冒充完整录制。
+在网页人工验收并合入新数据后，将它追加到拉门训练组合，再以
+`"data_recipe": "pull_door", "training_preset": "pull_joint_plus_full"` 准备训练发布物。
+新矩阵必须在全局存在 6 个合法配对；只有旧的独立阶段数据时会明确报缺少全流程样本，
+不能伪造指令或静默退化为三组合。这里仅准备支持，不启动训练。
 
 `three_goal_plus_full` 保留 `three_goal_conditioned` 的全部关系，并在三个物理状态中
 加入 `full_episode_command`。完整流程语言来自同一 episode 的四档独立标注；在
 approach/handle_press 中以 `future_goal_end` 延续到入室完成点，在 traversal 中使用
 `goal_end`。默认按允许的状态×指令组合等权采样，四档语言在选中组合内采样。
+
+### 分阶段联合＋全流程（不展开阶段目标的跨状态配对）
+
+`three_stage_plus_full` 在 `three_stage_joint` 的三条对应关系上增加全流程列，共 6 个组合：
+
+| 当前状态 | 对应阶段指令 | 全流程指令 |
+|---|---|---|
+| `approach` | `goal_approach` | `full_episode_command` |
+| `handle_press` | `goal_open` | `full_episode_command` |
+| `traversal` | `goal_enter` | `full_episode_command` |
+
+`external_grasp_joint_plus_full` 使用靠近、抓取各自的阶段目标，再增加全流程列，共 4 个组合：
+
+| 当前状态 | 对应阶段指令 | 全流程指令 |
+|---|---|---|
+| `object_approach` | `object_approach` | `full_episode_approach_grasp` |
+| `external_object_grasp` | `external_object_grasp` | `full_episode_approach_grasp` |
+
+每个单元格是一条允许关系：阶段目标模仿专家至本阶段目标完成点；全流程在前面的状态中
+延续至全流程完成点（`future_goal_end`），末状态使用 `goal_end`。不加入其他阶段目标的
+跨状态配对，也不加入已越过阶段目标的 complete＋hold 配对；选中关系内部到达完成点后的
+hold＋complete 仍按统一机制生成。完成点复用已验收的 sidecar，不重新定义完成语义。
+默认分别按 6 个组合各 1/6、4 个组合各 1/4 采样，四档语言在组合内采样。
+两者走同一训练入口、采样和发布物覆盖检查；选择任务 JSON 中的 `training_preset` 即可。
+数据需具备所选关系及全流程语言/完成监督；部分有效阶段和独立阶段仍遵循共享合法窗口规则。
+既有 `three_goal_plus_full` 的 12 个组合、`external_grasp_goal_plus_full` 的 6 个组合保持不变。
+新增 preset 不自动修改任何既有任务、发布数据或启动训练。
 
 ### 所有 preset 共用的采样规则
 
@@ -233,37 +401,25 @@ checkpoint（模型、optimizer、scheduler、RNG），沿用 W&B `3cmk2ai6` 与
 统一入口显式开启 updated-dataset / updated-training-objective，不使用旧数据顺序的复现语义。
 新验证集可能包含前 100k 已训练过的录制，不能声称它是全程未见数据的独立 held-out 集。
 
-新任务同时指定以下两个字段（不会自动更换现有任务的 sidecar）：
+新任务指定来源配方与监督 preset：
 
 ```json
 {
-  "training_preset": "three_goal_plus_full",
-  "semantic_views_file": "semantic_views_three_goal_plus_full.json"
+  "data_recipe": "staff1",
+  "training_preset": "three_goal_plus_full"
 }
 ```
 
-专用 sidecar 使用 `data_postprocessing/lerobot/build_goal_conditioned_semantic_views.py`
-构建，支持重复 `--full-episode-annotations` 来传入多个来源的 `annotations.json`：
-
-```bash
-python3 ../data_postprocessing/lerobot/build_goal_conditioned_semantic_views.py \
-  --source DATASET/meta/semantic_views.json \
-  --full-episode-annotations ANNOTATIONS/full_episode/full_episode_command/staff1/annotations.json \
-  --output DATASET/meta/semantic_views_three_goal_plus_full.json
-```
-
-构建器精确匹配 `episode.source_path` 和标注 `video_path`；逐阶段保留可用的 goal，
-不要求三个 goal 或全流程标注齐全。完整流程指令复用同一 episode 的 `goal_enter` 区间和完成边界，但保留
-完整流程自身的语言，不从其他 episode 或 `goal_enter` 语言补缺。原始 sidecar 和视频
-均不改写。输入必须是当前训练根目录的 canonical sidecar，不应只输入 cleaned Staff1
-完整录制而遗漏统一集中的独立 Stage2。旧构建策略或 canonical 来源哈希不匹配时拒绝启动。
+语言与全流程指令由数据流水线绑定，训练准备只消费验收后的组件，不手动拼标注路径。
+仍按独立有效阶段保留关系，不要求每个 episode 三个 goal 齐全；全流程自身的语言和完成
+证据必须齐全，不从其他 episode 或 goal_enter 文字补缺。发布器检查 preset 所需的全局组合覆盖。
 
 单次任务支持两种互斥、等价的配置形式。使用快捷配置时，在
 `training_jobs.json` 中只引用名称：
 
 ```json
 {
-  "dataset_family": "staff1",
+  "data_recipe": "staff1",
   "training_preset": "stage1_only",
   "resources": {
     "node": "f",
@@ -273,16 +429,13 @@ python3 ../data_postprocessing/lerobot/build_goal_conditioned_semantic_views.py 
 }
 ```
 
-任务默认读取数据集的 `meta/semantic_views.json`。当一种训练语义需要经过正式构建器
-筛选出的专用候选视图时，可在任务中显式填写同一 `meta/` 目录下的文件名，例如
-`"semantic_views_file": "semantic_views_three_goal_conditioned.json"`。该字段只选择语义
-侧车，不复制或改写物理数据；入口仍会对专用侧车执行逐 episode 的完整矩阵验收。
+任务只读取自动解析发布物的 `meta/semantic_views.json`，不配置 `semantic_views_file`。
 
 不使用快捷配置时，在 `training_jobs.json` 的该任务内直接填写完整权重和矩阵：
 
 ```json
 {
-  "dataset_family": "staff1",
+  "data_recipe": "staff1",
   "resources": {
     "node": "f",
     "gpu_ids": [0, 1, 2, 3],
@@ -388,7 +541,13 @@ bash ../data_postprocessing/lerobot/prepare_reset_presets.sh --dataset /绝对�
 生成器从已有 `raw_nonvisual` 的 `/arm_target_pos` 控制目标识别完整 reset 操作，
 排除启动 latched 消息，复现转换采样原点；不读 rosbag、不使用实际关节状态或任务名猜目标。
 末端命令需唯一匹配 preset（最多 0.03 rad），中断、未知目标或无法区分的切换保留为 unresolved。
-训练若实际采到未获证据支持的 reset 会报错，不回退 middle。
+训练若实际采到既无已识别目标、也未列入审计 `unresolved` 的 reset 会报错，不回退 middle。
+统一默认 `reset_preset_unknown_target_policy: mask_audited_unknown`：生成器无法唯一辨认的
+reset 目标记录到侧车 `unresolved`，训练自动仅屏蔽这些帧的 preset 分类 loss，
+原动作、padding 和 complete 监督均不变，无需按数据集逐次确认。
+未审计的缺失目标仍报错，不默认 middle、不屏蔽动作 loss，也不丢弃整个 episode。
+显式 `error` 可用于严格审计；旧 checkpoint 显式保存的策略仍按普通 resume 契约恢复。
+策略随训练配置保存，侧车随 checkpoint 保存。
 `meta/reset_presets.json` 绑定转换 manifest 与 action parquet 的 SHA256；数据变化必须重新审计，
 生成器拒绝覆盖旧侧车。数据不需重转、不传视频或 raw_nonvisual；远程只需同步该侧车及原训练数据。
 checkpoint 保存侧车与 hash；普通 resume 不允许偷偷更换监督。

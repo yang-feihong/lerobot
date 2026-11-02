@@ -375,6 +375,13 @@ def reconcile_pi05_action_representation_processors(
     if config.action_dt_seconds is None:
         raise ValueError("action_dt_seconds must be resolved from the model control frequency")
 
+    # A base-model processor can predate continuous MEM. The active policy, not
+    # that inherited processor JSON, owns how state enters the model.
+    for step in preprocessor.steps:
+        if isinstance(step, Pi05PrepareStateTokenizerProcessorStep):
+            step.continuous_state_memory = config.state_action_encoding == "continuous"
+            step.max_state_dim = config.max_state_dim
+
     raw_dataset_stats = dataset_stats
     transformed_stats = make_pi05_action_stats(
         dataset_stats,
@@ -484,6 +491,13 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
     max_state_dim: int = 32
     task_key: str = "task"
     continuous_state_memory: bool = False
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "max_state_dim": self.max_state_dim,
+            "task_key": self.task_key,
+            "continuous_state_memory": self.continuous_state_memory,
+        }
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()

@@ -249,6 +249,38 @@ def test_rejects_non_hold_counterfactual(tmp_path):
         )
 
 
+@pytest.mark.parametrize("source", ["physical_stage_tail", "last_stage_base_motion_end", "final_arm_inactive_tail"])
+def test_physical_stage_tail_uses_explicit_boundary_not_recorded_column(tmp_path, source):
+    view = {"intent_id": "go", "status": "active", "action_supervision": "demonstrated",
+            "frame_start": 0, "frame_stop": 10, "completion_frame": 2,
+            "completion_source": source}
+    catalog = _catalog(tmp_path, [view])
+    batch = _batch()
+    batch["frame_index"][:] = 0
+    batch[ACTION][..., 15] = 1.0  # contradictory legacy episode-global column
+    apply_semantic_views_to_batch(batch, catalog, step=0, seed=0, randomize=False)
+    assert batch[ACTION][0, :, 15].tolist() == [0.0, 0.0, 1.0, 1.0]
+    del view["completion_frame"]
+    with pytest.raises(ValueError, match="explicit completion_frame"):
+        _catalog(tmp_path, [view])
+
+
+@pytest.mark.parametrize("composite", ["full_episode_command", "full_episode_approach_grasp"])
+def test_composed_goal_boundary_is_not_a_physical_stage(tmp_path, composite):
+    catalog = _catalog(tmp_path, [{"intent_id": "go", "status": "active",
+                                   "action_supervision": "demonstrated"}])
+    phases = {
+        name: {"selected": True, "frame_start": start, "frame_stop": stop,
+               "source_group": "recording"}
+        for name, start, stop in [("object_approach", 0, 10),
+                                  ("external_object_grasp", 10, 20), (composite, 0, 20)]
+    }
+    (tmp_path / "stage_boundaries.json").write_text(json.dumps({"episodes": {"0": {"phases": phases}}}))
+    loaded = load_semantic_views(catalog.path)
+    assert [part.phase for part in loaded.physical_segments[0]] == [
+        "object_approach", "external_object_grasp"]
+
+
 def test_status_priors_follow_view_probability_not_language_count(tmp_path):
     catalog = _catalog(
         tmp_path,

@@ -21,6 +21,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from lerobot.data_domains import load_episode_domains
 from lerobot.policies.pi05.b2_action_transform import TASK_BLOCKED_KEY
 from lerobot.utils.constants import ACTION
 
@@ -28,6 +29,9 @@ FORMAT = "lerobot.semantic_views"
 VERSION = 1
 VALID_STATUS = {"active", "complete", "blocked"}
 VALID_ACTION_SUPERVISION = {"demonstrated", "hold"}
+EXPLICIT_COMPLETION_SOURCES = {
+    "physical_stage_tail", "last_stage_base_motion_end", "final_arm_inactive_tail",
+}
 
 
 @dataclass(frozen=True)
@@ -40,7 +44,7 @@ class SemanticView:
     weight: float = 1.0
     # For an active view, keep the physical dataset's terminal completion
     # labels only when they describe this exact instruction.
-    completion_source: str = "zero"  # zero | recorded
+    completion_source: str = "zero"  # Explicit-boundary provenance; recorded is legacy only.
     frame_start: int | None = None
     frame_stop: int | None = None
     completion_frame: int | None = None
@@ -73,6 +77,7 @@ class SemanticViewCatalog:
     valid_frame_ranges: dict[int, tuple[tuple[int, int], ...]] | None = None
     episode_lengths: dict[int, int] | None = None
     future_action_frames: int = 0
+    episode_domains: dict[int, str] = field(default_factory=dict)
 
 
 def with_semantic_temporal_filter(catalog: SemanticViewCatalog, dataset) -> SemanticViewCatalog:
@@ -245,7 +250,7 @@ def load_semantic_views(path: str | Path) -> SemanticViewCatalog:
                 raise ValueError(f"intent {intent_id!r} has no usable instructions")
             if status not in VALID_STATUS or supervision not in VALID_ACTION_SUPERVISION:
                 raise ValueError(f"invalid view status/supervision in episode {episode_key}: {raw}")
-            if completion_source not in {"zero", "recorded"} or weight <= 0:
+            if completion_source not in {"zero", "recorded"} | EXPLICIT_COMPLETION_SOURCES or weight <= 0:
                 raise ValueError(f"invalid completion source/weight in episode {episode_key}: {raw}")
             if status != "active" and supervision != "hold":
                 raise ValueError("complete/blocked views must use deterministic hold supervision")
@@ -254,6 +259,10 @@ def load_semantic_views(path: str | Path) -> SemanticViewCatalog:
             frame_start = raw.get("frame_start")
             frame_stop = raw.get("frame_stop")
             completion_frame = raw.get("completion_frame")
+            if completion_source in EXPLICIT_COMPLETION_SOURCES and (
+                type(completion_frame) is not int or completion_frame < 0
+            ):
+                raise ValueError(f"{completion_source} requires an explicit completion_frame")
             if (frame_start is None) != (frame_stop is None):
                 raise ValueError("frame_start and frame_stop must be configured together")
             if frame_start is not None and not 0 <= int(frame_start) < int(frame_stop):
@@ -318,7 +327,9 @@ def load_semantic_views(path: str | Path) -> SemanticViewCatalog:
                     str(definition["source_group"]),
                 )
                 for phase, definition in entry["phases"].items()
-                if definition["selected"]
+                # Full-episode entries are goal completion ranges, not an
+                # additional physical state overlapping the component stages.
+                if definition["selected"] and not phase.startswith("full_episode_")
             )
     return SemanticViewCatalog(
         path,
@@ -328,6 +339,7 @@ def load_semantic_views(path: str | Path) -> SemanticViewCatalog:
         semantic_names,
         selected_episodes,
         parsed_segments,
+        episode_domains=load_episode_domains(path, episodes),
         recording_ids={
             int(key): episode["recording_id"] if "recording_id" in episode else episode["source_path"]
             for key, episode in episodes.items()
@@ -466,6 +478,7 @@ def semantic_relation_sampling_groups(
     state_instruction_matrix,
     phase_weights=None,
     source_weights=None,
+    domain_weights=None,
     interior_static_frames=(),
     terminal_static_frames=(),
     interior_static_weight=1.0,
@@ -474,6 +487,10 @@ def semantic_relation_sampling_groups(
     """Choose a state/instruction cell first, independently of its eligible frame count."""
     phase_weights = phase_weights or dict.fromkeys(state_instruction_matrix, 1.0)
     source_weights = source_weights or {}
+    from lerobot.data_domains import validate_domain_weights
+
+    domain_weights = validate_domain_weights(domain_weights or {})
+    enabled_domains = {d: w for d, w in domain_weights.items() if w > 0}
     if set(phase_weights) != set(state_instruction_matrix):
         raise ValueError("State weights must match the configured relation matrix")
     if any(not np.isfinite(w) or w <= 0 for w in (*phase_weights.values(), *source_weights.values())):
@@ -487,6 +504,12 @@ def semantic_relation_sampling_groups(
     interior, terminal = set(interior_static_frames), set(terminal_static_frames)
     pools = {}
     for episode in selected_episodes:
+        domain = catalog.episode_domains.get(episode)
+        if domain_weights:
+            if domain is None:
+                raise ValueError(f"Missing recording domain for episode {episode}")
+            if domain not in enabled_domains:
+                continue
         offset = int(episode_from_indices[episode])
         for segment in catalog.segments.get(episode, ()):
             if segment.phase not in state_instruction_matrix:
@@ -519,27 +542,47 @@ def semantic_relation_sampling_groups(
                         frames.append(absolute)
                         weights.append(weight)
                 if frames:
-                    key = (segment.phase, view.canonical_intent, segment.source_group)
+                    key = (
+                        segment.phase, view.canonical_intent,
+                        domain if domain_weights else "*", segment.source_group,
+                    )
                     pools.setdefault(key, []).append(
                         (np.asarray(frames, dtype=np.int64), np.asarray(weights))
                     )
     groups, frame_weights, group_weights, states, intents, names = [], [], [], [], [], []
-    if source_weights and set(source_weights) != {source for _, _, source in pools}:
+    if source_weights and set(source_weights) != {source for _, _, _, source in pools}:
         raise ValueError("Source weights must match eligible physical source groups")
     phase_total = sum(
         phase_weights[state] * len(instructions) for state, instructions in state_instruction_matrix.items()
     )
+    domain_masses = enabled_domains or {"*": 1.0}
+    domain_total = sum(domain_masses.values())
     for state, instructions in state_instruction_matrix.items():
         for intent in instructions:
-            sources = sorted(source for phase, goal, source in pools if phase == state and goal == intent)
-            if not sources:
+            available = [
+                (domain, source) for phase, goal, domain, source in pools
+                if phase == state and goal == intent
+            ]
+            if not available:
                 raise ValueError(
                     f"Configured state/instruction cell has no eligible samples: {state} x {intent}"
                 )
-            source_sets = [[source] for source in sources] if source_weights else [sources]
-            source_masses = [source_weights[source] for source in sources] if source_weights else [1.0]
-            for sources_in_group, mass in zip(source_sets, source_masses, strict=True):
-                parts = [part for source in sources_in_group for part in pools[(state, intent, source)]]
+            partitions = []
+            for domain, domain_mass in domain_masses.items():
+                sources = sorted(source for d, source in available if d == domain)
+                if not sources:
+                    raise ValueError(
+                        f"Configured domain has no eligible samples: {state} x {intent} / {domain}"
+                    )
+                source_sets = [[source] for source in sources] if source_weights else [sources]
+                source_masses = [source_weights[source] for source in sources] if source_weights else [1.0]
+                for source_set, mass in zip(source_sets, source_masses, strict=True):
+                    partitions.append((
+                        domain, source_set,
+                        domain_mass / domain_total * mass / sum(source_masses),
+                    ))
+            for domain, sources_in_group, mass in partitions:
+                parts = [part for source in sources_in_group for part in pools[(state, intent, domain, source)]]
                 frames = np.concatenate([part[0] for part in parts])
                 weights = np.concatenate([part[1] for part in parts])
                 order = np.argsort(frames)
@@ -548,10 +591,13 @@ def semantic_relation_sampling_groups(
                     raise ValueError(f"Duplicate supervision in {state} x {intent}")
                 groups.append(frames)
                 frame_weights.append(weights)
-                group_weights.append(phase_weights[state] / phase_total * mass / sum(source_masses))
+                group_weights.append(phase_weights[state] / phase_total * mass)
                 states.append(state)
                 intents.append(intent)
-                names.append(f"{state}/{intent}/" + ("+".join(sources_in_group) if source_weights else "*"))
+                names.append(
+                    f"{state}/{intent}/" + (f"{domain}/" if domain_weights else "")
+                    + ("+".join(sources_in_group) if source_weights else "*")
+                )
     return SemanticRelationSampling(
         np.unique(np.concatenate(groups)),
         groups,

@@ -5,7 +5,20 @@ import pytest
 import torch
 
 from lerobot.datasets.reset_presets import ResetPresetCatalog
-from lerobot.utils.reset_presets import PRESET_ID_KEY, PRESET_VALID_KEY, default_reset_presets
+from lerobot.utils.reset_presets import (
+    DEFAULT_RESET_UNKNOWN_TARGET_POLICY,
+    PRESET_ID_KEY,
+    PRESET_VALID_KEY,
+    default_reset_presets,
+)
+
+
+def test_training_config_defaults_to_masking_only_audited_unknown_targets():
+    from lerobot.configs.train import TrainPipelineConfig
+
+    assert DEFAULT_RESET_UNKNOWN_TARGET_POLICY == "mask_audited_unknown"
+    assert (TrainPipelineConfig.__dataclass_fields__["reset_preset_unknown_target_policy"].default
+            == DEFAULT_RESET_UNKNOWN_TARGET_POLICY)
 
 
 def prepare(tmp_path):
@@ -87,3 +100,37 @@ def test_frame_identity_survives_the_training_preprocessor_boundary():
     restored = transition_to_batch(batch_to_transition(batch))
     assert restored["frame_index"].tolist() == [12]
     assert restored["episode_index"].tolist() == [7]
+
+
+def test_only_audited_unknown_targets_can_mask_classification(tmp_path):
+    path = prepare(tmp_path)
+    data = json.loads(path.read_text())
+    data["unresolved"] = {"7": [{"frame_start": 15, "frame_stop": 17}]}
+    path.write_text(json.dumps(data))
+    batch = {
+        "action": torch.ones(1, 5, 2),
+        "episode_index": torch.tensor([7]), "frame_index": torch.tensor([12]),
+        "action_is_pad": torch.zeros(1, 5, dtype=torch.bool),
+    }
+    actions, padding = batch["action"].clone(), batch["action_is_pad"].clone()
+    with pytest.raises(ValueError, match="no proven"):
+        ResetPresetCatalog(path, default_reset_presets(), unknown_target_policy="error").attach(
+            batch, action_names=["arm_reset", "task_complete"], fps=50, action_dt=.02)
+    catalog = ResetPresetCatalog(path, default_reset_presets())
+    catalog.attach(batch, action_names=["arm_reset", "task_complete"], fps=50, action_dt=.02)
+    assert batch[PRESET_ID_KEY].tolist() == [[0, 0, 0, -1, -1]]
+    assert batch[PRESET_VALID_KEY].tolist() == [[True, True, True, False, False]]
+    assert torch.equal(actions, batch["action"])
+    assert torch.equal(padding, batch["action_is_pad"])
+    batch["frame_index"][:] = 17
+    with pytest.raises(ValueError, match="no proven"):
+        catalog.attach(batch, action_names=["arm_reset", "task_complete"], fps=50, action_dt=.02)
+
+
+def test_audited_unknown_cannot_overlap_known_target(tmp_path):
+    path = prepare(tmp_path)
+    data = json.loads(path.read_text())
+    data["unresolved"] = {"7": [{"frame_start": 14, "frame_stop": 17}]}
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="Overlapping"):
+        ResetPresetCatalog(path, default_reset_presets(), unknown_target_policy="mask_audited_unknown")

@@ -1,9 +1,11 @@
 import pytest
+import torch
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.processor_pi05 import (
     OBS_ACTION_HISTORY,
+    Pi05PrepareStateTokenizerProcessorStep,
     reconcile_pi05_action_representation_processors,
 )
 from lerobot.processor import (
@@ -13,6 +15,26 @@ from lerobot.processor import (
     UnnormalizerProcessorStep,
 )
 from lerobot.utils.constants import ACTION
+from lerobot.types import TransitionKey
+
+
+@pytest.mark.parametrize("encoding", ["continuous", "text"])
+def test_inherited_state_prompt_is_reconciled_and_serialized(encoding):
+    config = PI05Config(device="cpu", io_schema_resolved=True, action_dt_seconds=.02,
+                        state_action_encoding=encoding)
+    inherited = Pi05PrepareStateTokenizerProcessorStep(continuous_state_memory=encoding != "continuous")
+    pre, post = DataProcessorPipeline(steps=[
+        RelativeActionsProcessorStep(), NormalizerProcessorStep(features={}, norm_map={}), inherited,
+    ]), DataProcessorPipeline(steps=[])
+    # Reconciliation requires the standard inverse normalizer.
+    post.steps = [UnnormalizerProcessorStep(features={}, norm_map={})]
+    reconcile_pi05_action_representation_processors(config, pre, post, dataset_stats=None)
+    assert inherited.continuous_state_memory is (encoding == "continuous")
+    restored = Pi05PrepareStateTokenizerProcessorStep(**inherited.get_config())
+    transition = {TransitionKey.OBSERVATION: {"observation.state": torch.zeros(1, 19)},
+                  TransitionKey.COMPLEMENTARY_DATA: {"task": ["Open the door."]}}
+    prompt = restored(transition)[TransitionKey.COMPLEMENTARY_DATA]["task"][0]
+    assert (", State:" in prompt) is (encoding != "continuous")
 
 
 @pytest.mark.parametrize("saved_fallback", [None, False, True])

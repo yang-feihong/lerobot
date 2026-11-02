@@ -23,18 +23,12 @@ source "${lock_file}"
 set +a
 
 required=(
+  CLUSTER_WANDB_PROXY_ENABLED CLUSTER_WANDB_PROXY_LOCAL_PORT CLUSTER_WANDB_PROXY_REMOTE_PORT
   CLUSTER_SSH_CONFIG CLUSTER_SSH_CONTROL_PATH CLUSTER_CONTAINER_NAME CLUSTER_IMAGE_BWLIMIT_KB
   CLUSTER_LOCAL_CHECKPOINT_ROOT CLUSTER_F_MIN_FREE_GIB CLUSTER_F_TARGET_FREE_GIB
   CLUSTER_CU124_IMAGE CLUSTER_CU124_IMAGE_ID
   CLUSTER_CU124_IMAGE_ARCHIVE CLUSTER_F_IMAGE CLUSTER_F_IMAGE_ID
   CLUSTER_F_IMAGE_ARCHIVE BASE_POLICY_SHA256 MEM_VIT_SHA256 POLICY_TOKENIZER_SHA256
-  STAFF1_EPISODES STAFF1_VIDEOS STAFF1_INFO_SHA256 STAFF1_SEMANTIC_SHA256
-  STAFF1_BOUNDARIES_SHA256
-  ALL_SCENES_EPISODES ALL_SCENES_VIDEOS ALL_SCENES_INFO_SHA256
-  ALL_SCENES_SEMANTIC_SHA256 ALL_SCENES_BOUNDARIES_SHA256
-  ALL_SCENES_SIMULATION_EPISODES ALL_SCENES_SIMULATION_VIDEOS
-  ALL_SCENES_SIMULATION_INFO_SHA256 ALL_SCENES_SIMULATION_SEMANTIC_SHA256
-  ALL_SCENES_SIMULATION_BOUNDARIES_SHA256
   CLUSTER_F_SSH_HOST CLUSTER_F_DATA_ROOT CLUSTER_F_SOURCE_ROOT CLUSTER_F_GPU_COUNT CLUSTER_F_CONTAINER_USER
   CLUSTER_WB1_SSH_HOST CLUSTER_WB1_DATA_ROOT CLUSTER_WB1_SOURCE_ROOT CLUSTER_WB1_GPU_COUNT CLUSTER_WB1_CONTAINER_USER
   CLUSTER_WB2_SSH_HOST CLUSTER_WB2_DATA_ROOT CLUSTER_WB2_SOURCE_ROOT CLUSTER_WB2_GPU_COUNT CLUSTER_WB2_CONTAINER_USER
@@ -208,6 +202,18 @@ ssh_node() {
       "${ssh_host}" "$@"
 }
 
+ensure_wandb_proxy() {
+  local node="$1"
+  node_profile "${node}"
+  [[ "${CLUSTER_WANDB_PROXY_ENABLED}" == true || "${CLUSTER_WANDB_PROXY_ENABLED}" == false ]] || {
+    echo 'CLUSTER_WANDB_PROXY_ENABLED must be true or false' >&2; return 2;
+  }
+  [[ "${CLUSTER_WANDB_PROXY_ENABLED}" == true ]] || return 0
+  python3 "${plan_dir}/wandb_proxy.py" --ssh-config "${CLUSTER_SSH_CONFIG}" \
+    --host "${ssh_host}" --local-port "${CLUSTER_WANDB_PROXY_LOCAL_PORT}" \
+    --remote-port "${CLUSTER_WANDB_PROXY_REMOTE_PORT}"
+}
+
 snapshot_file_list() {
   {
     git -C "${repo_root}" ls-files -z
@@ -215,7 +221,13 @@ snapshot_file_list() {
       training_plan/artifacts.lock training_plan/base_artifact_registry.json training_plan/README_zh.md \
       training_plan/semantic_plan.py training_plan/semantic_training_presets.json \
       training_plan/training_profile.json src/lerobot/datasets/episode_split.py \
+      src/lerobot/data_domains.py \
       src/lerobot/common/training_profile.py \
+      src/lerobot/common/model_initialization.py \
+      src/lerobot/common/semantic_input_audit.py \
+      training_plan/dataset_release.py training_plan/resolve_dataset.py \
+      training_plan/prepare_dataset.py training_plan/prepare_dataset.sh \
+      training_plan/sync_training_release.py training_plan/wandb_proxy.py \
       training_plan/training_jobs.json "${training_jobs_rel}"
   } | sort -zu
 }
@@ -240,6 +252,8 @@ container_code_dir() {
 usage() {
   cat <<'EOF'
 Usage:
+  training_plan/cluster.sh proxy-up NODE
+  training_plan/cluster.sh proxy-resume-task TASK_ID
   training_plan/cluster.sh describe
   training_plan/cluster.sh check [all|f|wb1|wb2|wb3|wb4|wb5|wb6|lerobot]
   training_plan/cluster.sh sync-code [all|f|wb1|wb2|wb3|wb4|wb5|wb6|lerobot]
@@ -295,7 +309,8 @@ describe() {
 }
 
 sync_code() {
-  local node="$1" commit target tmp
+  local node="$1" commit target tmp reference
+  local -a reuse_args=()
   commit="$(code_commit)"
   node_profile "${node}"
   target="${host_source}/lerobot_main_${commit}"
@@ -305,11 +320,15 @@ sync_code() {
   fi
   tmp="${target}.partial.$$"
   ssh_node "${node}" "rm -rf '${tmp}'; mkdir -p '${tmp}'"
-  (cd "${repo_root}" && tar --null -T <(snapshot_file_list) -cf -) | \
+  reference="$(ssh_node "${node}" "find '${host_source}' -mindepth 2 -maxdepth 2 -type f -name .source_commit -printf '%T@ %h\\n' | sort -nr | head -n 1 | cut -d' ' -f2-" )"
+  if [[ -n "${reference}" && "${reference%/*}" == "${host_source}" && "${reference##*/}" == lerobot_main_* ]]; then
+    reuse_args+=(--link-dest="${reference}")
+  fi
+  snapshot_file_list | \
     env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
-      ssh -F "${CLUSTER_SSH_CONFIG}" \
-        -o ControlMaster=auto -o ControlPersist=120 -o "ControlPath=${CLUSTER_SSH_CONTROL_PATH}" \
-        "${ssh_host}" "tar -xf - -C '${tmp}'"
+      rsync -a --checksum --from0 --files-from=- "${reuse_args[@]}" \
+        -e "ssh -F ${CLUSTER_SSH_CONFIG} -o ControlMaster=auto -o ControlPersist=120 -o ControlPath=${CLUSTER_SSH_CONTROL_PATH}" \
+        "${repo_root}/" "${ssh_host}:${tmp}/"
   ssh_node "${node}" "cd '${tmp}'; find . -type f ! -name '.source_commit' ! -name '.source_manifest.sha256' -print0 | sort -z | xargs -0 sha256sum > .source_manifest.sha256; printf '%s\\n' '${commit}' > .source_commit; cd /; rm -rf '${target}'; mv '${tmp}' '${target}'"
   ssh_node "${node}" "chown -R '${container_user}' '${target}'"
 }
@@ -418,8 +437,6 @@ probe_gpu_container() {
 
 check_node() {
   local node="$1" commit code_dir actual_image actual_gpus
-  local staff1_episodes staff1_videos all_scenes_episodes all_scenes_videos
-  local mixed_root mixed_episodes mixed_videos
   node_profile "${node}"
   commit="$(code_commit)"
   code_dir="${host_source}/lerobot_main_${commit}"
@@ -430,51 +447,18 @@ check_node() {
   ssh_node "${node}" "test -f '${code_dir}/.source_commit' && test \"\$(cat '${code_dir}/.source_commit')\" = '${commit}' && cd '${code_dir}' && sha256sum -c .source_manifest.sha256 >/dev/null 2>&1" || {
     echo "${node}: code snapshot mismatch" >&2; return 1;
   }
-  ssh_node "${node}" "test -f '${host_data}/datasets/b2_z1/training/staff1/meta/info.json' && test -f '${host_data}/checkpoints/lerobot_pi05_base_local_tokenizer/model.safetensors' && test -f '${host_data}/checkpoints/mem_vit_distill_20260716_142702/mem_vit_distill_latest.pt' && test -d '${host_data}/checkpoints/google_paligemma-3b-pt-224'" || {
+  ssh_node "${node}" "test -f '${host_data}/checkpoints/lerobot_pi05_base_local_tokenizer/model.safetensors' && test -f '${host_data}/checkpoints/mem_vit_distill_20260716_142702/mem_vit_distill_latest.pt' && test -d '${host_data}/checkpoints/google_paligemma-3b-pt-224'" || {
     echo "${node}: dataset or model missing" >&2; return 1;
   }
   verify_large_file "${node}" "${host_data}/checkpoints/lerobot_pi05_base_local_tokenizer/model.safetensors" "${BASE_POLICY_SHA256}"
   verify_large_file "${node}" "${host_data}/checkpoints/mem_vit_distill_20260716_142702/mem_vit_distill_latest.pt" "${MEM_VIT_SHA256}"
   verify_directory_tree "${node}" "${host_data}/checkpoints/google_paligemma-3b-pt-224" "${POLICY_TOKENIZER_SHA256}"
-  read -r staff1_episodes staff1_videos < <(ssh_node "${node}" "printf '%s %s\\n' \"\$(find '${host_data}/datasets/b2_z1/training/staff1/data' -type f -name '*.parquet' | wc -l)\" \"\$(find '${host_data}/datasets/b2_z1/training/staff1/videos' -type f -name '*.mp4' | wc -l)\"")
-  [[ "${staff1_episodes}" == "${STAFF1_EPISODES}" && "${staff1_videos}" == "${STAFF1_VIDEOS}" ]] || {
-    echo "${node}: dataset file-count mismatch" >&2; return 1;
-  }
-  ssh_node "${node}" "{ echo '${STAFF1_INFO_SHA256}  ${host_data}/datasets/b2_z1/training/staff1/meta/info.json'; echo '${STAFF1_SEMANTIC_SHA256}  ${host_data}/datasets/b2_z1/training/staff1/meta/semantic_views.json'; echo '${STAFF1_BOUNDARIES_SHA256}  ${host_data}/datasets/b2_z1/training/staff1/meta/stage_boundaries.json'; } | sha256sum -c - >/dev/null" || {
-    echo "${node}: dataset metadata checksum mismatch" >&2; return 1;
-  }
-  verify_dataset_readable "${node}" "${host_data}/datasets/b2_z1/training/staff1" staff1
-  if node_tasks "${node}" | while read -r task; do
-    "${semantic_plan_args[@]}" resolve "${task}" | head -1
-  done | grep -qx all_scenes; then
-    ssh_node "${node}" "test -f '${host_data}/datasets/b2_z1/training/all_scenes/meta/info.json'" || {
-      echo "${node}: all-scenes dataset missing" >&2; return 1;
-    }
-    read -r all_scenes_episodes all_scenes_videos < <(ssh_node "${node}" "printf '%s %s\\n' \"\$(find '${host_data}/datasets/b2_z1/training/all_scenes/data' -type f -name '*.parquet' | wc -l)\" \"\$(find '${host_data}/datasets/b2_z1/training/all_scenes/videos' -type f -name '*.mp4' | wc -l)\"")
-    [[ "${all_scenes_episodes}" == "${ALL_SCENES_EPISODES}" && "${all_scenes_videos}" == "${ALL_SCENES_VIDEOS}" ]] || {
-      echo "${node}: all-scenes dataset file-count mismatch" >&2; return 1;
-    }
-    ssh_node "${node}" "{ echo '${ALL_SCENES_INFO_SHA256}  ${host_data}/datasets/b2_z1/training/all_scenes/meta/info.json'; echo '${ALL_SCENES_SEMANTIC_SHA256}  ${host_data}/datasets/b2_z1/training/all_scenes/meta/semantic_views.json'; echo '${ALL_SCENES_BOUNDARIES_SHA256}  ${host_data}/datasets/b2_z1/training/all_scenes/meta/stage_boundaries.json'; } | sha256sum -c - >/dev/null" || {
-      echo "${node}: all-scenes dataset metadata checksum mismatch" >&2; return 1;
-    }
-    verify_dataset_readable "${node}" "${host_data}/datasets/b2_z1/training/all_scenes" all-scenes
-  fi
-  if node_tasks "${node}" | while read -r task; do
-    "${semantic_plan_args[@]}" resolve "${task}" | head -1
-  done | grep -qx all_scenes_simulation; then
-    mixed_root="${host_data}/datasets/b2_z1/training/all_scenes_plus_simulation_auto_open_v1"
-    ssh_node "${node}" "test -f '${mixed_root}/meta/info.json'" || {
-      echo "${node}: all-scenes-simulation dataset missing" >&2; return 1;
-    }
-    read -r mixed_episodes mixed_videos < <(ssh_node "${node}" "printf '%s %s\\n' \"\$(find '${mixed_root}/data' -type f -name '*.parquet' | wc -l)\" \"\$(find '${mixed_root}/videos' -type f -name '*.mp4' | wc -l)\"")
-    [[ "${mixed_episodes}" == "${ALL_SCENES_SIMULATION_EPISODES}" && "${mixed_videos}" == "${ALL_SCENES_SIMULATION_VIDEOS}" ]] || {
-      echo "${node}: all-scenes-simulation dataset file-count mismatch" >&2; return 1;
-    }
-    ssh_node "${node}" "{ echo '${ALL_SCENES_SIMULATION_INFO_SHA256}  ${mixed_root}/meta/info.json'; echo '${ALL_SCENES_SIMULATION_SEMANTIC_SHA256}  ${mixed_root}/meta/semantic_views.json'; echo '${ALL_SCENES_SIMULATION_BOUNDARIES_SHA256}  ${mixed_root}/meta/stage_boundaries.json'; } | sha256sum -c - >/dev/null" || {
-      echo "${node}: all-scenes-simulation dataset metadata checksum mismatch" >&2; return 1;
-    }
-    verify_dataset_readable "${node}" "${mixed_root}" all-scenes-simulation
-  fi
+  local task release_root
+  while IFS= read -r task; do
+    release_root="$(ssh_node "${node}" "python3 '${code_dir}/training_plan/resolve_dataset.py' --datasets-root '${host_data}/datasets/b2_z1' --jobs '${code_dir}/${training_jobs_rel}' --task '${task}' --format-lines" | head -n 1)" || return 1
+    [[ -n "${release_root}" ]] || { echo "${node}: no READY release for ${task}" >&2; return 1; }
+    verify_dataset_readable "${node}" "${release_root}" "${task}"
+  done < <(node_tasks "${node}")
   echo "${node}: OK image=${actual_image} gpus=${actual_gpus} code=${commit}"
 }
 
@@ -530,17 +514,18 @@ prepare_resume_io() {
 
 run_task_container() {
   local node="$1" task="$2" mode="$3" gpu="$4" port="$5" checkpoint="${6:-}"
-  local name code command_q existing model_mount
+  local name code command_q existing model_mount proxy_args=""
   node_profile "${node}"
   ensure_runtime_home "${node}"
   name="$(task_container_name "${node}" "${task}")"
-  code="$(container_code_dir)"
+  code="${7:-$(container_code_dir)}"
   model_mount=""
   if [[ "${host_model_data}" != "${host_data}" ]]; then
     model_mount="-v '${host_model_data}/models/trained/pi05:/data/models/trained/pi05:rw'"
   fi
   existing="$(ssh_node "${node}" "docker inspect '${name}' --format '{{.State.Status}}' 2>/dev/null || true")"
   if [[ "${existing}" == running ]]; then
+    ensure_wandb_proxy "${node}"
     echo "${node}/${task}: already running in ${name}"
     return
   fi
@@ -548,6 +533,12 @@ run_task_container() {
     echo "${node}/${task}: existing stopped container ${name}; use resume-plan after preserving its logs" >&2
     return 1
   }
+  ensure_wandb_proxy "${node}"
+  if [[ "${CLUSTER_WANDB_PROXY_ENABLED}" == true ]]; then
+    # The reverse forward is remote-host loopback only, never a public proxy.
+    # Host networking lets the training container reach that private listener.
+    proxy_args="--network host -e HTTP_PROXY=http://127.0.0.1:${CLUSTER_WANDB_PROXY_REMOTE_PORT} -e HTTPS_PROXY=http://127.0.0.1:${CLUSTER_WANDB_PROXY_REMOTE_PORT} -e http_proxy=http://127.0.0.1:${CLUSTER_WANDB_PROXY_REMOTE_PORT} -e https_proxy=http://127.0.0.1:${CLUSTER_WANDB_PROXY_REMOTE_PORT} -e NO_PROXY=127.0.0.1,localhost -e no_proxy=127.0.0.1,localhost"
+  fi
   if [[ "${mode}" == resume || "${mode}" == fork ]]; then
     prepare_resume_io "${node}" "${checkpoint}"
   fi
@@ -558,7 +549,7 @@ run_task_container() {
   else
     printf -v command_q '%q ' env "TRAINING_JOBS_FILE=${code}/${training_jobs_rel}" bash "${code}/training_plan/launch.sh" resume "${task}" "${gpu}" "${checkpoint}" "${port}"
   fi
-  ssh_node "${node}" "mkdir -p '${host_model_data}/models/trained/pi05'; docker run -d --name '${name}' --user '${container_user}' --gpus all --ipc=host --shm-size=64g --stop-timeout=120 -v '${host_data}:/data:rw' -v '${host_hf_cache}:/data/lerobot/cache/huggingface:rw' ${model_mount} -v '${host_source}:/workspace/source:rw' -w '${code}' -e NVIDIA_DISABLE_REQUIRE=1 -e NVIDIA_REQUIRE_CUDA= -e LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64 -e PYTHONPATH='${code}/src' -e UV_PROJECT_ENVIRONMENT=/lerobot/.venv -e VIRTUAL_ENV=/lerobot/.venv -e LEROBOT_RUNTIME_BIN=/lerobot/.venv/bin -e LEROBOT_TRAIN_FOREGROUND=true -e PATH=/lerobot/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -e HF_HOME=/data/lerobot/cache/huggingface -e HF_HUB_OFFLINE=1 -e HOME=/data/lerobot/home -e TZ=Asia/Shanghai '${image}' ${command_q} >/dev/null"
+  ssh_node "${node}" "mkdir -p '${host_model_data}/models/trained/pi05'; docker run -d --name '${name}' ${proxy_args} --user '${container_user}' --gpus all --ipc=host --shm-size=64g --stop-timeout=120 -v '${host_data}:/data:rw' -v '${host_hf_cache}:/data/lerobot/cache/huggingface:rw' ${model_mount} -v '${host_source}:/workspace/source:rw' -w '${code}' -e NVIDIA_DISABLE_REQUIRE=1 -e NVIDIA_REQUIRE_CUDA= -e LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64 -e PYTHONPATH='${code}/src' -e UV_PROJECT_ENVIRONMENT=/lerobot/.venv -e VIRTUAL_ENV=/lerobot/.venv -e LEROBOT_RUNTIME_BIN=/lerobot/.venv/bin -e LEROBOT_TRAIN_FOREGROUND=true -e PATH=/lerobot/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -e HF_HOME=/data/lerobot/cache/huggingface -e HF_HUB_OFFLINE=1 -e HOME=/data/lerobot/home -e TZ=Asia/Shanghai '${image}' ${command_q} >/dev/null"
   echo "${node}/${task}: started ${name} (${mode})"
 }
 
@@ -588,7 +579,7 @@ run_task_dry_run() {
   output="$(ssh_node "${node}" "set -e
     docker rm -f '${dry_name}' >/dev/null 2>&1 || true
     docker run -d --name '${dry_name}' --entrypoint bash --user '${container_user}' -v '${host_data}:/data:ro' -v '${host_hf_cache}:/data/lerobot/cache/huggingface:rw' ${model_mount} -v '${host_source}:/workspace/source:rw' -w '${code}' -e PYTHONPATH='${code}/src' -e UV_PROJECT_ENVIRONMENT=/lerobot/.venv -e VIRTUAL_ENV=/lerobot/.venv -e LEROBOT_RUNTIME_BIN=/lerobot/.venv/bin -e PATH=/lerobot/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -e HF_HOME=/data/lerobot/cache/huggingface -e HF_HUB_OFFLINE=1 -e HOME=/tmp -e TZ=Asia/Shanghai '${image}' -lc ${command_q@Q} >/dev/null
-    for i in 1 2 3 4 5 6 7 8 9 10; do
+    for i in {1..60}; do
       state=\$(docker inspect '${dry_name}' --format '{{.State.Status}}')
       test \"\${state}\" != running && break
       sleep 1
@@ -687,6 +678,7 @@ start_task() {
   local node="$1" task="$2" gpu port
   read -r gpu port < <(task_resources "${task}")
   if [[ -n "$(find_running_task "${node}" "${task}")" ]]; then
+    ensure_wandb_proxy "${node}"
     echo "${node}/${task}: already running"
     return
   fi
@@ -694,9 +686,10 @@ start_task() {
 }
 
 resume_task() {
-  local node="$1" task="$2" requested_checkpoint="${3:-}" gpu port run_dir step checkpoint name target_steps
+  local node="$1" task="$2" requested_checkpoint="${3:-}" runtime_code="${4:-}" gpu port run_dir step checkpoint name target_steps
   read -r gpu port < <(task_resources "${task}")
   if [[ -n "$(find_running_task "${node}" "${task}")" ]]; then
+    ensure_wandb_proxy "${node}"
     echo "${node}/${task}: already running"
     return
   fi
@@ -728,9 +721,51 @@ resume_task() {
   fi
   remove_incomplete_checkpoint_dirs "${node}" "${run_dir}" "${step}"
   name="$(task_container_name "${node}" "${task}")"
-  ssh_node "${node}" "mkdir -p '${host_data}/lerobot/logs'; if test -n \"\$(docker inspect '${name}' --format '{{.State.Status}}' 2>/dev/null)\"; then docker logs '${name}' >'${host_data}/lerobot/logs/${name}.container.log' 2>&1 || true; docker rm '${name}' >/dev/null; fi"
+  ssh_node "${node}" "mkdir -p '${host_data}/lerobot/logs'; if test -n \"\$(docker inspect '${name}' --format '{{.State.Status}}' 2>/dev/null)\"; then docker logs '${name}' >'${host_data}/lerobot/logs/${name}.$(date +%Y%m%d_%H%M%S).container.log' 2>&1 || true; docker rm '${name}' >/dev/null; fi"
   echo "${node}/${task}: resuming ${checkpoint} in the original W&B run"
-  run_task_container "${node}" "${task}" resume "${gpu}" "${port}" "${checkpoint}"
+  run_task_container "${node}" "${task}" resume "${gpu}" "${port}" "${checkpoint}" "${runtime_code}"
+}
+
+proxy_resume_task() {
+  local task="$1" node name code run_dir step command_json gpu port container_run original_job current_job
+  node="$(task_node "${task}")"
+  node_profile "${node}"
+  [[ "${CLUSTER_WANDB_PROXY_ENABLED}" == true ]] || { echo 'Proxy disabled' >&2; return 2; }
+  name="$(task_container_name "${node}" "${task}")"
+  if ssh_node "${node}" "test \"\$(docker inspect '${name}' --format '{{.State.Status}}')\" = running && test \"\$(docker inspect '${name}' --format '{{.HostConfig.NetworkMode}}')\" = host && docker inspect '${name}' --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -qx 'HTTPS_PROXY=http://127.0.0.1:${CLUSTER_WANDB_PROXY_REMOTE_PORT}'"; then
+    ensure_wandb_proxy "${node}"
+    echo "${node}/${task}: proxy already configured; training was not interrupted"
+    return
+  fi
+  # Capture the original immutable source identity, not today's changing workspace.
+  command_json="$(ssh_node "${node}" "docker inspect '${name}' --format '{{json .Config.Cmd}}'")"
+  read -r gpu port < <(task_resources "${task}")
+  code="$(python3 -c 'import json,sys; from pathlib import PurePosixPath as P
+c=json.loads(sys.argv[1]); task=sys.argv[2]; jobs=sys.argv[3]
+assert len(c)>=7 and c[0]=="env" and c[2]=="bash" and c[5]==task, "Not a standard training container"
+assert c[6]==sys.argv[4] and c[-1]==sys.argv[5], "Original GPU/port assignment differs"
+p=P(c[3]); assert p.name=="launch.sh" and p.parent.name=="training_plan"
+root=p.parent.parent; assert str(root).startswith("/workspace/source/lerobot_main_")
+assert c[1]==f"TRAINING_JOBS_FILE={root}/{jobs}", "Original plan differs"
+print(root)' "${command_json}" "${task}" "${training_jobs_rel}" "${gpu}" "${port}")"
+  current_job="$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["jobs"][sys.argv[2]], sort_keys=True))' "${training_jobs_file}" "${task}")"
+  original_job="$(ssh_node "${node}" "python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))[\"jobs\"][sys.argv[2]], sort_keys=True))' '${host_source}/${code#/workspace/source/}/${training_jobs_rel}' '${task}'")"
+  [[ "${current_job}" == "${original_job}" ]] || { echo 'Plan changed; refusing transport-only restart' >&2; return 1; }
+  # Bind recovery to this container's actual run, not the newest similarly named run.
+  container_run="$(ssh_node "${node}" "docker logs '${name}' 2>/dev/null | sed -n 's/^Output:[[:space:]]*//p' | tail -1")"
+  [[ "${container_run}" == /data/models/trained/pi05/*training_job_${task}_arm_mode_complete ]] || {
+    echo 'Cannot identify original container output; not stopping' >&2; return 1;
+  }
+  run_dir="${host_model_data}/${container_run#/data/}"
+  step="$(latest_complete_checkpoint "${node}" "${run_dir}")"
+  [[ -n "${step}" ]] || { echo 'No complete recovery checkpoint; not stopping' >&2; return 1; }
+  ensure_wandb_proxy "${node}"
+  echo "${node}/${task}: transport-only restart; preserve ${code}; latest recovery step ${step}"
+  ssh_node "${node}" "docker stop --time 120 '${name}' >/dev/null"
+  # Re-scan after stop: a checkpoint may have completed during preflight.
+  step="$(latest_complete_checkpoint "${node}" "${run_dir}")"
+  [[ -n "${step}" ]] || { echo 'Recovery checkpoint vanished; refusing automatic restart' >&2; return 1; }
+  resume_task "${node}" "${task}" "${container_run}/checkpoints/${step}" "${code}"
 }
 
 node_needs_resume() {
@@ -882,6 +917,8 @@ status() {
 validate_plan_resources
 
 case "${1:-}" in
+  proxy-up) ensure_wandb_proxy "${2:?NODE is required}" ;;
+  proxy-resume-task) proxy_resume_task "${2:?TASK_ID is required}" ;;
   describe) describe ;;
   check)
     while IFS= read -r node; do check_node "${node}"; done < <(select_nodes "${2:-all}")

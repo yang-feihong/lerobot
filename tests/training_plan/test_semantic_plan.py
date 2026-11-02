@@ -16,6 +16,35 @@ semantic_plan = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(semantic_plan)
 
 
+def test_inline_release_validation_does_not_require_a_preset_registry():
+    payload = {"tasks": {"release": {"state_weights": {"approach": 1}, "state_instruction_matrix": {}}},
+               "training_profile": {"memory_mode": "full_mem"}}
+    assert semantic_plan.domain_weights(payload, "release") == {}
+
+
+def test_domain_policy_is_independent_of_matrix_and_can_be_overridden(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "training_plan"))
+    from resolve_dataset import request_for_job
+
+    presets = json.loads(PRESETS_PATH.read_text())
+    presets["presets"]["three_stage_joint"]["domain_weights"] = {"simulation": 3, "real": 1}
+    jobs = {"format": "lerobot.training_jobs", "version": 1, "jobs": {
+        "mixed": {"data_recipe": "all_push_door", "training_preset": "three_stage_joint",
+                  "resources": {"node": "f", "gpu_ids": [0], "main_process_port": 29999}}
+    }}
+    pp, jp = tmp_path / "presets.json", tmp_path / "jobs.json"
+    pp.write_text(json.dumps(presets)); jp.write_text(json.dumps(jobs))
+    plan = semantic_plan.load_plan(pp, jp)
+    assert semantic_plan.domain_weights(plan, "mixed") == {"simulation": 3, "real": 1}
+    original_matrix = semantic_plan.selected_matrix(plan, "mixed")
+    original_request = request_for_job(plan, "mixed")
+    jobs["jobs"]["mixed"]["domain_weights"] = {"real": 1}
+    jp.write_text(json.dumps(jobs)); plan = semantic_plan.load_plan(pp, jp)
+    assert semantic_plan.domain_weights(plan, "mixed") == {"real": 1}
+    assert semantic_plan.selected_matrix(plan, "mixed") == original_matrix
+    assert request_for_job(plan, "mixed") == original_request
+
+
 def _sidecar(tmp_path: Path, intent: str = "goal_approach") -> Path:
     path = tmp_path / "semantic_views.json"
     path.write_text(
@@ -119,7 +148,7 @@ def test_all_scenes_goal_mixed_adds_full_command_and_preserves_eight_gpu_run():
     assert task["dataset_family"] == "all_scenes_simulation"
     assert task["memory_mode"] == "full_mem"
     assert task["training_preset"] == "three_goal_plus_full"
-    assert task["semantic_views_file"] == "semantic_views_three_goal_plus_full.json"
+    assert task["semantic_views_file"] == "semantic_views.json"
     assert task["train_steps"] == 100_000
     assert task["resources"] == {
         "node": "f",
@@ -143,7 +172,7 @@ def test_staff1_goal_plus_full_resume_targets_150k_in_original_run_on_wb6():
     )
     task = semantic_plan.resolve_task(plan, "staff1_goal_conditioned_filtered_full_mem")
     assert task["training_preset"] == "three_goal_plus_full"
-    assert task["semantic_views_file"] == "semantic_views_three_goal_plus_full.json"
+    assert task["semantic_views_file"] == "semantic_views.json"
     assert task["allow_resume_instruction_extension"] is True
     assert task["run_dir_name"].startswith("20261021_205355_")
     assert task["train_steps"] == 150_000
@@ -292,7 +321,8 @@ def test_goal_conditioned_contract_covers_every_state_and_goal():
     payload = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
     task = payload["tasks"]["staff1_goal_conditioned_full_mem"]
     matrix = semantic_plan.selected_matrix(payload, "staff1_goal_conditioned_full_mem")
-    assert task["semantic_views_file"] == "semantic_views_three_goal_conditioned.json"
+    assert task["data_recipe"] == "staff1"
+    assert "semantic_views_file" not in task
     assert set(matrix) == {"approach", "handle_press", "traversal"}
     assert all(
         set(relations) == {"goal_approach", "goal_open", "goal_enter"} for relations in matrix.values()

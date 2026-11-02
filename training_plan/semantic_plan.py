@@ -6,24 +6,24 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
+import sys
 from pathlib import Path
 from typing import Any
 
 PRESETS_FORMAT = "lerobot.semantic_training_presets"
 JOBS_FORMAT = "lerobot.training_jobs"
 VERSION = 1
-VALID_DATASET_FAMILIES = {
-    "staff1",
-    "all_scenes",
-    "all_scenes_simulation",
-    "staff3_grasp",
-    "pull_door",
-}
 VALID_MEMORY_MODES = {"standard", "mem_vit", "image_mem", "full_mem"}
 VALID_STATUSES = {"active", "complete", "blocked"}
 VALID_ACTION_SUPERVISION = {"demonstrated", "hold"}
 VALID_COMPLETION_BOUNDARIES = {"none", "state_end", "goal_end", "future_goal_end"}
 VALID_NODES = {"f", "wb1", "wb2", "wb3", "wb4", "wb5", "wb6", "lerobot"}
+
+# The launcher/preparation preflight also runs outside the training container.
+# Only this dependency-free origin contract is imported, never datasets/torch.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from lerobot.data_domains import load_episode_domains, validate_domain_weights
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -52,9 +52,10 @@ def _validate_relation(state: str, intent: str, relation: Any) -> None:
 def _validate_semantic_definition(name: str, definition: Any) -> None:
     if not isinstance(definition, dict):
         raise ValueError(f"{name} must be an object")
-    if set(definition) != {"state_weights", "state_instruction_matrix"}:
+    if set(definition) - {"domain_weights"} != {"state_weights", "state_instruction_matrix"}:
         raise ValueError(f"{name} requires state_weights and state_instruction_matrix")
     weights = definition["state_weights"]
+    _validate_domain_weights(definition.get("domain_weights", {}))
     matrix = definition["state_instruction_matrix"]
     if not isinstance(weights, dict) or not weights:
         raise ValueError(f"{name} requires explicit state_weights")
@@ -72,6 +73,10 @@ def _validate_semantic_definition(name: str, definition: Any) -> None:
             raise ValueError(f"{name} state {state!r} requires instructions")
         for intent, relation in instructions.items():
             _validate_relation(state, intent, relation)
+
+
+def _validate_domain_weights(weights):
+    validate_domain_weights(weights)
 
 
 def _validate_resources(task_id: str, resources: Any) -> None:
@@ -139,8 +144,15 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
             raise ValueError(f"task {task_id!r} must be an object")
         if "memory_mode" in task:
             raise ValueError("Per-task memory_mode is forbidden; use shared training_profile.json")
-        common = {"dataset_family", "resources"}
+        if ("dataset_family" in task)==("data_recipe" in task):
+            raise ValueError("Choose exactly one data_recipe (or legacy dataset_family alias)")
+        common = {"data_recipe" if "data_recipe" in task else "dataset_family", "resources"}
         optional = {
+            "domain_weights",
+            "dataset_artifact_id",
+            "model_init_checkpoint",
+            "reset_preset_sidecar",
+            "reset_preset_unknown_target_policy",
             "train_steps",
             "semantic_views_file",
             "allow_resume_semantic_adoption",
@@ -156,8 +168,17 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
                 f"task {task_id!r} must use exactly one semantic configuration form: "
                 "training_preset, or inline state_weights plus state_instruction_matrix"
             )
-        if task["dataset_family"] not in VALID_DATASET_FAMILIES:
-            raise ValueError(f"task {task_id!r} has invalid dataset_family")
+        recipe=task.get("data_recipe",task.get("dataset_family"))
+        _validate_domain_weights(task.get("domain_weights", {}))
+        if task.get("reset_preset_unknown_target_policy", "mask_audited_unknown") not in {"error", "mask_audited_unknown"}:
+            raise ValueError("Invalid reset_preset_unknown_target_policy")
+        if "dataset_artifact_id" in task and not re.fullmatch(r"[0-9a-f]{64}", task["dataset_artifact_id"]):
+            raise ValueError("dataset_artifact_id must be an explicit SHA256 release identity")
+        for path_field in ("model_init_checkpoint", "reset_preset_sidecar"):
+            if path_field in task and not Path(task[path_field]).is_absolute():
+                raise ValueError(f"{path_field} must be an explicit absolute container path")
+        if not isinstance(recipe,str) or not re.fullmatch(r"[A-Za-z0-9_-]+",recipe):
+            raise ValueError(f"task {task_id!r} has invalid data recipe")
         if not isinstance(task.get("allow_resume_semantic_adoption", False), bool):
             raise ValueError(f"task {task_id!r} allow_resume_semantic_adoption must be boolean")
         if not isinstance(task.get("allow_resume_artifact_adoption", False), bool):
@@ -214,7 +235,10 @@ def is_instruction_matrix_extension(saved: dict, requested: dict) -> bool:
 
 def resolve_task(payload: dict[str, Any], task_id: str) -> dict[str, Any]:
     try:
-        return {**payload["tasks"][task_id], "memory_mode": payload["training_profile"]["memory_mode"]}
+        task=payload["tasks"][task_id]
+        return {**task,"dataset_family":task.get("data_recipe",task.get("dataset_family")),
+                "semantic_views_file":task.get("semantic_views_file","semantic_views.json"),
+                "memory_mode": payload["training_profile"]["memory_mode"]}
     except KeyError as exc:
         raise ValueError(f"unknown task id: {task_id}") from exc
 
@@ -231,6 +255,12 @@ def state_weights(payload: dict[str, Any], task_id: str) -> dict[str, float]:
     if "training_preset" in task:
         return payload["training_presets"][task["training_preset"]]["state_weights"]
     return task["state_weights"]
+
+
+def domain_weights(payload: dict[str, Any], task_id: str) -> dict[str, float]:
+    task = resolve_task(payload, task_id)
+    preset = payload.get("training_presets", {}).get(task.get("training_preset"), {})
+    return task.get("domain_weights", preset.get("domain_weights", {}))
 
 
 def _relation_tuple(intent: str, relation: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -272,9 +302,19 @@ def validate_sidecar(payload: dict[str, Any], task_id: str, sidecar_path: Path) 
         for state in selected_states
     }
     seen: dict[str, set[tuple[str, str, str, str]]] = {state: set() for state in selected_states}
+    domains = domain_weights(payload, task_id)
+    episode_domains = load_episode_domains(sidecar_path, episodes) if domains else {}
+    domain_seen = {d: set() for d, w in domains.items() if w > 0}
     segment_count = 0
     frame_count = 0
+    episode_count = 0
     for episode_key, episode in episodes.items():
+        if domains:
+            if int(episode_key) not in episode_domains:
+                raise ValueError(f"Missing recording domain for episode {episode_key}")
+            if episode_domains[int(episode_key)] not in domain_seen:
+                continue
+        episode_count += 1
         if not isinstance(episode, dict):
             raise ValueError(f"episode {episode_key} must be an object")
         views = episode.get("views")
@@ -337,9 +377,11 @@ def validate_sidecar(payload: dict[str, Any], task_id: str, sidecar_path: Path) 
                 enabled.append((overlap_start, overlap_stop, relation))
                 boundaries.update((overlap_start, overlap_stop))
                 seen[state].add(relation)
+                if domains:
+                    domain_seen[episode_domains[int(episode_key)]].add((state, relation[0]))
             ordered = sorted(boundaries)
             covered_frames = 0
-            for left, right in zip(ordered, ordered[1:], strict=False):
+            for left, right in zip(ordered, ordered[1:]):
                 covering = [
                     relation
                     for view_start, view_stop, relation in enabled
@@ -365,7 +407,11 @@ def validate_sidecar(payload: dict[str, Any], task_id: str, sidecar_path: Path) 
             raise ValueError(
                 f"task {task_id} has configured cells with no sidecar supervision: {state}: {sorted(missing)}"
             )
-    return {"episodes": len(episodes), "segments": segment_count, "frames": frame_count}
+    cells = {(s, i) for s, row in matrix.items() for i in row}
+    for domain, found in domain_seen.items():
+        if cells - found:
+            raise ValueError(f"Domain {domain} has no sidecar coverage for cells: {sorted(cells - found)}")
+    return {"episodes": episode_count, "segments": segment_count, "frames": frame_count}
 
 
 def _compact(value: Any) -> str:
@@ -392,6 +438,7 @@ def command_resolve(args: argparse.Namespace) -> None:
         str(task.get("run_dir_name", "")),
         "true" if task.get("allow_resume_artifact_adoption", False) else "false",
         "true" if task.get("allow_resume_instruction_extension", False) else "false",
+        _compact(domain_weights(payload, args.task_id)),
     )
     print("\n".join(values))
 
@@ -418,6 +465,7 @@ def command_describe(args: argparse.Namespace) -> None:
     )
     print(f"enabled_states={_compact(list(weights))}")
     print(f"state_weights={_compact(weights)}")
+    print(f"domain_weights={_compact(domain_weights(payload, args.task_id))}")
     print(f"semantic_views_file={task.get('semantic_views_file', 'semantic_views.json')}")
     print("state_instruction_matrix:")
     for state, instructions in matrix.items():

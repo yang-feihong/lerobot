@@ -3,7 +3,7 @@
   "version": 1,
   "jobs": {
     "staff3_object_grasp_full_mem_0_to_50k": {
-      "dataset_family": "staff3_grasp",
+      "data_recipe": "staff3_grasp",
       "train_steps": 50000,
       "training_preset": "grasp",
       "resources": {

@@ -76,8 +76,14 @@ class DatasetConfig:
     semantic_phases: list[str] = field(default_factory=list)
     semantic_phase_weights: dict[str, float] = field(default_factory=dict)
     semantic_source_weights: dict[str, float] = field(default_factory=dict)
+    semantic_domain_weights: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        from lerobot.data_domains import validate_domain_weights
+
+        validate_domain_weights(self.semantic_domain_weights)
+        if self.semantic_domain_weights and not self.semantic_state_instruction_matrix:
+            raise ValueError("dataset.semantic_domain_weights requires a state/instruction matrix")
         if self.image_source not in ("real", "sim", "mixed"):
             raise ValueError(f"dataset.image_source must be real, sim or mixed, got {self.image_source!r}")
         if self.image_source != "real" and (self.sim_image_manifest is None or self.sim_image_root is None):

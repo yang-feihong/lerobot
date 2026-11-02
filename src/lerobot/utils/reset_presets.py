@@ -7,6 +7,7 @@ PRESET_ID_KEY = "action_reset_preset_id"
 PRESET_VALID_KEY = "action_reset_preset_valid"
 PRESET_EXECUTION_KEY = "arm_reset_preset_id"
 PRESET_SIDECAR = "reset_presets.json"
+DEFAULT_RESET_UNKNOWN_TARGET_POLICY = "mask_audited_unknown"
 
 
 def default_reset_presets():
