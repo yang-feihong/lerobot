@@ -83,6 +83,18 @@ B2_OBSERVED_VELOCITY_NAMES = ("b2_body_vx", "b2_body_vy", "b2_body_wz")
 B2_GLOBAL_POSE_NAMES = ("b2_position_x", "b2_position_y", "b2_yaw")
 
 
+def _rtc_action_normalizer(
+    unnormalizer: UnnormalizerProcessorStep, device: torch.device | str
+) -> NormalizerProcessorStep:
+    """Invert the saved processor contract, not a new processor's defaults."""
+    return NormalizerProcessorStep(
+        **unnormalizer.get_config(),
+        stats=unnormalizer.stats,
+        device=device,
+        dtype=unnormalizer.dtype,
+    )
+
+
 def _rtc_reanchor_group_is_well_conditioned(
     normalizer: NormalizerProcessorStep | UnnormalizerProcessorStep,
     action_names: tuple[str, ...],
@@ -97,10 +109,8 @@ def _rtc_reanchor_group_is_well_conditioned(
     mode = normalizer.norm_map.get(FeatureType.ACTION, NormalizationMode.IDENTITY)
     if mode == NormalizationMode.IDENTITY:
         return True
-    if mode == NormalizationMode.QUANTILES:
-        lower, upper = stats.get("q01"), stats.get("q99")
-    elif mode == NormalizationMode.QUANTILE10:
-        lower, upper = stats.get("q10"), stats.get("q90")
+    if mode in (NormalizationMode.QUANTILES, NormalizationMode.QUANTILE10):
+        lower, upper = normalizer.quantile_bounds(stats, mode)
     elif mode == NormalizationMode.MIN_MAX:
         lower, upper = stats.get("min"), stats.get("max")
     elif mode == NormalizationMode.MEAN_STD:
@@ -1179,12 +1189,7 @@ class AsyncRTCPolicy:
         if len(action_unnormalizers) != 1:
             raise ValueError(f"Expected one action unnormalizer, got {len(action_unnormalizers)}")
         self._action_unnormalizer = action_unnormalizers[0]
-        self._action_normalizer = NormalizerProcessorStep(
-            features=self._action_unnormalizer.features,
-            norm_map=self._action_unnormalizer.norm_map,
-            stats=self._action_unnormalizer.stats,
-            device=self.device,
-        )
+        self._action_normalizer = _rtc_action_normalizer(self._action_unnormalizer, self.device)
 
         self.policy.config.rtc_config = self.rtc_config
         self.policy.init_rtc_processor()
@@ -1407,12 +1412,7 @@ class AsyncRTCPolicy:
         if len(action_unnormalizers) != 1:
             raise ValueError(f"Expected one action unnormalizer, got {len(action_unnormalizers)}")
         action_unnormalizer = action_unnormalizers[0]
-        action_normalizer = NormalizerProcessorStep(
-            features=action_unnormalizer.features,
-            norm_map=action_unnormalizer.norm_map,
-            stats=action_unnormalizer.stats,
-            device=self.device,
-        )
+        action_normalizer = _rtc_action_normalizer(action_unnormalizer, self.device)
 
         from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
 

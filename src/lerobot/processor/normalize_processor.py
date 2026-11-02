@@ -307,6 +307,37 @@ class _NormalizationMixin:
         processed_action = self._apply_transform(action, ACTION, FeatureType.ACTION, inverse=inverse)
         return processed_action
 
+    def quantile_bounds(
+        self, stats: dict[str, Tensor], norm_mode: NormalizationMode
+    ) -> tuple[Tensor, Tensor]:
+        """Effective saved bounds, shared by transforms and RTC scale validation."""
+        if norm_mode not in (NormalizationMode.QUANTILES, NormalizationMode.QUANTILE10):
+            raise ValueError(f"Not a quantile normalization mode: {norm_mode}")
+        lower_key, upper_key = (
+            ("q01", "q99") if norm_mode == NormalizationMode.QUANTILES else ("q10", "q90")
+        )
+        lower, upper = stats.get(lower_key), stats.get(upper_key)
+        if lower is None or upper is None:
+            raise ValueError(
+                f"{norm_mode.value} normalization mode requires {lower_key} and {upper_key} stats, "
+                "please update the dataset with the correct stats using the "
+                "`augment_dataset_quantile_stats.py` script"
+            )
+        if self.quantile_fallback_to_min_max:
+            minimum, maximum = stats.get("min"), stats.get("max")
+            if minimum is not None and maximum is not None:
+                full_range = maximum - minimum
+                use_min_max = (
+                    ((upper - lower).abs() <= self.eps)
+                    & torch.isfinite(minimum)
+                    & torch.isfinite(maximum)
+                    & torch.isfinite(full_range)
+                    & (full_range > self.eps)
+                )
+                lower = torch.where(use_min_max, minimum, lower)
+                upper = torch.where(use_min_max, maximum, upper)
+        return lower, upper
+
     def _apply_transform(
         self, tensor: Tensor, key: str, feature_type: FeatureType, *, inverse: bool = False
     ) -> Tensor:
@@ -392,37 +423,8 @@ class _NormalizationMixin:
             return 2 * (tensor - min_val) / denom - 1
 
         if norm_mode in (NormalizationMode.QUANTILES, NormalizationMode.QUANTILE10):
-            lower_key, upper_key = (
-                ("q01", "q99") if norm_mode == NormalizationMode.QUANTILES else ("q10", "q90")
-            )
-            lower = stats.get(lower_key)
-            upper = stats.get(upper_key)
-            if lower is None or upper is None:
-                raise ValueError(
-                    f"{norm_mode.value} normalization mode requires {lower_key} and {upper_key} stats, "
-                    "please update the dataset with the correct stats using the "
-                    "`augment_dataset_quantile_stats.py` script"
-                )
-
+            lower, upper = self.quantile_bounds(stats, norm_mode)
             denom = upper - lower
-            if self.quantile_fallback_to_min_max:
-                minimum, maximum = stats.get("min"), stats.get("max")
-                if minimum is not None and maximum is not None:
-                    full_range = maximum - minimum
-                    # Sparse continuous actions can have identical quantiles while
-                    # still containing real motion. Epsilon is not a useful scale
-                    # for those dimensions. Use saved dataset bounds, never batch
-                    # extrema, and share the same offset/scale in both directions.
-                    use_min_max = (
-                        (denom.abs() <= self.eps)
-                        & torch.isfinite(minimum)
-                        & torch.isfinite(maximum)
-                        & torch.isfinite(full_range)
-                        & (full_range > self.eps)
-                    )
-                    lower = torch.where(use_min_max, minimum, lower)
-                    denom = torch.where(use_min_max, full_range, denom)
-
             # Preserve the legacy mapping for genuinely constant dimensions and
             # old statistics without usable min/max bounds.
             denom = torch.where(

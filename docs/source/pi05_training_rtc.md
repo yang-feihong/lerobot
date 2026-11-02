@@ -82,6 +82,14 @@ actions = policy.predict_action_chunk(
 
 The remaining chunk starts at the current observation's action origin. Its first `delay_steps` actions will execute while inference runs. Supply actions in the same transformed, normalized model space used for training, with the correct reference frame and feature order. These are pending future actions, not past action history. The existing VLA server handles chunk alignment, B2 pose-delta/EE reanchoring, and normalization before passing the prefix to the policy.
 
+RTC re-normalization must invert the checkpoint's saved action unnormalizer,
+including its epsilon and `quantile_fallback_to_min_max` setting, on both cold
+loads and hot swaps. Sparse actions may have zero quantile width but usable
+saved min/max bounds; the reanchoring scale check uses those same effective
+bounds. Genuinely constant coupled pose groups still skip reanchoring, and
+legacy checkpoints retain their saved normalization behavior. Do not replace
+these settings with processor defaults or clamp a misnormalized prefix.
+
 For the first prediction without a previous chunk, pass a zero delay to obtain ordinary unconditioned sampling. Positive delays require a real prefix of sufficient length. The VLA server handles this initial case automatically. Guidance weight and soft prefix schedules apply only to inference mode. Fine-tuning and robot evaluation are required to measure task quality and latency; implementation tests alone do not establish those results.
 
 ## Validation

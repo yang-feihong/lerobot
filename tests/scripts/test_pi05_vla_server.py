@@ -39,6 +39,8 @@ from lerobot.scripts.pi05_vla_server import (
     _deployment_rtc_config,
     _load_checkpoint_contract,
     _reanchor_b2_pose_delta,
+    _rtc_action_normalizer,
+    _rtc_reanchor_group_is_well_conditioned,
     _resolve_checkpoint_action_representations,
     _rtc_enabled_for_chunk_scheduling,
     _smooth_b2_execution_velocity,
@@ -697,6 +699,65 @@ def test_rtc_reanchor_skips_coupled_b2_group_with_degenerate_quantile_scale() ->
     torch.testing.assert_close(rebased[:, x_index], torch.tensor([0.25, 0.75]))
     assert torch.isfinite(rebased).all()
     assert torch.max(torch.abs(rebased)) <= 1.0
+
+
+@pytest.mark.parametrize("mode,keys", [
+    (NormalizationMode.QUANTILES, ("q01", "q99")),
+    (NormalizationMode.QUANTILE10, ("q10", "q90")),
+])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_rtc_normalizer_preserves_saved_contract(mode, keys, fallback) -> None:
+    # Include an offset sparse axis, a genuinely constant axis, and a regular axis.
+    unnormalizer = UnnormalizerProcessorStep(
+        features={"action": PolicyFeature(FeatureType.ACTION, (3,))},
+        norm_map={FeatureType.ACTION: mode},
+        eps=1e-6,
+        dtype=torch.float64,
+        quantile_fallback_to_min_max=fallback,
+    )
+    unnormalizer.load_state_dict({
+        f"action.{keys[0]}": torch.tensor([0.0, 0.0, -1.0]),
+        f"action.{keys[1]}": torch.tensor([0.0, 0.0, 1.0]),
+        "action.min": torch.tensor([-0.005, 0.0, -2.0]),
+        "action.max": torch.tensor([0.012, 0.0, 2.0]),
+    })
+    normalizer = _rtc_action_normalizer(unnormalizer, "cpu")
+    assert normalizer.get_config() == unnormalizer.get_config()
+    assert normalizer.dtype == unnormalizer.dtype
+    prefix = torch.tensor([[-1.0, -1.0, 0.5], [0.3, 0.7, -0.2]], dtype=torch.float64)
+    physical = AsyncRTCPolicy._apply_action_processor(unnormalizer, prefix)
+    restored = AsyncRTCPolicy._apply_action_processor(normalizer, physical)
+    torch.testing.assert_close(restored, prefix)
+    names = ("sparse", "constant", "regular")
+    assert _rtc_reanchor_group_is_well_conditioned(unnormalizer, names, ("sparse",)) == fallback
+    assert not _rtc_reanchor_group_is_well_conditioned(unnormalizer, names, ("sparse", "constant"))
+    assert _rtc_reanchor_group_is_well_conditioned(unnormalizer, names, ("regular",))
+
+
+def test_rtc_sparse_b2_prefix_uses_min_max_for_reanchoring() -> None:
+    names = ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.model_action_names = names
+    policy.b2_action_representation = "pose_delta"
+    policy.z1_action_representation = "ee_delta"
+    policy._action_unnormalizer = UnnormalizerProcessorStep(
+        features={"action": PolicyFeature(FeatureType.ACTION, (3,))},
+        norm_map={FeatureType.ACTION: NormalizationMode.QUANTILES},
+        stats={"action": {"q01": [0.0] * 3, "q99": [0.0] * 3,
+                          "min": [-0.01] * 3, "max": [0.01] * 3}},
+        quantile_fallback_to_min_max=True,
+    )
+    policy._action_normalizer = _rtc_action_normalizer(policy._action_unnormalizer, "cpu")
+    prefix = torch.zeros(50, 3)
+    old_anchor = np.zeros(3, dtype=np.float32)
+    new_anchor = np.asarray([0.002, -0.001, 0.0], dtype=np.float32)
+    rebased = policy._reanchor_rtc_prefix(
+        prefix, SimpleNamespace(b2_anchor=old_anchor),
+        SimpleNamespace(state_names=B2_GLOBAL_POSE_NAMES, state=new_anchor),
+    )
+    physical = policy._apply_action_processor(policy._action_unnormalizer, rebased)
+    torch.testing.assert_close(physical, torch.tensor([-0.002, 0.001, 0.0]).expand(50, 3))
+    assert rebased.abs().max() < 1.0
 
 
 def test_metadata_v2_is_rejected() -> None:
