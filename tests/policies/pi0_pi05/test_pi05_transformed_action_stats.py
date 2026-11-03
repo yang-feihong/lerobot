@@ -65,6 +65,7 @@ def test_transformed_stats_follow_episode_deltas_and_active_endpoint_mask(tmp_pa
         num_episodes=2,
     )
     config = SimpleNamespace(
+        model_ee_frame=None,
         io_schema_resolved=True,
         action_dt_seconds=0.02,
         control_frequency_hz=50.0,
@@ -150,6 +151,7 @@ def test_transformed_stats_only_traverse_selected_semantic_phase(tmp_path) -> No
         num_episodes=1,
     )
     config = SimpleNamespace(
+        model_ee_frame=None,
         io_schema_resolved=True,
         action_dt_seconds=0.02,
         control_frequency_hz=50.0,
@@ -288,8 +290,9 @@ def test_missing_blocked_schema_flag_is_backward_compatible_with_false() -> None
 @pytest.mark.parametrize("b2_representation", ["velocity", "pose_delta"])
 @pytest.mark.parametrize("z1_representation", ["ee_delta", "ee_state_delta"])
 @pytest.mark.parametrize("filtered", [False, True])
+@pytest.mark.parametrize("model_frame", [None, "legacy", "physical"])
 def test_transformed_stats_support_all_formal_representation_pairs(
-    tmp_path, b2_representation: str, z1_representation: str, filtered: bool
+    tmp_path, b2_representation: str, z1_representation: str, filtered: bool, model_frame
 ) -> None:
     frames = 8
     canonical = np.zeros((frames, 16), dtype=np.float32)
@@ -334,6 +337,7 @@ def test_transformed_stats_support_all_formal_representation_pairs(
         control_frequency_hz=50.0,
         chunk_size=4,
         b2_action_representation=b2_representation,
+        model_ee_frame=None,
         z1_action_representation=z1_representation,
         ee_delta_rotation_representation="rotvec",
         action_predict_arm_teleop_inactive=True,
@@ -393,7 +397,23 @@ def test_transformed_stats_support_all_formal_representation_pairs(
                 }
             },
         }
+    baseline = compute_transformed_action_stats(dataset, config, **kwargs)
+    if model_frame is not None:
+        import json
+        from lerobot.datasets.ee_frame_adapter import EpisodeEEFrameAdapter
+        from lerobot.utils.ee_frames import EE_FRAME_CONTRACT
+        (tmp_path / "meta").mkdir()
+        (tmp_path / "diagnostics").mkdir()
+        (tmp_path / "meta/ee_frames.json").write_text(json.dumps({
+            "version": 1, "ee_frame_contract": EE_FRAME_CONTRACT, "recordings": {"synthetic": "legacy"}}))
+        (tmp_path / "diagnostics/conversion_manifest.json").write_text(json.dumps({
+            "bags": {"synthetic": {"status": "done", "episode_index": 0}}}))
+        config.model_ee_frame = model_frame
+        dataset.reader = SimpleNamespace(ee_frame_adapter=EpisodeEEFrameAdapter(
+            tmp_path, dataset.meta.features, model_frame, {0}))
     payload = compute_transformed_action_stats(dataset, config, **kwargs)
+    for metric in baseline["stats"][ACTION]:
+        np.testing.assert_allclose(payload["stats"][ACTION][metric], baseline["stats"][ACTION][metric], atol=1e-6)
     if filtered:
         expected = 6
         if b2_representation == "pose_delta" or z1_representation == "ee_state_delta":

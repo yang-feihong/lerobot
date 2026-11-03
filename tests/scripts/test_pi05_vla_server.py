@@ -304,6 +304,41 @@ def test_checkpoint_hot_swap_signature_requires_identical_runtime_schema(tmp_pat
     assert _checkpoint_hot_swap_signature(first) != _checkpoint_hot_swap_signature(second)
 
 
+@pytest.mark.parametrize("resolved", [False, True])
+def test_hot_swap_compares_effective_state_tokenizer_config(tmp_path, resolved) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    for directory in (first, second):
+        directory.mkdir()
+        (directory / "config.json").write_text(json.dumps({
+            "io_schema_resolved": resolved, "max_state_dim": 32,
+            "state_action_encoding": "continuous",
+        }))
+        for name in ("adapter_config.json", "pi05_deployment_metadata.json", "policy_postprocessor.json"):
+            (directory / name).write_text("{}")
+
+    def write_processor(directory, config):
+        (directory / "policy_preprocessor.json").write_text(json.dumps({"steps": [{
+            "registry_name": "pi05_prepare_state_tokenizer_processor_step", "config": config,
+        }]}))
+
+    write_processor(first, {})
+    write_processor(second, {"max_state_dim": 32, "task_key": "task", "continuous_state_memory": resolved})
+    assert _checkpoint_hot_swap_signature(first) == _checkpoint_hot_swap_signature(second)
+    # Only resolved policy schemas override saved tokenizer memory/width.
+    write_processor(second, {"max_state_dim": 64, "continuous_state_memory": True})
+    assert (_checkpoint_hot_swap_signature(first) == _checkpoint_hot_swap_signature(second)) == resolved
+    # A different input task key is never overwritten by reconciliation.
+    write_processor(second, {"task_key": "different_task"})
+    assert _checkpoint_hot_swap_signature(first) != _checkpoint_hot_swap_signature(second)
+    # Continuous-vs-text model encoding remains a real incompatibility.
+    write_processor(second, {})
+    path = second / "config.json"
+    config = json.loads(path.read_text())
+    config["state_action_encoding"] = "text"
+    path.write_text(json.dumps(config))
+    assert _checkpoint_hot_swap_signature(first) != _checkpoint_hot_swap_signature(second)
+
+
 def test_checkpoint_hot_swap_signature_ignores_training_only_fields(tmp_path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"

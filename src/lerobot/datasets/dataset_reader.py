@@ -106,6 +106,7 @@ class DatasetReader:
         self._random_history_rng: Random | None = None
         self._valid_frame_ranges: dict[int, tuple[tuple[int, int], ...]] | None = None
         self._semantic_catalog = None
+        self.ee_frame_adapter = None
         self._paired_image_source = None
         if image_source != "real":
             if sim_image_manifest is None or sim_image_root is None:
@@ -436,4 +437,6 @@ class DatasetReader:
         task_idx = item["task_index"].item()
         item["task"] = self._meta.tasks.iloc[task_idx].name
 
+        if self.ee_frame_adapter is not None:
+            item = self.ee_frame_adapter.sample(item, ep_idx)
         return item

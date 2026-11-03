@@ -16,7 +16,7 @@ def dry_run(*args):
     env.pop("LEROBOT_RUNTIME_BIN", None)
     with tempfile.TemporaryDirectory() as output_root:
         return subprocess.run(
-            ["bash", str(SCRIPT), "--dry-run=true", f"--output-root={output_root}", *args],
+            ["bash", str(SCRIPT), "--dry-run=true", "--model-ee-frame=legacy", f"--output-root={output_root}", *args],
             capture_output=True,
             text=True,
             env=env,
@@ -29,6 +29,24 @@ def test_mem_is_enabled_by_default():
     assert result.returncode == 0, result.stderr
     flags = dict(arg.split("=", 1) for arg in shlex.split(result.stdout) if arg.startswith("--"))
     assert "--policy.mem_vit_checkpoint" in flags
+
+
+def test_new_training_defaults_to_physical_tool_frame(tmp_path):
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--dry-run=true", f"--output-root={tmp_path}"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    flags = dict(arg.split("=", 1) for arg in shlex.split(result.stdout) if arg.startswith("--"))
+    assert flags["--policy.model_ee_frame"] == "physical"
+
+
+@pytest.mark.parametrize("frame", ["legacy", "physical"])
+def test_tool_frame_choice_is_forwarded_to_policy(frame):
+    result = dry_run(f"--model-ee-frame={frame}")
+    assert result.returncode == 0, result.stderr
+    flags = dict(arg.split("=", 1) for arg in shlex.split(result.stdout) if arg.startswith("--"))
+    assert flags["--policy.model_ee_frame"] == frame
 
 
 @pytest.mark.parametrize("finetune", ["lora", "expert", "full"])

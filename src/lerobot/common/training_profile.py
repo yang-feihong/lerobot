@@ -72,6 +72,12 @@ RUN_FIELDS = {
 
 def canonical_policy(config: dict) -> dict:
     result = copy.deepcopy(config)
+    # This is a resolved per-run representation choice, not an architecture
+    # override. Checkpoint metadata and the resume gate lock its actual value.
+    frame = result.pop("model_ee_frame", None)
+    if frame is not None:
+        from lerobot.utils.ee_frames import validate_ee_frame
+        validate_ee_frame(frame)
     selector_contract(result)
     for key in RESET_SELECTOR_FIELDS:
         result.pop(key, None)
@@ -128,6 +134,7 @@ def compare_profile(
         "checked_fields": {section: len(values) for section, values in actual.items()},
         "dataset_specific_policy": {k: policy[k] for k in POLICY_DATA_FIELDS},
         "reset_selector": selector_contract(policy),
+        "model_ee_frame": policy.get("model_ee_frame") or "legacy",
     }
 
 

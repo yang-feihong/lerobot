@@ -27,6 +27,7 @@ def test_old_resume_accepts_only_missing_disabled_selector(tmp_path, monkeypatch
     elif change == "observation":
         current["observation"]["cameras"].reverse()
     policy = SimpleNamespace(
+        model_ee_frame=None,
         io_schema_resolved=True, action_predict_reset_preset=change == "enable_selector",
         deployment_metadata=lambda: deepcopy(current), restore_camera_metadata=lambda metadata: None,
     )

@@ -582,3 +582,23 @@ bash training_plan/cluster.sh archive-f-checkpoints
 这样训练进程即使在传输期间按滚动保留策略删除原 checkpoint，也不会造成半份传输。
 远端快照和本地文件会逐文件做 SHA256 比对；完全一致后，才精确删除对应原 checkpoint
 及其临时快照。
+# 模型工具轴选择与历史兼容
+
+新训练默认 physical，无需手动选择。可在 `.env` 用 `MODEL_EE_FRAME=legacy|physical`、
+直接脚本入口用 `--model-ee-frame=legacy|physical` 或 Python 的 `policy.model_ee_frame`
+显式覆盖。留空时，新训练解析为 physical；普通 resume 始终继承 checkpoint，
+不会把新训练的默认值应用到旧模型。
+工具轴不属于数据配方或监督 preset；同一混合来源数据可供两种模型约定使用。
+
+数据读取以 `meta/ee_frames.json` 的逐录制声明适配完整状态和动作历史，
+在相对动作生成与归一化之前统一为本轮模型工具轴。直接遍历 HF 数值的统计入口采用
+同一个适配器；需要变化的姿态统计从转换后数值计算，不套用另一工具轴的分位数。
+数据文件不被改写，也不复制视频或派生另一套 training 数据。
+
+新 checkpoint 的部署 metadata v11 必须包含 `model_ee_frame` 和
+`ee_frame_contract=same_tcp_tool_rx_minus_90_v1`，并与 config/processor 一致。
+历史 v10 无该字段的 checkpoint 在 resume/部署时按 legacy 解释；普通 resume
+不能改变工具轴，显式不一致会报错。新格式缺失契约或非法值不按历史规则吞掉。
+公共机器人服务始终输入输出 physical，服务按模型 metadata 决定是否补偿；
+相对动作须在模型约定中先解码成绝对目标再转换，RTC/历史/anchor 使用相同约定。
+历史发布物补齐全 legacy 元信息不改变原发布身份或 checkpoint 的锁定路径。

@@ -144,7 +144,10 @@ print(json.dumps(dict(linked=linked, existing=existing, missing=missing, bytes_r
         ),
         flush=True,
     )
-    files = [*receipt["assets"]["files"], RECEIPT, *result["missing"]]
+    transfer_assets = dict(receipt["assets"]["files"])
+    if (source / "meta/ee_frames.json").is_file():
+        transfer_assets["meta/ee_frames.json"] = digest_file(source / "meta/ee_frames.json")
+    files = [*transfer_assets, RECEIPT, *result["missing"]]
     upload_files(
         [
             "rsync",
@@ -197,7 +200,7 @@ print(json.dumps(dict(verified=True, training_files=len(p["files"]), videos=len(
 """,
         {
             "root": remote_root,
-            "files": receipt["assets"]["files"] | {RECEIPT: digest_file(source / RECEIPT)},
+            "files": transfer_assets | {RECEIPT: digest_file(source / RECEIPT)},
             "videos": videos,
         },
     )

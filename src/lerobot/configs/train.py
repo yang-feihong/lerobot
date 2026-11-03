@@ -431,8 +431,16 @@ class TrainPipelineConfig(HubMixin):
                     )
                 with metadata_path.open() as f:
                     saved_metadata = json.load(f)
+                from lerobot.utils.ee_frames import EE_FRAME_CONTRACT, checkpoint_ee_frame, resume_ee_frame
+
+                saved_frame = checkpoint_ee_frame(saved_metadata)
+                requested_frame = self.policy.model_ee_frame
+                self.policy.model_ee_frame = resume_ee_frame(requested_frame, saved_metadata)
                 self.policy.restore_camera_metadata(saved_metadata)
                 current_metadata = deployment_metadata()
+                if "ee_frame_contract" in current_metadata:
+                    saved_metadata = dict(saved_metadata, ee_frame_contract=EE_FRAME_CONTRACT,
+                                          model_ee_frame=saved_frame, version=current_metadata["version"])
                 # Pre-selector checkpoints already mean reset -> middle. Match
                 # inference compatibility without enabling or initializing a head.
                 if "reset_preset_selector" not in saved_metadata["action"] and not self.policy.action_predict_reset_preset:
@@ -461,6 +469,13 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        if active_cfg.type == "pi05":
+            from lerobot.utils.ee_frames import validate_ee_frame
+
+            # Checkpoint resolution above handles the historical resume fallback.
+            if not self.resume and active_cfg.model_ee_frame is None:
+                active_cfg.model_ee_frame = "physical"
+            validate_ee_frame(active_cfg.model_ee_frame)
         if self.rename_map and active_cfg.pretrained_path is None:
             raise ValueError(
                 "`rename_map` requires a pretrained policy checkpoint. "

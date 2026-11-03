@@ -1553,6 +1553,9 @@ def main() -> None:
         **image_source_kwargs,
     )
     meta = dataset.meta
+    if io_schema_enabled:
+        from lerobot.datasets.ee_frame_adapter import configure_dataset_ee_frame
+        configure_dataset_ee_frame(dataset, policy_cfg.model_ee_frame or "legacy")
 
     dataset_action_dim = int(meta.features[ACTION]["shape"][0])
     dataset_action_names = _default_action_names(meta, dataset_action_dim)

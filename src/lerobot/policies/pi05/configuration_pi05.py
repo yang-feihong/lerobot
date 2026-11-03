@@ -91,6 +91,8 @@ class PI05Config(PreTrainedConfig):
     state_use_b2_angular_velocity: bool = False
     b2_action_representation: str = "velocity"  # "velocity" or "pose_delta"
     z1_action_representation: str = "ee_delta"  # "ee_delta" or "ee_state_delta"
+    # None preserves historical checkpoint loading. Fresh training resolves it to physical.
+    model_ee_frame: str | None = None
     ee_delta_rotation_representation: str = "rot6d"  # "rot6d" or "rotvec"
     action_predict_arm_teleop_inactive: bool = True
     action_predict_arm_reset: bool = True
@@ -655,6 +657,14 @@ class PI05Config(PreTrainedConfig):
     def action_delta_indices(self) -> list:
         return list(range(self.chunk_size))
 
+    def ee_frame_metadata(self) -> dict:
+        from lerobot.utils.ee_frames import EE_FRAME_CONTRACT, validate_ee_frame
+
+        if self.model_ee_frame is None:
+            return {}  # Exact compatibility with historical checkpoint metadata.
+        return {"ee_frame_contract": EE_FRAME_CONTRACT,
+                "model_ee_frame": validate_ee_frame(self.model_ee_frame)}
+
     def deployment_metadata(self) -> dict:
         """Return the complete, versioned deployment contract for this checkpoint."""
         control_hz = self.control_frequency_hz
@@ -698,7 +708,8 @@ class PI05Config(PreTrainedConfig):
         }
         return {
             "format": "lerobot.pi05.deployment",
-            "version": 10,
+            "version": 10 if self.model_ee_frame is None else 11,
+            **self.ee_frame_metadata(),
             "policy": {
                 "type": self.type,
                 "paligemma_variant": self.paligemma_variant,

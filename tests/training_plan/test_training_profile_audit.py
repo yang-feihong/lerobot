@@ -26,6 +26,15 @@ def test_complete_reference_contract_passes_and_ignores_only_declared_data_field
     assert compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])["ok"]
 
 
+@pytest.mark.parametrize("frame", ["legacy", "physical"])
+def test_model_tool_frame_is_a_recorded_run_choice_not_architecture_drift(frame):
+    training, policy = values()
+    policy["model_ee_frame"] = frame
+    report = compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])
+    assert report["ok"]
+    assert report["model_ee_frame"] == frame
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

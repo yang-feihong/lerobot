@@ -279,6 +279,12 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
+    frame = getattr(cfg.trainable_config, "model_ee_frame", None)
+    if frame is not None:
+        if cfg.dataset.streaming or not isinstance(cfg.dataset.repo_id, str):
+            raise ValueError("EE frame adaptation requires the episode-aware non-streaming reader")
+        from .ee_frame_adapter import configure_dataset_ee_frame
+        configure_dataset_ee_frame(dataset, frame)
     return dataset
 
 
@@ -372,4 +378,10 @@ def make_train_eval_datasets(
                 for stats_type, stats in IMAGENET_STATS.items():
                     ds.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
+    frame = getattr(cfg.trainable_config, "model_ee_frame", None)
+    if frame is not None:
+        from .ee_frame_adapter import configure_dataset_ee_frame
+        configure_dataset_ee_frame(train_dataset, frame)
+        configure_dataset_ee_frame(eval_dataset, frame)
+        eval_dataset.meta.stats = train_dataset.meta.stats
     return train_dataset, eval_dataset

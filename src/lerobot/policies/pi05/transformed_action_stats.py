@@ -79,6 +79,8 @@ def is_task_complete_schema_extension(saved: dict[str, Any], measured: dict[str,
     """Return whether measured only appends task_complete to the saved action schema."""
     saved_schema = dict(saved["schema"])
     measured_schema = dict(measured["schema"])
+    saved_schema.setdefault("model_ee_frame", "legacy")
+    measured_schema.setdefault("model_ee_frame", "legacy")
     saved_names = list(saved_schema.pop("action_names"))
     measured_names = list(measured_schema.pop("action_names"))
     saved_task_complete = bool(saved_schema.pop("include_task_complete", False))
@@ -95,6 +97,8 @@ def transformed_action_schemas_equal(saved: dict[str, Any], measured: dict[str, 
     """Compare schemas after the explicit pre-task-blocked metadata migration."""
     saved_schema = dict(saved["schema"])
     measured_schema = dict(measured["schema"])
+    saved_schema.setdefault("model_ee_frame", "legacy")
+    measured_schema.setdefault("model_ee_frame", "legacy")
     saved_schema.setdefault("include_task_blocked", False)
     measured_schema.setdefault("include_task_blocked", False)
     return saved_schema == measured_schema
@@ -104,6 +108,8 @@ def is_task_status_schema_extension(saved: dict[str, Any], measured: dict[str, A
     """Allow resume to append complete and/or blocked flow channels only."""
     saved_schema = dict(saved["schema"])
     measured_schema = dict(measured["schema"])
+    saved_schema.setdefault("model_ee_frame", "legacy")
+    measured_schema.setdefault("model_ee_frame", "legacy")
     saved_names = list(saved_schema.pop("action_names"))
     measured_names = list(measured_schema.pop("action_names"))
     appended: list[str] = []
@@ -134,6 +140,12 @@ def validate_transformed_action_stats(payload: dict[str, Any], dataset, config) 
                 f"saved={dataset_record.get(key)!r}, current={expected!r}"
             )
     saved_schema = payload["schema"]
+    adapter = getattr(getattr(dataset, "reader", None), "ee_frame_adapter", None)
+    saved_frame_hash = payload["dataset"].get("ee_frames_sha256")
+    if saved_frame_hash is not None and (adapter is None or saved_frame_hash != adapter.metadata_sha256):
+        raise ValueError("Dataset recording tool-axis metadata changed")
+    if saved_schema.get("model_ee_frame", "legacy") != (config.model_ee_frame or "legacy"):
+        raise ValueError("Transformed-action statistics use a different model EE frame")
     for key, expected in action_schema_kwargs(config).items():
         actual = saved_schema.get(key, False) if key == "include_task_blocked" else saved_schema.get(key)
         if actual != expected:
@@ -370,6 +382,11 @@ def compute_transformed_action_stats(
                 counts_by_dimension[index] += selected.size
 
     for episode_index, frame_indices, actions_np, states_np in _episode_arrays(dataset):
+        adapter = getattr(getattr(dataset, "reader", None), "ee_frame_adapter", None)
+        if adapter is not None:
+            actions_np = adapter.feature(actions_np, ACTION, episode_index)
+            if states_np is not None:
+                states_np = adapter.feature(states_np, OBS_STATE, episode_index)
         if len(actions_np) <= stride:
             continue
         if frame_indices[0] != 0 or not np.all(np.diff(frame_indices) == 1):
@@ -503,6 +520,8 @@ def compute_transformed_action_stats(
         "format": "lerobot.pi05.transformed_action_stats",
         "version": 1,
         "dataset": {
+            **({"ee_frames_sha256": dataset.reader.ee_frame_adapter.metadata_sha256}
+               if getattr(getattr(dataset, "reader", None), "ee_frame_adapter", None) is not None else {}),
             "root": str(dataset.root),
             "repo_id": str(dataset.repo_id),
             "num_frames": int(dataset.num_frames),
@@ -515,6 +534,7 @@ def compute_transformed_action_stats(
         },
         "schema": {
             **schema,
+            **({"model_ee_frame": config.model_ee_frame} if config.model_ee_frame is not None else {}),
             "ee_target_dataset_semantics": config.ee_target_dataset_semantics,
             "ee_delta_supervision_mode": config.ee_delta_supervision_mode,
             "gripper_target_representation": config.gripper_target_representation,

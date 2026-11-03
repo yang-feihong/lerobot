@@ -24,6 +24,7 @@ state_use_b2_trunk_pose="true"
 state_use_b2_linear_velocity="false"
 state_use_b2_angular_velocity="false"
 b2_action_representation="velocity" # "velocity" or "pose_delta"
+model_ee_frame="" # Resolve fresh runs to physical; resume inherits its checkpoint.
 z1_action_representation="ee_delta" # "ee_delta" (adjacent target) or "ee_state_delta" (inference-time state anchor)
 ee_delta_rotation_representation="rotvec" # "rotvec" for new EE-delta checkpoints
 action_semantics_profile="joint_control_arm_mode_v2"
@@ -343,6 +344,7 @@ while (( $# > 0 )); do
     --training-rtc-simulated-delay=*) training_rtc_simulated_delay="${1#*=}"; training_rtc_simulated_delay_explicit="true" ;;
     --training-rtc-delay-distribution=*) training_rtc_delay_distribution="${1#*=}"; training_rtc_delay_distribution_explicit="true" ;;
     --b2-action-representation=*) b2_action_representation="${1#*=}" ;;
+    --model-ee-frame=*) model_ee_frame="${1#*=}" ;;
     --z1-action-representation=*) z1_action_representation="${1#*=}" ;;
     --action-semantics-profile=*) action_semantics_profile="${1#*=}" ;;
     --discrete-action-training-mode=*) discrete_action_training_mode="${1#*=}" ;;
@@ -759,6 +761,13 @@ PY
 fi
 
 policy_io_args=()
+if [[ -z "$model_ee_frame" && -z "$resume_checkpoint" ]]; then
+  model_ee_frame="physical"
+fi
+if [[ -n "$model_ee_frame" ]]; then
+  [[ "$model_ee_frame" == legacy || "$model_ee_frame" == physical ]] || { echo "Invalid --model-ee-frame" >&2; exit 2; }
+  policy_io_args+=(--policy.model_ee_frame="$model_ee_frame")
+fi
 if [[ -z "$resume_checkpoint" ]]; then
   policy_io_args+=(
     --policy.input_features=null

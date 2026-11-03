@@ -38,7 +38,7 @@ from lerobot.policies.pi05.b2_action_transform import (
     action_dataset_indices,
     ee_reference_delta_to_absolute,
 )
-from lerobot.policies.pi05.processor_pi05 import OBS_ACTION_HISTORY
+from lerobot.policies.pi05.processor_pi05 import OBS_ACTION_HISTORY, Pi05PrepareStateTokenizerProcessorStep
 from lerobot.policies.rtc import RTCConfig
 from lerobot.processor import NormalizerProcessorStep, UnnormalizerProcessorStep
 from lerobot.types import TransitionKey
@@ -449,7 +449,7 @@ def _resolve_checkpoint_action_representations(
 ) -> tuple[str, str]:
     b2_representation = str(action_metadata["representation"])
     del raw_config
-    if metadata_version != 10:
+    if metadata_version not in (10, 11):
         raise ValueError(f"Deployment metadata version {metadata_version} uses a retired contract")
     z1_representation = str(action_metadata["z1_representation"])
     if b2_representation not in {"pose_delta", "velocity"}:
@@ -475,9 +475,14 @@ def _load_checkpoint_contract(
     if not metadata_path.is_file():
         raise FileNotFoundError(f"Checkpoint is missing deployment metadata: {metadata_path}")
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+    from lerobot.utils.ee_frames import checkpoint_ee_frame
+
+    saved_ee_frame = checkpoint_ee_frame(saved)
+    if config.model_ee_frame is not None and config.model_ee_frame != saved_ee_frame:
+        raise ValueError("Model EE frame differs between deployment metadata and config")
     metadata_version = saved.get("version")
-    if saved.get("format") != "lerobot.pi05.deployment" or metadata_version != 10:
-        raise ValueError("Checkpoint deployment metadata must use lerobot.pi05.deployment version 10")
+    if saved.get("format") != "lerobot.pi05.deployment" or metadata_version not in (10, 11):
+        raise ValueError("Checkpoint deployment metadata must use lerobot.pi05.deployment version 10 or 11")
     if not config.io_schema_resolved:
         raise ValueError("Checkpoint contains unresolved PI0.5 I/O metadata")
     config.restore_camera_metadata(saved)
@@ -746,6 +751,21 @@ def _checkpoint_hot_swap_signature(policy_path: Path) -> str:
     for processor_name in ("policy_preprocessor.json", "policy_postprocessor.json"):
         for step in documents[processor_name].get("steps", ()):
             step.get("config", {}).pop("supervise_terminal_static_padding", None)
+            if (
+                processor_name == "policy_preprocessor.json"
+                and step.get("registry_name") == "pi05_prepare_state_tokenizer_processor_step"
+            ):
+                from lerobot.policies.pi05.configuration_pi05 import PI05Config
+
+                effective = Pi05PrepareStateTokenizerProcessorStep(**step.get("config", {}))
+                # Match make_pre_post_processors' reconciliation, including
+                # dataclass defaults in checkpoints predating explicit configs.
+                if config.get("io_schema_resolved", False):
+                    effective.max_state_dim = config.get("max_state_dim", PI05Config.max_state_dim)
+                    effective.continuous_state_memory = (
+                        config.get("state_action_encoding", PI05Config.state_action_encoding) == "continuous"
+                    )
+                step["config"] = effective.get_config()
     canonical = json.dumps(documents, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(canonical).hexdigest()
 
@@ -1839,6 +1859,7 @@ class AsyncRTCPolicy:
     def input_spec(self) -> dict[str, object]:
         spec = {
             "protocol_version": PROTOCOL_VERSION, "model_input_format": 1,
+            **self.policy.config.ee_frame_metadata(),
             "source_state_names": list(self.source_state_names),
             "selected_state_names": list(self.selected_state_names),
             "base_camera_key": self.base_camera_key, "wrist_camera_key": self.wrist_camera_key,

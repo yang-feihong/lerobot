@@ -14,8 +14,9 @@ SCRIPT = Path(__file__).resolve().parents[2] / "train_vla_pi05.sh"
 def dry_run(tmp_path, *args):
     env = os.environ.copy()
     env.pop("LEROBOT_RUNTIME_BIN", None)
+    frame_args = [] if any(arg.startswith("--resume-checkpoint=") for arg in args) else ["--model-ee-frame=legacy"]
     return subprocess.run(
-        ["bash", str(SCRIPT), "--dry-run=true", f"--output-root={tmp_path / 'outputs'}", *args],
+        ["bash", str(SCRIPT), "--dry-run=true", *frame_args, f"--output-root={tmp_path / 'outputs'}", *args],
         capture_output=True,
         text=True,
         env=env,

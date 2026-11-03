@@ -183,6 +183,7 @@ common_args=(
   --keep-last-checkpoints="${KEEP_LAST_CHECKPOINTS}"
   --keep-checkpoint-every-n-steps="${KEEP_CHECKPOINT_EVERY_N_STEPS}"
   --b2-action-representation="${B2_ACTION_REPRESENTATION}"
+  --model-ee-frame="${MODEL_EE_FRAME:-}"
   --z1-action-representation="${Z1_ACTION_REPRESENTATION}"
   --action-semantics-profile="${ACTION_SEMANTICS_PROFILE}"
   --action-loss-schema="${ACTION_LOSS_SCHEMA}"

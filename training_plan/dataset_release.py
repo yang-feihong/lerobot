@@ -69,9 +69,30 @@ def verify_release(root, request=None, *, allow_relation_subset=False):
     # the physical dataset for each supervision preset (including old releases).
     if request is not None and receipt['inputs']['request']['recipe'] != request['recipe']:
         raise ValueError("Training configuration differs from the locked release recipe")
-    if asset_identity(root) != receipt["assets"]:
+    if not assets_match(root, receipt["assets"]):
         raise ValueError(f"Published training assets changed: {root}")
     return receipt
+
+
+def assets_match(root, expected):
+    """An audited all-legacy sidecar only makes the old implicit contract explicit.
+
+    Preserve historical release identities; never exempt a physical/mixed map,
+    nor an already-hashed sidecar, from asset integrity checks.
+    """
+    current = asset_identity(root)
+    relative = "meta/ee_frames.json"
+    if relative not in expected["files"] and relative in current["files"]:
+        sidecar = read(Path(root) / relative)
+        manifest = read(Path(root) / "diagnostics/conversion_manifest.json")
+        records = {k: r for k, r in manifest["bags"].items() if r.get("status") == "done"}
+        if (sidecar.get("version") == 1
+                and sidecar.get("ee_frame_contract") == "same_tcp_tool_rx_minus_90_v1"
+                and set(sidecar.get("recordings", {})) == set(records)
+                and all(v == "legacy" for v in sidecar["recordings"].values())
+                and all(r.get("ee_frame", "legacy") == "legacy" for r in records.values())):
+            current["files"].pop(relative)
+    return current == expected
 
 
 def resolve_release(datasets_root, request, *, pinned_root=None, artifact_id=None):
