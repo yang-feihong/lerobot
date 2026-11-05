@@ -1485,6 +1485,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             source_weights=cfg.dataset.semantic_source_weights,
             **static_args,
             domain_weights=cfg.dataset.semantic_domain_weights,
+            instruction_domain_weights=cfg.dataset.semantic_instruction_domain_weights,
         )
     if semantic_views is not None:
         expected_episodes = set(dataset.episodes or range(dataset.meta.total_episodes))
@@ -1504,6 +1505,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "phase_weights": cfg.dataset.semantic_phase_weights,
                 "source_weights": cfg.dataset.semantic_source_weights,
                 "domain_weights": cfg.dataset.semantic_domain_weights,
+                "instruction_domain_weights": cfg.dataset.semantic_instruction_domain_weights,
                 "exclude_incomplete_static_starts": cfg.dataset.semantic_exclude_incomplete_static_starts,
                 "sampling_strategy": "state_instruction_cells"
                 if relation_sampling is not None
@@ -1871,6 +1873,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             },
             "rename_observations_processor": {"rename_map": cfg.rename_map},
         }
+        if isinstance(active_cfg, PI05Config) and not cfg.resume:
+            # Only a new training run may choose a new prompt contract. Resume
+            # inherits the checkpoint, including legacy implicit defaults.
+            preprocessor_overrides["pi05_prepare_state_tokenizer_processor_step"] = {
+                "max_state_dim": active_cfg.max_state_dim,
+                "continuous_state_memory": active_cfg.state_action_encoding == "continuous",
+            }
         postprocessor_overrides = {
             "unnormalizer_processor": {
                 "stats": dataset.meta.stats,

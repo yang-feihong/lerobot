@@ -68,6 +68,37 @@ def test_domain_ratio_missing_cell_fails_instead_of_silent_renormalization():
             state_instruction_matrix=matrix, domain_weights={"simulation": 3, "real": 1})
 
 
+def test_full_sim_only_preserves_six_equal_cells_and_three_to_one_diagonals():
+    from dataclasses import replace
+
+    catalog, _, length, matrix = make_plan("pull_joint_plus_full")
+    real_views = tuple(v for v in catalog.episodes[0] if v.canonical_intent != "full_episode_command")
+    catalog = replace(catalog, episodes={0: catalog.episodes[0], 1: real_views},
+                      segments={0: catalog.segments[0], 1: catalog.segments[0]},
+                      episode_domains={0: "simulation", 1: "real"})
+    kwargs = dict(state_instruction_matrix=matrix, domain_weights={"simulation": 3, "real": 1})
+    with pytest.raises(ValueError, match="domain has no eligible samples"):
+        semantic_relation_sampling_groups(catalog, [0, length], [0, 1], **kwargs)
+    plan = semantic_relation_sampling_groups(
+        catalog, [0, length], [0, 1], **kwargs,
+        instruction_domain_weights={"full_episode_command": {"simulation": 1}},
+    )
+    cells, domains = Counter(), Counter()
+    assert len(plan.frame_groups) == 9
+    for name, mass, frames in zip(plan.names, plan.group_weights, plan.frame_groups, strict=True):
+        state, intent, domain, _ = name.split("/")
+        cells[state, intent] += mass
+        domains[domain] += mass
+        if intent == "full_episode_command":
+            assert domain == "simulation"
+            assert mass == pytest.approx(1/6)
+        else:
+            assert mass == pytest.approx((.75 if domain == "simulation" else .25)/6)
+        assert all((frame < length) == (domain == "simulation") for frame in frames)
+    assert list(cells.values()) == pytest.approx([1/6]*6)
+    assert domains == pytest.approx({"simulation": 7/8, "real": 1/8})
+
+
 def test_domain_ratio_precedes_source_weights_and_static_frame_weights():
     from dataclasses import replace
 

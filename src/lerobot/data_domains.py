@@ -41,6 +41,25 @@ def recording_domain(record, *, required=True):
     return None
 
 
+def validate_instruction_domain_weights(overrides, default, matrix):
+    """Instruction-specific restrictions never silently invent a missing domain."""
+    validate_domain_weights(default)
+    if not isinstance(overrides, dict):
+        raise ValueError("Instruction domain weights must be an object")
+    if overrides and not default:
+        raise ValueError("Instruction domain weights require explicit default domain weights")
+    intents = {intent for row in matrix.values() for intent in row}
+    if set(overrides) - intents:
+        raise ValueError("Instruction domain weights reference an unconfigured instruction")
+    for weights in overrides.values():
+        validate_domain_weights(weights)
+        if not weights:
+            raise ValueError("Instruction domain weights cannot be empty")
+        if any(w > 0 and default.get(d, 0) <= 0 for d, w in weights.items()):
+            raise ValueError("Instruction domain weights cannot enable a globally excluded domain")
+    return overrides
+
+
 def load_episode_domains(sidecar_path, episodes):
     """Join sidecar identity to immutable manifest; fail on reindex/membership drift."""
     manifest_path = Path(sidecar_path).parent.parent / "diagnostics/conversion_manifest.json"

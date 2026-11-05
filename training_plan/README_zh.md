@@ -28,6 +28,8 @@ bash training_plan/prepare_dataset.sh --task TASK \
 原 `dataset_family` 只保留旧配置读取兼容，正式计划统一使用 `data_recipe`。
 远程使用前同步相应完整发布目录和生成索引，再走现有 `cluster.sh check/dry-run`；
 本地准备不自动传输数据，`cluster.sh prepare` 也不替代本地数据发布。
+远程发布解析预检使用已锁定训练镜像中的 Python，以只读挂载保留宿主路径；
+不依赖训练节点可能较旧的系统 Python，解析失败仍阻止启动。
 
 普通 resume 从 checkpoint 的 `dataset.root` 锁定原不可变版本，不随索引换数据；
 变更配方、监督矩阵或采用新数据必须显式 fork。旧 checkpoint 指向 cleaned 或历史可变
@@ -45,6 +47,12 @@ training 目录时不自动迁移，也不修改 checkpoint；应保留历史代
 `{}`（默认）保持历史按合法帧自然混合，不强制域比例。所有数值须有限、非负且总和为正。
 
 采样顺序是：状态×指令组合 → 来源域 → 可选 source_group → 合法帧。
+任务可用 `instruction_domain_weights` 显式覆盖某指令的来源域策略，例如
+`"domain_weights": {"simulation": 3, "real": 1}` 配合
+`"instruction_domain_weights": {"full_episode_command": {"simulation": 1}}`，
+表示 full 组合只采仿真，其余组合仍为 3:1。组合等权不变；六组合时整体为 7:1。
+覆盖项必须引用已配置指令、非空且不能启用全局排除的域；不自动容忍缺失域。
+策略写入 config/runtime，普通 resume 禁止悄悄变更，需显式 fork。
 因此默认组合等权不变，3:1 是**每个组合内部**的比例，而非整个数据集 episode 数配额；
 小域会重复采样，有限 batch 允许取整误差，不承诺每个 batch 恰好 3:1。
 任一启用组合在所需域中无合法帧（包括历史过滤/窗口检查之后）就报错，不能自动改成其他比例。
@@ -154,14 +162,28 @@ reset selector 保持新初始化，不可静默丢失旧权重。普通 `fork-t
 验收后使用同计划的 `start-task`。训练输出保存 `model_initialization.json`、
 `training_profile_audit.json`、`semantic_view_runtime.json` 和由真实训练 batch 采集的
 `semantic_input_audit.json`（自然语言原文、tokenizer prompt、实际 token IDs 及解码结果）。
+状态文本格式属于 checkpoint 的预处理契约，独立于连续状态历史输入。
+部署和 resume 保留 `policy_preprocessor.json` 的状态 tokenizer 配置；历史空配置 `{}`
+按原默认保留 `State: ...`，不能因 `state_action_encoding=continuous` 删除该文本。
+新训练（非 resume）显式按配置选择状态文本格式，并随 processor 保存。
+热切换比较保存的实际文本格式；文本格式不同则完整重载，不隐式改写旧模型输入。
 数据传输用 `sync_training_release.py`，只发送接收凭据列出的训练文件及确实缺失的视频；
+发布物中的本地软链接在传输时解引用为内容，远端不保留指向本地挂载的绝对链接。
 远端相同视频须 SHA256 一致才硬链接，最终复验所有训练文件及视频内容，不传 raw_nonvisual 或诊断图片。
 可用 `--parallel-transfers 16` 分组传输；每个文件只分配一个发送端，连接错峰建立、失败有限重试，
 中断文件保留在 `.rsync-partial`，全部发送完成且 SHA256 验收通过后才发布 READY 入口。
+已有 VERIFIED 接收凭据时，可用 `sync_training_release.py --expected-video-identities FILE`
+传入按发布物相对路径索引的 `{path: {"size": N, "sha256": "..."}}` 子集，复用已验收的
+期望哈希以减少本地视频重复预读；未列出的视频仍现场计算。此选项不跳过远端已有视频
+或传输后内容的完整 SHA256 校验，任何差异仍拒绝发布。清单来源凭据须随任务证据保留。
 代码同步通过校验和及 `--link-dest` 复用同节点已发布快照，仍生成独立的内容身份和文件校验清单。
 
 拉门和外部抓取的四卡 50k 新训练维护在 `pull_external_grasp_50k_jobs.json`，分别引用
 `pull_joint`（3×1/3）与 `external_grasp_joint_plus_full`（4×1/4），共用 full-MEM profile。
+
+所有拉门 5122 条的四卡 0→50k 任务维护在 `all_pull_joint_full_50k_jobs.json`，
+使用 `pull_joint_plus_full` 六组合等权。full 组合只采仿真，其余组合内仿真∶实采 3∶1；
+这是显式任务采样策略，不补造独立单阶段实采的全流程监督。
 
 筐内抓取四卡 50k→100k 的权重复用任务维护在 `bin_grasp_fresh_50k_to_100k_jobs.json`，
 使用 `grasp`（1×1）与共享 full-MEM profile，在 wholebody2 运行。
@@ -539,6 +561,10 @@ bash ../data_postprocessing/lerobot/prepare_reset_presets.sh --dataset /绝对�
 ```
 
 生成器从已有 `raw_nonvisual` 的 `/arm_target_pos` 控制目标识别完整 reset 操作，
+仿真则从 manifest 明示的 accepted shard `raw_audit` 中读取
+`arm_joint_target_dispatched`，先验证逐帧关节反馈与训练 episode 对齐，再识别原始
+完整 reset 操作的最终下发目标，映射到清洗后的 reset 范围。反馈仅用于对齐，不用于猜目标。
+可用 `--workers 4` 并行审计；原始证据仍只在本地读取，远程只同步生成侧车。
 排除启动 latched 消息，复现转换采样原点；不读 rosbag、不使用实际关节状态或任务名猜目标。
 末端命令需唯一匹配 preset（最多 0.03 rad），中断、未知目标或无法区分的切换保留为 unresolved。
 训练若实际采到既无已识别目标、也未列入审计 `unresolved` 的 reset 会报错，不回退 middle。

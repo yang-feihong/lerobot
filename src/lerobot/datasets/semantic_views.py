@@ -78,6 +78,7 @@ class SemanticViewCatalog:
     episode_lengths: dict[int, int] | None = None
     future_action_frames: int = 0
     episode_domains: dict[int, str] = field(default_factory=dict)
+    image_valid_start_frames: dict[int, int] = field(default_factory=dict)
 
 
 def with_semantic_temporal_filter(catalog: SemanticViewCatalog, dataset) -> SemanticViewCatalog:
@@ -119,12 +120,16 @@ def with_semantic_temporal_filter(catalog: SemanticViewCatalog, dataset) -> Sema
         for segment in sorted(physical.get(episode, ()), key=lambda s: s.frame_start):
             if not 0 <= segment.frame_start < segment.frame_stop <= length:
                 raise ValueError(f"semantic segment exceeds physical episode {episode}")
-            if components and segment.frame_start < components[-1][1]:
+            image_start=catalog.image_valid_start_frames.get(episode,0)
+            if not 0<=image_start<length:raise ValueError(f'Invalid image-valid prefix for episode {episode}')
+            start=max(segment.frame_start,image_start)
+            if start>=segment.frame_stop:continue
+            if components and start < components[-1][1]:
                 raise ValueError(f"Overlapping physical stage ranges in episode {episode}")
-            if components and components[-1][1] == segment.frame_start:
+            if components and components[-1][1] == start:
                 components[-1] = (components[-1][0], segment.frame_stop)
             else:
-                components.append((segment.frame_start, segment.frame_stop))
+                components.append((start, segment.frame_stop))
         valid_ranges[episode] = tuple(components)
         eligible[episode] = tuple(
             (left, right)
@@ -229,7 +234,11 @@ def load_semantic_views(path: str | Path) -> SemanticViewCatalog:
         raise ValueError("semantic-view sidecar requires object-valued intents and episodes")
     parsed: dict[int, tuple[SemanticView, ...]] = {}
     parsed_segments: dict[int, tuple[SemanticSegment, ...]] = {}
+    image_starts={}
     for episode_key, episode in episodes.items():
+        image_start=episode.get('image_valid_start_frame',0)
+        if type(image_start) is not int or image_start<0:raise ValueError(f'Invalid image-valid prefix in episode {episode_key}')
+        image_starts[int(episode_key)]=image_start
         views_raw = episode.get("views") if isinstance(episode, dict) else None
         if not isinstance(views_raw, list) or not views_raw:
             raise ValueError(f"episode {episode_key} has no semantic views")
@@ -346,6 +355,7 @@ def load_semantic_views(path: str | Path) -> SemanticViewCatalog:
             if "recording_id" in episode or "source_path" in episode
         },
         physical_segments=physical_segments,
+        image_valid_start_frames=image_starts,
     )
 
 
@@ -479,6 +489,7 @@ def semantic_relation_sampling_groups(
     phase_weights=None,
     source_weights=None,
     domain_weights=None,
+    instruction_domain_weights=None,
     interior_static_frames=(),
     terminal_static_frames=(),
     interior_static_weight=1.0,
@@ -487,9 +498,12 @@ def semantic_relation_sampling_groups(
     """Choose a state/instruction cell first, independently of its eligible frame count."""
     phase_weights = phase_weights or dict.fromkeys(state_instruction_matrix, 1.0)
     source_weights = source_weights or {}
-    from lerobot.data_domains import validate_domain_weights
+    from lerobot.data_domains import validate_domain_weights, validate_instruction_domain_weights
 
     domain_weights = validate_domain_weights(domain_weights or {})
+    instruction_domain_weights = validate_instruction_domain_weights(
+        instruction_domain_weights or {}, domain_weights, state_instruction_matrix,
+    )
     enabled_domains = {d: w for d, w in domain_weights.items() if w > 0}
     if set(phase_weights) != set(state_instruction_matrix):
         raise ValueError("State weights must match the configured relation matrix")
@@ -555,10 +569,12 @@ def semantic_relation_sampling_groups(
     phase_total = sum(
         phase_weights[state] * len(instructions) for state, instructions in state_instruction_matrix.items()
     )
-    domain_masses = enabled_domains or {"*": 1.0}
-    domain_total = sum(domain_masses.values())
     for state, instructions in state_instruction_matrix.items():
         for intent in instructions:
+            domain_masses = {
+                d: w for d, w in instruction_domain_weights.get(intent, enabled_domains).items() if w > 0
+            } or {"*": 1.0}
+            domain_total = sum(domain_masses.values())
             available = [
                 (domain, source) for phase, goal, domain, source in pools
                 if phase == state and goal == intent

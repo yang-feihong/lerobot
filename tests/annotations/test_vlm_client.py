@@ -25,9 +25,6 @@ from lerobot.annotations.steerable_pipeline.vlm_client import _bind_serve_port  
 
 
 def test_bind_serve_port_substitutes_placeholder() -> None:
-    # The {port} placeholder is replaced everywhere it appears, regardless of
-    # parallel vs single server — the bug was the single-server path passing
-    # it through unsubstituted.
     cmd = "vllm serve M --max-model-len 32768 --port {port}"
     assert _bind_serve_port(cmd, 8000) == "vllm serve M --max-model-len 32768 --port 8000"
 

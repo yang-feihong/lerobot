@@ -1,0 +1,21 @@
+{
+  "format": "lerobot.training_jobs",
+  "version": 1,
+  "jobs": {
+    "all_pull_joint_plus_full_sim3_real1_50k": {
+      "data_recipe": "all_pull_door__3d7c7b2d0883c1e13230",
+      "dataset_artifact_id": "2c9ae3012dd31f30a0ef046c9b5a1ff7c69c5d595408563b5fdf1b8da69334a3",
+      "training_preset": "pull_joint_plus_full",
+      "domain_weights": {"simulation": 3, "real": 1},
+      "instruction_domain_weights": {"full_episode_command": {"simulation": 1}},
+      "reset_preset_unknown_target_policy": "mask_audited_unknown",
+      "reset_preset_sidecar": "/data/datasets/b2_z1/supervision/all_pull_door--2c9ae3012dd31f30a0ef046c9b5a1ff7c69c5d595408563b5fdf1b8da69334a3/reset_presets.json",
+      "train_steps": 50000,
+      "resources": {
+        "node": "wb1",
+        "gpu_ids": [0, 1, 2, 3],
+        "main_process_port": 29516
+      }
+    }
+  }
+}

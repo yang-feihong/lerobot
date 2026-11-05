@@ -63,7 +63,7 @@ mapfile -t semantic_task_spec < <(
   python3 "${plan_dir}/semantic_plan.py" \
     --presets "${semantic_presets_file}" --jobs "${training_jobs_file}" resolve "${task_id}"
 )
-[[ "${#semantic_task_spec[@]}" -eq 15 ]] || {
+[[ "${#semantic_task_spec[@]}" -eq 16 ]] || {
   echo "Failed to resolve semantic task ${task_id} from ${training_jobs_file}" >&2
   exit 2
 }
@@ -84,6 +84,7 @@ allow_resume_instruction_extension="${semantic_task_spec[13]}"
 effective_train_steps="${task_train_steps:-${TRAIN_STEPS}}"
 semantic_source_weights='{}'
 semantic_domain_weights="${semantic_task_spec[14]}"
+semantic_instruction_domain_weights="${semantic_task_spec[15]}"
 
 dataset_resolve_args=(--jobs "${training_jobs_file}" --presets "${semantic_presets_file}"
   --task "${task_id}" --datasets-root "${VLA_STORAGE_ROOT}/datasets/b2_z1" --format-lines)
@@ -165,6 +166,7 @@ common_args=(
   --semantic-phase-weights="${semantic_phase_weights}"
   --semantic-source-weights="${semantic_source_weights}"
   --semantic-domain-weights="${semantic_domain_weights}"
+  --semantic-instruction-domain-weights="${semantic_instruction_domain_weights}"
   --random-semantic-view=true
   --base-policy="${BASE_POLICY}"
   --mem-vit-checkpoint="${MEM_VIT_CHECKPOINT}"
@@ -291,7 +293,7 @@ PY
       "${BASE_POLICY_ARTIFACT_ID}" "${BASE_POLICY_SHA256}" \
       "${MEM_VIT_ARTIFACT_ID}" "${MEM_VIT_SHA256}" \
       "${POLICY_TOKENIZER_ARTIFACT_ID}" "${POLICY_TOKENIZER_SHA256}" \
-      "${allow_resume_instruction_extension}" "${semantic_domain_weights}" <<'PY'
+      "${allow_resume_instruction_extension}" "${semantic_domain_weights}" "${semantic_instruction_domain_weights}" <<'PY'
 import json
 import sys
 
@@ -365,6 +367,8 @@ def memory_matches() -> bool:
 expected = {
     "dataset.semantic_domain_weights": fork_mode
     or dataset.get("semantic_domain_weights", {}) == json.loads(sys.argv[29]),
+    "dataset.semantic_instruction_domain_weights": fork_mode
+    or dataset.get("semantic_instruction_domain_weights", {}) == json.loads(sys.argv[30]),
     "wandb.run_id": isinstance(run_id, str) and bool(run_id.strip()),
     "dataset.root": fork_mode
     or same_release_root(dataset.get("root"), sys.argv[2])
@@ -418,6 +422,7 @@ PY
       --semantic-phase-weights="${semantic_phase_weights}"
       --semantic-source-weights="${semantic_source_weights}"
       --semantic-domain-weights="${semantic_domain_weights}"
+      --semantic-instruction-domain-weights="${semantic_instruction_domain_weights}"
       --random-semantic-view=true
       --action-loss-schema="${ACTION_LOSS_SCHEMA}"
       --action-continuous-group-weight="${ACTION_CONTINUOUS_GROUP_WEIGHT}"

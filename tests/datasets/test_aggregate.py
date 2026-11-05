@@ -824,7 +824,7 @@ def test_aggregate_already_merged_dataset(tmp_path, lerobot_dataset_factory):
         total_frames=100,
     )
 
-    # Step 4: Merge AB+C into final - THIS IS WHERE THE BUG OCCURRED
+    # Step 4: Merge AB+C into final.
     aggregate_datasets(
         repo_ids=[ds_ab.repo_id, ds_c.repo_id],
         roots=[ds_ab.root, ds_c.root],
@@ -855,5 +855,4 @@ def test_aggregate_already_merged_dataset(tmp_path, lerobot_dataset_factory):
     assert ds_abc.num_episodes == expected_episodes
     assert ds_abc.num_frames == expected_frames
 
-    # This would raise FileNotFoundError before the fix
     assert_dataset_iteration_works(ds_abc)

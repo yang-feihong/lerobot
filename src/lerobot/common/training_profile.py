@@ -42,6 +42,7 @@ POLICY_DATA_FIELDS = {
     "semantic_view_manifest_sha256",
 }
 DATASET_IDENTITY_FIELDS = {
+    "semantic_instruction_domain_weights",
     "semantic_domain_weights",
     "episodes",
     "repo_id",

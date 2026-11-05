@@ -144,6 +144,7 @@ semantic_phases="[]"
 semantic_phase_weights="{}"
 semantic_source_weights="{}"
 semantic_domain_weights="{}"
+semantic_instruction_domain_weights="{}"
 # A mixture manifest describes source membership in a losslessly merged dataset:
 # {"sources":[
 #   {"name":"stage1_stage2","weight":0.8,"episode_range":[0,1085]},
@@ -264,6 +265,7 @@ semantic_phases_explicit="false"
 semantic_phase_weights_explicit="false"
 semantic_source_weights_explicit="false"
 semantic_domain_weights_explicit="false"
+semantic_instruction_domain_weights_explicit="false"
 for argument in "$@"; do
   if [[ "$argument" == --action-semantics-profile=* ]]; then
     action_semantics_profile="${argument#*=}"
@@ -391,6 +393,7 @@ while (( $# > 0 )); do
     --semantic-phase-weights=*) semantic_phase_weights="${1#*=}"; semantic_phase_weights_explicit="true" ;;
     --semantic-source-weights=*) semantic_source_weights="${1#*=}"; semantic_source_weights_explicit="true" ;;
     --semantic-domain-weights=*) semantic_domain_weights="${1#*=}"; semantic_domain_weights_explicit="true" ;;
+    --semantic-instruction-domain-weights=*) semantic_instruction_domain_weights="${1#*=}"; semantic_instruction_domain_weights_explicit="true" ;;
     --finetune-mode=*) finetune_mode="${1#*=}" ;;
     --dataset-repo-id=*) dataset_repo_id="${1#*=}"; dataset_repo_id_explicit="true" ;;
     --dataset-root=*) dataset_root="${1#*=}"; dataset_root_explicit="true" ;;
@@ -454,10 +457,11 @@ if [[ -n "$semantic_views_path" && ! -f "$semantic_views_path" ]]; then
   echo "Semantic-view sidecar not found: $semantic_views_path" >&2
   exit 2
 fi
-python3 - "$semantic_view_kind_weights" "$semantic_state_instruction_matrix" "$semantic_phases" "$semantic_phase_weights" "$semantic_source_weights" "$semantic_domain_weights" <<'PY'
+PYTHONPATH="${repo_root}/src${PYTHONPATH:+:${PYTHONPATH}}" python3 - "$semantic_view_kind_weights" "$semantic_state_instruction_matrix" "$semantic_phases" "$semantic_phase_weights" "$semantic_source_weights" "$semantic_domain_weights" "$semantic_instruction_domain_weights" <<'PY'
 import json
 import sys
 import math
+from lerobot.data_domains import validate_instruction_domain_weights
 
 domains = json.loads(sys.argv[6])
 if not isinstance(domains, dict) or set(domains) - {"simulation", "real"} or any(
@@ -473,6 +477,7 @@ if not isinstance(value, dict) or any(not isinstance(k, str) or not isinstance(v
 if value and not any(v > 0 for v in value.values()):
     raise SystemExit("--semantic-view-kind-weights must enable at least one view kind")
 matrix = json.loads(sys.argv[2])
+validate_instruction_domain_weights(json.loads(sys.argv[7]), domains, matrix)
 if not isinstance(matrix, dict):
     raise SystemExit("--semantic-state-instruction-matrix must be a JSON object")
 if matrix and value:
@@ -918,6 +923,7 @@ if [[ -z "$resume_checkpoint" ]]; then
       --dataset.semantic_phase_weights="$semantic_phase_weights"
       --dataset.semantic_source_weights="$semantic_source_weights"
       --dataset.semantic_domain_weights="$semantic_domain_weights"
+      --dataset.semantic_instruction_domain_weights="$semantic_instruction_domain_weights"
     )
     if [[ -n "$semantic_view_kind_weights" && "$semantic_view_kind_weights" != "{}" ]]; then
       dataset_args+=(--dataset.semantic_view_kind_weights="$semantic_view_kind_weights")
@@ -946,6 +952,7 @@ else
   [[ "$semantic_phase_weights_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_phase_weights="$semantic_phase_weights")
   [[ "$semantic_source_weights_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_source_weights="$semantic_source_weights")
   [[ "$semantic_domain_weights_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_domain_weights="$semantic_domain_weights")
+  [[ "$semantic_instruction_domain_weights_explicit" == "false" ]] || dataset_args+=(--dataset.semantic_instruction_domain_weights="$semantic_instruction_domain_weights")
 fi
 if [[ -n "$video_backend" ]]; then
   dataset_args+=(--dataset.video_backend="$video_backend")

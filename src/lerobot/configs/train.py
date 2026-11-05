@@ -419,6 +419,11 @@ class TrainPipelineConfig(HubMixin):
             )
             if saved_domains != self.dataset.semantic_domain_weights:
                 raise ValueError("Resume domain sampling differs from checkpoint; explicitly fork with an updated dataset policy")
+            saved_instruction_domains = json.loads(saved_train_config.read_text()).get("dataset", {}).get(
+                "semantic_instruction_domain_weights", {}
+            )
+            if saved_instruction_domains != self.dataset.semantic_instruction_domain_weights:
+                raise ValueError("Resume instruction domain sampling differs from checkpoint; explicitly fork with an updated dataset policy")
 
         if self.policy is not None:
             self.policy.pretrained_path = policy_dir

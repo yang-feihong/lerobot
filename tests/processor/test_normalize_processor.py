@@ -2203,15 +2203,7 @@ def test_dtype_adaptation_device_processor_bfloat16_normalizer_float32():
 
 
 def test_stats_reconstruction_after_load_state_dict():
-    """
-    Test that stats dict is properly reconstructed from _tensor_stats after loading.
-
-    This test ensures the bug where stats became empty after loading is fixed.
-    The bug occurred when:
-    1. Only _tensor_stats were saved via state_dict()
-    2. stats field became empty {} after loading
-    3. Calling to() method or hotswap_stats would fail because they depend on self.stats
-    """
+    """Loading tensor stats restores the stats required by to() and hotswap_stats()."""
 
     # Create normalizer with stats
     features = {
@@ -2247,7 +2239,6 @@ def test_stats_reconstruction_after_load_state_dict():
     # Create new normalizer with empty stats (simulating load)
     new_normalizer = NormalizerProcessorStep(features=features, norm_map=norm_map, stats={})
 
-    # Before fix: this would cause stats to remain empty
     new_normalizer.load_state_dict(state_dict)
 
     # Verify that stats dict is properly reconstructed from _tensor_stats
@@ -2269,12 +2260,10 @@ def test_stats_reconstruction_after_load_state_dict():
     np.testing.assert_allclose(new_normalizer.stats[ACTION]["std"], [1.0, 2.0])
 
     # Test that methods that depend on self.stats work correctly after loading
-    # This would fail before the bug fix because self.stats was empty
 
     # Test 1: to() method should work without crashing
     try:
         new_normalizer.to(device="cpu", dtype=torch.float32)
-        # If we reach here, the bug is fixed
     except (KeyError, AttributeError) as e:
         pytest.fail(f"to() method failed after loading state_dict: {e}")
 

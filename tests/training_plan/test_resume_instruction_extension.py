@@ -17,7 +17,7 @@ VALIDATOR = next(block.split("\nPY\n", 1)[0] for block in
                  if "expected_phases =" in block)
 
 
-@pytest.mark.parametrize("change", ["add", "remove", "rewrite", "new_state", "memory_drift", "domain_drift"])
+@pytest.mark.parametrize("change", ["add", "remove", "rewrite", "new_state", "memory_drift", "domain_drift", "instruction_domain_drift"])
 @pytest.mark.parametrize("allow", [False, True])
 def test_same_run_instruction_extension_requires_opt_in_and_keeps_old_contracts(tmp_path, change, allow):
     old = copy.deepcopy(PRESETS["three_goal_conditioned"]["state_instruction_matrix"])
@@ -39,6 +39,8 @@ def test_same_run_instruction_extension_requires_opt_in_and_keeps_old_contracts(
     }
     if change == "domain_drift":
         dataset["semantic_domain_weights"] = {"simulation": 3, "real": 1}
+    if change == "instruction_domain_drift":
+        dataset["semantic_instruction_domain_weights"] = {"full_episode_command": {"simulation": 1}}
     config = tmp_path / "train_config.json"
     config.write_text(json.dumps({"wandb": {"run_id": "existing-run"}, "dataset": dataset, "policy": policy}))
     args = [
@@ -75,6 +77,7 @@ def test_same_run_instruction_extension_requires_opt_in_and_keeps_old_contracts(
             )
         ],
         str(allow).lower(),
+        "{}",
         "{}",
     ]
     result = subprocess.run(

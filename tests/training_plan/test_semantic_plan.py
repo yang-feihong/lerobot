@@ -45,6 +45,37 @@ def test_domain_policy_is_independent_of_matrix_and_can_be_overridden(tmp_path, 
     assert request_for_job(plan, "mixed") == original_request
 
 
+def test_instruction_domain_override_is_explicit_and_does_not_rewrite_matrix_or_release(tmp_path):
+    from copy import deepcopy
+
+    plan = semantic_plan.load_plan(PRESETS_PATH, JOBS_PATH)
+    task = "staff1_joint_full_mem"
+    matrix = deepcopy(semantic_plan.selected_matrix(plan, task))
+    plan["tasks"][task]["domain_weights"] = {"simulation": 3, "real": 1}
+    plan["tasks"][task]["instruction_domain_weights"] = {"goal_open": {"simulation": 1}}
+    assert semantic_plan.instruction_domain_weights(plan, task) == {"goal_open": {"simulation": 1}}
+    assert semantic_plan.selected_matrix(plan, task) == matrix
+    path = _sidecar(tmp_path)
+    data = json.loads(path.read_text())
+    data["episodes"]["0"]["data_domain"] = "simulation"
+    path.write_text(json.dumps(data))
+    plan["tasks"][task].pop("training_preset")
+    plan["tasks"][task]["state_weights"] = {"approach": 1}
+    plan["tasks"][task]["state_instruction_matrix"] = {
+        "approach": {"goal_approach": {"status": "active", "action_supervision": "demonstrated",
+                                      "completion_boundary": "goal_end"},
+                     "goal_open": {"status": "active", "action_supervision": "demonstrated",
+                                   "completion_boundary": "goal_end"}}}
+    data["episodes"]["1"] = deepcopy(data["episodes"]["0"])
+    data["episodes"]["1"]["data_domain"] = "real"
+    data["episodes"]["1"]["views"] = data["episodes"]["1"]["views"][:1]
+    path.write_text(json.dumps(data))
+    assert semantic_plan.validate_sidecar(plan, task, path)["episodes"] == 2
+    plan["tasks"][task]["instruction_domain_weights"] = {}
+    with pytest.raises(ValueError, match="Domain real has no sidecar coverage"):
+        semantic_plan.validate_sidecar(plan, task, path)
+
+
 def _sidecar(tmp_path: Path, intent: str = "goal_approach") -> Path:
     path = tmp_path / "semantic_views.json"
     path.write_text(

@@ -322,11 +322,13 @@ def test_hot_swap_compares_effective_state_tokenizer_config(tmp_path, resolved) 
         }]}))
 
     write_processor(first, {})
-    write_processor(second, {"max_state_dim": 32, "task_key": "task", "continuous_state_memory": resolved})
+    write_processor(second, {"max_state_dim": 32, "task_key": "task", "continuous_state_memory": False})
     assert _checkpoint_hot_swap_signature(first) == _checkpoint_hot_swap_signature(second)
-    # Only resolved policy schemas override saved tokenizer memory/width.
+    # Explicit prompt formats remain distinct even with continuous state input.
+    write_processor(second, {"continuous_state_memory": True})
+    assert _checkpoint_hot_swap_signature(first) != _checkpoint_hot_swap_signature(second)
     write_processor(second, {"max_state_dim": 64, "continuous_state_memory": True})
-    assert (_checkpoint_hot_swap_signature(first) == _checkpoint_hot_swap_signature(second)) == resolved
+    assert _checkpoint_hot_swap_signature(first) != _checkpoint_hot_swap_signature(second)
     # A different input task key is never overwritten by reconciliation.
     write_processor(second, {"task_key": "different_task"})
     assert _checkpoint_hot_swap_signature(first) != _checkpoint_hot_swap_signature(second)

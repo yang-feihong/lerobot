@@ -1324,8 +1324,7 @@ def test_dataset_resume_recording(tmp_path, empty_lerobot_dataset_factory):
     3. Recording additional episodes
     4. Verifying all data (old + new) is intact
 
-    This specifically tests the bug fix where parquet files were being overwritten
-    instead of appended to during resume.
+    Resume appends to existing parquet files without overwriting recorded data.
     """
     features = {
         "observation.state": {"dtype": "float32", "shape": (2,), "names": ["x", "y"]},
@@ -1562,11 +1561,7 @@ def test_valid_video_codecs_constant():
 
 
 def test_delta_timestamps_with_episodes_filter(tmp_path, empty_lerobot_dataset_factory):
-    """Regression test for bug where delta_timestamps incorrectly marked all frames as padded when using episodes filter.
-
-    The bug occurred because _get_query_indices was using the relative index (idx) in the filtered dataset
-    instead of the absolute index when comparing against episode boundaries (ep_start, ep_end).
-    """
+    """Episode filtering preserves absolute frame indices and correct padding masks."""
     features = {
         "observation.state": {"dtype": "float32", "shape": (2,), "names": ["x", "y"]},
         "action": {"dtype": "float32", "shape": (2,), "names": ["vx", "vy"]},

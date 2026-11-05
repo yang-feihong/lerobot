@@ -69,6 +69,21 @@ def test_invalid_middle_stage_only_excludes_intersecting_windows():
     assert starts.tolist() == list(range(51)) + list(range(265, 400))
 
 
+def test_bad_image_prefix_excludes_anchors_fixed_state_and_random_mem_history():
+    original,dataset=fixture()
+    original=replace(original,image_valid_start_frames={0:3},segments={0:(SemanticSegment('approach',0,400),)})
+    catalog=with_semantic_temporal_filter(original,dataset)
+    assert catalog.valid_frame_ranges[0]==((3,400),)
+    assert not semantic_sample_views(catalog,0,0)
+    assert not semantic_sample_views(catalog,0,3)
+    start=catalog.eligible_start_ranges[0][0][0]
+    for _ in range(20):
+        indices,_=dataset.reader._get_query_indices(start,0)
+        assert all(index>=3 for key,values in indices.items() for index in values)
+    assert original.episodes[0][0].completion_frame==380
+    assert original.segments[0][0].frame_start==0
+
+
 def test_crossing_adjacent_valid_stages_remains_legal():
     original, dataset = fixture()
     catalog = replace(

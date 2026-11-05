@@ -270,7 +270,6 @@ class PaliGemmaWithExpertModel(nn.Module):
                         layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond
                     )
 
-                # Old code removed - now using compute_layer_complete function above
 
             # final norm
             # Define final norm computation function for gradient checkpointing

@@ -2078,11 +2078,8 @@ class PI05Policy(PreTrainedPolicy):
                 available_lengths = (~image_pad.to(device=device).bool()).sum(dim=1)
 
         lengths = torch.minimum(target_lengths, available_lengths).clamp_min(1)
-        # Deployment batches are already left-padded to the checkpoint's fixed
-        # history shape.  Keep that shape during inference and express startup
-        # history only through the mask.  Shrinking K=6 to K=1,2,... caused
-        # torch.compile to build a new graph on the first live observations even
-        # though model loading had reported READY after a K=6 warmup.
+        # Keep the padded inference shape stable for torch.compile; the mask
+        # represents the available startup history.
         window_num_frames = (
             int(image.shape[1]) if preserve_input_window and image.ndim >= 5 else int(lengths.max().item())
         )

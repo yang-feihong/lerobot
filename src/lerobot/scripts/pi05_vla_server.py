@@ -755,16 +755,9 @@ def _checkpoint_hot_swap_signature(policy_path: Path) -> str:
                 processor_name == "policy_preprocessor.json"
                 and step.get("registry_name") == "pi05_prepare_state_tokenizer_processor_step"
             ):
-                from lerobot.policies.pi05.configuration_pi05 import PI05Config
-
                 effective = Pi05PrepareStateTokenizerProcessorStep(**step.get("config", {}))
-                # Match make_pre_post_processors' reconciliation, including
-                # dataclass defaults in checkpoints predating explicit configs.
-                if config.get("io_schema_resolved", False):
-                    effective.max_state_dim = config.get("max_state_dim", PI05Config.max_state_dim)
-                    effective.continuous_state_memory = (
-                        config.get("state_action_encoding", PI05Config.state_action_encoding) == "continuous"
-                    )
+                # Missing fields retain historical dataclass defaults. Prompt
+                # format is a saved contract, not implied by state encoding.
                 step["config"] = effective.get_config()
     canonical = json.dumps(documents, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(canonical).hexdigest()

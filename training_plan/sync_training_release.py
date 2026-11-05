@@ -6,6 +6,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -45,6 +46,18 @@ def digest_file(path):
     return h.hexdigest()
 
 
+def expected_video_identity(path, size, expected=None):
+    """A proven expected digest is verified against received bytes, never size alone."""
+    if expected is None:
+        return {"size": size, "sha256": digest_file(path)}
+    if (set(expected) != {"size", "sha256"} or expected["size"] != size
+            or path.stat().st_size != size
+            or not isinstance(expected["sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected["sha256"])):
+        raise ValueError(f"Invalid expected video identity: {path}")
+    return expected
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
@@ -53,6 +66,8 @@ def main():
     parser.add_argument("--remote-training-root", required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--parallel-transfers", type=int, default=1)
+    parser.add_argument("--expected-video-identities", type=Path,
+                        help="Optional relative-path identities from a previously verified SHA256 receipt; received bytes still fully hashed")
     args = parser.parse_args()
     if not 1 <= args.parallel_transfers <= 32:
         parser.error("--parallel-transfers must be between 1 and 32")
@@ -81,9 +96,12 @@ def main():
             raise RuntimeError(f"Remote release operation failed on {args.host}: {result.stderr.strip()}")
         return json.loads(result.stdout)
 
+    expected = json.loads(args.expected_video_identities.read_text()) if args.expected_video_identities else {}
+    if not isinstance(expected, dict) or set(expected) - set(receipt["assets"]["videos"]):
+        raise ValueError("Expected video identities must reference release video paths only")
     videos = {}
     for index, (relative, size) in enumerate(receipt["assets"]["videos"].items()):
-        videos[relative] = {"size": size, "sha256": digest_file(source / relative)}
+        videos[relative] = expected_video_identity(source / relative, size, expected.get(relative))
         if index % 500 == 0:
             print(f"Local video identity {index}/{len(receipt['assets']['videos'])}", flush=True)
     result = remote(
@@ -117,6 +135,10 @@ def sha(path):
 linked, existing, missing, bytes_reused = 0, 0, [], 0
 for relative, identity in p["videos"].items():
     target = root / relative
+    # Releases may use absolute local symlinks into accepted simulation shards.
+    # Remote training must receive the bytes, never a link to a local-only path.
+    if target.is_symlink():
+        target.unlink()
     if target.exists():
         if target.stat().st_size != identity["size"] or sha(target) != identity["sha256"]:
             raise ValueError(f"Existing destination video differs: {target}")
@@ -152,9 +174,13 @@ print(json.dumps(dict(linked=linked, existing=existing, missing=missing, bytes_r
         [
             "rsync",
             "-a",
+            "--copy-links",
             "--partial",
             "--partial-dir=.rsync-partial",
-            "--checksum",
+            # Final receiver SHA256 is authoritative. --checksum would pre-read
+            # every large source video before rsync sends even its file list.
+            # Force selected files through instead of trusting size/mtime.
+            "--ignore-times",
             "--files-from=-",
             "--stats",
             "-e",
@@ -236,6 +262,8 @@ print(json.dumps(dict(training_entry=str(entry))))
         "destination": remote_root,
         "artifact_id": receipt["artifact_id"],
         "parallel_transfers": args.parallel_transfers,
+        "expected_video_identities": str(args.expected_video_identities) if args.expected_video_identities else None,
+        "reused_expected_video_digests": len(expected),
         **result,
         **verified,
         **published,

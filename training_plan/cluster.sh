@@ -435,6 +435,26 @@ probe_gpu_container() {
   echo "${node}: CUDA probe ${output//$'\n'/ }"
 }
 
+resolve_node_release() {
+  local node="$1" code_dir="$2" task="$3" probe_name
+  node_profile "${node}"
+  # Use the pinned training interpreter, not the node's older system Python.
+  # Keep host paths intact so the result can feed host-side readability checks.
+  probe_name="${CLUSTER_CONTAINER_NAME}-release-probe-${node}-${BASHPID}"
+  ssh_node "${node}" "set -e
+    trap \"docker rm -f '${probe_name}' >/dev/null 2>&1\" EXIT
+    docker run -d --name '${probe_name}' --user '${container_user}' --network none \\
+      -e PYTHONDONTWRITEBYTECODE=1 \\
+      -v '${host_data}:${host_data}:ro' -v '${code_dir}:${code_dir}:ro' \\
+      --entrypoint /lerobot/.venv/bin/python '${image}' \\
+      '${code_dir}/training_plan/resolve_dataset.py' \\
+      --datasets-root '${host_data}/datasets/b2_z1' \\
+      --jobs '${code_dir}/${training_jobs_rel}' --task '${task}' --format-lines >/dev/null
+    result=\$(docker wait '${probe_name}')
+    docker logs '${probe_name}'
+    test \"\$result\" = 0"
+}
+
 check_node() {
   local node="$1" commit code_dir actual_image actual_gpus
   node_profile "${node}"
@@ -455,7 +475,7 @@ check_node() {
   verify_directory_tree "${node}" "${host_data}/checkpoints/google_paligemma-3b-pt-224" "${POLICY_TOKENIZER_SHA256}"
   local task release_root
   while IFS= read -r task; do
-    release_root="$(ssh_node "${node}" "python3 '${code_dir}/training_plan/resolve_dataset.py' --datasets-root '${host_data}/datasets/b2_z1' --jobs '${code_dir}/${training_jobs_rel}' --task '${task}' --format-lines" | head -n 1)" || return 1
+    release_root="$(resolve_node_release "${node}" "${code_dir}" "${task}" | head -n 1)" || return 1
     [[ -n "${release_root}" ]] || { echo "${node}: no READY release for ${task}" >&2; return 1; }
     verify_dataset_readable "${node}" "${release_root}" "${task}"
   done < <(node_tasks "${node}")

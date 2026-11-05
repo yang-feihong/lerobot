@@ -23,7 +23,7 @@ VALID_NODES = {"f", "wb1", "wb2", "wb3", "wb4", "wb5", "wb6", "lerobot"}
 # The launcher/preparation preflight also runs outside the training container.
 # Only this dependency-free origin contract is imported, never datasets/torch.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from lerobot.data_domains import load_episode_domains, validate_domain_weights
+from lerobot.data_domains import load_episode_domains, validate_domain_weights, validate_instruction_domain_weights
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -149,6 +149,7 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
         common = {"data_recipe" if "data_recipe" in task else "dataset_family", "resources"}
         optional = {
             "domain_weights",
+            "instruction_domain_weights",
             "dataset_artifact_id",
             "model_init_checkpoint",
             "reset_preset_sidecar",
@@ -218,7 +219,10 @@ def load_plan(presets_path: Path, jobs_path: Path) -> dict[str, Any]:
                     "state_instruction_matrix": task["state_instruction_matrix"],
                 },
             )
-    return {"training_presets": presets, "tasks": tasks, "training_profile": profile}
+    payload = {"training_presets": presets, "tasks": tasks, "training_profile": profile}
+    for task_id in tasks:
+        instruction_domain_weights(payload, task_id)
+    return payload
 
 
 def is_instruction_matrix_extension(saved: dict, requested: dict) -> bool:
@@ -263,6 +267,14 @@ def domain_weights(payload: dict[str, Any], task_id: str) -> dict[str, float]:
     return task.get("domain_weights", preset.get("domain_weights", {}))
 
 
+def instruction_domain_weights(payload: dict[str, Any], task_id: str) -> dict[str, dict[str, float]]:
+    task = resolve_task(payload, task_id)
+    return validate_instruction_domain_weights(
+        task.get("instruction_domain_weights", {}), domain_weights(payload, task_id),
+        selected_matrix(payload, task_id),
+    )
+
+
 def _relation_tuple(intent: str, relation: dict[str, Any]) -> tuple[str, str, str, str]:
     return (
         intent,
@@ -303,6 +315,7 @@ def validate_sidecar(payload: dict[str, Any], task_id: str, sidecar_path: Path) 
     }
     seen: dict[str, set[tuple[str, str, str, str]]] = {state: set() for state in selected_states}
     domains = domain_weights(payload, task_id)
+    instruction_domains = instruction_domain_weights(payload, task_id)
     episode_domains = load_episode_domains(sidecar_path, episodes) if domains else {}
     domain_seen = {d: set() for d, w in domains.items() if w > 0}
     segment_count = 0
@@ -409,8 +422,9 @@ def validate_sidecar(payload: dict[str, Any], task_id: str, sidecar_path: Path) 
             )
     cells = {(s, i) for s, row in matrix.items() for i in row}
     for domain, found in domain_seen.items():
-        if cells - found:
-            raise ValueError(f"Domain {domain} has no sidecar coverage for cells: {sorted(cells - found)}")
+        required = {(s, i) for s, i in cells if instruction_domains.get(i, domains).get(domain, 0) > 0}
+        if required - found:
+            raise ValueError(f"Domain {domain} has no sidecar coverage for cells: {sorted(required - found)}")
     return {"episodes": episode_count, "segments": segment_count, "frames": frame_count}
 
 
@@ -439,6 +453,7 @@ def command_resolve(args: argparse.Namespace) -> None:
         "true" if task.get("allow_resume_artifact_adoption", False) else "false",
         "true" if task.get("allow_resume_instruction_extension", False) else "false",
         _compact(domain_weights(payload, args.task_id)),
+        _compact(instruction_domain_weights(payload, args.task_id)),
     )
     print("\n".join(values))
 
@@ -466,6 +481,7 @@ def command_describe(args: argparse.Namespace) -> None:
     print(f"enabled_states={_compact(list(weights))}")
     print(f"state_weights={_compact(weights)}")
     print(f"domain_weights={_compact(domain_weights(payload, args.task_id))}")
+    print(f"instruction_domain_weights={_compact(instruction_domain_weights(payload, args.task_id))}")
     print(f"semantic_views_file={task.get('semantic_views_file', 'semantic_views.json')}")
     print("state_instruction_matrix:")
     for state, instructions in matrix.items():

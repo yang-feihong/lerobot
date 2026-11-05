@@ -375,13 +375,8 @@ def reconcile_pi05_action_representation_processors(
     if config.action_dt_seconds is None:
         raise ValueError("action_dt_seconds must be resolved from the model control frequency")
 
-    # A base-model processor can predate continuous MEM. The active policy, not
-    # that inherited processor JSON, owns how state enters the model.
-    for step in preprocessor.steps:
-        if isinstance(step, Pi05PrepareStateTokenizerProcessorStep):
-            step.continuous_state_memory = config.state_action_encoding == "continuous"
-            step.max_state_dim = config.max_state_dim
-
+    # Saved prompt formatting is independent of continuous state memory. Old
+    # checkpoints can use both; loading/resuming must not rewrite their prompt.
     raw_dataset_stats = dataset_stats
     transformed_stats = make_pi05_action_stats(
         dataset_stats,

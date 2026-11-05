@@ -5,6 +5,22 @@ import pytest
 from lerobot.data_domains import load_episode_domains, recording_domain, select_domain_episodes
 
 
+@pytest.mark.parametrize("override", [
+    {"typo": {"simulation": 1}},
+    {"full_episode_command": {}},
+    {"full_episode_command": {"simulation": -1}},
+    {"full_episode_command": {"simulation": True}},
+    {"full_episode_command": {"real": 1}},
+])
+def test_instruction_policy_rejects_invalid_or_globally_excluded_domains(override):
+    from lerobot.data_domains import validate_instruction_domain_weights
+
+    with pytest.raises(ValueError):
+        validate_instruction_domain_weights(
+            override, {"simulation": 1}, {"approach": {"full_episode_command": {}}},
+        )
+
+
 def test_historical_origins_do_not_need_raw_mounts_or_directory_heuristics(tmp_path):
     (tmp_path / "diagnostics").mkdir()
     records = {
