@@ -82,6 +82,7 @@ from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.policies.pi05.b2_action_transform import EE_DELTA_VALID_KEY
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.pi05.history_pause import augment_history_pause
 from lerobot.policies.pi05.physical_validation import (
     physical_action_metric_sums,
     physical_metric_names,
@@ -1377,10 +1378,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         dataset, eval_dataset = make_train_eval_datasets(cfg)
 
     from lerobot.datasets.reset_presets import ResetPresetCatalog
+    from lerobot.policies.pi05.action_history import RESET_TARGET_NAMES
     from lerobot.utils.reset_presets import PRESET_SIDECAR
 
     reset_presets = None
-    if cfg.policy is not None and cfg.policy.type == "pi05" and cfg.policy.action_predict_reset_preset:
+    history_reset_targets = (isinstance(cfg.policy, PI05Config) and cfg.policy.action_history_enabled
+                             and bool(set(cfg.policy.action_history_feature_names) & set(RESET_TARGET_NAMES)))
+    if isinstance(cfg.policy, PI05Config) and (cfg.policy.action_predict_reset_preset or history_reset_targets):
         reset_path = cfg.reset_preset_sidecar or dataset.root / "meta" / PRESET_SIDECAR
         reset_presets = ResetPresetCatalog(
             reset_path, cfg.policy.reset_preset_catalog, dataset_root=dataset.root,
@@ -2444,13 +2448,19 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     randomize=cfg.dataset.random_semantic_view,
                     view_kind_weights=cfg.dataset.semantic_view_kind_weights,
                     state_instruction_matrix=cfg.dataset.semantic_state_instruction_matrix,
+                    action_history_length=(cfg.policy.state_num_frames - 1
+                        if getattr(cfg.policy, "action_history_enabled", False) else 0),
                 )
                 train_tracker.task_variant_applied = sum(semantic_counts.values()) - semantic_counts["hold"]
             selected_natural_language = list(batch["task"]) if semantic_input_audit is not None else None
+            if history_reset_targets:
+                reset_presets.attach_history(batch, cfg.policy)
+            if isinstance(cfg.policy, PI05Config) and cfg.policy.history_pause_max_steps > 0:
+                batch = augment_history_pause(batch, cfg.policy)
             batch = preprocessor(batch)
             if semantic_input_audit is not None:
                 semantic_input_audit.record(batch, selected_natural_language, step)
-            if reset_presets is not None:
+            if reset_presets is not None and cfg.policy.action_predict_reset_preset:
                 reset_presets.attach(
                     batch, action_names=cfg.policy.action_feature_names,
                     fps=dataset.fps, action_dt=cfg.policy.action_dt_seconds,
@@ -2555,6 +2565,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                             randomize=True,
                             view_kind_weights=cfg.dataset.semantic_view_kind_weights,
                             state_instruction_matrix=cfg.dataset.semantic_state_instruction_matrix,
+                            action_history_length=(cfg.policy.state_num_frames - 1
+                                if getattr(cfg.policy, "action_history_enabled", False) else 0),
                         )
                     physical_groups = (
                         _physical_eval_groups(
@@ -2571,8 +2583,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         if physical_eval_enabled
                         else []
                     )
+                    if history_reset_targets:
+                        reset_presets.attach_history(eval_batch, cfg.policy)
                     eval_batch = preprocessor(eval_batch)
-                    if reset_presets is not None:
+                    if reset_presets is not None and cfg.policy.action_predict_reset_preset:
                         reset_presets.attach(
                             eval_batch, action_names=cfg.policy.action_feature_names,
                             fps=dataset.fps, action_dt=cfg.policy.action_dt_seconds,

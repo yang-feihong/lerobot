@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import draccus
 from peft import get_peft_model_state_dict
@@ -73,6 +74,17 @@ RUN_FIELDS = {
 
 def canonical_policy(config: dict) -> dict:
     result = copy.deepcopy(config)
+    # Optional input extension; absent/default fields keep old audits identical.
+    result.pop("action_history_feature_names", None)
+    result.pop("max_action_history_dim", None)
+    history_semantics = result.pop("action_history_ee_semantics", None)
+    if history_semantics not in {None, "active_only_v1", "legacy_control_v0", "mode_reset_target_v2"}:
+        raise ValueError("Unknown action history EE semantics")
+    pause_steps = result.pop("history_pause_max_steps", 0)
+    if type(pause_steps) is not int or pause_steps < 0:
+        raise ValueError("history_pause_max_steps must be a nonnegative integer")
+    if pause_steps and not config.get("action_history_enabled", False):
+        raise ValueError("history_pause_max_steps requires action history")
     # This is a resolved per-run representation choice, not an architecture
     # override. Checkpoint metadata and the resume gate lock its actual value.
     frame = result.pop("model_ee_frame", None)
@@ -119,6 +131,19 @@ def compare_profile(
         training["batch_size"] * training["gradient_accumulation_steps"] * num_processes
     )
     expected["policy"] = canonical_policy(expected["policy"])
+    if policy.get("action_history_enabled", False):
+        from lerobot.policies.pi05.action_history import action_history_schema
+
+        if type(policy["action_history_enabled"]) is not bool:
+            raise ValueError("Action history enable must be boolean")
+        action_history_schema(SimpleNamespace(
+            action_history_feature_names=policy.get("action_history_feature_names"),
+            dataset_action_feature_names=policy.get("dataset_action_feature_names"),
+            max_action_history_dim=policy.get("max_action_history_dim", 32),
+        ))
+        expected["policy"]["action_history_enabled"] = True
+    elif policy.get("action_history_feature_names") is not None:
+        raise ValueError("Disabled action history cannot declare an input extension")
     differences = {
         section: {
             key: {"expected": expected[section].get(key), "actual": actual[section].get(key)}
@@ -161,6 +186,18 @@ def audit_training_profile(cfg, policy, path: Path, num_processes: int) -> dict:
     elif selector_shapes:
         raise ValueError("Disabled selector unexpectedly has saved weights")
     shapes = {key: shape for key, shape in shapes.items() if key not in selector_shapes}
+    history_shapes = {key: shape for key, shape in shapes.items() if ".action_memory_proj." in key}
+    if policy.config.action_history_enabled:
+        model = policy.get_base_model().model if hasattr(policy, "get_base_model") else policy.model
+        width = model.state_memory_proj.out_features
+        expected_history = {"weight": [width, policy.config.max_action_history_dim], "bias": [width]}
+        actual_history = {key.split(".action_memory_proj.", 1)[1]: shape
+                          for key, shape in history_shapes.items()}
+        if actual_history != expected_history or len(history_shapes) != 2:
+            raise ValueError(f"Action history adapter schema mismatch: {history_shapes}")
+    elif history_shapes:
+        raise ValueError("Disabled action history unexpectedly has saved weights")
+    shapes = {key: shape for key, shape in shapes.items() if key not in history_shapes}
     schema = {
         "tensor_count": len(shapes),
         "sha256": hashlib.sha256(
@@ -170,6 +207,8 @@ def audit_training_profile(cfg, policy, path: Path, num_processes: int) -> dict:
     report = compare_profile(profile, cfg.to_dict(), draccus.encode(policy.config), schema, num_processes)
     report["profile_sha256"] = hashlib.sha256(raw).hexdigest()
     report["reset_selector_adapter_shapes"] = selector_shapes
+    if policy.config.action_history_enabled:
+        report["action_history_adapter_shapes"] = history_shapes
     if not report["ok"]:
         raise ValueError("Mainline training profile mismatch: " + json.dumps(report["differences"]))
     return report

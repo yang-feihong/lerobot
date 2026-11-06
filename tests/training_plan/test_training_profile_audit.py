@@ -65,6 +65,53 @@ def test_unknown_model_field_optimizer_sampling_and_real_adapter_schema_are_chec
     )
 
 
+def test_explicit_action_history_extension_preserves_base_profile_checks():
+    training, policy = values()
+    policy.update(action_history_enabled=True, action_history_feature_names=["b2_vx"], max_action_history_dim=8)
+    assert compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])["ok"]
+    policy["mem_vit_enabled"] = False
+    assert not compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])["ok"]
+    policy["action_history_feature_names"] = ["task_complete"]
+    with pytest.raises(ValueError):
+        compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])
+
+
+def test_new_default_history_fields_do_not_change_disabled_profile():
+    training, policy = values()
+    policy.update(action_history_feature_names=None, max_action_history_dim=32)
+    assert compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])["ok"]
+
+
+def test_actual_history_projection_shapes_are_audited(tmp_path, monkeypatch):
+    import hashlib
+    from types import SimpleNamespace
+
+    import torch
+
+    from lerobot.common import training_profile
+
+    profile = copy.deepcopy(PROFILE)
+    shapes = {"base": [1]}
+    profile["adapter_schema"] = {"tensor_count": 1, "sha256": hashlib.sha256(
+        json.dumps(shapes, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps(profile))
+    training, policy = values()
+    policy.update(action_history_enabled=True, action_history_feature_names=["b2_vx"],
+                  max_action_history_dim=8, action_predict_reset_preset=False)
+    actual_policy = SimpleNamespace(config=SimpleNamespace(**policy),
+        model=SimpleNamespace(state_memory_proj=torch.nn.Linear(32, 16)))
+    tensors = {"base": torch.ones(1), "model.action_memory_proj.weight": torch.zeros(16, 8),
+               "model.action_memory_proj.bias": torch.zeros(16)}
+    monkeypatch.setattr(training_profile, "get_peft_model_state_dict", lambda *a, **k: tensors)
+    monkeypatch.setattr(training_profile.draccus, "encode", lambda _: policy)
+    cfg = SimpleNamespace(resume=True, to_dict=lambda: training)
+    assert training_profile.audit_training_profile(cfg, actual_policy, path, 4)["ok"]
+    tensors["model.action_memory_proj.weight"] = torch.zeros(16, 9)
+    with pytest.raises(ValueError, match="history adapter schema"):
+        training_profile.audit_training_profile(cfg, actual_policy, path, 4)
+
+
 def test_gpu_count_may_change_but_not_effective_batch():
     training, policy = values()
     training["gradient_accumulation_steps"] = 12

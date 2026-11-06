@@ -1079,7 +1079,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if config.state_action_encoding == "continuous":
             self.state_memory_proj = nn.Linear(config.max_state_dim, paligemma_config.width)
         if config.action_history_enabled:
-            self.action_memory_proj = nn.Linear(config.max_action_dim, paligemma_config.width)
+            self.action_memory_proj = nn.Linear(config.max_action_history_dim, paligemma_config.width)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -1220,7 +1220,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 f"Action history mask shape {tuple(action_history_mask.shape)} does not match "
                 f"history shape {tuple(action_history.shape[:2])}."
             )
-        action_history = pad_vector(action_history, self.config.max_action_dim)
+        action_history = pad_vector(action_history, self.config.max_action_history_dim)
         if self.action_memory_proj.weight.dtype == torch.float32:
             action_history = action_history.to(torch.float32)
         action_emb = self._apply_checkpoint(self.action_memory_proj, action_history)
@@ -2102,6 +2102,19 @@ class PI05Policy(PreTrainedPolicy):
             raise ValueError(f"MEM input requires {key}.")
         batch_size = value.shape[0]
         device = value.device
+        if allow_empty and value.ndim >= 3 and f"{key}_is_pad" in batch:
+            # Executed-command telemetry can be unknown in the middle of a
+            # window (e.g. ROS publishing disabled). Preserve exact time slots;
+            # counting valid frames and assuming a suffix would unmask holes.
+            window = min(int(value.shape[1]), max_frames)
+            pad = batch[f"{key}_is_pad"].to(device=device, dtype=torch.bool)
+            if pad.shape != value.shape[:2]:
+                raise ValueError(f"History padding does not match {key}")
+            mask = ~pad[:, -window:]
+            if randomize:
+                suffix = (torch.rand(batch_size, device=device) * (window + 1)).long()
+                mask = mask & (torch.arange(window, device=device)[None] >= (window - suffix[:, None]))
+            return window, mask.sum(dim=1), mask
         available = torch.ones(batch_size, dtype=torch.long, device=device)
         if value.ndim >= 3:
             available.fill_(value.shape[1])
@@ -2138,6 +2151,13 @@ class PI05Policy(PreTrainedPolicy):
         if not self.config.action_history_enabled:
             return None
         action_history = batch[OBS_ACTION_HISTORY]
+        if self.config.action_history_ee_semantics in {"active_only_v1", "mode_reset_target_v2"}:
+            feature_pad = batch[f"{OBS_ACTION_HISTORY}_feature_is_pad"]
+            if feature_pad.shape != action_history.shape or feature_pad.dtype != torch.bool:
+                raise ValueError("Action history feature mask does not match its input")
+            # Mask AFTER normalization: zero is a neutral projection contribution,
+            # not an invented absolute EE pose at the coordinate origin.
+            action_history = action_history.masked_fill(feature_pad, 0)
         if action_history.ndim == 2:
             return action_history[:, None, :]
         if action_history.ndim != 3:

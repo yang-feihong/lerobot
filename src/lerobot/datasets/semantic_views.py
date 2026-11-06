@@ -781,6 +781,7 @@ def apply_semantic_views_to_batch(
     randomize: bool,
     view_kind_weights: dict[str, float] | None = None,
     state_instruction_matrix: dict[str, dict[str, dict[str, str]]] | None = None,
+    action_history_length: int = 0,
 ) -> dict[str, int]:
     """Materialize one deterministic semantic view for each physical sample."""
     episode_values = torch.as_tensor(batch["episode_index"]).reshape(-1).tolist()
@@ -789,6 +790,11 @@ def apply_semantic_views_to_batch(
     actions = batch.get(ACTION)
     if not isinstance(actions, torch.Tensor) or actions.ndim != 3:
         raise ValueError("semantic views require a batched temporal action tensor")
+    if not 0 <= action_history_length < actions.shape[1]:
+        raise ValueError("Invalid action-history prefix length")
+    # History is a factual input. Never apply counterfactual goal/hold labels
+    # to it, and start future supervision's clock at the actual current frame.
+    actions = actions[:, action_history_length:]
     tasks = list(batch.get("task", [""] * len(episode_values)))
     sampled_intents = batch.pop("semantic_sampling_intent", None)
     blocked = torch.zeros(actions.shape[:2], dtype=actions.dtype, device=actions.device)

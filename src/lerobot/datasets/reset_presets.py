@@ -28,6 +28,7 @@ class ResetPresetCatalog:
         if data["format"] != "lerobot.reset_presets" or data["version"] != 1:
             raise ValueError("Unsupported reset preset sidecar")
         validate_reset_presets(catalog)
+        self.joint_targets = torch.tensor([entry["joint_target"] for entry in catalog], dtype=torch.float32)
         if data["catalog"] != catalog:
             raise ValueError("Reset preset catalog differs from policy config")
         names = validate_reset_presets(catalog)
@@ -80,6 +81,40 @@ class ResetPresetCatalog:
             ):
                 raise ValueError("Overlapping audited unresolved reset range")
             existing.append((start, stop))
+
+    def attach_history(self, batch, config):
+        """Attach proven targets at STRICTLY PAST dataset frames, before pause augmentation."""
+        from lerobot.policies.pi05.action_history import RESET_HISTORY_KEY
+        from lerobot.policies.pi05.b2_action_transform import CONTROL_EXTENDED_DATASET_ACTION_NAMES
+
+        k = config.state_num_frames - 1
+        raw = batch["action"]
+        source = config.dataset_action_feature_names or CONTROL_EXTENDED_DATASET_ACTION_NAMES
+        reset = raw[:, :k, source.index("arm_reset")] >= .5
+        inactive = raw[:, :k, source.index("arm_teleop_inactive")] >= .5
+        reset = reset & ~inactive
+        if "action_is_pad" in batch:
+            reset = reset & ~batch["action_is_pad"][:, :k].bool()
+        targets = torch.zeros((*reset.shape, 6), device=raw.device, dtype=raw.dtype)
+        valid = torch.zeros_like(reset)
+        q = self.joint_targets.to(device=raw.device, dtype=raw.dtype)
+        offsets = torch.arange(-k, 0, device=raw.device) * config.state_history_frame_stride
+        for row, (ep, first) in enumerate(zip(batch["episode_index"].reshape(-1).tolist(),
+                                            batch["frame_index"].reshape(-1).tolist(), strict=True)):
+            frames = int(first) + offsets
+            labels = torch.full((k,), -1, device=raw.device, dtype=torch.long)
+            unknown = torch.zeros(k, device=raw.device, dtype=torch.bool)
+            for start, stop, label in self.episodes.get(int(ep), []):
+                labels[(frames >= start) & (frames < stop)] = label
+            if self.unknown_target_policy == "mask_audited_unknown":
+                for start, stop in self.unresolved.get(int(ep), []):
+                    unknown |= (frames >= start) & (frames < stop)
+            if (reset[row] & (labels < 0) & ~unknown).any():
+                raise ValueError("Historical reset has no proven target; audit reset_presets.json")
+            valid[row] = reset[row] & (labels >= 0) & ~unknown
+            targets[row, valid[row]] = q[labels[valid[row]]]
+        batch[RESET_HISTORY_KEY] = targets
+        batch[RESET_HISTORY_KEY + "_is_pad"] = ~valid
 
     def attach(self, batch, *, action_names, fps, action_dt):
         actions = batch["action"]

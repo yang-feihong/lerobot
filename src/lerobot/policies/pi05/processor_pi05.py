@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -23,7 +24,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
+from lerobot.configs import FeatureType, NormalizationMode, PipelineFeatureType, PolicyFeature
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
@@ -49,7 +50,9 @@ from lerobot.utils.constants import (
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
+from .action_history import RESET_HISTORY_KEY, RESET_TARGET_NAMES, action_history_schema
 from .b2_action_transform import (
+    CONTROL_EXTENDED_DATASET_ACTION_NAMES,
     DATASET_ACTION_NAMES,
     EE_DELTA_VALID_KEY,
     TASK_BLOCKED_KEY,
@@ -66,16 +69,65 @@ from .configuration_pi05 import PI05Config
 OBS_ACTION_HISTORY = "observation.action_history"
 
 
+def _is_history_normalizer(step):
+    # JSON restores the allowlist as a list, while newly built steps use sets.
+    return (isinstance(step, NormalizerProcessorStep)
+            and set(step.normalize_observation_keys or ()) == {OBS_ACTION_HISTORY})
+
+
+def validate_action_history_normalizer(config, preprocessor):
+    """Fail closed when a saved enabled-input contract lacks matching statistics."""
+    if not config.action_history_enabled:
+        return
+    matches = [step for step in preprocessor.steps if _is_history_normalizer(step)]
+    if len(matches) != 1:
+        raise ValueError("Checkpoint requires one action history normalizer")
+    normalizer = matches[0]
+    names, _, _ = action_history_schema(config)
+    if normalizer.features[OBS_ACTION_HISTORY].shape != (len(names),):
+        raise ValueError("Saved action history features disagree with its input schema")
+    if normalizer.norm_map.get(FeatureType.STATE) == NormalizationMode.IDENTITY:
+        return
+    stats = normalizer.stats.get(OBS_ACTION_HISTORY)
+    if not stats:
+        raise ValueError("Checkpoint is missing action history normalization statistics")
+    for name, value in stats.items():
+        tensor = torch.as_tensor(value)
+        if name != "count" and (tensor.ndim > 1 or tensor.numel() != len(names)):
+            raise ValueError("Saved action history statistics disagree with its input schema")
+
+
 def _selected_action_history_stats(
-    dataset_stats: dict[str, dict[str, Any]] | None, indices: tuple[int, ...]
+    dataset_stats: dict[str, dict[str, Any]] | None, indices: tuple[int, ...], source_dim: int,
+    command_names: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]] | None:
     if dataset_stats is None or ACTION not in dataset_stats:
         return None
     selected: dict[str, Any] = {}
     for name, value in dataset_stats[ACTION].items():
         tensor = torch.as_tensor(value)
-        if tensor.ndim > 0 and tensor.shape[-1] == 16:
-            converted = tensor[..., list(indices)]
+        if name != "count" and tensor.ndim > 0:
+            if tensor.shape[-1] != source_dim:
+                raise ValueError(f"Action history statistics {name} do not match the named dataset schema")
+            converted = tensor[..., [max(i, 0) for i in indices]].clone()
+            if not converted.is_floating_point():
+                converted = converted.float()
+            for column, index in enumerate(indices):
+                mode = bool(command_names) and command_names[column] in {"arm_teleop_inactive", "arm_reset"}
+                if index >= 0 and not mode:
+                    continue
+                low, high = (0., 1.) if mode else (-math.pi, math.pi)
+                if name in {"mean", "q50"}:
+                    fixed = (low + high) / 2
+                elif name == "std":
+                    fixed = (high - low) / 2
+                elif name == "min" or (name.startswith("q") and float(name[1:]) < 50):
+                    fixed = low
+                elif name == "max" or (name.startswith("q") and float(name[1:]) > 50):
+                    fixed = high
+                else:
+                    raise ValueError(f"Unsupported history statistic: {name}")
+                converted[..., column] = fixed
             selected[name] = converted if isinstance(value, torch.Tensor) else converted.cpu().numpy()
         else:
             selected[name] = deepcopy(value)
@@ -88,24 +140,34 @@ def _action_history_steps(
     needs_reference = config.z1_action_representation == "ee_delta"
     if not config.action_history_enabled and not needs_reference:
         return ()
-    indices = action_dataset_indices(
-        **{
-            key: value
-            for key, value in action_schema_kwargs(config).items()
-            if key
-            not in {
-                "representation",
-                "z1_representation",
-                "ee_delta_rotation_representation",
-                "include_task_blocked",
-            }
-        }
-    )
     history_length = config.state_num_frames - 1 if config.action_history_enabled else 0
+    if config.action_history_enabled:
+        _names, indices, source_dim = action_history_schema(config)
+    else:
+        # Only the historical zero-history reference step uses output switches.
+        indices = action_dataset_indices(**{
+            key: value for key, value in action_schema_kwargs(config).items()
+            if key not in {"representation", "z1_representation",
+                           "ee_delta_rotation_representation", "include_task_blocked"}
+        })
+    ee_validity_enabled = config.action_history_enabled and config.action_history_ee_semantics in {
+        "active_only_v1", "mode_reset_target_v2"}
+    ee_columns = ()
+    mode_indices = (3, 4)
+    if ee_validity_enabled:
+        ee_columns = tuple(i for i, name in enumerate(_names) if name.startswith("height_invariant_ee_"))
+        if ee_columns or set(_names) & set(RESET_TARGET_NAMES):
+            source_names = config.dataset_action_feature_names or CONTROL_EXTENDED_DATASET_ACTION_NAMES
+            mode_indices = tuple(source_names.index(name) for name in ("arm_teleop_inactive", "arm_reset"))
     split = Pi05SplitActionHistoryProcessorStep(
         history_length=history_length,
         target_length=config.chunk_size + int(needs_reference),
         action_indices=indices,
+        ee_validity_enabled=ee_validity_enabled,
+        ee_columns=ee_columns,
+        mode_indices=mode_indices,
+        reset_columns=(tuple((i, RESET_TARGET_NAMES.index(name)) for i, name in enumerate(_names)
+                             if name in RESET_TARGET_NAMES) if config.action_history_enabled else ()),
     )
     if not config.action_history_enabled:
         return split, None
@@ -115,7 +177,8 @@ def _action_history_steps(
     normalizer = NormalizerProcessorStep(
         features={OBS_ACTION_HISTORY: PolicyFeature(type=FeatureType.STATE, shape=(len(indices),))},
         norm_map={FeatureType.STATE: action_mode},
-        stats=_selected_action_history_stats(dataset_stats, indices),
+        stats=_selected_action_history_stats(dataset_stats, indices, source_dim,
+            _names if config.action_history_ee_semantics == "mode_reset_target_v2" else ()),
         normalize_observation_keys={OBS_ACTION_HISTORY},
     )
     return split, normalizer
@@ -127,6 +190,10 @@ class Pi05SplitActionHistoryProcessorStep(ProcessorStep):
     history_length: int
     target_length: int
     action_indices: tuple[int, ...]
+    ee_validity_enabled: bool = False
+    ee_columns: tuple[int, ...] = ()
+    mode_indices: tuple[int, ...] = (3, 4)
+    reset_columns: tuple[tuple[int, int], ...] = ()
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         action = transition.get(TransitionKey.ACTION)
@@ -144,11 +211,31 @@ class Pi05SplitActionHistoryProcessorStep(ProcessorStep):
         new_transition = transition.copy()
         if self.history_length:
             observations = dict(new_transition.get(TransitionKey.OBSERVATION, {}) or {})
-            observations[OBS_ACTION_HISTORY] = action[..., : self.history_length, list(self.action_indices)]
+            observations[OBS_ACTION_HISTORY] = action[..., : self.history_length,
+                                                      [max(i, 0) for i in self.action_indices]]
             new_transition[TransitionKey.OBSERVATION] = observations
         new_transition[TransitionKey.ACTION] = action[..., self.history_length :, :]
 
         complementary = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {})
+        if self.history_length and self.ee_validity_enabled:
+            feature_pad = torch.zeros_like(observations[OBS_ACTION_HISTORY], dtype=torch.bool)
+            if self.ee_columns:
+                modes = action[..., : self.history_length, list(self.mode_indices)]
+                unavailable = (modes >= 0.5).any(dim=-1)
+                feature_pad[..., list(self.ee_columns)] = unavailable[..., None]
+            if self.reset_columns:
+                targets = observations.pop(RESET_HISTORY_KEY)
+                target_pad = complementary.pop(RESET_HISTORY_KEY + "_is_pad")
+                if targets.shape != (*action.shape[:-2], self.history_length, 6) or target_pad.shape != targets.shape[:-1]:
+                    raise ValueError("Reset target history does not match command history")
+                reset_mode = action[..., :self.history_length, self.mode_indices[1]] >= .5
+                inactive_mode = action[..., :self.history_length, self.mode_indices[0]] >= .5
+                unavailable = target_pad.bool() | ~reset_mode | inactive_mode
+                for column, joint in self.reset_columns:
+                    observations[OBS_ACTION_HISTORY][..., column] = targets[..., joint]
+                    feature_pad[..., column] = unavailable
+                new_transition[TransitionKey.OBSERVATION] = observations
+            complementary[f"{OBS_ACTION_HISTORY}_feature_is_pad"] = feature_pad
         pad_key = f"{ACTION}_is_pad"
         if pad_key in complementary:
             combined_pad = complementary[pad_key]
@@ -168,6 +255,10 @@ class Pi05SplitActionHistoryProcessorStep(ProcessorStep):
             "history_length": self.history_length,
             "target_length": self.target_length,
             "action_indices": list(self.action_indices),
+            "ee_validity_enabled": self.ee_validity_enabled,
+            "ee_columns": list(self.ee_columns),
+            "mode_indices": list(self.mode_indices),
+            "reset_columns": [list(pair) for pair in self.reset_columns],
         }
 
 
@@ -419,14 +510,12 @@ def reconcile_pi05_action_representation_processors(
         )
         steps.insert(normalizer_index, desired_pre_step)
 
-    history_quantile_fallback = next(
-        (
-            step.quantile_fallback_to_min_max
-            for step in steps
-            if isinstance(step, NormalizerProcessorStep)
-            and step.normalize_observation_keys == {OBS_ACTION_HISTORY}
-        ),
-        False,
+    saved_history_normalizer = next((
+        step for step in steps if _is_history_normalizer(step)
+    ), None)
+    history_quantile_fallback = (
+        saved_history_normalizer.quantile_fallback_to_min_max
+        if saved_history_normalizer is not None else False
     )
     history_steps = _action_history_steps(config, raw_dataset_stats)
     steps = [
@@ -434,8 +523,7 @@ def reconcile_pi05_action_representation_processors(
         for step in steps
         if not isinstance(step, Pi05SplitActionHistoryProcessorStep)
         and not (
-            isinstance(step, NormalizerProcessorStep)
-            and step.normalize_observation_keys == {OBS_ACTION_HISTORY}
+            _is_history_normalizer(step)
         )
     ]
     if history_steps:
@@ -445,6 +533,11 @@ def reconcile_pi05_action_representation_processors(
         )
         steps.insert(relative_index, split_step)
         if history_normalizer is not None:
+            if raw_dataset_stats is None and saved_history_normalizer is not None:
+                # Deployment/ordinary resume have no raw dataset statistics:
+                # keep the loaded tensor statistics instead of replacing them
+                # by an empty normalizer. Refresh only for explicit new data.
+                history_normalizer.load_state_dict(saved_history_normalizer.state_dict())
             # Refreshing stats must preserve the checkpoint's normalization convention.
             history_normalizer.quantile_fallback_to_min_max = history_quantile_fallback
             main_normalizer_index = next(
@@ -656,7 +749,7 @@ def make_pi05_pre_post_processors(
             i
             for i, step in enumerate(input_steps)
             if isinstance(step, NormalizerProcessorStep)
-            and step.normalize_observation_keys != {OBS_ACTION_HISTORY}
+            and not _is_history_normalizer(step)
         )
         if history_normalizer is not None:
             input_steps.insert(main_normalizer_index + 1, history_normalizer)

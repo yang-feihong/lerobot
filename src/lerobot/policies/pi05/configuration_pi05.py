@@ -255,6 +255,15 @@ class PI05Config(PreTrainedConfig):
     state_history_frame_stride: int = 1
     state_history_frame_interval_seconds: float = 0.04
     action_history_enabled: bool = False
+    # Training-only ideal pause, measured in state-history intervals; zero is a no-op.
+    history_pause_max_steps: int = 0
+    # Executed input commands, not selected output/loss channels. Default: base
+    # velocity (3), arm mode (2), control EE (9), gripper (1), reset target q (6).
+    # None selects this default schema; explicit saved lists retain their meaning.
+    action_history_feature_names: list[str] | None = None
+    # None resolves new/reset-target schemas to v2, explicit old lists to legacy.
+    action_history_ee_semantics: str | None = None
+    max_action_history_dim: int = 32
 
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5
@@ -525,10 +534,41 @@ class PI05Config(PreTrainedConfig):
                 "state_history_frame_interval_seconds must be positive, got "
                 f"{self.state_history_frame_interval_seconds}"
             )
+        if type(self.history_pause_max_steps) is not int or self.history_pause_max_steps < 0:
+            raise ValueError("history_pause_max_steps must be a nonnegative integer")
+        if self.history_pause_max_steps > 0 and not self.action_history_enabled:
+            raise ValueError("history_pause_max_steps requires action_history_enabled=true")
         if self.action_history_enabled and self.state_action_encoding != "continuous":
             raise ValueError("action_history_enabled requires state_action_encoding='continuous'")
         if self.action_history_enabled and self.state_num_frames < 2:
             raise ValueError("action_history_enabled requires state_num_frames >= 2")
+        if self.action_history_enabled:
+            from .action_history import RESET_TARGET_NAMES, action_history_schema
+
+            if self.action_history_ee_semantics is None:
+                self.action_history_ee_semantics = (
+                    "mode_reset_target_v2" if self.action_history_feature_names is None
+                    or set(self.action_history_feature_names) & set(RESET_TARGET_NAMES) else "legacy_control_v0"
+                )
+            if self.action_history_ee_semantics not in {"active_only_v1", "legacy_control_v0", "mode_reset_target_v2"}:
+                raise ValueError("Unknown action_history_ee_semantics")
+            if self.action_history_ee_semantics in {"active_only_v1", "mode_reset_target_v2"}:
+                from .b2_action_transform import CONTROL_EXTENDED_DATASET_ACTION_NAMES
+
+                source_names = self.dataset_action_feature_names or CONTROL_EXTENDED_DATASET_ACTION_NAMES
+                selected = action_history_schema(self)[0]
+                needs_modes = any(name.startswith(("height_invariant_ee_", "arm_reset_joint_target_"))
+                                  for name in selected)
+                if needs_modes and not {"arm_teleop_inactive", "arm_reset"}.issubset(source_names):
+                    raise ValueError("Mode-aware history requires recorded arm modes")
+            if self.max_action_history_dim < 1:
+                raise ValueError("max_action_history_dim must be positive")
+            # Freeze defaults into the checkpoint so future command-schema
+            # extensions cannot reinterpret an already-trained input projection.
+            self.action_history_feature_names = list(action_history_schema(self)[0])
+            if set(self.action_history_feature_names) & set(RESET_TARGET_NAMES):
+                if self.action_history_ee_semantics != "mode_reset_target_v2":
+                    raise ValueError("Reset target history requires mode_reset_target_v2")
 
     @staticmethod
     def canonical_camera_order(keys: list[str]) -> list[str]:
@@ -667,6 +707,8 @@ class PI05Config(PreTrainedConfig):
 
     def deployment_metadata(self) -> dict:
         """Return the complete, versioned deployment contract for this checkpoint."""
+        from .action_history import action_history_schema
+
         control_hz = self.control_frequency_hz
         action_dt = None if control_hz is None else 1.0 / control_hz
         image_history_interval = self.mem_vit_frame_interval_seconds if self.mem_vit_enabled else None
@@ -963,6 +1005,10 @@ class PI05Config(PreTrainedConfig):
                 },
                 "action_history": {
                     "enabled": self.action_history_enabled,
+                    **({"feature_names": list(action_history_schema(self)[0]),
+                        "projection_input_dim": self.max_action_history_dim,
+                        "ee_semantics": self.action_history_ee_semantics}
+                       if self.action_history_enabled else {}),
                     "shares_state_sampling_clock": True,
                     "num_strictly_past_frames": (
                         self.state_num_frames - 1 if self.action_history_enabled else 0

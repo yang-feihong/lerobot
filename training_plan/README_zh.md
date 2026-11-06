@@ -185,6 +185,41 @@ reset selector 保持新初始化，不可静默丢失旧权重。普通 `fork-t
 使用 `pull_joint_plus_full` 六组合等权。full 组合只采仿真，其余组合内仿真∶实采 3∶1；
 这是显式任务采样策略，不补造独立单阶段实采的全流程监督。
 
+历史动作输入默认关闭。新训练可在统一入口的环境配置中显式设置
+`ACTION_HISTORY_ENABLED=true`；普通 resume 始终继承 checkpoint，不在恢复时增删模型结构。
+`ACTION_HISTORY_FEATURE_NAMES` 可指定 JSON 字符串数组，默认 `null` 表示标准已执行命令：
+按顺序为底盘速度 3D、inactive/reset 模式 2D、控制目标 EE 9D、夹爪命令 1D、
+reset 最终关节目标 6D，共 21D；reset 六维具名为 `arm_reset_joint_target_1..6`。
+历史 checkpoint 已保存的显式字段列表继续沿用（包括旧的 13D/15D 列表），不静默迁移；
+切换字段属于新输入契约，不能按普通 resume 或热切换处理。不包含生成的 complete/blocked 标签，
+也不随输出通道开关变化。EE 按字段名读取 `control_*`，统计量使用同一映射；不靠 16/25 维猜测。
+新默认历史采用 `mode_reset_target_v2`：只有主动 Cartesian EE 控制（inactive=0 且 reset=0）
+时使用 EE 目标；保持/reset 的九维 EE 历史在归一化后 mask 成零，模式、底盘/夹爪仍保留。
+reset 六维仅在 reset 时有效：训练按历史采样帧读取已审计 `reset_presets.json`，
+将对应 preset 映射为该发布物/catalog 的六关节目标；已审计未知目标仅屏蔽六维，
+未审计漏标仍报错，不默认 middle。历史目标在暂停增强前绑定，随后与指令一起移动；
+不含当前/未来帧的 preset。部署读取执行端下发/采用的最终目标，不取预测的未来类别序列。
+模式固定归一化到 [-1,1]，reset 关节目标固定以 [-pi,pi] 作为归一化边界，不依赖输出维数。
+这是“不提供该模式下的 EE 指令”，不是实际反馈或零位置目标；保持与 reset 由显式模式区分。
+已保存的显式字段列表若缺语义版本，按 `legacy_control_v0` 保留旧行为。新自定义字段列表可显式
+设置 `ACTION_HISTORY_EE_SEMANTICS=mode_reset_target_v2`；已有 `active_only_v1` 保留其原行为。
+该语义版本随 checkpoint/input-spec 固化，
+普通 resume 不切换；已有历史权重禁止用同形状掩盖语义变化。未来动作监督不受此 mask 影响。
+`MAX_ACTION_HISTORY_DIM`（默认 32）是独立输入投影容量，不使用输出的 `max_action_dim`。
+12 帧历史（默认）与 state 共享 25Hz 时钟，仅覆盖当前之前；语义 complete/hold 仅修改未来监督。
+`HISTORY_PAUSE_MAX_STEPS` 默认 `0`，完全关闭暂停增强；正整数要求开启历史动作输入。
+训练每个样本均匀抽取 `0..最大值` 个历史步（每步默认 40ms，设为 5 即最多 0.2s），
+将短期状态与指令历史一起向更早槽位移动，截掉溢出历史，末端补理想保持。
+状态重复当前快照（含原字段值，不模拟物理停稳）；指令底盘零速、机械臂 inactive、reset=0，
+夹爪保持最后历史目标，EE 与 reset 目标组按保持模式屏蔽。padding 跟随来源，不把未知命令变成已知。
+图像、当前状态/anchor、未来动作及全部输出监督不变。超过窗口的移动使历史全部保持；
+验证和部署不执行增强，普通 resume 继承 checkpoint 配置。此增强不模拟接触/回弹动力学。
+模型保存输入字段、容量、投影和独立归一化统计，部署按该契约选择实际执行记录；
+缺字段报错，缺少启动历史则 padding/mask，不以实际状态冒充动作。
+历史字段或容量变化须重建模型，不能热切换相同形状但不同含义的历史输入。
+仅复用旧模型权重的新训练可以新增历史投影，保留原权重、新投影单独初始化；
+已有历史模型禁止静默换字段语义。关闭开关时不新增投影、不改变旧部署 metadata/schema。
+
 筐内抓取四卡 50k→100k 的权重复用任务维护在 `bin_grasp_fresh_50k_to_100k_jobs.json`，
 使用 `grasp`（1×1）与共享 full-MEM profile，在 wholebody2 运行。
 数据锁定逻辑入口 `training/bin_grasp_all_real` 当次的 READY 发布物；任务中的配方标识

@@ -222,6 +222,10 @@ state_num_frames="13"
 state_history_frame_interval_seconds="0.04"
 # Uses the state-history clock and excludes the current action.
 action_history_enabled="false"
+action_history_feature_names="null"
+action_history_ee_semantics="null"
+max_action_history_dim="32"
+history_pause_max_steps="0"
 
 # Optional named overrides used by checked-in experiment launchers. Ordinary
 # single-run training can keep editing the user configuration above.
@@ -342,6 +346,10 @@ while (( $# > 0 )); do
     --reset-preset-unknown-target-policy=*) reset_preset_unknown_target_policy="${1#*=}" ;;
     --state-action-encoding=*) state_action_encoding="${1#*=}" ;;
     --action-history-enabled=*) action_history_enabled="${1#*=}" ;;
+    --action-history-feature-names=*) action_history_feature_names="${1#*=}" ;;
+    --action-history-ee-semantics=*) action_history_ee_semantics="${1#*=}" ;;
+    --max-action-history-dim=*) max_action_history_dim="${1#*=}" ;;
+    --history-pause-max-steps=*) history_pause_max_steps="${1#*=}" ;;
     --training-rtc=*) training_rtc="${1#*=}"; training_rtc_explicit="true" ;;
     --training-rtc-simulated-delay=*) training_rtc_simulated_delay="${1#*=}"; training_rtc_simulated_delay_explicit="true" ;;
     --training-rtc-delay-distribution=*) training_rtc_delay_distribution="${1#*=}"; training_rtc_delay_distribution_explicit="true" ;;
@@ -895,6 +903,10 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.state_num_frames="$state_num_frames"
     --policy.state_history_frame_interval_seconds="$state_history_frame_interval_seconds"
     --policy.action_history_enabled="$action_history_enabled"
+    --policy.action_history_feature_names="$action_history_feature_names"
+    --policy.action_history_ee_semantics="$action_history_ee_semantics"
+    --policy.max_action_history_dim="$max_action_history_dim"
+    --policy.history_pause_max_steps="$history_pause_max_steps"
   )
 fi
 

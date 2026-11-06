@@ -34,6 +34,26 @@ def initialize_model_weights(policy, checkpoint, *, resume=False):
         "policy_tokenizer_sha256",
     )
     mismatches = [key for key in fields if source.get(key) != current.get(key)]
+    source_history = source.get("action_history_enabled", False)
+    target_history = current.get("action_history_enabled", False)
+    if source_history and not target_history:
+        mismatches.append("action_history_enabled")
+    if source_history and target_history:
+        from types import SimpleNamespace
+
+        from lerobot.policies.pi05.action_history import action_history_schema
+
+        def history_identity(config):
+            capacity = config.get("max_action_history_dim", 32)
+            names = action_history_schema(SimpleNamespace(
+                action_history_feature_names=config.get("action_history_feature_names"),
+                dataset_action_feature_names=config.get("dataset_action_feature_names"),
+                max_action_history_dim=capacity,
+            ))[0]
+            return names, capacity, config.get("action_history_ee_semantics") or "legacy_control_v0"
+
+        if history_identity(source) != history_identity(current):
+            mismatches.append("action_history_schema")
     if mismatches:
         raise ValueError(f"Model initialization I/O or base artifact identity differs: {mismatches}")
     path = root / "adapter_model.safetensors"
@@ -44,6 +64,11 @@ def initialize_model_weights(policy, checkpoint, *, resume=False):
         "action_predict_reset_preset", False
     )
     allowed_missing = {key for key in expected if ".reset_preset_head." in key} if selector_added else set()
+    if target_history and not source_history:
+        history_added = {key for key in expected if ".action_memory_proj." in key}
+        if len(history_added) != 2:
+            raise ValueError("New action history requires a saved projection weight and bias")
+        allowed_missing |= history_added
     wrong_shapes = [key for key in state.keys() & expected.keys() if state[key].shape != expected[key].shape]
     if missing != allowed_missing or unexpected or wrong_shapes:
         raise ValueError(

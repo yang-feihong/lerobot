@@ -18,7 +18,7 @@ release = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release)
 
 
-def model(enabled):
+def model(enabled, history=False):
     class Tiny(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -31,10 +31,16 @@ def model(enabled):
             self.model.proj = torch.nn.Linear(4, 4)
             if enabled:
                 self.model.reset_preset_head = ResetPresetHead(4, default_reset_presets())
+            if history:
+                self.config.update(action_history_enabled=True, action_history_feature_names=["b2_vx"],
+                                   max_action_history_dim=8)
+                self.model.action_memory_proj = torch.nn.Linear(8, 4)
 
     return get_peft_model(
         Tiny(),
-        LoraConfig(r=2, target_modules=["proj"], modules_to_save=["reset_preset_head"] if enabled else None),
+        LoraConfig(r=2, target_modules=["proj"], modules_to_save=(
+            (["reset_preset_head"] if enabled else []) + (["action_memory_proj"] if history else [])
+        ) or None),
     )
 
 
@@ -81,6 +87,30 @@ def test_missing_old_weight_or_io_drift_rejected(tmp_path):
         initialize_model_weights(current, root)
     with pytest.raises(ValueError, match="mutually exclusive"):
         initialize_model_weights(current, root, resume=True)
+
+
+def test_weights_only_initialization_can_add_history_without_changing_old_weights(tmp_path):
+    old, root = checkpoint(tmp_path)
+    current = model(True, history=True)
+    initial = {k: v.clone() for k, v in get_peft_model_state_dict(current).items()
+               if ".action_memory_proj." in k or ".reset_preset_head." in k}
+    result = initialize_model_weights(current, root)
+    assert set(result["new_parameter_keys"]) == set(initial)
+    loaded = get_peft_model_state_dict(current)
+    for key, value in {**get_peft_model_state_dict(old), **initial}.items():
+        torch.testing.assert_close(loaded[key], value, rtol=0, atol=0)
+
+
+def test_history_weights_cannot_be_reinterpreted_as_other_commands(tmp_path):
+    old = model(True, history=True)
+    root = tmp_path / "source"
+    (root / "pretrained_model").mkdir(parents=True)
+    old.save_pretrained(root / "pretrained_model")
+    (root / "pretrained_model/config.json").write_text(json.dumps(old.config))
+    current = model(True, history=True)
+    current.config["action_history_feature_names"] = ["b2_vy"]
+    with pytest.raises(ValueError, match="action_history_schema"):
+        initialize_model_weights(current, root)
 
 
 def test_release_pin_is_independent_of_training_supervision_configuration(tmp_path):

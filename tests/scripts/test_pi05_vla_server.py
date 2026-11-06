@@ -151,6 +151,36 @@ def test_prepared_image_window_is_consumed_without_sampling_or_cache():
             _decode_model_image_history(snapshot, **args)
 
 
+@pytest.mark.parametrize("semantics", ["active_only_v1", "mode_reset_target_v2"])
+def test_active_only_history_requires_and_transports_feature_validity_mask(monkeypatch, semantics):
+    import lerobot.scripts.pi05_vla_server as server_module
+
+    monkeypatch.setattr(server_module, "_decode_model_image_history", lambda *args, **kwargs:
+        ([SimpleNamespace(base_jpeg=b"", wrist_jpeg=b"")], torch.zeros(1, 1, dtype=torch.bool)))
+    monkeypatch.setattr(server_module, "_decode_jpeg", lambda *args: np.zeros((2, 2, 3), dtype=np.uint8))
+    engine = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    engine.state_num_frames = 3
+    engine.source_state_names = ("state",)
+    engine.action_history_enabled = True
+    engine.action_history_indices = tuple(range(13))
+    engine.policy = SimpleNamespace(config=SimpleNamespace(action_history_ee_semantics=semantics))
+    engine.mem_image_num_frames = 1
+    engine.mem_enabled = False
+    engine.base_camera_key, engine.wrist_camera_key = "base", "wrist"
+    engine.input_spec = lambda: {"schema_id": "test"}
+    packet = SimpleNamespace(input_schema="test", prepared_state=np.zeros((3, 1)),
+        prepared_state_is_pad=np.zeros(3, dtype=np.bool_), prepared_action_history=np.ones((2, 13)),
+        prepared_action_history_is_pad=np.zeros(2, dtype=np.bool_),
+        prepared_action_history_feature_is_pad=None, sim_step=4, task="test", model_image_history=b"")
+    with pytest.raises(ValueError, match="EE validity mask"):
+        engine.validate_input(packet)
+    packet.prepared_action_history_feature_is_pad = np.zeros((2, 13), dtype=np.bool_)
+    packet.prepared_action_history_feature_is_pad[1, 3:12] = True
+    batch = engine._make_batch(packet)
+    assert torch.equal(batch["observation.action_history_feature_is_pad"],
+                       torch.from_numpy(packet.prepared_action_history_feature_is_pad)[None])
+
+
 @pytest.mark.parametrize("wrist_first", [False, True])
 def test_real_robot_jpeg_roles_reach_metadata_model_slots(wrist_first):
     import cv2
@@ -301,6 +331,26 @@ def test_checkpoint_hot_swap_signature_requires_identical_runtime_schema(tmp_pat
     assert _checkpoint_hot_swap_signature(first) == _checkpoint_hot_swap_signature(second)
 
     (second / "config.json").write_text(json.dumps({"max_action_dim": 64}))
+    assert _checkpoint_hot_swap_signature(first) != _checkpoint_hot_swap_signature(second)
+
+
+def test_history_input_schema_is_structural_only_when_enabled(tmp_path):
+    directories = [tmp_path / "first", tmp_path / "second"]
+    for directory in directories:
+        directory.mkdir()
+        for name in ("config.json", "adapter_config.json", "pi05_deployment_metadata.json",
+                     "policy_preprocessor.json", "policy_postprocessor.json"):
+            (directory / name).write_text("{}")
+    first, second = directories
+    baseline = {"action_history_enabled": False}
+    (first / "config.json").write_text(json.dumps(baseline))
+    (second / "config.json").write_text(json.dumps({**baseline, "max_action_history_dim": 32,
+                                                   "action_history_feature_names": None}))
+    assert _checkpoint_hot_swap_signature(first) == _checkpoint_hot_swap_signature(second)
+    for name in ("b2_vx", "b2_vy"):
+        target = first if name == "b2_vx" else second
+        (target / "config.json").write_text(json.dumps({"action_history_enabled": True,
+            "max_action_history_dim": 32, "action_history_feature_names": [name]}))
     assert _checkpoint_hot_swap_signature(first) != _checkpoint_hot_swap_signature(second)
 
 

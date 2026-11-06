@@ -35,7 +35,6 @@ from lerobot.policies.pi05.b2_action_transform import (
     _matrix_to_rot6d,
     _rotvec_to_matrix,
     absolute_ee_pose_to_reference_delta,
-    action_dataset_indices,
     ee_reference_delta_to_absolute,
 )
 from lerobot.policies.pi05.processor_pi05 import OBS_ACTION_HISTORY, Pi05PrepareStateTokenizerProcessorStep
@@ -726,6 +725,9 @@ def _checkpoint_hot_swap_signature(policy_path: Path) -> str:
         "training_rtc_config",
     }
     config = documents["config.json"]
+    if config.get("action_history_enabled", False):
+        structural_config_fields.update({"action_history_feature_names", "max_action_history_dim",
+                                         "action_history_ee_semantics"})
     config["action_predict_reset_preset"] = config.get("action_predict_reset_preset", False)
     if not config["action_predict_reset_preset"]:
         config.pop("reset_preset_catalog", None)
@@ -846,6 +848,8 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
             if "model_action_history" in packet else None,
             prepared_action_history_is_pad=np.asarray(packet["model_action_history_is_pad"])
             if "model_action_history_is_pad" in packet else None,
+            prepared_action_history_feature_is_pad=np.asarray(packet["model_action_history_feature_is_pad"])
+            if "model_action_history_feature_is_pad" in packet else None,
             inference_delay_steps=delay_steps,
             source_steps_per_wall_second=source_rate,
             diagnostic_flow_seed=(
@@ -946,6 +950,7 @@ class ObservationPacket:
     server_received_ns: int
     model_image_history: bytes
     scheduling_mode: str | None = None
+    prepared_action_history_feature_is_pad: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -1064,6 +1069,9 @@ class RolloutRecorder:
                 model_state_is_pad=packet.prepared_state_is_pad,
                 model_action_history=packet.prepared_action_history if packet.prepared_action_history is not None else np.empty((0, 0), dtype=np.float32),
                 model_action_history_is_pad=packet.prepared_action_history_is_pad if packet.prepared_action_history_is_pad is not None else np.empty(0, dtype=np.bool_),
+                model_action_history_feature_is_pad=(packet.prepared_action_history_feature_is_pad
+                    if packet.prepared_action_history_feature_is_pad is not None
+                    else np.empty((0, 0), dtype=np.bool_)),
                 model_image_history=np.frombuffer(packet.model_image_history, dtype=np.uint8),
                 server_received_ns=np.asarray(packet.server_received_ns),
             )
@@ -1264,19 +1272,22 @@ class AsyncRTCPolicy:
             1, round(float(config.state_history_frame_interval_seconds) * self.low_level_hz)
         )
         self.action_history_enabled = bool(config.action_history_enabled)
-        self.action_history_indices = action_dataset_indices(
-            **{
-                key: value
-                for key, value in action_schema_kwargs(config).items()
-                if key
-                not in {
-                    "representation",
-                    "z1_representation",
-                    "ee_delta_rotation_representation",
-                    "include_task_blocked",
-                }
-            }
+        from lerobot.policies.pi05.action_history import action_history_schema
+
+        self.action_history_names, self.action_history_indices, _ = (
+            action_history_schema(config) if self.action_history_enabled else ((), (), 0)
         )
+        if not self.action_history_enabled:
+            # Preserve disabled checkpoints' input-spec/schema IDs exactly.
+            from lerobot.policies.pi05.b2_action_transform import action_dataset_indices, action_schema_kwargs
+
+            options = action_schema_kwargs(config)
+            self.action_history_indices = action_dataset_indices(**{
+                key: value for key, value in options.items()
+                if key not in {"representation", "z1_representation",
+                               "ee_delta_rotation_representation", "include_task_blocked"}
+            })
+            self.action_history_names = tuple(self.source_action_names[i] for i in self.action_history_indices)
         self._mailbox_condition = Condition()
         self._model_lock = Lock()
         self._request_gate = Lock()
@@ -1511,6 +1522,10 @@ class AsyncRTCPolicy:
                 1, action_frames, len(self.action_history_indices), dtype=torch.float32
             )
             batch[f"{OBS_ACTION_HISTORY}_is_pad"] = torch.ones(1, action_frames, dtype=torch.bool)
+            if self.policy.config.action_history_ee_semantics in {"active_only_v1", "mode_reset_target_v2"}:
+                batch[f"{OBS_ACTION_HISTORY}_feature_is_pad"] = torch.ones_like(
+                    batch[OBS_ACTION_HISTORY], dtype=torch.bool
+                )
         return batch
 
     def _warmup(self) -> None:
@@ -1862,8 +1877,10 @@ class AsyncRTCPolicy:
             "state_stride_steps": self.state_history_stride,
             "control_frequency_hz": self.low_level_hz,
             "action_history_enabled": self.action_history_enabled,
-            "action_history_names": [self.source_action_names[index] for index in self.action_history_indices],
+            "action_history_names": list(self.action_history_names),
         }
+        if self.action_history_enabled:
+            spec["action_history_ee_semantics"] = self.policy.config.action_history_ee_semantics
         spec["schema_id"] = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
         return spec
 
@@ -1879,6 +1896,10 @@ class AsyncRTCPolicy:
             if (actions is None or actions.shape != expected or not np.isfinite(actions).all()
                     or pad is None or pad.dtype != np.bool_ or pad.shape != expected[:1]):
                 raise ValueError("Prepared action history does not match model shape")
+            if self.policy.config.action_history_ee_semantics in {"active_only_v1", "mode_reset_target_v2"}:
+                feature_pad = packet.prepared_action_history_feature_is_pad
+                if feature_pad is None or feature_pad.shape != expected or feature_pad.dtype != np.bool_:
+                    raise ValueError("Prepared action history is missing its EE validity mask")
         _decode_model_image_history(packet.model_image_history, source_step=packet.sim_step,
             count=self.mem_image_num_frames, base_key=self.base_camera_key, wrist_key=self.wrist_camera_key)
 
@@ -1905,6 +1926,10 @@ class AsyncRTCPolicy:
             actions, pad = packet.prepared_action_history, packet.prepared_action_history_is_pad
             batch[OBS_ACTION_HISTORY] = torch.from_numpy(actions.copy()).unsqueeze(0)
             batch[f"{OBS_ACTION_HISTORY}_is_pad"] = torch.from_numpy(pad.copy()).unsqueeze(0)
+            if self.policy.config.action_history_ee_semantics in {"active_only_v1", "mode_reset_target_v2"}:
+                batch[f"{OBS_ACTION_HISTORY}_feature_is_pad"] = torch.from_numpy(
+                    packet.prepared_action_history_feature_is_pad.copy()
+                ).unsqueeze(0)
         return batch
 
     @staticmethod

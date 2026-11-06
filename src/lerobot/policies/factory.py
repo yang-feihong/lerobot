@@ -373,7 +373,10 @@ def make_pre_post_processors(
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
         if isinstance(policy_cfg, PI05Config):
-            from .pi05.processor_pi05 import reconcile_pi05_action_representation_processors
+            from .pi05.processor_pi05 import (
+                reconcile_pi05_action_representation_processors,
+                validate_action_history_normalizer,
+            )
 
             preprocessor, postprocessor = reconcile_pi05_action_representation_processors(
                 policy_cfg,
@@ -382,6 +385,7 @@ def make_pre_post_processors(
                 kwargs.get("dataset_stats"),
                 kwargs.get("transformed_action_stats"),
             )
+            validate_action_history_normalizer(policy_cfg, preprocessor)
         if isinstance(policy_cfg, Evo1Config):
             from .evo1.processor_evo1 import reconcile_evo1_processors
 
