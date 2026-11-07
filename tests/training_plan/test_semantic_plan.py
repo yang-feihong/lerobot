@@ -19,7 +19,27 @@ SPEC.loader.exec_module(semantic_plan)
 def test_inline_release_validation_does_not_require_a_preset_registry():
     payload = {"tasks": {"release": {"state_weights": {"approach": 1}, "state_instruction_matrix": {}}},
                "training_profile": {"memory_mode": "full_mem"}}
-    assert semantic_plan.domain_weights(payload, "release") == {}
+    assert semantic_plan.domain_weights(payload, "release") is None
+
+
+def test_default_domain_policy_accepts_mixed_and_single_domain_cells(tmp_path):
+    from copy import deepcopy
+
+    path = _sidecar(tmp_path)
+    data = json.loads(path.read_text())
+    data['episodes']['0']['data_domain'] = 'simulation'
+    data['episodes']['1'] = deepcopy(data['episodes']['0'])
+    data['episodes']['1']['data_domain'] = 'real'
+    data['episodes']['1']['views'] = data['episodes']['1']['views'][:1]
+    path.write_text(json.dumps(data))
+    relation = {'status': 'active', 'action_supervision': 'demonstrated', 'completion_boundary': 'goal_end'}
+    payload = {'tasks': {'test': {'state_weights': {'approach': 1},
+        'state_instruction_matrix': {'approach': {'goal_approach': relation, 'goal_open': relation}}}},
+        'training_profile': {'memory_mode': 'full_mem'}}
+    assert semantic_plan.validate_sidecar(payload, 'test', path)['episodes'] == 2
+    payload['tasks']['test']['domain_weights'] = {'simulation': 3, 'real': 1}
+    with pytest.raises(ValueError, match='Domain real has no sidecar coverage'):
+        semantic_plan.validate_sidecar(payload, 'test', path)
 
 
 def test_domain_policy_is_independent_of_matrix_and_can_be_overridden(tmp_path, monkeypatch):
@@ -95,6 +115,7 @@ def _sidecar(tmp_path: Path, intent: str = "goal_approach") -> Path:
                 },
                 "episodes": {
                     "0": {
+                        "data_domain": "real",
                         "segments": [
                             {
                                 "phase": "approach",
@@ -282,8 +303,9 @@ def test_three_goal_matrix_is_an_allowlist_not_a_per_episode_cartesian_requireme
                     "action_supervision": "hold",
                 }
             )
-    sample["episodes"]["0"] = {"segments": segments, "views": views}
+    sample["episodes"]["0"] = {"data_domain": "real", "segments": segments, "views": views}
     sample["episodes"]["1"] = {
+        "data_domain": "real",
         "segments": [{"phase": "handle_press", "frame_start": 0, "frame_stop": 10}],
         "views": [
             {
@@ -508,6 +530,7 @@ def test_pull_presets_use_separate_recordings_with_matching_phase_language(
     ):
         intents[goal] = {"canonical_intent": goal, "instructions": [instruction]}
         episodes[str(index)] = {
+            "data_domain": "real",
             "source_path": f"/pull/independent_recording_{index}.bag",
             "segments": [{"phase": phase, "frame_start": 0, "frame_stop": 10}],
             "views": [

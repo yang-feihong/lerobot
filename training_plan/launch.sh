@@ -86,6 +86,16 @@ semantic_source_weights='{}'
 semantic_domain_weights="${semantic_task_spec[14]}"
 semantic_instruction_domain_weights="${semantic_task_spec[15]}"
 
+# Ordinary resume keeps the saved policy, even when an old plan omitted weights.
+# A fork is required to adopt the new automatic policy on an existing run.
+if [[ ( "${1:-}" == resume || "${1:-}" == resume-dry-run ) && "${semantic_domain_weights}" == null ]]; then
+  semantic_domain_weights="$(python3 - "${4:?Resume requires a checkpoint}/pretrained_model/train_config.json" <<'PY_DOMAINS'
+import json, sys
+print(json.dumps(json.load(open(sys.argv[1]))['dataset'].get('semantic_domain_weights', {})))
+PY_DOMAINS
+)"
+fi
+
 dataset_resolve_args=(--jobs "${training_jobs_file}" --presets "${semantic_presets_file}"
   --task "${task_id}" --datasets-root "${VLA_STORAGE_ROOT}/datasets/b2_z1" --format-lines)
 if [[ "${1:-}" == resume || "${1:-}" == resume-dry-run ]]; then

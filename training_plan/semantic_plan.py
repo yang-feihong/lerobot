@@ -23,7 +23,12 @@ VALID_NODES = {"f", "wb1", "wb2", "wb3", "wb4", "wb5", "wb6", "lerobot"}
 # The launcher/preparation preflight also runs outside the training container.
 # Only this dependency-free origin contract is imported, never datasets/torch.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from lerobot.data_domains import load_episode_domains, validate_domain_weights, validate_instruction_domain_weights
+from lerobot.data_domains import (
+    effective_domain_weights,
+    load_episode_domains,
+    validate_domain_weights,
+    validate_instruction_domain_weights,
+)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -261,10 +266,10 @@ def state_weights(payload: dict[str, Any], task_id: str) -> dict[str, float]:
     return task["state_weights"]
 
 
-def domain_weights(payload: dict[str, Any], task_id: str) -> dict[str, float]:
+def domain_weights(payload: dict[str, Any], task_id: str) -> dict[str, float] | None:
     task = resolve_task(payload, task_id)
     preset = payload.get("training_presets", {}).get(task.get("training_preset"), {})
-    return task.get("domain_weights", preset.get("domain_weights", {}))
+    return task.get("domain_weights", preset.get("domain_weights"))
 
 
 def instruction_domain_weights(payload: dict[str, Any], task_id: str) -> dict[str, dict[str, float]]:
@@ -314,7 +319,8 @@ def validate_sidecar(payload: dict[str, Any], task_id: str, sidecar_path: Path) 
         for state in selected_states
     }
     seen: dict[str, set[tuple[str, str, str, str]]] = {state: set() for state in selected_states}
-    domains = domain_weights(payload, task_id)
+    automatic_domains = domain_weights(payload, task_id) is None
+    domains = effective_domain_weights(domain_weights(payload, task_id))
     instruction_domains = instruction_domain_weights(payload, task_id)
     episode_domains = load_episode_domains(sidecar_path, episodes) if domains else {}
     domain_seen = {d: set() for d, w in domains.items() if w > 0}
@@ -423,6 +429,8 @@ def validate_sidecar(payload: dict[str, Any], task_id: str, sidecar_path: Path) 
     cells = {(s, i) for s, row in matrix.items() for i in row}
     for domain, found in domain_seen.items():
         required = {(s, i) for s, i in cells if instruction_domains.get(i, domains).get(domain, 0) > 0}
+        if automatic_domains:
+            required = {(s, i) for s, i in required if i in instruction_domains}
         if required - found:
             raise ValueError(f"Domain {domain} has no sidecar coverage for cells: {sorted(required - found)}")
     return {"episodes": episode_count, "segments": segment_count, "frames": frame_count}

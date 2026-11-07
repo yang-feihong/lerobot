@@ -1,0 +1,19 @@
+{
+  "format": "lerobot.training_jobs",
+  "version": 1,
+  "jobs": {
+    "external_grasp_physical_history_full_mem_50k": {
+      "data_recipe": "external_grasp_all_real__8f30a97dc581bfd89ccc",
+      "dataset_artifact_id": "269aa94e8afcb3551e2416bd645f653c8a4540d4c5cd27fc7df53f5647c542e1",
+      "training_preset": "external_grasp_joint_plus_full",
+      "reset_preset_unknown_target_policy": "mask_audited_unknown",
+      "reset_preset_sidecar": "/data/datasets/b2_z1/supervision/external_grasp_all_real--269aa94e8afcb3551e2416bd645f653c8a4540d4c5cd27fc7df53f5647c542e1/reset_presets.json",
+      "train_steps": 50000,
+      "resources": {
+        "node": "f",
+        "gpu_ids": [0, 1, 2, 3, 4, 5, 6, 7],
+        "main_process_port": 29514
+      }
+    }
+  }
+}

@@ -624,6 +624,11 @@ class TrainPipelineConfig(HubMixin):
             with open(config_file) as f:
                 config = json.load(f)
             migrated_config = _migrate_legacy_rabc_fields(config)
+            # Missing in old saved configurations meant natural mixing, not the new default.
+            if "dataset" in config and "semantic_domain_weights" not in config["dataset"]:
+                if migrated_config is None:
+                    migrated_config = config
+                migrated_config["dataset"]["semantic_domain_weights"] = {}
             if migrated_config is not None:
                 with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
                     json.dump(migrated_config, f)

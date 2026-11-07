@@ -44,7 +44,11 @@ training 目录时不自动迁移，也不修改 checkpoint；应保留历史代
 `"domain_weights": {"simulation": 3, "real": 1}` 即为仿真 3:实采 1；
 也支持在 `semantic_training_presets.json` 的某个 preset 中设置同名默认值，job 显式值优先。
 `{"simulation": 1}` 为仅仿真，`{"real": 1}` 为仅实采；未写的域或权重为 0 的域不参与。
-`{}`（默认）保持历史按合法帧自然混合，不强制域比例。所有数值须有限、非负且总和为正。
+新训练不设置 `domain_weights`（配置中保存为 `null`）时，默认每个状态×指令组合内
+仿真∶实采为 **3∶1**；组合内只有仿真或只有实采合法样本时，全部采该来源。
+可用域在历史窗口、静止帧等合法性筛选后确定，不依据整个数据集的来源总数。
+显式 `{}` 保持历史按合法帧自然混合，不强制域比例；显式数值权重仍严格要求所选域覆盖。
+所有数值须有限、非负且总和为正。
 
 采样顺序是：状态×指令组合 → 来源域 → 可选 source_group → 合法帧。
 任务可用 `instruction_domain_weights` 显式覆盖某指令的来源域策略，例如
@@ -55,7 +59,8 @@ training 目录时不自动迁移，也不修改 checkpoint；应保留历史代
 策略写入 config/runtime，普通 resume 禁止悄悄变更，需显式 fork。
 因此默认组合等权不变，3:1 是**每个组合内部**的比例，而非整个数据集 episode 数配额；
 小域会重复采样，有限 batch 允许取整误差，不承诺每个 batch 恰好 3:1。
-任一启用组合在所需域中无合法帧（包括历史过滤/窗口检查之后）就报错，不能自动改成其他比例。
+显式权重下，任一启用组合在所需域中无合法帧（包括历史过滤/窗口检查之后）就报错。
+只有上述自动默认策略允许单域组合自动使用唯一来源；显式逐指令来源限制不自动放宽。
 某个域根本不存在时，不应选择要求该域的混合策略。
 
 数据处理负责保存逐 episode 不可变来源证据：转换 manifest 的 `data_domain=simulation|real`；
@@ -70,6 +75,9 @@ training 目录时不自动迁移，也不修改 checkpoint；应保留历史代
 不按训练比例重采样；跨比例对比指标时须核对验证域组成。
 运行 `semantic_view_runtime.json` 记录域策略、各组合/域实际权重及合法配对数，checkpoint config 保存策略。
 普通 resume 不允许改变域权重，调整比例应显式 fork，保持数据发布身份不变。
+旧配置缺少域策略或保存 `{}` 时继续自然混合，不因新默认值变化而改写；普通 resume
+沿用已保存策略，新训练/fork 才采用新默认。运行审计中的 `domain_sampling_policy`
+明确标记自动 3∶1，`sampling_groups` 保存每个组合/来源实际权重。
 
 这与 `dataset.image_source/mixed_sim_probability` 的图像替换增强完全独立，不能用图像增强概率代替录制来源比例。
 
@@ -78,6 +86,18 @@ training 目录时不自动迁移，也不修改 checkpoint；应保留历史代
 仿真∶实采为 3∶1，wholebody6 四卡。用 `fork-dry-run-task` 验收后再用
 `fork-task`，显式指定 20261019 的 `checkpoints/150000`；保留模型、优化器和训练状态，
 新建输出与 W&B run，旧模型的 reset selector 结构保持不变。
+
+11589 条新版多场景推门 Stage2 的四卡 0→100k 任务维护在
+`all_push_stage2_fresh_100k_jobs.json`，锁定 READY artifact `cca3f6e…`，使用 `stage2_only`。
+从基座全新初始化，不读取上轮模型、配置或优化器；使用当前共享 full-MEM profile、
+默认 physical 工具轴、默认组合内仿真∶实采 3∶1（单域自动适配），历史指令输入关闭。
+通过 `TRAINING_JOBS_FILE=training_plan/all_push_stage2_fresh_100k_jobs.json`
+选择计划，再执行 `cluster.sh prepare wb6`、`dry-run-task`、`start-task`；
+reset 监督放在发布物之外，并仅屏蔽已审计未知目标的分类 loss。
+
+远程 dry-run 包含正式发布物解析和大数据集的语义前置检查；编排等待上限由
+`.env` 的 `CLUSTER_DRY_RUN_TIMEOUT_SECONDS` 配置，默认 300 秒。
+超时会输出诊断容器日志后停止，不启动训练，也不会绕过任何数据验收。
 
 训练和开环评估共用 `datasets/episode_split.py`，不保留按任务/数据来源末尾截取的旧算法。
 分组单位是不可变的原始录制身份：优先语义 sidecar 的 `recording_id`，否则使用
@@ -187,6 +207,10 @@ reset selector 保持新初始化，不可静默丢失旧权重。普通 `fork-t
 
 历史动作输入默认关闭。新训练可在统一入口的环境配置中显式设置
 `ACTION_HISTORY_ENABLED=true`；普通 resume 始终继承 checkpoint，不在恢复时增删模型结构。
+20261106 wholebodyF 的 `external_grasp_history_50k_jobs.json` 已用独立代码快照开启历史输入，
+暂停增强为 0；当前 `.env` 已为下一轮无历史指令训练关闭历史输入，不影响运行中的 F 任务。
+该 F 任务沿用 20261105 外部抓取任务的同一数据 artifact、四组合、八卡及
+50k 目标，从基座 0 步新训，不加载上一轮权重或训练状态；旧任务计划仍保留。
 `ACTION_HISTORY_FEATURE_NAMES` 可指定 JSON 字符串数组，默认 `null` 表示标准已执行命令：
 按顺序为底盘速度 3D、inactive/reset 模式 2D、控制目标 EE 9D、夹爪命令 1D、
 reset 最终关节目标 6D，共 21D；reset 六维具名为 `arm_reset_joint_target_1..6`。

@@ -1,0 +1,18 @@
+{
+  "format": "lerobot.training_jobs",
+  "version": 1,
+  "jobs": {
+    "all_push_stage2_sim3_real1_fresh_100k": {
+      "data_recipe": "all_push_door__444aae6792e4d2e2c05f",
+      "dataset_artifact_id": "cca3f6e57d6aa80ba6b0063326be39570f9133398c50c621a67436be04c6dbe8",
+      "training_preset": "stage2_only",
+      "train_steps": 100000,
+      "reset_preset_sidecar": "/data/datasets/b2_z1/supervision/all_push_door--cca3f6e57d6aa80ba6b0063326be39570f9133398c50c621a67436be04c6dbe8/reset_presets.json",
+      "resources": {
+        "node": "wb6",
+        "gpu_ids": [0, 1, 2, 3],
+        "main_process_port": 29518
+      }
+    }
+  }
+}

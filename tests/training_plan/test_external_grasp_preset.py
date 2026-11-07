@@ -40,7 +40,7 @@ def sidecar(tmp_path):
     ]
     path = tmp_path / "views.json"
     path.write_text(json.dumps({"format": "lerobot.semantic_views", "version": 1, "intents": intents,
-        "episodes": {"0": {"segments": [
+        "episodes": {"0": {"data_domain": "real", "segments": [
             {"phase": "object_approach", "frame_start": 0, "frame_stop": 10, "source_group": "external_object_grasp"},
             {"phase": "external_object_grasp", "frame_start": 10, "frame_stop": 20, "source_group": "external_object_grasp"}],
             "views": views}}}))

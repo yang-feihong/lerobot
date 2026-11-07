@@ -1288,7 +1288,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             cfg.dataset.semantic_state_instruction_matrix
         )
         cfg.trainable_config.semantic_view_kind_weights = dict(cfg.dataset.semantic_view_kind_weights)
-        if cfg.dataset.semantic_domain_weights:
+        if (
+            cfg.dataset.semantic_domain_weights is None and cfg.dataset.semantic_state_instruction_matrix
+        ) or cfg.dataset.semantic_domain_weights:
             from lerobot.data_domains import select_domain_episodes
 
             cfg.dataset.episodes = select_domain_episodes(
@@ -1509,6 +1511,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "phase_weights": cfg.dataset.semantic_phase_weights,
                 "source_weights": cfg.dataset.semantic_source_weights,
                 "domain_weights": cfg.dataset.semantic_domain_weights,
+                "domain_sampling_policy": "automatic_sim3_real1_available_per_cell"
+                if cfg.dataset.semantic_domain_weights is None
+                else "explicit",
                 "instruction_domain_weights": cfg.dataset.semantic_instruction_domain_weights,
                 "exclude_incomplete_static_starts": cfg.dataset.semantic_exclude_incomplete_static_starts,
                 "sampling_strategy": "state_instruction_cells"

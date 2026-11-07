@@ -76,7 +76,9 @@ class DatasetConfig:
     semantic_phases: list[str] = field(default_factory=list)
     semantic_phase_weights: dict[str, float] = field(default_factory=dict)
     semantic_source_weights: dict[str, float] = field(default_factory=dict)
-    semantic_domain_weights: dict[str, float] = field(default_factory=dict)
+    # None: automatic 3:1 in mixed cells, single-domain cells use their available domain.
+    # Explicit {} retains natural mixing (including historical checkpoints).
+    semantic_domain_weights: dict[str, float] | None = None
     semantic_instruction_domain_weights: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

@@ -9,7 +9,14 @@ import math
 from pathlib import Path
 
 
+def effective_domain_weights(weights):
+    """None is the new automatic 3:1 policy; {} preserves legacy natural mixing."""
+    return {"simulation": 3.0, "real": 1.0} if weights is None else weights
+
+
 def validate_domain_weights(weights):
+    if weights is None:
+        return None
     if not isinstance(weights, dict) or set(weights) - {"simulation", "real"}:
         raise ValueError("Domain weights require only simulation and real keys")
     if any(
@@ -44,6 +51,7 @@ def recording_domain(record, *, required=True):
 def validate_instruction_domain_weights(overrides, default, matrix):
     """Instruction-specific restrictions never silently invent a missing domain."""
     validate_domain_weights(default)
+    default = effective_domain_weights(default)
     if not isinstance(overrides, dict):
         raise ValueError("Instruction domain weights must be an object")
     if overrides and not default:
@@ -97,6 +105,7 @@ def load_episode_domains(sidecar_path, episodes):
 def select_domain_episodes(catalog, selected, weights):
     """Filter before split/loading/derived-action statistics without changing hashes."""
     validate_domain_weights(weights)
+    weights = effective_domain_weights(weights)
     if not weights:
         return list(selected)
     missing = set(selected) - set(catalog.episode_domains)

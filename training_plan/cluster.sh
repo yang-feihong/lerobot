@@ -575,7 +575,12 @@ run_task_container() {
 
 run_task_dry_run() {
   local node="$1" task="$2" mode="$3" gpu="$4" port="$5" checkpoint="${6:-}" target_steps dataset_family
-  local code command_q output dry_name model_mount
+  local code command_q output dry_name model_mount timeout_seconds
+  timeout_seconds="${CLUSTER_DRY_RUN_TIMEOUT_SECONDS:-300}"
+  [[ "${timeout_seconds}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "CLUSTER_DRY_RUN_TIMEOUT_SECONDS must be a positive integer" >&2
+    return 2
+  }
   node_profile "${node}"
   code="$(container_code_dir)"
   dry_name="${CLUSTER_CONTAINER_NAME}-dry-run-${task}"
@@ -599,13 +604,19 @@ run_task_dry_run() {
   output="$(ssh_node "${node}" "set -e
     docker rm -f '${dry_name}' >/dev/null 2>&1 || true
     docker run -d --name '${dry_name}' --entrypoint bash --user '${container_user}' -v '${host_data}:/data:ro' -v '${host_hf_cache}:/data/lerobot/cache/huggingface:rw' ${model_mount} -v '${host_source}:/workspace/source:rw' -w '${code}' -e PYTHONPATH='${code}/src' -e UV_PROJECT_ENVIRONMENT=/lerobot/.venv -e VIRTUAL_ENV=/lerobot/.venv -e LEROBOT_RUNTIME_BIN=/lerobot/.venv/bin -e PATH=/lerobot/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -e HF_HOME=/data/lerobot/cache/huggingface -e HF_HUB_OFFLINE=1 -e HOME=/tmp -e TZ=Asia/Shanghai '${image}' -lc ${command_q@Q} >/dev/null
-    for i in {1..60}; do
+    deadline=\$((SECONDS + ${timeout_seconds}))
+    while (( SECONDS < deadline )); do
       state=\$(docker inspect '${dry_name}' --format '{{.State.Status}}')
       test \"\${state}\" != running && break
       sleep 1
     done
     state=\$(docker inspect '${dry_name}' --format '{{.State.Status}}')
-    test \"\${state}\" != running || { docker rm -f '${dry_name}' >/dev/null; echo 'dry-run container timed out' >&2; exit 1; }
+    test \"\${state}\" != running || {
+      docker logs '${dry_name}' >&2 2>&1 || true
+      docker rm -f '${dry_name}' >/dev/null
+      echo 'dry-run container timed out after ${timeout_seconds}s' >&2
+      exit 1
+    }
     exit_code=\$(docker inspect '${dry_name}' --format '{{.State.ExitCode}}')
     docker logs '${dry_name}' 2>&1
     docker rm '${dry_name}' >/dev/null

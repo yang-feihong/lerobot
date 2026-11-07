@@ -68,6 +68,42 @@ def test_domain_ratio_missing_cell_fails_instead_of_silent_renormalization():
             state_instruction_matrix=matrix, domain_weights={"simulation": 3, "real": 1})
 
 
+def test_default_domain_policy_balances_mixed_cells_and_uses_single_domain_cells():
+    from dataclasses import replace
+
+    catalog, length, matrix = mixed_domain_catalog()
+    catalog = replace(catalog, segments={0: catalog.segments[0], 1: catalog.segments[1][:1]})
+    plan = semantic_relation_sampling_groups(
+        catalog, [0, length], [0, 1], state_instruction_matrix=matrix,
+    )
+    masses = dict(zip(plan.names, plan.group_weights, strict=True))
+    assert masses['approach/goal_approach/simulation/*'] == pytest.approx(.75 / 3)
+    assert masses['approach/goal_approach/real/*'] == pytest.approx(.25 / 3)
+    assert masses['handle_press/goal_open/simulation/*'] == pytest.approx(1 / 3)
+    assert masses['traversal/goal_enter/simulation/*'] == pytest.approx(1 / 3)
+
+
+def test_automatic_domain_policy_keeps_real_only_and_rejects_unknown_origin():
+    from dataclasses import replace
+
+    catalog, _, length, matrix = make_plan('three_stage_joint')
+    plan = semantic_relation_sampling_groups(catalog, [0], [0], state_instruction_matrix=matrix)
+    assert all('/real/' in name for name in plan.names)
+    assert plan.group_weights == pytest.approx([1 / 3] * 3)
+    with pytest.raises(ValueError, match='Missing recording domain'):
+        semantic_relation_sampling_groups(replace(catalog, episode_domains={}), [0], [0],
+                                         state_instruction_matrix=matrix)
+
+
+def test_explicit_empty_domain_policy_preserves_legacy_natural_mixing():
+    catalog, length, matrix = mixed_domain_catalog()
+    plan = semantic_relation_sampling_groups(catalog, [0, length], [0, 1],
+                                            state_instruction_matrix=matrix, domain_weights={})
+    assert len(plan.frame_groups) == 3
+    assert all(name.endswith('/*') and '/simulation/' not in name and '/real/' not in name
+               for name in plan.names)
+
+
 def test_full_sim_only_preserves_six_equal_cells_and_three_to_one_diagonals():
     from dataclasses import replace
 
@@ -156,7 +192,7 @@ def make_plan(preset):
                 )
             )
         start = stop
-    catalog = SemanticViewCatalog(Path("unused"), {0: tuple(views)}, "sha", 1, (), (0,), {0: tuple(segments)})
+    catalog = SemanticViewCatalog(Path("unused"), {0: tuple(views)}, "sha", 1, (), (0,), {0: tuple(segments)}, episode_domains={0: "real"})
     plan = semantic_relation_sampling_groups(
         catalog, [0], [0], state_instruction_matrix=matrix, phase_weights=PRESETS[preset]["state_weights"]
     )
@@ -191,7 +227,8 @@ def test_pull_joint_plus_full_mixes_independent_stages_only_into_diagonal_cells(
                                         frame_start=0, frame_stop=length, completion_frame=length-2),)
         segments[episode] = (SemanticSegment(phase, 0, length, 'independent_pull'),)
         offsets.append(offsets[-1] + length)
-    catalog = replace(catalog, episodes=episodes, segments=segments, selected_episodes=(0, 1, 2, 3))
+    catalog = replace(catalog, episodes=episodes, segments=segments, selected_episodes=(0, 1, 2, 3),
+                      episode_domains=dict.fromkeys(episodes, 'real'))
     plan = semantic_relation_sampling_groups(catalog, offsets[:-1], [0, 1, 2, 3],
                                             state_instruction_matrix=matrix)
     assert len(plan.frame_groups) == 6
@@ -252,8 +289,8 @@ def test_static_rejection_can_shrink_one_cell_without_changing_cell_prior():
     catalog = replace(catalog, static_first_action_frames=frozenset((0, frame) for frame in range(11, 40)))
     plan = semantic_relation_sampling_groups(catalog, [0], [0], state_instruction_matrix=matrix)
     sizes = {name: len(frames) for name, frames in zip(plan.names, plan.frame_groups, strict=True)}
-    assert sizes["handle_press/goal_approach/*"] == 53
-    assert sizes["handle_press/goal_open/*"] == 24
+    assert sizes["handle_press/goal_approach/real/*"] == 53
+    assert sizes["handle_press/goal_open/real/*"] == 24
     assert plan.group_weights == pytest.approx([1 / 9] * 9)
     priors = semantic_status_priors(catalog, {0: length}, action_horizon=1, relation_sampling=plan)
     assert priors["task_complete"] > 1 / 3  # Three always-complete cells plus active completion tails.
@@ -309,5 +346,5 @@ def test_completed_holds_are_not_removed_by_raw_interior_static_classification()
         interior_static_frames=list(range(11, 40)),
         interior_static_weight=0,
     )
-    approach = plan.names.index("handle_press/goal_approach/*")
+    approach = plan.names.index("handle_press/goal_approach/real/*")
     assert set(range(11, 40)).issubset(set(plan.frame_groups[approach]))

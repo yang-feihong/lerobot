@@ -143,7 +143,7 @@ semantic_view_kind_weights="{}"
 semantic_phases="[]"
 semantic_phase_weights="{}"
 semantic_source_weights="{}"
-semantic_domain_weights="{}"
+semantic_domain_weights="null"
 semantic_instruction_domain_weights="{}"
 # A mixture manifest describes source membership in a losslessly merged dataset:
 # {"sources":[
@@ -469,13 +469,10 @@ PYTHONPATH="${repo_root}/src${PYTHONPATH:+:${PYTHONPATH}}" python3 - "$semantic_
 import json
 import sys
 import math
-from lerobot.data_domains import validate_instruction_domain_weights
+from lerobot.data_domains import validate_domain_weights, validate_instruction_domain_weights
 
 domains = json.loads(sys.argv[6])
-if not isinstance(domains, dict) or set(domains) - {"simulation", "real"} or any(
-    isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in domains.values()
-) or (domains and not any(domains.values())):
-    raise SystemExit("--semantic-domain-weights requires finite non-negative simulation/real weights and positive total")
+validate_domain_weights(domains)
 if domains and not json.loads(sys.argv[2]):
     raise SystemExit("--semantic-domain-weights requires a state/instruction matrix")
 

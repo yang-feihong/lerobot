@@ -498,9 +498,14 @@ def semantic_relation_sampling_groups(
     """Choose a state/instruction cell first, independently of its eligible frame count."""
     phase_weights = phase_weights or dict.fromkeys(state_instruction_matrix, 1.0)
     source_weights = source_weights or {}
-    from lerobot.data_domains import validate_domain_weights, validate_instruction_domain_weights
+    from lerobot.data_domains import (
+        effective_domain_weights,
+        validate_domain_weights,
+        validate_instruction_domain_weights,
+    )
 
-    domain_weights = validate_domain_weights(domain_weights or {})
+    automatic_domains = domain_weights is None
+    domain_weights = effective_domain_weights(validate_domain_weights(domain_weights))
     instruction_domain_weights = validate_instruction_domain_weights(
         instruction_domain_weights or {}, domain_weights, state_instruction_matrix,
     )
@@ -574,7 +579,6 @@ def semantic_relation_sampling_groups(
             domain_masses = {
                 d: w for d, w in instruction_domain_weights.get(intent, enabled_domains).items() if w > 0
             } or {"*": 1.0}
-            domain_total = sum(domain_masses.values())
             available = [
                 (domain, source) for phase, goal, domain, source in pools
                 if phase == state and goal == intent
@@ -583,6 +587,10 @@ def semantic_relation_sampling_groups(
                 raise ValueError(
                     f"Configured state/instruction cell has no eligible samples: {state} x {intent}"
                 )
+            if automatic_domains and intent not in instruction_domain_weights:
+                present = {domain for domain, _ in available}
+                domain_masses = {domain: mass for domain, mass in domain_masses.items() if domain in present}
+            domain_total = sum(domain_masses.values())
             partitions = []
             for domain, domain_mass in domain_masses.items():
                 sources = sorted(source for d, source in available if d == domain)
