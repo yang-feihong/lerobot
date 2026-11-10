@@ -15,6 +15,7 @@ def test_snapshot_contains_domain_contract_and_resolves_outside_container(tmp_pa
     )
     paths = result.stdout.decode().split("\0")
     assert "src/lerobot/data_domains.py" in paths
+    assert "src/lerobot/common/distributed_preprocessing.py" in paths
     for name in paths:
         if not name or not (name.startswith("training_plan/") or name == "src/lerobot/data_domains.py"):
             continue

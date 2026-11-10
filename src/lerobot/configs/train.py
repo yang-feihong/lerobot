@@ -146,6 +146,27 @@ def is_training_loss_metadata_update(saved: dict[str, Any], current: dict[str, A
     return saved_schema in supported and current_schema in supported and saved == current
 
 
+def is_ee_supervision_metadata_update(saved: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Allow a source-only fork; tensor layout, anchors and all other I/O stay fixed."""
+    saved = json.loads(json.dumps(saved))
+    current = json.loads(json.dumps(current))
+    try:
+        old = saved['action'].get('ee_supervision_source', 'control_action')
+        new = current['action']['ee_supervision_source']
+        if old == new or {old, new} != {'control_action', 'recorded_action'}:
+            return False
+        saved['action']['ee_supervision_source'] = new
+        history = saved.get('memory', {}).get('action_history', {})
+        if history.get('enabled'):
+            expected = {'control_action': 'dataset_executed_command', 'recorded_action': 'dataset_recorded_command'}
+            if history['source_representation'] != expected[old]:
+                return False
+            history['source_representation'] = expected[new]
+        return saved == current
+    except (KeyError, TypeError):
+        return False
+
+
 @dataclass
 class MotionBalancedSamplingConfig:
     enabled: bool = False
@@ -459,7 +480,13 @@ class TrainPipelineConfig(HubMixin):
                     self.resume_with_updated_training_objective
                     and is_training_loss_metadata_update(saved_metadata, current_metadata)
                 )
-                if not metadata_matches and not task_status_extension and not training_loss_update:
+                source_update = (
+                    self.resume_with_updated_dataset
+                    and self.resume_with_updated_training_objective
+                    and not self.wandb.resume_training_run
+                    and is_ee_supervision_metadata_update(saved_metadata, current_metadata)
+                )
+                if not metadata_matches and not task_status_extension and not training_loss_update and not source_update:
                     raise ValueError("Resume checkpoint deployment metadata disagrees with policy config")
         if self.reward_model is not None:
             self.reward_model.pretrained_path = str(policy_dir)

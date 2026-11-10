@@ -34,6 +34,8 @@ def initialize_model_weights(policy, checkpoint, *, resume=False):
         "policy_tokenizer_sha256",
     )
     mismatches = [key for key in fields if source.get(key) != current.get(key)]
+    if source.get("ee_delta_reference", "current_state") != current.get("ee_delta_reference", "current_state"):
+        mismatches.append("ee_delta_reference")
     source_history = source.get("action_history_enabled", False)
     target_history = current.get("action_history_enabled", False)
     if source_history and not target_history:
@@ -49,8 +51,10 @@ def initialize_model_weights(policy, checkpoint, *, resume=False):
                 action_history_feature_names=config.get("action_history_feature_names"),
                 dataset_action_feature_names=config.get("dataset_action_feature_names"),
                 max_action_history_dim=capacity,
+                ee_supervision_source=config.get("ee_supervision_source", "control_action"),
             ))[0]
-            return names, capacity, config.get("action_history_ee_semantics") or "legacy_control_v0"
+            return (names, capacity, config.get("action_history_ee_semantics") or "legacy_control_v0",
+                    config.get("ee_supervision_source", "control_action"))
 
         if history_identity(source) != history_identity(current):
             mismatches.append("action_history_schema")

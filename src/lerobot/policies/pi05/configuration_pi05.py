@@ -91,6 +91,8 @@ class PI05Config(PreTrainedConfig):
     state_use_b2_angular_velocity: bool = False
     b2_action_representation: str = "velocity"  # "velocity" or "pose_delta"
     z1_action_representation: str = "ee_delta"  # "ee_delta" or "ee_state_delta"
+    # Fixed-anchor ee_state_delta only: use the last model-visible history command.
+    ee_delta_reference: str = "current_state"  # or "previous_command"
     # None preserves historical checkpoint loading. Fresh training resolves it to physical.
     model_ee_frame: str | None = None
     ee_delta_rotation_representation: str = "rot6d"  # "rot6d" or "rotvec"
@@ -114,6 +116,8 @@ class PI05Config(PreTrainedConfig):
     semantic_view_kind_weights: dict[str, float] = field(default_factory=dict)
     discrete_action_training_mode: str = "continuous_flow"
     ee_target_dataset_semantics: str = "joint_control_inactive_interpolated"
+    # Shared by future supervision and historical command inputs.
+    # recorded_action selects stored action[5:14], not necessarily raw VR.
     ee_supervision_source: str = "control_action"
     ee_state_anchor_indices: list[int] | None = None
     ee_delta_supervision_mode: str = "all"
@@ -376,7 +380,7 @@ class PI05Config(PreTrainedConfig):
                 "ee_target_dataset_semantics must be 'joint_control_inactive_interpolated', got "
                 f"{self.ee_target_dataset_semantics!r}"
             )
-        if self.ee_supervision_source != "control_action":
+        if self.ee_supervision_source not in {"control_action", "recorded_action"}:
             raise ValueError(f"Unsupported ee_supervision_source: {self.ee_supervision_source!r}")
         if self.ee_delta_supervision_mode not in {"active_only", "all"}:
             raise ValueError(
@@ -542,6 +546,18 @@ class PI05Config(PreTrainedConfig):
             raise ValueError("action_history_enabled requires state_action_encoding='continuous'")
         if self.action_history_enabled and self.state_num_frames < 2:
             raise ValueError("action_history_enabled requires state_num_frames >= 2")
+        if self.ee_delta_reference not in {"current_state", "previous_command"}:
+            raise ValueError(f"Unsupported ee_delta_reference: {self.ee_delta_reference!r}")
+        if self.ee_delta_reference == "previous_command":
+            if not self.action_history_enabled:
+                raise ValueError("previous_command EE reference requires action_history_enabled=true")
+            if self.z1_action_representation != "ee_state_delta" or not self.action_predict_ee_pose:
+                raise ValueError("previous_command EE reference requires ee_state_delta with EE output")
+            from .action_history import action_history_schema
+            from .b2_action_transform import DATASET_ACTION_NAMES
+
+            if not set(DATASET_ACTION_NAMES[5:14]).issubset(action_history_schema(self)[0]):
+                raise ValueError("previous_command EE reference requires all 9 EE history features")
         if self.action_history_enabled:
             from .action_history import RESET_TARGET_NAMES, action_history_schema
 
@@ -873,17 +889,26 @@ class PI05Config(PreTrainedConfig):
                     else "body_twist_command_at_each_future_step"
                 ),
                 "ee_delta_reference": (
-                    "inference_time_measured_height_invariant_ee_state"
+                    ("inference_time_measured_height_invariant_ee_state"
+                     if self.ee_delta_reference == "current_state"
+                     else "last_visible_history_ee_command_or_measured_state")
                     if self.z1_action_representation == "ee_state_delta"
-                    else "previous_joint_control_height_invariant_ee_target_for_each_step"
+                    else (
+                        "previous_joint_control_height_invariant_ee_target_for_each_step"
+                        if self.ee_supervision_source == "control_action"
+                        else "previous_recorded_height_invariant_ee_target_for_each_step"
+                    )
                 ),
                 "ee_deployment_anchor": (
-                    "actual_ee_state_at_source_step"
+                    ("actual_ee_state_at_source_step" if self.ee_delta_reference == "current_state"
+                     else "last_visible_history_ee_command_or_measured_state")
                     if self.z1_action_representation == "ee_state_delta"
                     else "executed_ee_target_at_source_step"
                 ),
                 "ee_rtc_prefix_reanchor": (
-                    "old_anchor_targets_to_current_actual_ee_state"
+                    ("old_anchor_targets_to_current_actual_ee_state"
+                     if self.ee_delta_reference == "current_state"
+                     else "old_anchor_targets_to_last_visible_history_command_or_measured_state")
                     if self.z1_action_representation == "ee_state_delta"
                     else None
                 ),
@@ -1017,7 +1042,8 @@ class PI05Config(PreTrainedConfig):
                         state_history_interval if self.action_history_enabled else None
                     ),
                     "source_representation": (
-                        "dataset_executed_command" if self.action_history_enabled else None
+                        ("dataset_executed_command" if self.ee_supervision_source == "control_action"
+                         else "dataset_recorded_command") if self.action_history_enabled else None
                     ),
                     "includes_current_supervision": False,
                 },

@@ -1,7 +1,7 @@
 import json
 import time
 from io import BytesIO
-from threading import Event, Lock, Thread, get_ident
+from threading import Condition, Event, Lock, Thread, get_ident
 from types import SimpleNamespace
 
 import numpy as np
@@ -30,7 +30,6 @@ from lerobot.scripts.pi05_vla_server import (
     PROTOCOL_VERSION,
     ActionRecord,
     AsyncRTCPolicy,
-    ImagePacket,
     _apply_completion_stop,
     _b2_velocity_smoothing_transition_step,
     _camera_bindings,
@@ -125,6 +124,7 @@ def test_prepared_image_window_is_consumed_without_sampling_or_cache():
     import cv2
     base = [cv2.imencode(".jpg", np.full((8, 8, 3), color, dtype=np.uint8))[1] for color in (10, 80)]
     engine = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    engine._image_inputs = None
     engine.state_num_frames = 1
     engine.source_state_names = ("state",)
     engine.mem_image_num_frames = 3
@@ -137,7 +137,7 @@ def test_prepared_image_window_is_consumed_without_sampling_or_cache():
         [(base[0], base[0]), (base[0], base[0]), (base[1], base[1])], [0, 0, 5], [True, False, False], 5)
     packet = SimpleNamespace(sim_step=5, task="Open the door.", input_schema="test",
         prepared_state=np.zeros((1, 1), dtype=np.float32), prepared_state_is_pad=np.zeros(1, dtype=np.bool_),
-        model_image_history=snapshot)
+        model_image_history=snapshot, base_jpeg=base[1], wrist_jpeg=base[1], decoded_images=None)
     batch = engine._make_batch(packet)
     assert batch.model_image_history == snapshot
     assert batch[engine.base_camera_key + "_is_pad"].tolist() == [[True, False, False]]
@@ -155,10 +155,11 @@ def test_prepared_image_window_is_consumed_without_sampling_or_cache():
 def test_active_only_history_requires_and_transports_feature_validity_mask(monkeypatch, semantics):
     import lerobot.scripts.pi05_vla_server as server_module
 
-    monkeypatch.setattr(server_module, "_decode_model_image_history", lambda *args, **kwargs:
-        ([SimpleNamespace(base_jpeg=b"", wrist_jpeg=b"")], torch.zeros(1, 1, dtype=torch.bool)))
-    monkeypatch.setattr(server_module, "_decode_jpeg", lambda *args: np.zeros((2, 2, 3), dtype=np.uint8))
+    monkeypatch.setattr(server_module, "_validated_model_image_history", lambda *args, **kwargs:
+        ([SimpleNamespace(base_jpeg=np.empty(0, dtype=np.uint8), wrist_jpeg=np.empty(0, dtype=np.uint8))], np.zeros(1, dtype=np.bool_)))
+    monkeypatch.setattr(server_module, "_decode_jpeg", lambda *args, **kwargs: np.zeros((2, 2, 3), dtype=np.uint8))
     engine = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    engine._image_inputs = None
     engine.state_num_frames = 3
     engine.source_state_names = ("state",)
     engine.action_history_enabled = True
@@ -168,7 +169,8 @@ def test_active_only_history_requires_and_transports_feature_validity_mask(monke
     engine.mem_enabled = False
     engine.base_camera_key, engine.wrist_camera_key = "base", "wrist"
     engine.input_spec = lambda: {"schema_id": "test"}
-    packet = SimpleNamespace(input_schema="test", prepared_state=np.zeros((3, 1)),
+    packet = SimpleNamespace(input_schema="test", decoded_images=None, base_jpeg=np.empty(0, dtype=np.uint8),
+        wrist_jpeg=np.empty(0, dtype=np.uint8), prepared_state=np.zeros((3, 1)),
         prepared_state_is_pad=np.zeros(3, dtype=np.bool_), prepared_action_history=np.ones((2, 13)),
         prepared_action_history_is_pad=np.zeros(2, dtype=np.bool_),
         prepared_action_history_feature_is_pad=None, sim_step=4, task="test", model_image_history=b"")
@@ -190,6 +192,7 @@ def test_real_robot_jpeg_roles_reach_metadata_model_slots(wrist_first):
     keys = [wrist_key, base_key] if wrist_first else [base_key, wrist_key]
     jpeg = lambda value: cv2.imencode(".jpg", np.full((224, 224, 3), value, dtype=np.uint8))[1]
     engine = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    engine._image_inputs = None
     engine.state_num_frames = 1
     engine.source_state_names = ("state",)
     engine.mem_image_num_frames = 1
@@ -198,7 +201,8 @@ def test_real_robot_jpeg_roles_reach_metadata_model_slots(wrist_first):
     engine.input_spec = lambda: {"schema_id": "test"}
     packet = SimpleNamespace(sim_step=0, task="test", input_schema="test",
         prepared_state=np.zeros((1, 1), dtype=np.float32), prepared_state_is_pad=np.zeros(1, dtype=np.bool_),
-        model_image_history=_prepared_images(base_key, wrist_key, [(jpeg(0), jpeg(255))], [0], [False], 0))
+        model_image_history=_prepared_images(base_key, wrist_key, [(jpeg(0), jpeg(255))], [0], [False], 0),
+        base_jpeg=jpeg(0), wrist_jpeg=jpeg(255), decoded_images=None)
     batch = engine._make_batch(packet)
     policy = PI05Policy.__new__(PI05Policy)
     torch.nn.Module.__init__(policy)
@@ -258,7 +262,7 @@ def test_inference_worker_immediately_consumes_an_observation_waiting_in_the_mai
     policy._mailbox = None
     policy._mailbox_version = 0
     policy._last_inferred_version = 0
-    policy._records_lock = Lock()
+    policy._records_lock = Condition()
     policy._records = {}
     policy._latest_record = None
     policy._inference_count = 0
@@ -711,7 +715,8 @@ def test_b2_rtc_pose_delta_prefix_is_reexpressed_in_new_inference_frame() -> Non
 
 
 
-def test_z1_state_delta_rtc_prefix_is_reexpressed_from_current_actual_state() -> None:
+@pytest.mark.parametrize("reference", ["current_state", "previous_command"])
+def test_z1_state_delta_rtc_prefix_is_reexpressed_from_selected_reference(reference) -> None:
     model_names = (*B2_EXECUTION_VELOCITY_NAMES, *EE_DELTA_ROTVEC_NAMES, *EE_DELTA_ACTION_NAMES[6:9])
     policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
     policy._action_unnormalizer = lambda transition: transition
@@ -719,6 +724,8 @@ def test_z1_state_delta_rtc_prefix_is_reexpressed_from_current_actual_state() ->
     policy.b2_action_representation = "velocity"
     policy.b2_execution_mode = "velocity_chunk"
     policy.z1_action_representation = "ee_state_delta"
+    policy.ee_delta_reference = reference
+    policy.ee_history_anchor_indices = tuple(range(9))
     policy.model_action_names = model_names
     prefix = torch.zeros(2, len(model_names))
     prefix[:, model_names.index("height_invariant_ee_delta_x")] = torch.tensor([1.0, 2.0])
@@ -729,11 +736,31 @@ def test_z1_state_delta_rtc_prefix_is_reexpressed_from_current_actual_state() ->
     rebased = policy._reanchor_rtc_prefix(
         prefix,
         SimpleNamespace(ee_anchor=old_anchor),
-        SimpleNamespace(actual_ee_state=new_anchor),
+        SimpleNamespace(actual_ee_state=new_anchor if reference == "current_state" else old_anchor,
+                        prepared_action_history=new_anchor[None],
+                        prepared_action_history_is_pad=np.zeros(1, dtype=bool),
+                        prepared_action_history_feature_is_pad=np.zeros((1, 9), dtype=bool)),
     )
 
     x_index = model_names.index("height_invariant_ee_delta_x")
     torch.testing.assert_close(rebased[:, x_index], torch.tensor([0.5, 1.5]))
+
+
+@pytest.mark.parametrize("padding,feature_padding", [(False, False), (True, False), (False, True)])
+def test_command_anchor_falls_back_when_last_input_slot_is_unavailable(padding, feature_padding):
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.z1_action_representation = "ee_state_delta"
+    policy.ee_delta_reference = "previous_command"
+    policy.ee_history_anchor_indices = tuple(range(9))
+    actual = np.array([1., 0., 0., 0., 1., 0., .3, .4, .5], dtype=np.float32)
+    command = actual.copy()
+    command[-3:] += .2
+    packet = SimpleNamespace(actual_ee_state=actual, prepared_action_history=command[None],
+                             prepared_action_history_is_pad=np.array([padding]),
+                             prepared_action_history_feature_is_pad=np.full((1, 9), feature_padding))
+    kind, anchor = policy._ee_anchor(packet)
+    assert kind == ("actual_ee_state" if padding or feature_padding else "history_ee_command")
+    np.testing.assert_array_equal(anchor, actual if padding or feature_padding else command)
 
 
 def test_rtc_reanchor_skips_coupled_b2_group_with_degenerate_quantile_scale() -> None:
@@ -760,6 +787,7 @@ def test_rtc_reanchor_skips_coupled_b2_group_with_degenerate_quantile_scale() ->
     policy._action_normalizer = NormalizerProcessorStep(**processor_kwargs)
     policy.b2_action_representation = "pose_delta"
     policy.z1_action_representation = "ee_state_delta"
+    policy.ee_delta_reference = "current_state"
     policy.model_action_names = model_names
     prefix = torch.zeros((2, len(model_names)))
     prefix[:, :3] = -1.0
@@ -1042,10 +1070,11 @@ def test_continuous_ee_schema_defaults_missing_arm_modes_to_active() -> None:
 
 
 @pytest.mark.parametrize(
-    ("z1_representation", "expected_anchor_kind", "expected_anchor"),
+    ("z1_representation", "ee_reference", "expected_anchor_kind", "expected_anchor"),
     [
-        ("ee_delta", "executed_ee_target", np.zeros(9, dtype=np.float32)),
-        ("ee_state_delta", "actual_ee_state", np.ones(9, dtype=np.float32)),
+        ("ee_delta", "current_state", "executed_ee_target", np.zeros(9, dtype=np.float32)),
+        ("ee_state_delta", "current_state", "actual_ee_state", np.ones(9, dtype=np.float32)),
+        ("ee_state_delta", "previous_command", "history_ee_command", np.full(9, 2., dtype=np.float32)),
     ],
 )
 @pytest.mark.parametrize("rtc_mode", ["inference", "training"])
@@ -1053,6 +1082,7 @@ def test_continuous_ee_schema_defaults_missing_arm_modes_to_active() -> None:
 @pytest.mark.parametrize("selector_enabled", [False, True])
 def test_infer_records_model_action_names_and_source_step_anchor(
     z1_representation: str,
+    ee_reference: str,
     expected_anchor_kind: str,
     expected_anchor: np.ndarray,
     rtc_mode: str,
@@ -1081,7 +1111,7 @@ def test_infer_records_model_action_names_and_source_step_anchor(
         actions = torch.zeros((1, 2, len(model_names)))
         return (actions, torch.tensor([[0, 2]])) if selector_enabled else actions
 
-    policy.policy = SimpleNamespace(predict_action_chunk=predict)
+    policy.policy = SimpleNamespace(predict_action_chunk=predict, predict_action_chunk_in_eval=predict)
     raw_batch = _RecordedImageBatch()
     raw_batch.model_image_history = b"selected-image-window"
     policy._make_batch = lambda _packet: raw_batch
@@ -1095,6 +1125,8 @@ def test_infer_records_model_action_names_and_source_step_anchor(
     policy.gripper_negative_value = -1.0471976
     policy.gripper_nonnegative_value = 0.0
     policy.z1_action_representation = z1_representation
+    policy.ee_delta_reference = ee_reference
+    policy.ee_history_anchor_indices = tuple(range(9))
     policy.b2_action_representation = "velocity"
     policy.b2_execution_mode = "velocity_chunk"
     policy.action_names = EXECUTION_ACTION_NAMES
@@ -1118,6 +1150,9 @@ def test_infer_records_model_action_names_and_source_step_anchor(
             source_steps_per_wall_second=50.0,
             executed_ee_target=np.zeros(9, dtype=np.float32),
             actual_ee_state=np.ones(9, dtype=np.float32),
+            prepared_action_history=np.full((1, 9), 2., dtype=np.float32),
+            prepared_action_history_is_pad=np.zeros(1, dtype=bool),
+            prepared_action_history_feature_is_pad=np.zeros((1, 9), dtype=bool),
             state_names=B2_GLOBAL_POSE_NAMES,
             state=np.asarray([1.0, 2.0, 0.3], dtype=np.float32),
         )
@@ -1171,7 +1206,7 @@ def test_completion_stops_motion_at_the_first_true_row() -> None:
 
 def _completion_engine(enabled):
     policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
-    policy._records_lock = Lock()
+    policy._records_lock = Condition()
     policy._mailbox_condition = __import__("threading").Condition()
     actions = torch.zeros((3, len(EXECUTION_ACTION_NAMES)))
     actions[1, EXECUTION_ACTION_NAMES.index("task_complete")] = 1.0
@@ -1271,12 +1306,45 @@ def test_http_direct_inference_and_async_submission_share_complete_packet(model_
     engine.submit.assert_called_once()
     with request.urlopen(url + "/v1/actions?after=0") as response:
         assert response.status == 204
+    with request.urlopen(url + "/v1/actions?after=2&wait_ms=20") as response:
+        assert response.status == 204
+    engine.latest_after.assert_called_with(2, 20)
     with request.urlopen(url + "/v1/schema") as response:
         schema = json.load(response)
         assert schema["protocol_version"] == PROTOCOL_VERSION
         assert schema["output"]["chunk_size"] == 50
         assert schema["output"]["action_names"] == list(EXECUTION_ACTION_NAMES)
         assert schema["endpoints"]["infer"] == "/v1/infer"
+
+
+def test_http_array_wire_and_keepalive(model_http):
+    import http.client
+    from urllib.parse import urlsplit
+    from lerobot.scripts.pi05_array_wire import CONTENT_TYPE, dump_arrays as encode_wire
+    from lerobot.scripts.pi05_npz import load_arrays
+    url, engine = model_http
+    target = urlsplit(url)
+    connection = http.client.HTTPConnection(target.hostname, target.port, timeout=2)
+    payload = encode_wire(load_arrays(_complete_packet()))
+    try:
+        connection.request("POST", "/v1/observations", body=payload, headers={"Content-Type": CONTENT_TYPE})
+        response = connection.getresponse()
+        assert response.status == 202
+        response.read()
+        stream = connection.sock
+        connection.request("GET", "/v1/actions?after=0&wait_ms=20")
+        response = connection.getresponse()
+        assert response.status == 204
+        response.read()
+        assert connection.sock is stream
+        broken = bytearray(payload); broken[-1] ^= 1
+        connection.request("POST", "/v1/observations", body=bytes(broken), headers={"Content-Type": CONTENT_TYPE})
+        response = connection.getresponse()
+        assert response.status == 400 and response.will_close
+        response.read()
+        engine.submit.assert_called_once()
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize("path,body,content_type,status,code", [

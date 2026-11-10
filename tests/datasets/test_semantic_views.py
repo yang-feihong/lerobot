@@ -186,6 +186,8 @@ def _batch():
     action[..., 14] = -1.047
     action[:, 0, 16:25] = torch.arange(9)
     action[:, 1:, 16:25] = 99.0
+    action[:, 0, 5:14] = torch.arange(9) + 10
+    action[:, 1:, 5:14] = 199.0
     return {
         ACTION: action,
         "episode_index": torch.tensor([0]),
@@ -208,8 +210,23 @@ def test_complete_view_materializes_hold_without_masking_action(tmp_path):
     assert torch.equal(batch[ACTION][0, :, 3], torch.ones(4))
     assert torch.equal(batch[ACTION][0, :, 4], torch.zeros(4))
     assert torch.equal(batch[ACTION][0, :, 16:25], torch.arange(9).repeat(4, 1))
+    assert torch.equal(batch[ACTION][0, :, 5:14], (torch.arange(9) + 10).repeat(4, 1))
     assert torch.equal(batch[ACTION][0, :, 15], torch.ones(4))
     assert torch.equal(batch[TASK_BLOCKED_KEY], torch.zeros((1, 4)))
+
+
+def test_completion_tail_holds_each_ee_source_independently():
+    from lerobot.datasets.semantic_views import _hold_action_tail
+
+    action = _batch()[ACTION][0]
+    action[1, 5:14] = 7.0
+    action[1, 16:25] = 8.0
+    before = action.clone()
+    held = _hold_action_tail(action, 2)
+    torch.testing.assert_close(held[:2], before[:2])
+    torch.testing.assert_close(held[2:, 5:14], torch.full((2, 9), 7.0))
+    torch.testing.assert_close(held[2:, 16:25], torch.full((2, 9), 8.0))
+    torch.testing.assert_close(action, before)
 
 
 def test_blocked_and_complete_are_mutually_exclusive(tmp_path):

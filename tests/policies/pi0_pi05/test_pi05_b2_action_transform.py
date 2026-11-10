@@ -129,11 +129,16 @@ def test_encode_ee_state_delta_uses_50_targets_and_one_measured_anchor():
     torch.testing.assert_close(encoded[0, :, 8], torch.arange(50, dtype=torch.float32) * 0.01)
 
 
-def test_processor_reads_ee_state_anchor_without_using_it_as_supervision():
+@pytest.mark.parametrize("source,expected", [
+    ("control_action", [0.2, 0.4]), ("recorded_action", [0.6, 0.8]),
+])
+def test_processor_reads_ee_state_anchor_without_using_it_as_supervision(source, expected):
     identity = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
     action = torch.zeros(1, 2, 25)
     action[..., 16:22] = identity
     action[0, :, 22] = torch.tensor([1.2, 1.4])
+    action[..., 5:11] = identity
+    action[0, :, 11] = torch.tensor([1.6, 1.8])
     state = torch.zeros(1, 58)
     state[..., 49:55] = identity
     state[..., 55] = 1.0
@@ -142,7 +147,7 @@ def test_processor_reads_ee_state_anchor_without_using_it_as_supervision():
         representation="velocity",
         z1_representation="ee_state_delta",
         ee_delta_rotation_representation="rotvec",
-        ee_supervision_source="control_action",
+        ee_supervision_source=source,
         ee_state_anchor_indices=tuple(range(49, 58)),
     )
     transformed = step(
@@ -152,7 +157,7 @@ def test_processor_reads_ee_state_anchor_without_using_it_as_supervision():
             TransitionKey.COMPLEMENTARY_DATA: {f"{ACTION}_is_pad": torch.zeros(1, 2, dtype=torch.bool)},
         }
     )[TransitionKey.ACTION]
-    torch.testing.assert_close(transformed[0, :, 8], torch.tensor([0.2, 0.4]))
+    torch.testing.assert_close(transformed[0, :, 8], torch.tensor(expected))
 
 
 @pytest.mark.parametrize("b2_representation", ["velocity", "pose_delta"])
@@ -248,15 +253,20 @@ def test_ee_delta_padding_requires_both_adjacent_targets():
     assert transformed[TransitionKey.COMPLEMENTARY_DATA][f"{ACTION}_is_pad"].tolist() == [[False, True]]
 
 
-def test_extended_action_supervision_selects_joint_control_ee_without_leaking_extra_dimensions():
+@pytest.mark.parametrize("source,value", [("control_action", 3.0), ("recorded_action", -1.0)])
+def test_extended_action_supervision_selects_ee_without_leaking_extra_dimensions(source, value):
     action = torch.zeros(1, 2, 25)
     action[..., 5:14] = -1.0
     action[..., 16:25] = 3.0
 
-    selected = select_dataset_action_supervision(action, source="control_action")
+    before = action.clone()
+    selected = select_dataset_action_supervision(action, source=source)
 
     assert selected.shape == (1, 2, 16)
-    torch.testing.assert_close(selected[..., 5:14], torch.full((1, 2, 9), 3.0))
+    torch.testing.assert_close(selected[..., 5:14], torch.full((1, 2, 9), value))
+    torch.testing.assert_close(selected[..., :5], action[..., :5])
+    torch.testing.assert_close(selected[..., 14:16], action[..., 14:16])
+    torch.testing.assert_close(action, before)
 
 
 def test_execution_action_names_accept_control_storage_schema():

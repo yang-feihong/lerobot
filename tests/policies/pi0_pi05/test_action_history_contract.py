@@ -32,9 +32,10 @@ def config(**kwargs):
 
 
 @pytest.mark.parametrize("extra,reorder", [(0, False), (4, False), (7, True)])
+@pytest.mark.parametrize("ee_source", ["control_action", "recorded_action"])
 @pytest.mark.parametrize("predict_complete,predict_ee", [(True, True), (False, True), (False, False)])
 def test_named_selection_stats_and_projection_ignore_output_dimensions(
-    extra, reorder, predict_complete, predict_ee
+    extra, reorder, predict_complete, predict_ee, ee_source
 ):
     source = list(CONTROL_EXTENDED_DATASET_ACTION_NAMES) + [f"future_command_{i}" for i in range(extra)]
     if reorder:
@@ -43,6 +44,7 @@ def test_named_selection_stats_and_projection_ignore_output_dimensions(
         dataset_action_feature_names=source,
         action_predict_task_complete=predict_complete,
         action_predict_ee_pose=predict_ee,
+        ee_supervision_source=ee_source,
     )
     cfg.max_action_dim = 3  # The output padding capacity is NOT the history capacity.
     names, indices, size = action_history_schema(cfg)
@@ -50,7 +52,8 @@ def test_named_selection_stats_and_projection_ignore_output_dimensions(
     assert "arm_teleop_inactive" not in names
     assert "arm_reset" not in names
     assert "task_complete" not in names
-    assert source[indices[names.index("height_invariant_ee_x")]] == "control_height_invariant_ee_x"
+    prefix = "control_" if ee_source == "control_action" else ""
+    assert source[indices[names.index("height_invariant_ee_x")]] == prefix + "height_invariant_ee_x"
     low = torch.arange(size, dtype=torch.float32)
     stats = {"action": {"q01": low, "q99": low + 2, "count": torch.tensor([50])}}
     split, normalizer = _action_history_steps(cfg, stats)

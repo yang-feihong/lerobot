@@ -1,0 +1,24 @@
+{
+  "format": "lerobot.training_jobs",
+  "version": 1,
+  "jobs": {
+    "all_pull_joint_plus_full_raw_latest_fork_100k": {
+      "data_recipe": "all_pull_door__e3b168eb8387e0540495",
+      "dataset_artifact_id": "d712de6533eacdf122063eaae4c4cec70a6539cefd9ea34a987953e85d659f0a",
+      "training_preset": "three_stage_plus_full",
+      "domain_weights": {"simulation": 3, "real": 1},
+      "instruction_domain_weights": {"full_episode_command": {"simulation": 1}},
+      "train_steps": 100000,
+      "reset_preset_sidecar": "/data/datasets/b2_z1/supervision/all_pull_door--d712de6533eacdf122063eaae4c4cec70a6539cefd9ea34a987953e85d659f0a/reset_presets.json",
+      "resources": {"node": "wb1", "gpu_ids": [0, 1, 2, 3], "main_process_port": 29531}
+    },
+    "all_push_joint_plus_full_raw_latest_fork_100k": {
+      "data_recipe": "all_push_door__444aae6792e4d2e2c05f",
+      "dataset_artifact_id": "f711860ca7352dfebdd7832281f50ca671809f12e92d40a359f0642ea2597d90",
+      "training_preset": "three_stage_plus_full",
+      "train_steps": 100000,
+      "reset_preset_sidecar": "/data/datasets/b2_z1/supervision/all_push_door--f711860ca7352dfebdd7832281f50ca671809f12e92d40a359f0642ea2597d90/reset_presets.json",
+      "resources": {"node": "wb6", "gpu_ids": [0, 1, 2, 3], "main_process_port": 29532}
+    }
+  }
+}

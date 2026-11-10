@@ -42,6 +42,7 @@ from termcolor import colored
 from torch.optim import Optimizer
 from tqdm import tqdm
 
+from lerobot.common.distributed_preprocessing import run_main_process_preprocessing
 from lerobot.common.train_utils import (
     gather_fsdp_state_dicts,
     get_step_checkpoint_dir,
@@ -1314,10 +1315,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        # Computing exact transformed-action statistics is intentionally done on rank 0 only.
-        # Large semantic mixtures can take longer than torch.distributed's 10-minute default,
-        # while the remaining ranks wait at the following barrier.  Keep that legitimate
-        # preprocessing phase from being mistaken for a deadlocked collective.
+        # Long CPU-only statistics use a separate Gloo group below; this remains
+        # the timeout for actual training collectives.
         process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=2))
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when the active config's device is set to CPU (works for both policy and reward model training).
@@ -1677,7 +1676,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         and policy.config.z1_action_representation in {"ee_delta", "ee_state_delta"}
     ):
         output_stats_path = cfg.output_dir / PI05_TRANSFORMED_ACTION_STATS_NAME
-        if is_main_process:
+        def measure_and_save_transformed_action_stats():
             logging.info("Traversing continuous episodes for exact transformed-action statistics")
             measured_action_stats_payload = compute_transformed_action_stats(
                 dataset,
@@ -1701,7 +1700,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 saved_action_stats_payload = load_transformed_action_stats(resume_stats_path)
                 if cfg.resume_with_updated_dataset:
                     schema_matches = transformed_action_schemas_equal(
-                        saved_action_stats_payload, measured_action_stats_payload
+                        saved_action_stats_payload, measured_action_stats_payload,
+                        allow_ee_source_update=(cfg.resume_with_updated_training_objective and not cfg.wandb.resume_training_run),
                     )
                     task_complete_extension = is_task_status_schema_extension(
                         saved_action_stats_payload, measured_action_stats_payload
@@ -1742,7 +1742,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 counts["all_transitions"],
                 transformed_action_stats_ee_valid_count(transformed_action_stats_payload),
             )
-        accelerator.wait_for_everyone()
+            return transformed_action_stats_payload
+
+        transformed_action_stats_payload = run_main_process_preprocessing(
+            measure_and_save_transformed_action_stats
+        )
         if not is_main_process:
             transformed_action_stats_payload = load_transformed_action_stats(output_stats_path)
             validate_transformed_action_stats(transformed_action_stats_payload, dataset, policy.config)
@@ -1993,10 +1997,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         if cfg.motion_balanced_sampling.enabled:
             if not isinstance(active_cfg, PI05Config):
                 raise ValueError("Motion-balanced sampling currently requires a PI0.5 policy")
-            if active_cfg.ee_supervision_source != "control_action":
-                raise ValueError(
-                    "Motion-balanced sampling requires a continuous height-invariant EE supervision trajectory"
-                )
             from lerobot.policies.pi05.b2_action_transform import action_sample_offsets
 
             offsets = action_sample_offsets(
@@ -2009,6 +2009,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if is_main_process:
                 pool = build_motion_priority_pool(
                     dataset,
+                    ee_supervision_source=active_cfg.ee_supervision_source,
                     horizon_frames=int(offsets[-1]),
                     translation_threshold_m=motion_cfg.ee_translation_threshold_m,
                     rotation_threshold_rad=motion_cfg.ee_rotation_threshold_rad,

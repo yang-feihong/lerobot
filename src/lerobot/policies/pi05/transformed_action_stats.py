@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from lerobot.datasets.semantic_views import (
 )
 from lerobot.utils.constants import ACTION, OBS_STATE
 
+from .action_history import command_reference_anchor
 from .b2_action_transform import (
     ARM_TELEOP_INACTIVE_NAME,
     TASK_BLOCKED_NAME,
@@ -93,7 +95,7 @@ def is_task_complete_schema_extension(saved: dict[str, Any], measured: dict[str,
     )
 
 
-def transformed_action_schemas_equal(saved: dict[str, Any], measured: dict[str, Any]) -> bool:
+def transformed_action_schemas_equal(saved: dict[str, Any], measured: dict[str, Any], *, allow_ee_source_update: bool = False) -> bool:
     """Compare schemas after the explicit pre-task-blocked metadata migration."""
     saved_schema = dict(saved["schema"])
     measured_schema = dict(measured["schema"])
@@ -101,6 +103,13 @@ def transformed_action_schemas_equal(saved: dict[str, Any], measured: dict[str, 
     measured_schema.setdefault("model_ee_frame", "legacy")
     saved_schema.setdefault("include_task_blocked", False)
     measured_schema.setdefault("include_task_blocked", False)
+    if allow_ee_source_update:
+        old = saved_schema.get('ee_supervision_source', 'control_action')
+        new = measured_schema.get('ee_supervision_source', 'control_action')
+        if old not in {'control_action', 'recorded_action'} or new not in {'control_action', 'recorded_action'}:
+            return False
+        saved_schema['ee_supervision_source'] = new
+        measured_schema['ee_supervision_source'] = new
     return saved_schema == measured_schema
 
 
@@ -140,6 +149,11 @@ def validate_transformed_action_stats(payload: dict[str, Any], dataset, config) 
                 f"saved={dataset_record.get(key)!r}, current={expected!r}"
             )
     saved_schema = payload["schema"]
+    reference = getattr(config, "ee_delta_reference", "current_state")
+    if saved_schema.get("ee_delta_reference", "current_state") != reference:
+        raise ValueError("Transformed-action statistics EE delta reference mismatch")
+    if reference == "previous_command" and saved_schema.get("ee_reference_history_stride") != config.state_history_frame_stride:
+        raise ValueError("Transformed-action statistics EE reference sampling interval mismatch")
     adapter = getattr(getattr(dataset, "reader", None), "ee_frame_adapter", None)
     saved_frame_hash = payload["dataset"].get("ee_frames_sha256")
     if saved_frame_hash is not None and (adapter is None or saved_frame_hash != adapter.metadata_sha256):
@@ -381,7 +395,10 @@ def compute_transformed_action_stats(
                 values_by_dimension[index].append(selected.astype(np.float32, copy=False))
                 counts_by_dimension[index] += selected.size
 
-    for episode_index, frame_indices, actions_np, states_np in _episode_arrays(dataset):
+    for processed, (episode_index, frame_indices, actions_np, states_np) in enumerate(_episode_arrays(dataset), 1):
+        if processed == 1 or processed % 500 == 0:
+            logging.info("Transformed-action statistics: episode %d/%d, accumulated %d window points",
+                         processed, dataset.num_episodes, total_transitions)
         adapter = getattr(getattr(dataset, "reader", None), "ee_frame_adapter", None)
         if adapter is not None:
             actions_np = adapter.feature(actions_np, ACTION, episode_index)
@@ -429,6 +446,16 @@ def compute_transformed_action_stats(
                     if states_np is None or not config.ee_state_anchor_indices:
                         raise ValueError("ee_state_delta statistics require resolved EE state indices")
                     ee_state_anchor = torch.from_numpy(states_np[starts][:, config.ee_state_anchor_indices])
+                    if getattr(config, "ee_delta_reference", "current_state") == "previous_command":
+                        previous = starts - config.state_history_frame_stride
+                        historical = select_dataset_action_supervision(
+                            torch.from_numpy(actions_np[np.maximum(previous, 0)]),
+                            source=config.ee_supervision_source,
+                        )
+                        valid = torch.from_numpy(previous >= 0)
+                        if config.action_history_ee_semantics in {"active_only_v1", "mode_reset_target_v2"}:
+                            valid = valid & (historical[:, 3:5] < .5).all(dim=-1)
+                        ee_state_anchor = command_reference_anchor(ee_state_anchor, historical[:, 5:14], valid)
                 transformed = encode_b2_action_chunk(
                     raw,
                     dt=float(config.action_dt_seconds),
@@ -484,6 +511,7 @@ def compute_transformed_action_stats(
             f"counts={counts_by_dimension.tolist()}"
         )
 
+    logging.info("Transformed-action statistics: traversal complete, reducing %d window points", total_transitions)
     arrays = [np.concatenate(parts) for parts in values_by_dimension]
     stats: dict[str, Any] = {
         "min": np.asarray([array.min() for array in arrays], dtype=np.float32),
@@ -494,6 +522,7 @@ def compute_transformed_action_stats(
     }
     for quantile, name in ((0.01, "q01"), (0.10, "q10"), (0.50, "q50"), (0.90, "q90"), (0.99, "q99")):
         stats[name] = np.asarray([np.quantile(array, quantile) for array in arrays], dtype=np.float32)
+        logging.info("Transformed-action statistics: exact %s complete", name)
 
     categorical_names = {ARM_TELEOP_INACTIVE_NAME, "arm_reset", TASK_COMPLETE_NAME, TASK_BLOCKED_NAME}
     for index, name in enumerate(action_names):
@@ -534,6 +563,9 @@ def compute_transformed_action_stats(
         },
         "schema": {
             **schema,
+            **({"ee_delta_reference": config.ee_delta_reference,
+                "ee_reference_history_stride": config.state_history_frame_stride}
+               if getattr(config, "ee_delta_reference", "current_state") == "previous_command" else {}),
             **({"model_ee_frame": config.model_ee_frame} if config.model_ee_frame is not None else {}),
             "ee_target_dataset_semantics": config.ee_target_dataset_semantics,
             "ee_delta_supervision_mode": config.ee_delta_supervision_mode,

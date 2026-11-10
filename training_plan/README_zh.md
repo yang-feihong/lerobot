@@ -95,6 +95,14 @@ training 目录时不自动迁移，也不修改 checkpoint；应保留历史代
 选择计划，再执行 `cluster.sh prepare wb6`、`dry-run-task`、`start-task`；
 reset 监督放在发布物之外，并仅屏蔽已审计未知目标的分类 loss。
 
+2026-11-08 已停止上述误配的 Stage2 新训。当前推门全流程任务改用
+`all_push_joint_plus_full_fresh_100k_jobs.json`，任务
+`all_push_joint_plus_full_sim3_real1_fresh_100k`：沿用同一 11589 条 READY 发布物，
+`three_stage_plus_full` 的六个状态×指令组合等权，组合内默认仿真∶实采 3∶1，
+单域组合自动使用唯一来源。wholebody6 四卡从基座重新训练 0→100k，
+不加载已停止的 Stage2 权重/优化器，不启用历史指令输入，新建输出和 W&B run。
+旧 Stage2 计划与产物仅保留作历史记录，不能冒充全流程六组合训练。
+
 远程 dry-run 包含正式发布物解析和大数据集的语义前置检查；编排等待上限由
 `.env` 的 `CLUSTER_DRY_RUN_TIMEOUT_SECONDS` 配置，默认 300 秒。
 超时会输出诊断容器日志后停止，不启动训练，也不会绕过任何数据验收。
@@ -204,6 +212,67 @@ reset selector 保持新初始化，不可静默丢失旧权重。普通 `fork-t
 所有拉门 5122 条的四卡 0→50k 任务维护在 `all_pull_joint_full_50k_jobs.json`，
 使用 `pull_joint_plus_full` 六组合等权。full 组合只采仿真，其余组合内仿真∶实采 3∶1；
 这是显式任务采样策略，不补造独立单阶段实采的全流程监督。
+
+2026-11-08 的 767 条外部抓取三组四卡对比计划为
+`external_grasp_raw_3way_50k_jobs.json`，锁定发布物 `e6554faa…`，
+沿用 `external_grasp_joint_plus_full` 四组合等权，全部从基座 0→50k。
+三组均设置 `EE_SUPERVISION_SOURCE=recorded_action`、`MODEL_EE_FRAME=physical`、
+`GLOBAL_BATCH_SIZE=48`、`HISTORY_PAUSE_MAX_STEPS=0`；每卡 batch=2，四卡累积=6。
+每个任务必须使用**独立源码快照中的 `.env`** 固化下表配置，不能只切 TASK_ID 而共用同一环境：
+
+| 任务 | 节点 / GPU | ACTION_HISTORY_ENABLED | EE_DELTA_REFERENCE |
+|---|---|---|---|
+| `external_raw_nohist_state_delta_50k` | wb2 / 0–3 | false | current_state |
+| `external_raw_history_state_delta_50k` | f / 0–3 | true | current_state |
+| `external_raw_history_command_delta_50k` | f / 4–7 | true | previous_command |
+
+本轮源码快照与传输、预检、验收记录存于
+`MEM_videos/workspace/codex_scratch/external_raw_3way_20261108.rglx38/`。
+三份 `src` 内容哈希相同；差异只来自 `.env` 的历史输入开关和 EE delta 基准。
+关闭历史输入时禁止 previous_command；有历史时指令基准取模型可见的最后一个历史槽，
+保持/reset/启动 padding 时按统一契约回退到当前实测 EE，不使用未来标签。
+
+EE 来源由一个配置同时控制动作监督与历史动作输入（包括对应的归一化统计）：
+`EE_SUPERVISION_SOURCE=control_action`（默认）选择存储的 `action[16:25]`；
+`EE_SUPERVISION_SOURCE=recorded_action` 选择存储的 `action[5:14]`。
+
+已有 checkpoint 切换 EE 监督来源必须使用显式 `fork-task`，设置
+`EE_SUPERVISION_SOURCE` 后会通过新 run、更新数据及更新训练目标三个条件验收，
+继承模型/优化器/scheduler/RNG与累计步数，但重新统计新来源的动作归一化。
+张量布局、工具轴、delta 基准和历史窗口不得同时改变；普通 resume 保持 checkpoint 来源，
+不会被当前环境变量覆盖。禁止仅换 run 名而继续使用旧监督来源。
+直接训练脚本对应 `--ee-supervision-source=recorded_action`，Python/CLI policy 配置对应
+`--policy.ee_supervision_source=recorded_action`。它只切换 EE 的 9 个通道，
+不改底盘、机械臂模式、夹爪或其他监督，也不自动开启历史输入。
+`recorded_action` 指数据集已有列，并不保证每个来源都是 IK 前的 VR 请求；
+已核对当前门/抓取仿真生产者：两段列均写入下发关节目标的 FK 结果，
+不是两套独立的 IK 前/后目标；后处理可能仅改变控制列，使数值不同但不改变来源身份。
+因此该开关不等于已统一实采与仿真的 IK 前原始指令语义。
+历史 EE 的 inactive/reset 屏蔽规则仍保留；语义 hold 对两套 EE 列分别保持，不跨来源替换。
+部署 metadata/config 保存来源；动作差分与精确动作统计均使用所选来源，
+不同来源的统计不可混用。普通 resume 继承 checkpoint，不切换该语义。
+部署的历史输入也应提供与所选来源对应的目标；不能将上游请求和下游控制目标视为等价。
+
+精确动作统计仅由主进程执行。该 CPU 预处理使用独立的 Gloo 同步组（最长 6 小时），
+不让其他 rank 在训练 NCCL barrier 中空等并触发 watchdog；训练 collective 原有超时保持不变。
+主进程失败会通知其他 rank，不能继续读取不存在的统计文件。日志按 episode 进度及精确分位数
+完成情况输出；本机制不改变统计样本、数值算法或普通 resume 的统计一致性检查。
+新增的预处理运行模块已显式纳入源码快照清单（不依赖本地未跟踪文件），远程 dry-run
+还会先导入实际快照中的训练模块，避免本地测试通过而部署漏文件后才在模型加载末尾失败。
+
+固定基准 EE delta 支持 `EE_DELTA_REFERENCE=current_state|previous_command`，默认
+`current_state` 保持原实测 EE 基准。设为 `previous_command` 时，必须同时设置
+`Z1_ACTION_REPRESENTATION=ee_state_delta`、`ACTION_HISTORY_ENABLED=true`，且历史字段包含完整 EE 9D；
+否则配置/启动直接报错。直接脚本参数为 `--ee-delta-reference=previous_command`，
+policy CLI 为 `--policy.ee_delta_reference=previous_command`。
+此模式用最后一个输入历史采样槽中的 EE 指令，作为整个未来块共同的绝对姿态基准，
+不是上次推理输出的 50 帧，也不是旧 `ee_delta` 的逐帧累加；默认历史间隔 40ms，
+因此该槽不一定等于 50Hz 控制器上一拍。基准来源跟随 `EE_SUPERVISION_SOURCE`。
+启动历史不足、该槽未知或 EE 被 inactive/reset feature mask 屏蔽时，训练与部署
+均回退到当前实测 EE，不使用被遮住的目标。暂停增强后的历史也使用同一规则。
+动作统计按同一历史槽/来源计算并锁定参考模式与采样间隔；不同模式不能复用统计。
+checkpoint 保存该配置，SYNC 自动按对应基准解码；RTC 还会将旧前缀的绝对目标
+重新表达为本次基准下的 delta，避免换基准造成轨迹跳变。现有模型和普通 resume 不切换基准。
 
 历史动作输入默认关闭。新训练可在统一入口的环境配置中显式设置
 `ACTION_HISTORY_ENABLED=true`；普通 resume 始终继承 checkpoint，不在恢复时增删模型结构。

@@ -94,16 +94,17 @@ def select_dataset_action_supervision(
     *,
     source: str,
 ) -> Tensor:
-    """Select B2 velocity and Z1 control-target channels from the stored action."""
+    """Select one stored EE source; all non-EE channels remain unchanged."""
     if action.ndim < 2 or action.shape[-1] != CONTROL_EXTENDED_DATASET_ACTION_DIM:
         raise ValueError(
-            f"Control-action supervision requires {CONTROL_EXTENDED_DATASET_ACTION_DIM}D action, "
+            f"EE-source selection requires {CONTROL_EXTENDED_DATASET_ACTION_DIM}D action, "
             f"got {tuple(action.shape)}"
         )
-    if source != "control_action":
-        raise ValueError(f"Unsupported supervision source {source!r}; expected 'control_action'")
+    if source not in {"control_action", "recorded_action"}:
+        raise ValueError(f"Unsupported supervision source {source!r}")
     result = action[..., :DATASET_ACTION_DIM].clone()
-    result[..., 5:14] = action[..., 16:25]
+    if source == "control_action":
+        result[..., 5:14] = action[..., 16:25]
     return result
 
 

@@ -55,6 +55,11 @@ def test_default_allows_preflight_longer_than_old_minute():
     assert "start dry-run OK" in result.stdout
 
 
+def test_remote_dry_run_imports_actual_trainer_before_launch():
+    assert "import lerobot.scripts.lerobot_train" in FUNCTION
+    assert "&& ${command_q}" in FUNCTION
+
+
 def test_configured_timeout_reports_logs_and_does_not_pass():
     result = gate(2)
     assert result.returncode != 0

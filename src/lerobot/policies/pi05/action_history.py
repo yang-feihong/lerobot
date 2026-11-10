@@ -1,5 +1,7 @@
 """Executed-command input schema, independent of the predicted action schema."""
 
+import torch
+
 from .b2_action_transform import CONTROL_EXTENDED_DATASET_ACTION_NAMES, DATASET_ACTION_NAMES
 
 RESET_TARGET_NAMES = tuple(f"arm_reset_joint_target_{i}" for i in range(1, 7))
@@ -7,11 +9,24 @@ RESET_HISTORY_KEY = "observation.reset_joint_history"
 DEFAULT_ACTION_HISTORY_NAMES = (*DATASET_ACTION_NAMES[:-1], *RESET_TARGET_NAMES)
 
 
+def command_reference_anchor(current_state, command_pose, valid):
+    """Use the last visible historical EE command, otherwise the measured pose.
+
+    Invalid/reset/hold and startup padding must not introduce a hidden anchor.
+    All arguments are in the same unnormalized model tool frame.
+    """
+    if command_pose.shape != current_state.shape or current_state.shape[-1] != 9:
+        raise ValueError("EE command reference requires matching 9D poses")
+    if valid.shape != current_state.shape[:-1]:
+        raise ValueError("EE command reference validity shape mismatch")
+    return torch.where(valid[..., None], command_pose, current_state)
+
+
 def action_history_schema(config):
     """Return command names, source indices (-1 for sidecar targets), source width.
 
-    Completion/blocked are supervision, not executed commands. EE history uses
-    control targets, never the legacy feedback-derived action columns.
+    Completion/blocked are supervision, not commands. EE history follows the
+    same stored source as future supervision.
     """
     requested = getattr(config, "action_history_feature_names", None)
     names = DEFAULT_ACTION_HISTORY_NAMES if requested is None else tuple(requested)
@@ -24,7 +39,11 @@ def action_history_schema(config):
     source = tuple(config.dataset_action_feature_names or CONTROL_EXTENDED_DATASET_ACTION_NAMES)
     if len(source) != len(set(source)):
         raise ValueError("Dataset action names must be unique")
-    stored = tuple("control_" + name if name.startswith("height_invariant_ee_") else name for name in names)
+    ee_source = config.ee_supervision_source
+    if ee_source not in {"control_action", "recorded_action"}:
+        raise ValueError(f"Unsupported supervision source {ee_source!r}")
+    stored = tuple("control_" + name if ee_source == "control_action"
+                   and name.startswith("height_invariant_ee_") else name for name in names)
     missing = set(stored) - set(source) - set(RESET_TARGET_NAMES)
     if missing:
         raise ValueError(f"Missing executed-command history fields: {sorted(missing)}")

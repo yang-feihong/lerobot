@@ -35,6 +35,28 @@ def test_model_tool_frame_is_a_recorded_run_choice_not_architecture_drift(frame)
     assert report["model_ee_frame"] == frame
 
 
+@pytest.mark.parametrize("source", ["control_action", "recorded_action"])
+def test_ee_source_is_audited_as_an_explicit_run_choice(source):
+    training, policy = values()
+    policy["ee_supervision_source"] = source
+    report = compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])
+    assert report["ok"]
+    assert report["ee_supervision_source"] == source
+
+
+def test_command_reference_is_audited_and_cannot_be_enabled_without_history():
+    from lerobot.policies.pi05.b2_action_transform import DATASET_ACTION_NAMES
+
+    training, policy = values()
+    policy["ee_delta_reference"] = "previous_command"
+    with pytest.raises(ValueError, match="requires history"):
+        compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])
+    policy.update(action_history_enabled=True, action_history_feature_names=list(DATASET_ACTION_NAMES[:-1]))
+    report = compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])
+    assert report["ok"]
+    assert report["ee_delta_reference"] == "previous_command"
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

@@ -197,6 +197,8 @@ common_args=(
   --b2-action-representation="${B2_ACTION_REPRESENTATION}"
   --model-ee-frame="${MODEL_EE_FRAME:-}"
   --z1-action-representation="${Z1_ACTION_REPRESENTATION}"
+  --ee-supervision-source="${EE_SUPERVISION_SOURCE:-control_action}"
+  --ee-delta-reference="${EE_DELTA_REFERENCE:-current_state}"
   --action-semantics-profile="${ACTION_SEMANTICS_PROFILE}"
   --action-loss-schema="${ACTION_LOSS_SCHEMA}"
   --action-continuous-group-weight="${ACTION_CONTINUOUS_GROUP_WEIGHT}"
@@ -456,6 +458,11 @@ PY
     if [[ "${command}" == fork || "${command}" == fork-dry-run ]]; then
       fork_name="$(date +%Y%m%d_%H%M%S)_mem_pi05_b2_z1_vla_training_job_${task_id}_arm_mode_complete"
       resume_args+=(--resume-new-run-name="${fork_name}")
+      if [[ -n "${EE_SUPERVISION_SOURCE:-}" ]]; then
+        resume_args+=(--ee-supervision-source="${EE_SUPERVISION_SOURCE}")
+      fi
+      [[ -z "${initialization_spec[1]}" ]] || resume_args+=(--reset-preset-sidecar="${initialization_spec[1]}")
+      [[ -z "${initialization_spec[2]}" ]] || resume_args+=(--reset-preset-unknown-target-policy="${initialization_spec[2]}")
     fi
     if [[ "${command}" == resume-dry-run || "${command}" == fork-dry-run ]]; then
       resume_args+=(--dry-run=true)

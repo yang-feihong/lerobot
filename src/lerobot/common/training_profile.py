@@ -74,6 +74,16 @@ RUN_FIELDS = {
 
 def canonical_policy(config: dict) -> dict:
     result = copy.deepcopy(config)
+    # Dataset EE source is an explicit run choice; retain it in the audit report.
+    source = result.pop("ee_supervision_source", "control_action")
+    if source not in {"control_action", "recorded_action"}:
+        raise ValueError(f"Unsupported EE supervision source: {source!r}")
+    reference = result.pop("ee_delta_reference", "current_state")
+    if reference not in {"current_state", "previous_command"}:
+        raise ValueError(f"Unsupported EE delta reference: {reference!r}")
+    if reference == "previous_command" and (not config.get("action_history_enabled", False)
+                                            or config["z1_action_representation"] != "ee_state_delta"):
+        raise ValueError("previous_command EE reference requires history and ee_state_delta")
     # Optional input extension; absent/default fields keep old audits identical.
     result.pop("action_history_feature_names", None)
     result.pop("max_action_history_dim", None)
@@ -140,6 +150,7 @@ def compare_profile(
             action_history_feature_names=policy.get("action_history_feature_names"),
             dataset_action_feature_names=policy.get("dataset_action_feature_names"),
             max_action_history_dim=policy.get("max_action_history_dim", 32),
+            ee_supervision_source=policy.get("ee_supervision_source", "control_action"),
         ))
         expected["policy"]["action_history_enabled"] = True
     elif policy.get("action_history_feature_names") is not None:
@@ -161,6 +172,8 @@ def compare_profile(
         "dataset_specific_policy": {k: policy[k] for k in POLICY_DATA_FIELDS},
         "reset_selector": selector_contract(policy),
         "model_ee_frame": policy.get("model_ee_frame") or "legacy",
+        "ee_supervision_source": policy.get("ee_supervision_source", "control_action"),
+        "ee_delta_reference": policy.get("ee_delta_reference", "current_state"),
     }
 
 

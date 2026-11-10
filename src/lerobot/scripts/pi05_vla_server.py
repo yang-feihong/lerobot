@@ -14,15 +14,16 @@ import logging
 import math
 import time
 import traceback
-from collections import deque
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from functools import lru_cache, partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from io import BytesIO
 from pathlib import Path
 from threading import Condition, Event, Lock, Thread
 from urllib.parse import parse_qs, urlparse
 from zipfile import BadZipFile
+from weakref import WeakKeyDictionary
 
 import cv2
 import numpy as np
@@ -37,9 +38,18 @@ from lerobot.policies.pi05.b2_action_transform import (
     absolute_ee_pose_to_reference_delta,
     ee_reference_delta_to_absolute,
 )
+from lerobot.policies.pi05.modeling_pi05 import resize_with_pad_torch
 from lerobot.policies.pi05.processor_pi05 import OBS_ACTION_HISTORY, Pi05PrepareStateTokenizerProcessorStep
 from lerobot.policies.rtc import RTCConfig
 from lerobot.processor import NormalizerProcessorStep, UnnormalizerProcessorStep
+from lerobot.scripts.pi05_image_inputs import ImageTensorCache, images_are_unchanged
+from lerobot.scripts.pi05_npz import dump_action_arrays, open_arrays
+from lerobot.scripts.pi05_array_wire import MAGIC as ARRAY_MAGIC, FORMAT as ARRAY_FORMAT
+from lerobot.scripts.pi05_array_wire import CONTENT_TYPE as ARRAY_CONTENT_TYPE, dump_arrays as encode_wire
+from lerobot.scripts.pi05_image_table import FORMAT as IMAGE_TABLE_FORMAT, decode_image_table
+from lerobot.scripts.pi05_image_resources import FEATURE as IMAGE_RESOURCES_FEATURE, ImageResources
+from lerobot.scripts.pi05_processor_cache import bind_b2_reference_capture, cache_tokenized_prompts
+from types import MappingProxyType
 from lerobot.types import TransitionKey
 from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.utils import init_logging
@@ -675,6 +685,7 @@ def _checkpoint_hot_swap_signature(policy_path: Path) -> str:
         "z1_action_representation",
         "ee_delta_rotation_representation",
         "ee_state_anchor_indices",
+        "ee_delta_reference",
         "ee_supervision_source",
         "ee_target_dataset_semantics",
         "gripper_target_representation",
@@ -765,15 +776,49 @@ def _checkpoint_hot_swap_signature(policy_path: Path) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def _decode_jpeg(encoded: np.ndarray, name: str) -> np.ndarray:
-    image = cv2.imdecode(np.asarray(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+@lru_cache(maxsize=32)
+def _decode_jpeg_bytes(encoded: bytes) -> np.ndarray:
+    image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
     if image is None:
-        raise ValueError(f"Could not decode {name} JPEG")
-    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        raise ValueError("Could not decode JPEG")
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    return np.frombuffer(rgb.tobytes(), dtype=rgb.dtype).reshape(rgb.shape)
 
 
-def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> ObservationPacket:
-    with np.load(BytesIO(payload), allow_pickle=False) as packet:
+def _decode_jpeg(encoded: np.ndarray, name: str, *, writable=True) -> np.ndarray:
+    try:
+        image = _decode_jpeg_bytes(np.asarray(encoded, dtype=np.uint8).tobytes())
+        return image.copy() if writable else image
+    except ValueError as exc:
+        raise ValueError(f"Could not decode {name} JPEG") from exc
+
+
+@lru_cache(maxsize=1)
+def _image_decode_pool():
+    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="vla-image-decode")
+
+
+def _decode_jpeg_window(images, *, writable=True):
+    return list(_image_decode_pool().map(lambda image: _decode_jpeg(*image, writable=writable), images))
+
+
+@dataclass(frozen=True, eq=False)
+class FlatImageHistory:
+    data: MappingProxyType
+    input_payload: bytes
+    input_sha256: str
+    wire_values: MappingProxyType | None = None
+
+
+def _image_output_fields(history):
+    if isinstance(history, FlatImageHistory):
+        return dict(model_input_sha256=np.asarray(history.input_sha256))
+    return dict(model_image_history=np.frombuffer(history or b"", dtype=np.uint8))
+
+
+def decode_observation_packet(payload: bytes, max_state_dim: int = 4096, *, decode_current=True, decode_window=False, image_resources=None) -> ObservationPacket:
+    with open_arrays(payload) as source:
+        packet = {key: source[key] for key in source.files}
         version = int(packet["protocol_version"].item())
         if version != PROTOCOL_VERSION:
             raise ValueError(f"Protocol version {version} != {PROTOCOL_VERSION}")
@@ -802,7 +847,7 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
             state_anchor = state[[state_index[name] for name in EE_STATE_NAMES]]
             if not np.array_equal(actual_ee_state, state_anchor):
                 raise ValueError("Actual EE anchor disagrees with the named observation.state channels")
-        if any(key.startswith("history_") for key in packet.files):
+        if any(key.startswith("history_") for key in packet):
             raise ValueError("Raw sensor histories are not model inputs; assemble them in the deployment adapter")
         prepared_state = np.asarray(packet["model_state"], dtype=np.float32)
         prepared_pad = np.asarray(packet["model_state_is_pad"])
@@ -819,6 +864,30 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
         scheduling_mode = str(packet["chunk_scheduling_mode"].item()) if "chunk_scheduling_mode" in packet else None
         if scheduling_mode is not None and scheduling_mode not in CHUNK_SCHEDULING_MODES:
             raise ValueError("Invalid request scheduling mode")
+        if "model_images_format" in packet:
+            if any(key in packet for key in ("model_image_history", "base_jpeg", "wrist_jpeg")):
+                raise ValueError("Mixed legacy and flat image inputs")
+            expanded = image_resources.expand(packet) if image_resources is not None else packet
+            history, (base_jpeg, wrist_jpeg) = decode_image_table(expanded)
+            image_history = FlatImageHistory(MappingProxyType(history), payload, hashlib.sha256(payload).hexdigest(),
+                                            MappingProxyType(packet))
+        else:
+            base_jpeg = np.asarray(packet["base_jpeg"], dtype=np.uint8)
+            wrist_jpeg = np.asarray(packet["wrist_jpeg"], dtype=np.uint8)
+            image_history = np.asarray(packet["model_image_history"], dtype=np.uint8).tobytes()
+        decoded_images = None
+        if decode_window:
+            images = {base_jpeg.tobytes(): (base_jpeg, "base"), wrist_jpeg.tobytes(): (wrist_jpeg, "wrist")}
+            history_values = (image_history.data if isinstance(image_history, FlatImageHistory)
+                              else _load_model_image_history(image_history) if image_history else {})
+            for key, image in history_values.items():
+                if key.startswith(("base_jpeg_", "wrist_jpeg_")):
+                    images.setdefault(image.tobytes(), (image, key))
+            decoded_images = MappingProxyType(dict(zip(images, _decode_jpeg_window(list(images.values()), writable=False), strict=True)))
+            base_rgb, wrist_rgb = decoded_images[base_jpeg.tobytes()], decoded_images[wrist_jpeg.tobytes()]
+        else:
+            base_rgb, wrist_rgb = (_decode_jpeg_window(((base_jpeg, "base"), (wrist_jpeg, "wrist")), writable=False)
+                                  if decode_current else (None, None))
         return ObservationPacket(
             control_epoch=int(packet["control_epoch"].item()),
             sim_step=sim_step,
@@ -827,10 +896,11 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
             task=str(packet["task"].item()),
             state=state,
             state_names=state_names,
-            base_rgb=_decode_jpeg(packet["base_jpeg"], "base"),
-            wrist_rgb=_decode_jpeg(packet["wrist_jpeg"], "wrist"),
-            base_jpeg=np.asarray(packet["base_jpeg"], dtype=np.uint8),
-            wrist_jpeg=np.asarray(packet["wrist_jpeg"], dtype=np.uint8),
+            base_rgb=base_rgb,
+            wrist_rgb=wrist_rgb,
+            decoded_images=decoded_images,
+            base_jpeg=base_jpeg,
+            wrist_jpeg=wrist_jpeg,
             capture_started_ns=int(packet["capture_started_ns"].item())
             if "capture_started_ns" in packet
             else -1,
@@ -856,16 +926,14 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096) -> Obse
                 int(packet["diagnostic_flow_seed"].item()) if "diagnostic_flow_seed" in packet else None
             ),
             server_received_ns=time.monotonic_ns(),
-            model_image_history=np.asarray(packet["model_image_history"], dtype=np.uint8).tobytes(),
+            model_image_history=image_history,
             scheduling_mode=scheduling_mode,
         )
 
 
-def encode_action_packet(record: ActionRecord) -> bytes:
-    output = BytesIO()
-    np.savez(
-        output,
-        model_image_history=np.frombuffer(record.model_image_history or b"", dtype=np.uint8),
+def encode_action_packet(record: ActionRecord, *, binary_arrays=False) -> bytes:
+    return (encode_wire if binary_arrays else dump_action_arrays)(dict(
+        **_image_output_fields(record.model_image_history),
         protocol_version=np.asarray(PROTOCOL_VERSION, dtype=np.int64),
         sequence=np.asarray(record.sequence, dtype=np.int64),
         source_step=np.asarray(record.source_step, dtype=np.int64),
@@ -901,8 +969,7 @@ def encode_action_packet(record: ActionRecord) -> bytes:
             record.velocity_smoothing_transition_step, dtype=np.int64
         ),
         sim_steps_per_wall_second=np.asarray(record.sim_steps_per_wall_second, dtype=np.float64),
-    )
-    return output.getvalue()
+    ))
 
 
 @dataclass(frozen=True)
@@ -926,8 +993,8 @@ class ObservationPacket:
     task: str
     state: np.ndarray
     state_names: tuple[str, ...]
-    base_rgb: np.ndarray
-    wrist_rgb: np.ndarray
+    base_rgb: np.ndarray | None
+    wrist_rgb: np.ndarray | None
     base_jpeg: np.ndarray
     wrist_jpeg: np.ndarray
     capture_started_ns: int
@@ -948,9 +1015,10 @@ class ObservationPacket:
     # is not confounded by a fresh stochastic sample.
     diagnostic_flow_seed: int | None
     server_received_ns: int
-    model_image_history: bytes
+    model_image_history: bytes | FlatImageHistory
     scheduling_mode: str | None = None
     prepared_action_history_feature_is_pad: np.ndarray | None = None
+    decoded_images: MappingProxyType | None = None
 
 
 @dataclass(frozen=True)
@@ -982,40 +1050,61 @@ class ActionRecord:
     sim_steps_per_wall_second: float
     rtc_mode: str = "inference"
     rtc_conditioning_delay_steps: int = 0
-    model_image_history: bytes | None = None
+    model_image_history: bytes | FlatImageHistory | None = None
     reset_preset_catalog: list[dict] | None = None
 
 
 class _RecordedImageBatch(dict):
     """Keep recording data outside the dictionary passed to the model processors."""
 
-    model_image_history: bytes
+    model_image_history: bytes | FlatImageHistory
+
+
+@lru_cache(maxsize=4)
+def _load_model_image_history(payload: bytes) -> dict[str, np.ndarray]:
+    if isinstance(payload, FlatImageHistory):
+        return payload.data
+    with open_arrays(payload) as data:
+        return {key: data[key] for key in data.files}
+
+
+@lru_cache(maxsize=4)
+def _validated_model_image_history(payload, *, source_step, count, base_key, wrist_key):
+    data = _load_model_image_history(payload)
+    if int(data["format_version"]) != 1 or int(data["source_step"]) != source_step:
+        raise ValueError("Recorded model image history version/source_step mismatch")
+    if str(data["base_camera_key"].item()) != base_key or str(data["wrist_camera_key"].item()) != wrist_key:
+        raise ValueError("Recorded model image history physical camera roles mismatch")
+    pad = np.asarray(data["is_pad"])
+    if pad.dtype != np.bool_ or pad.ndim != 1 or len(pad) != count:
+        raise ValueError("Recorded model image history frame count/padding mismatch")
+    fields = ("capture_ns", "base_capture_ns", "wrist_capture_ns", "encoded_ns", "server_received_ns", "sim_step")
+    for field in fields:
+        if data[field].shape != (count,):
+            raise ValueError(f"Recorded model image history invalid {field}")
+    records = []
+    for index in range(count):
+        images = {}
+        for role in ("base", "wrist"):
+            array = data[f"{role}_jpeg_{index}"]
+            if array.dtype != np.uint8 or array.ndim != 1 or not array.size:
+                raise ValueError("Recorded model image history invalid JPEG bytes")
+            image = array if isinstance(payload, FlatImageHistory) else array.copy()
+            image.setflags(write=False)
+            images[f"{role}_jpeg"] = image
+        values = {field: int(data[field][index]) for field in fields}
+        values["sim_step"] = None if values["sim_step"] < 0 else values["sim_step"]
+        records.append(ImagePacket(**images, **values))
+    pad = pad if isinstance(payload, FlatImageHistory) else pad.copy()
+    pad.setflags(write=False)
+    return tuple(records), pad
 
 
 def _decode_model_image_history(payload, *, source_step, count, base_key, wrist_key):
-    with np.load(BytesIO(payload), allow_pickle=False) as data:
-        if int(data["format_version"]) != 1 or int(data["source_step"]) != source_step:
-            raise ValueError("Recorded model image history version/source_step mismatch")
-        if str(data["base_camera_key"].item()) != base_key or str(data["wrist_camera_key"].item()) != wrist_key:
-            raise ValueError("Recorded model image history physical camera roles mismatch")
-        pad = np.asarray(data["is_pad"])
-        if pad.dtype != np.bool_ or pad.ndim != 1 or len(pad) != count:
-            raise ValueError("Recorded model image history frame count/padding mismatch")
-        for field in ("capture_ns", "base_capture_ns", "wrist_capture_ns", "encoded_ns", "server_received_ns", "sim_step"):
-            if data[field].shape != (count,):
-                raise ValueError(f"Recorded model image history invalid {field}")
-        records = []
-        for index in range(count):
-            images = {}
-            for role in ("base", "wrist"):
-                array = data[f"{role}_jpeg_{index}"]
-                if array.dtype != np.uint8 or array.ndim != 1 or not array.size:
-                    raise ValueError("Recorded model image history invalid JPEG bytes")
-                images[f"{role}_jpeg"] = array.copy()
-            values = {field: int(data[field][index]) for field in ("capture_ns", "base_capture_ns", "wrist_capture_ns", "encoded_ns", "server_received_ns", "sim_step")}
-            values["sim_step"] = None if values["sim_step"] < 0 else values["sim_step"]
-            records.append(ImagePacket(**images, **values))
-    return records, torch.from_numpy(pad.copy()).unsqueeze(0)
+    records, pad = _validated_model_image_history(payload, source_step=source_step,
+        count=count, base_key=base_key, wrist_key=wrist_key)
+    return [replace(record, base_jpeg=record.base_jpeg.copy(), wrist_jpeg=record.wrist_jpeg.copy())
+            for record in records], torch.from_numpy(pad.copy()).unsqueeze(0)
 
 
 class RolloutRecorder:
@@ -1044,37 +1133,53 @@ class RolloutRecorder:
     def observation(self, packet: ObservationPacket) -> None:
         if self.root is None:
             return
-        path = self.root / "vla" / "observations" / f"{packet.sim_step:06d}.npz"
+        suffix = ".awb" if isinstance(packet.model_image_history, FlatImageHistory) and packet.model_image_history.input_payload.startswith(ARRAY_MAGIC) else ".npz"
+        path = self.root / "vla" / "observations" / f"{packet.sim_step:06d}{suffix}"
         with self._lock:
-            np.savez_compressed(
-                path,
-                protocol_version=np.asarray(PROTOCOL_VERSION),
-                control_epoch=np.asarray(packet.control_epoch),
-                sim_step=np.asarray(packet.sim_step),
-                active_sequence=np.asarray(packet.active_sequence),
-                active_index=np.asarray(packet.active_index),
-                task=np.asarray(packet.task),
-                state=packet.state,
-                state_names=np.asarray(packet.state_names, dtype=np.str_),
-                base_jpeg=packet.base_jpeg,
-                wrist_jpeg=packet.wrist_jpeg,
-                capture_started_ns=np.asarray(packet.capture_started_ns),
-                capture_finished_ns=np.asarray(packet.capture_finished_ns),
-                encoded_ns=np.asarray(packet.encoded_ns),
-                executed_ee_target=packet.executed_ee_target,
-                executed_ee_target_names=np.asarray(packet.executed_ee_target_names, dtype=np.str_),
-                actual_ee_state=packet.actual_ee_state,
-                model_input_schema=np.asarray(packet.input_schema),
-                model_state=packet.prepared_state,
-                model_state_is_pad=packet.prepared_state_is_pad,
-                model_action_history=packet.prepared_action_history if packet.prepared_action_history is not None else np.empty((0, 0), dtype=np.float32),
-                model_action_history_is_pad=packet.prepared_action_history_is_pad if packet.prepared_action_history_is_pad is not None else np.empty(0, dtype=np.bool_),
-                model_action_history_feature_is_pad=(packet.prepared_action_history_feature_is_pad
-                    if packet.prepared_action_history_feature_is_pad is not None
-                    else np.empty((0, 0), dtype=np.bool_)),
-                model_image_history=np.frombuffer(packet.model_image_history, dtype=np.uint8),
-                server_received_ns=np.asarray(packet.server_received_ns),
-            )
+            if isinstance(packet.model_image_history, FlatImageHistory):
+                history = packet.model_image_history
+                directory = self.root / "vla" / "inputs"
+                directory.mkdir(exist_ok=True)
+                input_path = directory / (history.input_sha256 + suffix)
+                if input_path.exists():
+                    if input_path.read_bytes() != history.input_payload:
+                        raise ValueError("Recorded model input checksum mismatch")
+                else:
+                    with input_path.open("xb") as target:
+                        target.write(history.input_payload)
+                pending = path.with_suffix(".pending")
+                pending.hardlink_to(input_path)
+                pending.replace(path)
+            else:
+                np.savez_compressed(
+                    path,
+                    protocol_version=np.asarray(PROTOCOL_VERSION),
+                    control_epoch=np.asarray(packet.control_epoch),
+                    sim_step=np.asarray(packet.sim_step),
+                    active_sequence=np.asarray(packet.active_sequence),
+                    active_index=np.asarray(packet.active_index),
+                    task=np.asarray(packet.task),
+                    state=packet.state,
+                    state_names=np.asarray(packet.state_names, dtype=np.str_),
+                    base_jpeg=packet.base_jpeg,
+                    wrist_jpeg=packet.wrist_jpeg,
+                    capture_started_ns=np.asarray(packet.capture_started_ns),
+                    capture_finished_ns=np.asarray(packet.capture_finished_ns),
+                    encoded_ns=np.asarray(packet.encoded_ns),
+                    executed_ee_target=packet.executed_ee_target,
+                    executed_ee_target_names=np.asarray(packet.executed_ee_target_names, dtype=np.str_),
+                    actual_ee_state=packet.actual_ee_state,
+                    model_input_schema=np.asarray(packet.input_schema),
+                    model_state=packet.prepared_state,
+                    model_state_is_pad=packet.prepared_state_is_pad,
+                    model_action_history=packet.prepared_action_history if packet.prepared_action_history is not None else np.empty((0, 0), dtype=np.float32),
+                    model_action_history_is_pad=packet.prepared_action_history_is_pad if packet.prepared_action_history_is_pad is not None else np.empty(0, dtype=np.bool_),
+                    model_action_history_feature_is_pad=(packet.prepared_action_history_feature_is_pad
+                        if packet.prepared_action_history_feature_is_pad is not None
+                        else np.empty((0, 0), dtype=np.bool_)),
+                    model_image_history=np.frombuffer(packet.model_image_history, dtype=np.uint8),
+                    server_received_ns=np.asarray(packet.server_received_ns),
+                )
             prompt_path = self.root / "prompt.txt"
             if not prompt_path.exists():
                 prompt_path.write_text(packet.task + "\n", encoding="utf-8")
@@ -1084,6 +1189,9 @@ class RolloutRecorder:
             active_sequence=packet.active_sequence,
             active_index=packet.active_index,
             control_epoch=packet.control_epoch,
+            server_received_ns=packet.server_received_ns,
+            model_input_sha256=(packet.model_image_history.input_sha256
+                                if isinstance(packet.model_image_history, FlatImageHistory) else None),
             prepared_state_frames=len(packet.prepared_state),
             transport_ms=(packet.server_received_ns - packet.encoded_ns) / 1e6
             if packet.encoded_ns >= 0
@@ -1099,7 +1207,7 @@ class RolloutRecorder:
         with self._lock:
             np.savez_compressed(
                 path,
-                model_image_history=np.frombuffer(record.model_image_history or b"", dtype=np.uint8),
+                **_image_output_fields(record.model_image_history),
                 sequence=np.asarray(record.sequence),
                 source_step=np.asarray(record.source_step),
                 action_names=np.asarray(record.action_names),
@@ -1204,6 +1312,7 @@ class AsyncRTCPolicy:
             pretrained_path=str(policy_path),
             pretrained_revision=getattr(config, "pretrained_revision", None),
         )
+        cache_tokenized_prompts(self.preprocessor)
         action_unnormalizers = [
             step for step in self.postprocessor.steps if isinstance(step, UnnormalizerProcessorStep)
         ]
@@ -1248,6 +1357,7 @@ class AsyncRTCPolicy:
         self.gripper_negative_value = contract.gripper_negative_value
         self.gripper_nonnegative_value = contract.gripper_nonnegative_value
         self.z1_action_representation = contract.z1_action_representation
+        self.ee_delta_reference = config.ee_delta_reference
         self.b2_action_representation = contract.model_action_representation
         self.b2_pose_delta_control_mode = args.b2_pose_delta_control_mode
         self.b2_execution_mode = (
@@ -1255,6 +1365,10 @@ class AsyncRTCPolicy:
             if self.b2_action_representation == "pose_delta"
             and self.b2_pose_delta_control_mode == "se2_feedback"
             else "velocity_chunk"
+        )
+        self._b2_reference_capture = (
+            bind_b2_reference_capture(self.postprocessor, self._action_unnormalizer, self.model_action_names)
+            if self.b2_execution_mode == "se2_feedback" else None
         )
         self.action_names = execution_action_names(self.z1_action_representation)
         self.reset_preset_catalog = config.reset_preset_catalog if config.action_predict_reset_preset else None
@@ -1265,6 +1379,11 @@ class AsyncRTCPolicy:
         self.source_action_names = contract.source_action_names
         self.mem_enabled = bool(config.mem_vit_enabled)
         self.mem_image_num_frames = int(config.mem_vit_num_frames) if self.mem_enabled else 1
+        self._image_inputs = (
+            ImageTensorCache(self.camera_keys, self.mem_image_num_frames, tuple(config.image_resolution),
+                             self.device, partial(_decode_jpeg_window, writable=False), resize_with_pad_torch)
+            if self.device.type == "cuda" and images_are_unchanged(self.preprocessor) else None
+        )
         self.mem_image_interval_ns = max(1, round(float(config.mem_vit_frame_interval_seconds or 0.0) * 1e9))
         self.continuous_state_enabled = config.state_action_encoding == "continuous"
         self.state_num_frames = int(config.state_num_frames) if self.continuous_state_enabled else 1
@@ -1276,6 +1395,10 @@ class AsyncRTCPolicy:
 
         self.action_history_names, self.action_history_indices, _ = (
             action_history_schema(config) if self.action_history_enabled else ((), (), 0)
+        )
+        self.ee_history_anchor_indices = (
+            tuple(self.action_history_names.index(name) for name in EE_POSE_ACTION_NAMES)
+            if self.ee_delta_reference == "previous_command" else ()
         )
         if not self.action_history_enabled:
             # Preserve disabled checkpoints' input-spec/schema IDs exactly.
@@ -1294,7 +1417,7 @@ class AsyncRTCPolicy:
         self._mailbox: ObservationPacket | None = None
         self._mailbox_version = 0
         self._last_inferred_version = 0
-        self._records_lock = Lock()
+        self._records_lock = Condition()
         self._records: dict[int, ActionRecord] = {}
         self._latest_record: ActionRecord | None = None
         self._next_sequence = 1
@@ -1430,6 +1553,7 @@ class AsyncRTCPolicy:
             pretrained_path=str(policy_path),
             pretrained_revision=getattr(config, "pretrained_revision", None),
         )
+        cache_tokenized_prompts(preprocessor)
         action_unnormalizers = [
             step for step in postprocessor.steps if isinstance(step, UnnormalizerProcessorStep)
         ]
@@ -1455,9 +1579,18 @@ class AsyncRTCPolicy:
                     f"Hot-swapped adapter has unexpected keys: {load_result.unexpected_keys[:8]}"
                 )
             self.preprocessor = preprocessor
+            self._image_inputs = (
+                ImageTensorCache(self.camera_keys, self.mem_image_num_frames, tuple(config.image_resolution),
+                                 self.device, partial(_decode_jpeg_window, writable=False), resize_with_pad_torch)
+                if self.device.type == "cuda" and images_are_unchanged(preprocessor) else None
+            )
             self.postprocessor = postprocessor
             self._action_unnormalizer = action_unnormalizer
             self._action_normalizer = action_normalizer
+            self._b2_reference_capture = (
+                bind_b2_reference_capture(postprocessor, action_unnormalizer, self.model_action_names)
+                if self.b2_execution_mode == "se2_feedback" else None
+            )
             self.policy_path = policy_path
             b2_rtc_reanchor, ee_rtc_reanchor, _, _ = self._rtc_reanchor_status()
             self._reset_runtime_after_model_switch()
@@ -1599,11 +1732,13 @@ class AsyncRTCPolicy:
 
     def stop(self) -> None:
         self._stop.set()
+        with self._records_lock:
+            self._records_lock.notify_all()
         with self._mailbox_condition:
             self._mailbox_condition.notify_all()
         self._worker.join(timeout=5.0)
 
-    def submit(self, packet: ObservationPacket, *, enqueue: bool = True) -> None:
+    def submit(self, packet: ObservationPacket, *, enqueue: bool = True) -> bool:
         executed_completion = False
         if self.stop_on_model_task_complete and packet.active_sequence >= 0 and packet.active_index > 0:
             with self._records_lock:
@@ -1623,11 +1758,12 @@ class AsyncRTCPolicy:
             self._control_epoch = packet.control_epoch
             if enqueue:
                 if self._mailbox is not None and packet.sim_step < self._mailbox.sim_step:
-                    return
+                    return False
                 self._mailbox = packet
                 self._mailbox_version += 1
                 self._mailbox_condition.notify()
         self.recorder.observation(packet)
+        return True
 
     def _publish_record(self, record: ActionRecord) -> None:
         with self._records_lock:
@@ -1637,6 +1773,7 @@ class AsyncRTCPolicy:
             while len(self._records) > 16:
                 self._records.pop(min(self._records))
             self._inference_count += 1
+            self._records_lock.notify_all()
         self._last_error = None
         self._last_error_traceback = None
         self.recorder.action(record)
@@ -1655,8 +1792,14 @@ class AsyncRTCPolicy:
         finally:
             self._request_gate.release()
 
-    def latest_after(self, sequence: int) -> ActionRecord | None:
+    def latest_after(self, sequence: int, wait_ms: int = 0) -> ActionRecord | None:
         with self._records_lock:
+            if wait_ms:
+                self._records_lock.wait_for(
+                    lambda: self._stop.is_set() or (
+                        self._latest_record is not None and self._latest_record.sequence > sequence
+                    ), timeout=wait_ms / 1000,
+                )
             record = self._latest_record
             return record if record is not None and record.sequence > sequence else None
 
@@ -1731,6 +1874,25 @@ class AsyncRTCPolicy:
             raise TypeError(f"Action processor returned {type(result)}")
         return result
 
+    def _ee_anchor(self, packet: ObservationPacket) -> tuple[str, np.ndarray]:
+        if self.z1_action_representation != "ee_state_delta":
+            return "executed_ee_target", packet.executed_ee_target.copy()
+        if self.ee_delta_reference == "current_state":
+            return "actual_ee_state", packet.actual_ee_state.copy()
+        from lerobot.policies.pi05.action_history import command_reference_anchor
+
+        indices = list(self.ee_history_anchor_indices)
+        valid = not bool(packet.prepared_action_history_is_pad[-1])
+        feature_pad = packet.prepared_action_history_feature_is_pad
+        if feature_pad is not None:
+            valid = valid and not bool(feature_pad[-1, indices].any())
+        anchor = command_reference_anchor(
+            torch.as_tensor(packet.actual_ee_state),
+            torch.as_tensor(packet.prepared_action_history[-1, indices]),
+            torch.tensor(valid),
+        ).numpy().copy()
+        return ("history_ee_command" if valid else "actual_ee_state"), anchor
+
     def _rtc_reanchor_status(self) -> tuple[bool, bool, tuple[str, ...], str]:
         b2_names = ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")
         b2_enabled = self.b2_action_representation == "pose_delta" and (
@@ -1780,7 +1942,7 @@ class AsyncRTCPolicy:
         if ee_reanchor:
             indices = [self.model_action_names.index(name) for name in ee_names]
             old_anchor = torch.as_tensor(record.ee_anchor, dtype=physical.dtype, device=physical.device)
-            new_anchor = torch.as_tensor(packet.actual_ee_state, dtype=physical.dtype, device=physical.device)
+            new_anchor = torch.as_tensor(self._ee_anchor(packet)[1], dtype=physical.dtype, device=physical.device)
             absolute_targets = ee_reference_delta_to_absolute(
                 physical[:, indices].unsqueeze(0),
                 old_anchor.unsqueeze(0),
@@ -1830,7 +1992,8 @@ class AsyncRTCPolicy:
                     self.z1_action_representation == "ee_state_delta" and not ee_reanchored
                 ),
                 ee_old_anchor=record.ee_anchor.tolist(),
-                ee_new_anchor=packet.actual_ee_state.tolist(),
+                ee_new_anchor=(self._ee_anchor(packet)[1] if self.z1_action_representation == "ee_state_delta"
+                               else packet.actual_ee_state).tolist(),
             )
         if self.rtc_config.mode == "training":
             # Hard conditioning must only freeze actions that are really queued.
@@ -1879,9 +2042,18 @@ class AsyncRTCPolicy:
             "action_history_enabled": self.action_history_enabled,
             "action_history_names": list(self.action_history_names),
         }
+        if self.mem_image_num_frames <= 64:
+            spec["image_transport"] = IMAGE_TABLE_FORMAT
         if self.action_history_enabled:
             spec["action_history_ee_semantics"] = self.policy.config.action_history_ee_semantics
-        spec["schema_id"] = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
+            if self.ee_delta_reference == "previous_command":
+                spec["ee_delta_reference"] = self.ee_delta_reference
+        schema_spec = {key: value for key, value in spec.items() if key != "image_transport"}
+        spec["schema_id"] = hashlib.sha256(json.dumps(schema_spec, sort_keys=True).encode()).hexdigest()
+        spec["result_wait_ms"] = 20
+        spec["array_transport"] = ARRAY_FORMAT
+        spec["persistent_http"] = True
+        spec["image_resources"] = IMAGE_RESOURCES_FEATURE
         return spec
 
     def validate_input(self, packet: ObservationPacket) -> None:
@@ -1900,7 +2072,7 @@ class AsyncRTCPolicy:
                 feature_pad = packet.prepared_action_history_feature_is_pad
                 if feature_pad is None or feature_pad.shape != expected or feature_pad.dtype != np.bool_:
                     raise ValueError("Prepared action history is missing its EE validity mask")
-        _decode_model_image_history(packet.model_image_history, source_step=packet.sim_step,
+        _validated_model_image_history(packet.model_image_history, source_step=packet.sim_step,
             count=self.mem_image_num_frames, base_key=self.base_camera_key, wrist_key=self.wrist_camera_key)
 
     def _make_batch(self, packet: ObservationPacket) -> dict[str, object]:
@@ -1910,18 +2082,26 @@ class AsyncRTCPolicy:
             f"{OBS_STATE}_is_pad": torch.from_numpy(packet.prepared_state_is_pad.copy()).unsqueeze(0),
             "task": [packet.task],
         })
-        image_records, image_pad = _decode_model_image_history(
+        image_records, image_pad = _validated_model_image_history(
             packet.model_image_history, source_step=packet.sim_step,
             count=self.mem_image_num_frames, base_key=self.base_camera_key, wrist_key=self.wrist_camera_key,
         )
+        image_pad = torch.from_numpy(image_pad.copy()).unsqueeze(0)
         batch.model_image_history = packet.model_image_history
-        for key, role in ((self.base_camera_key, "base_jpeg"), (self.wrist_camera_key, "wrist_jpeg")):
-            image_window = torch.stack([
-                torch.from_numpy(np.ascontiguousarray(_decode_jpeg(getattr(record, role), key)))
-                .permute(2, 0, 1).to(torch.float32).div_(255.0) for record in image_records
-            ]).unsqueeze(0)
-            batch[key] = image_window if self.mem_enabled else image_window[:, -1]
-            batch[f"{key}_is_pad"] = image_pad if self.mem_enabled else image_pad[:, -1]
+        bindings = ((self.base_camera_key, "base_jpeg"), (self.wrist_camera_key, "wrist_jpeg"))
+        if self._image_inputs is not None:
+            prepared = self._image_inputs.prepare({
+                key: [getattr(record, role) for record in image_records] for key, role in bindings
+            }, current=(packet.base_jpeg, packet.wrist_jpeg), decoded=packet.decoded_images if packet.decoded_images is not None else {
+                image.tobytes(): rgb for image, rgb in ((packet.base_jpeg, packet.base_rgb),
+                                                       (packet.wrist_jpeg, packet.wrist_rgb)) if rgb is not None
+            })
+            for key, _role in bindings:
+                batch[key] = prepared[key] if self.mem_enabled else prepared[key][:, -1]
+                batch[f"{key}_is_pad"] = image_pad if self.mem_enabled else image_pad[:, -1]
+        else:
+            self._add_image_windows(batch, image_records, image_pad, bindings,
+                current=(packet.base_jpeg, packet.wrist_jpeg), decoded=packet.decoded_images)
         if self.action_history_enabled:
             actions, pad = packet.prepared_action_history, packet.prepared_action_history_is_pad
             batch[OBS_ACTION_HISTORY] = torch.from_numpy(actions.copy()).unsqueeze(0)
@@ -1931,6 +2111,23 @@ class AsyncRTCPolicy:
                     packet.prepared_action_history_feature_is_pad.copy()
                 ).unsqueeze(0)
         return batch
+
+    def _add_image_windows(self, batch, image_records, image_pad, bindings, *, current=(), decoded=None):
+        images = [(getattr(record, role), key) for key, role in bindings for record in image_records]
+        images += [(image, "current") for image in current]
+        decoded_by_content = {} if decoded is None else dict(decoded)
+        unique = {image.tobytes(): (image, key) for image, key in images if image.tobytes() not in decoded_by_content}
+        if unique:
+            decoded_by_content.update(zip(unique, _decode_jpeg_window(list(unique.values()), writable=False), strict=True))
+        decoded = [decoded_by_content[getattr(record, role).tobytes()] for _key, role in bindings for record in image_records]
+        for camera_index, (key, role) in enumerate(bindings):
+            images = decoded[camera_index * len(image_records):(camera_index + 1) * len(image_records)]
+            image_window = (
+                torch.from_numpy(np.stack(images)).permute(0, 3, 1, 2).contiguous()
+                .to(torch.float32).div_(255.0).unsqueeze(0)
+            )
+            batch[key] = image_window if self.mem_enabled else image_window[:, -1]
+            batch[f"{key}_is_pad"] = image_pad if self.mem_enabled else image_pad[:, -1]
 
     @staticmethod
     def _observed_b2_velocity(packet: ObservationPacket) -> torch.Tensor:
@@ -1994,25 +2191,25 @@ class AsyncRTCPolicy:
         # Both RTC modes operate without autograd or tensor version counters.
         with torch.inference_mode():
             if self.reset_preset_catalog is not None:
-                actions, preset_ids = self.policy.predict_action_chunk(batch, return_reset_presets=True, **conditioning)
+                actions, preset_ids = self.policy.predict_action_chunk_in_eval(batch, return_reset_presets=True, **conditioning)
             else:
-                actions = self.policy.predict_action_chunk(batch, **conditioning)
+                actions = self.policy.predict_action_chunk_in_eval(batch, **conditioning)
             original = actions.squeeze(0).detach().cpu().clone()
             b2_reference = None
             if self.b2_execution_mode == "se2_feedback":
-                physical_model_actions = (
-                    self._apply_action_processor(self._action_unnormalizer, actions.squeeze(0))
-                    .detach()
-                    .cpu()
-                    .to(torch.float32)
-                )
-                reference_indices = [
-                    self.model_action_names.index(name)
-                    for name in ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")
-                ]
-                b2_reference = physical_model_actions[:, reference_indices].clone()
+                if self._b2_reference_capture is not None:
+                    self._b2_reference_capture.reference = None
+                else:
+                    physical = self._apply_action_processor(self._action_unnormalizer, actions.squeeze(0))
+                    columns = [self.model_action_names.index(name)
+                               for name in ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")]
+                    b2_reference = physical.detach().cpu().to(torch.float32)[:, columns].clone()
             predicted = time.perf_counter()
             postprocessed = self.postprocessor(actions).squeeze(0).detach().cpu().to(torch.float32)
+            if self.b2_execution_mode == "se2_feedback" and self._b2_reference_capture is not None:
+                b2_reference = self._b2_reference_capture.reference
+                if b2_reference is None:
+                    raise RuntimeError("Postprocessor did not capture the physical B2 reference")
             postprocessed = _decode_discrete_actions(
                 original,
                 postprocessed,
@@ -2055,6 +2252,7 @@ class AsyncRTCPolicy:
             raise ValueError(
                 f"Processed action shape {tuple(processed.shape)} does not match names {self.action_names}"
             )
+        ee_anchor_kind, ee_anchor = self._ee_anchor(packet)
         record = ActionRecord(
             reset_preset_catalog=self.reset_preset_catalog,
             sequence=self._next_sequence,
@@ -2068,16 +2266,8 @@ class AsyncRTCPolicy:
             b2_anchor_kind="actual_world_pose",
             b2_anchor=self._b2_global_pose(packet),
             b2_reference=b2_reference,
-            ee_anchor_kind=(
-                "actual_ee_state"
-                if self.z1_action_representation == "ee_state_delta"
-                else "executed_ee_target"
-            ),
-            ee_anchor=(
-                packet.actual_ee_state.copy()
-                if self.z1_action_representation == "ee_state_delta"
-                else packet.executed_ee_target.copy()
-            ),
+            ee_anchor_kind=ee_anchor_kind,
+            ee_anchor=ee_anchor,
             original=original,
             unsmoothed=unsmoothed,
             processed=processed,
@@ -2154,8 +2344,21 @@ class AsyncRTCPolicy:
                     return
 
 
+_image_resource_servers = WeakKeyDictionary()
+_image_resource_servers_lock = Lock()
+
+
+def _server_image_resources(server):
+    with _image_resource_servers_lock:
+        if server not in _image_resource_servers:
+            _image_resource_servers[server] = ImageResources()
+        return _image_resource_servers[server]
+
+
 class VLARequestHandler(BaseHTTPRequestHandler):
     server_version = "Pi05VLA/1"
+    protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
 
     @property
     def engine(self) -> AsyncRTCPolicy:
@@ -2169,10 +2372,14 @@ class VLARequestHandler(BaseHTTPRequestHandler):
         LOG.debug("http %s - %s", self.address_string(), fmt % args)
 
     def _write_json(self, status: int, value: dict[str, object]) -> None:
+        if status >= 400:
+            self.close_connection = True
         payload = json.dumps(value, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         try:
             self.wfile.write(payload)
@@ -2180,12 +2387,14 @@ class VLARequestHandler(BaseHTTPRequestHandler):
             pass
 
     def _error(self, status: int, code: str, message: str) -> None:
+        self.close_connection = True
         self._write_json(status, {"error": {"code": code, "message": message}})
 
     def _write_actions(self, record: ActionRecord) -> None:
-        payload = encode_action_packet(record)
+        binary = self.headers.get("Accept") == ARRAY_CONTENT_TYPE
+        payload = encode_action_packet(record, binary_arrays=True) if binary else encode_action_packet(record)
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "application/x-npz")
+        self.send_header("Content-Type", ARRAY_CONTENT_TYPE if binary else "application/x-npz")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         try:
@@ -2225,7 +2434,8 @@ class VLARequestHandler(BaseHTTPRequestHandler):
         if path not in {"/v1/observations", "/v1/infer"}:
             self._error(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint")
             return
-        if self.headers.get_content_type() != "application/x-npz":
+        content_type = self.headers.get_content_type()
+        if content_type not in {"application/x-npz", ARRAY_CONTENT_TYPE}:
             self._error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type", "Use application/x-npz")
             return
         try:
@@ -2235,16 +2445,31 @@ class VLARequestHandler(BaseHTTPRequestHandler):
                 return
             if length <= 0:
                 raise ValueError(f"Invalid Content-Length: {length}")
-            packet = decode_observation_packet(self.rfile.read(length))
-            if packet.input_schema != self.engine.input_spec()["schema_id"]:
-                self._error(HTTPStatus.CONFLICT, "schema_mismatch", "Refresh /v1/input-spec and reassemble the input")
-                return
-            self.engine.validate_input(packet)
-            if path == "/v1/infer":
-                self._write_actions(self.engine.infer_request(packet))
-            else:
-                self.engine.submit(packet)
-                self._write_json(HTTPStatus.ACCEPTED, {"accepted_step": packet.sim_step, "control_epoch": packet.control_epoch})
+            payload = self.rfile.read(length)
+            if (content_type == ARRAY_CONTENT_TYPE) != payload.startswith(ARRAY_MAGIC):
+                raise ValueError("Input content type differs from payload format")
+            resources = _server_image_resources(self.server)
+            with resources.lock:
+                packet = decode_observation_packet(payload, decode_window=True, image_resources=resources)
+                if packet.input_schema != self.engine.input_spec()["schema_id"]:
+                    self._error(HTTPStatus.CONFLICT, "schema_mismatch", "Refresh /v1/input-spec and reassemble the input")
+                    return
+                self.engine.validate_input(packet)
+                if path == "/v1/infer":
+                    record = self.engine.infer_request(packet)
+                else:
+                    if self.engine.submit(packet) is False:
+                        raise ValueError("Observation is older than the pending input")
+                acknowledgement = {}
+                if isinstance(packet.model_image_history, FlatImageHistory):
+                    history = packet.model_image_history
+                    resources.commit(history.wire_values, history.input_sha256)
+                    acknowledgement["image_input_sha256"] = history.input_sha256
+                if path == "/v1/infer":
+                    self._write_actions(record)
+                else:
+                    self._write_json(HTTPStatus.ACCEPTED, dict(accepted_step=packet.sim_step,
+                        control_epoch=packet.control_epoch, **acknowledgement))
         except InferenceBusyError as exc:
             self._error(HTTPStatus.TOO_MANY_REQUESTS, "inference_busy", str(exc))
         except (ValueError, KeyError, TypeError, OSError, EOFError, BadZipFile) as exc:
@@ -2283,12 +2508,16 @@ class VLARequestHandler(BaseHTTPRequestHandler):
             return
         try:
             after = int(parse_qs(parsed.query).get("after", ["0"])[0])
+            wait_ms = int(parse_qs(parsed.query).get("wait_ms", ["0"])[0])
+            if not 0 <= wait_ms <= 20:
+                raise ValueError("wait_ms outside 0..20")
         except ValueError:
-            self._error(HTTPStatus.BAD_REQUEST, "invalid_cursor", "after must be an integer")
+            self._error(HTTPStatus.BAD_REQUEST, "invalid_cursor", "after must be an integer; wait_ms must be 0..20")
             return
-        record = self.engine.latest_after(after)
+        record = self.engine.latest_after(after, wait_ms) if wait_ms else self.engine.latest_after(after)
         if record is None:
             self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Content-Length", "0")
             self.end_headers()
             return
         self._write_actions(record)

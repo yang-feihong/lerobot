@@ -31,6 +31,55 @@ def test_mem_is_enabled_by_default():
     assert "--policy.mem_vit_checkpoint" in flags
 
 
+@pytest.mark.parametrize("source", ["control_action", "recorded_action"])
+def test_ee_source_is_forwarded_without_requiring_a_custom_profile(source):
+    result = dry_run(f"--ee-supervision-source={source}", "--action-history-enabled=true")
+    assert result.returncode == 0, result.stderr
+    flags = dict(arg.split("=", 1) for arg in shlex.split(result.stdout) if arg.startswith("--"))
+    assert flags["--policy.ee_supervision_source"] == source
+    assert flags["--policy.action_history_enabled"] == "true"
+
+
+def test_unknown_ee_source_is_rejected():
+    result = dry_run("--ee-supervision-source=typo")
+    assert result.returncode != 0
+    assert "EE supervision source" in result.stderr
+
+
+@pytest.mark.parametrize('fork,update_data,update_objective,accepted', [
+    (False, False, False, False), (False, True, True, False),
+    (True, False, True, False), (True, True, False, False), (True, True, True, True),
+])
+def test_ee_source_change_requires_explicit_fork(tmp_path, fork, update_data, update_objective, accepted):
+    import json
+    checkpoint = tmp_path / 'run/checkpoints/000500'
+    pretrained = checkpoint / 'pretrained_model'
+    pretrained.mkdir(parents=True)
+    (pretrained / 'train_config.json').write_text(json.dumps({'policy': {'ee_supervision_source': 'control_action'}}))
+    args = [f'--resume-checkpoint={checkpoint}', '--ee-supervision-source=recorded_action',
+            f'--resume-with-updated-dataset={str(update_data).lower()}',
+            f'--resume-with-updated-training-objective={str(update_objective).lower()}']
+    if fork:
+        args += ['--resume-new-run-name=raw_fork']
+    result = dry_run(*args)
+    assert (result.returncode == 0) == accepted, result.stderr
+    if accepted:
+        flags = dict(arg.split('=', 1) for arg in shlex.split(result.stdout) if arg.startswith('--'))
+        assert flags['--policy.ee_supervision_source'] == 'recorded_action'
+        assert flags['--resume'] == 'true'
+
+
+def test_previous_command_reference_requires_history_and_is_forwarded():
+    result = dry_run("--ee-delta-reference=previous_command", "--z1-action-representation=ee_state_delta",
+                     "--action-history-enabled=true")
+    assert result.returncode == 0, result.stderr
+    flags = dict(arg.split("=", 1) for arg in shlex.split(result.stdout) if arg.startswith("--"))
+    assert flags["--policy.ee_delta_reference"] == "previous_command"
+    result = dry_run("--ee-delta-reference=previous_command", "--z1-action-representation=ee_state_delta")
+    assert result.returncode != 0
+    assert "requires action history" in result.stderr
+
+
 def test_new_training_defaults_to_physical_tool_frame(tmp_path):
     result = subprocess.run(
         ["bash", str(SCRIPT), "--dry-run=true", f"--output-root={tmp_path}"],

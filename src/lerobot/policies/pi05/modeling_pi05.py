@@ -2939,6 +2939,16 @@ class PI05Policy(PreTrainedPolicy):
     ) -> Tensor | tuple[Tensor, Tensor]:
         """Predict a chunk of actions given environment observations."""
         self.eval()
+        return self.predict_action_chunk_in_eval(batch, return_reset_presets=return_reset_presets, **kwargs)
+
+    @torch.no_grad()
+    def predict_action_chunk_in_eval(
+        self, batch: dict[str, Tensor], *, return_reset_presets: bool = False,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        """Predict a chunk when the caller owns the policy's evaluation mode."""
+        if self.training:
+            raise RuntimeError("Evaluation-only prediction requires policy.eval()")
 
         # Prepare inputs
         mem_vit_window_num_frames, _mem_vit_lengths, mem_vit_memory_mask = self._mem_vit_window_plan(

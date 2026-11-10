@@ -91,11 +91,14 @@ def build_motion_priority_pool(
     translation_threshold_m: float,
     rotation_threshold_rad: float,
     gripper_change_threshold: float,
+    ee_supervision_source: str = "control_action",
 ) -> MotionPriorityPool:
+    if ee_supervision_source not in {"control_action", "recorded_action"}:
+        raise ValueError(f"Unsupported EE supervision source: {ee_supervision_source!r}")
     state_names = dataset.meta.features.get(OBS_STATE, {}).get("names") or []
     action_names = dataset.meta.features.get(ACTION, {}).get("names") or []
     control_ee_names = [
-        f"control_height_invariant_ee_{suffix}"
+        f"{'control_' if ee_supervision_source == 'control_action' else ''}height_invariant_ee_{suffix}"
         for suffix in (
             "rot6d_col0_x", "rot6d_col0_y", "rot6d_col0_z",
             "rot6d_col1_x", "rot6d_col1_y", "rot6d_col1_z", "x", "y", "z",
@@ -106,6 +109,8 @@ def build_motion_priority_pool(
         if all(name in action_names for name in control_ee_names)
         else None
     )
+    if ee_supervision_source == "recorded_action" and control_ee_indices is None:
+        raise ValueError("Motion-balanced sampling requires the recorded EE action channels")
     continuous_ee_names = [
         f"continuous_height_invariant_ee_state_{suffix}"
         for suffix in (

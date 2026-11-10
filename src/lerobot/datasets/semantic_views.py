@@ -758,8 +758,9 @@ def _hold_action(action: torch.Tensor) -> torch.Tensor:
     held[:, :3] = 0.0
     held[:, 3] = 1.0
     held[:, 4] = 0.0
-    # Keep the current executed target and gripper command for the whole chunk.
-    held[:, 5:14] = action[0, 16:25]
+    # Hold each EE source independently; choosing recorded supervision must not
+    # silently substitute the downstream joint-control target at completion.
+    held[:, 5:14] = action[0, 5:14]
     held[:, 14] = action[0, 14]
     held[:, 16:25] = action[0, 16:25]
     return held
@@ -774,7 +775,7 @@ def _hold_action_tail(action: torch.Tensor, start: int) -> torch.Tensor:
     result[start:, :3] = 0.0
     result[start:, 3] = 1.0
     result[start:, 4] = 0.0
-    result[start:, 5:14] = anchor[16:25]
+    result[start:, 5:14] = anchor[5:14]
     result[start:, 14] = anchor[14]
     result[start:, 16:25] = anchor[16:25]
     return result

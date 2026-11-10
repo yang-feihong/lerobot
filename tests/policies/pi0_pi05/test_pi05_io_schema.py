@@ -38,7 +38,8 @@ def _state_names() -> list[str]:
     ]
 
 
-def test_policy_factory_resolves_control_action_and_named_ee_state(monkeypatch, tmp_path):
+@pytest.mark.parametrize("ee_source", ["control_action", "recorded_action"])
+def test_policy_factory_resolves_control_action_and_named_ee_state(monkeypatch, tmp_path, ee_source):
     meta = SimpleNamespace(
         features={
             OBS_STATE: {
@@ -64,7 +65,8 @@ def test_policy_factory_resolves_control_action_and_named_ee_state(monkeypatch, 
             self.config = config
 
     monkeypatch.setattr(policy_factory, "get_policy_class", lambda _: DummyPolicy)
-    policy = policy_factory.make_policy(PI05Config(device="cpu"), ds_meta=meta)
+    policy = policy_factory.make_policy(PI05Config(device="cpu", ee_supervision_source=ee_source), ds_meta=meta)
+    assert policy.config.deployment_metadata()["action"]["ee_supervision_source"] == ee_source
     assert policy.config.input_features[OBS_STATE].shape == (10,)
     assert policy.config.output_features[ACTION].shape == (16,)
     assert policy.config.state_feature_indices == [0, 1, 2, 3, 4, 5, 12, 37, 38, 39]
@@ -400,6 +402,22 @@ def test_saved_config_without_current_semantic_fields_loads_current_defaults(tmp
     assert restored.ee_delta_supervision_mode == "all"
     assert restored.gripper_target_representation == "continuous_position"
     assert restored.ee_supervision_source == "control_action"
+
+
+def test_recorded_source_roundtrip_preserves_history_and_metadata(tmp_path) -> None:
+    from lerobot.policies.pi05.action_history import action_history_schema
+
+    config = PI05Config(state_action_encoding="continuous", action_history_enabled=True,
+                        ee_supervision_source="recorded_action")
+    config._save_pretrained(tmp_path)
+    restored = PreTrainedConfig.from_pretrained(tmp_path)
+    assert restored.ee_supervision_source == "recorded_action"
+    assert action_history_schema(restored) == action_history_schema(config)
+    names, indices, _ = action_history_schema(restored)
+    assert indices[names.index("height_invariant_ee_x")] == 11
+    metadata = restored.deployment_metadata()
+    assert metadata["action"]["ee_supervision_source"] == "recorded_action"
+    assert metadata["memory"]["action_history"]["source_representation"] == "dataset_recorded_command"
 
 
 def test_structured_metadata_records_temporal_decoder_contract() -> None:

@@ -224,6 +224,7 @@ snapshot_file_list() {
       src/lerobot/data_domains.py \
       src/lerobot/common/training_profile.py \
       src/lerobot/common/model_initialization.py \
+      src/lerobot/common/distributed_preprocessing.py \
       src/lerobot/common/semantic_input_audit.py \
       training_plan/dataset_release.py training_plan/resolve_dataset.py \
       training_plan/prepare_dataset.py training_plan/prepare_dataset.sh \
@@ -599,6 +600,7 @@ run_task_dry_run() {
   else
     printf -v command_q '%q ' env "TRAINING_JOBS_FILE=${code}/${training_jobs_rel}" bash "${code}/training_plan/launch.sh" resume-dry-run "${task}" "${gpu}" "${checkpoint}" "${port}"
   fi
+  command_q="/lerobot/.venv/bin/python -c 'import lerobot.scripts.lerobot_train' && ${command_q}"
   # Mizar's frontend does not relay stdout from foreground docker run. Launch a
   # CPU-only short-lived container and read its logs after it exits instead.
   output="$(ssh_node "${node}" "set -e

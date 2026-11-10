@@ -695,8 +695,8 @@ def make_policy(
         elif dataset_state_names is None:
             raise ValueError("PI0.5 configurable B2+Z1 I/O requires named observation.state dimensions")
         else:
-            if cfg.ee_supervision_source != "control_action":
-                raise ValueError("PI0.5 B2+Z1 supervision must use the stored control-action channels")
+            if cfg.ee_supervision_source not in {"control_action", "recorded_action"}:
+                raise ValueError(f"Unsupported EE supervision source: {cfg.ee_supervision_source!r}")
             cfg.ee_state_anchor_indices = None
             if cfg.z1_action_representation == "ee_state_delta":
                 missing = [

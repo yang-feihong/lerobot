@@ -41,6 +41,8 @@ predict_task_blocked="false"
 discrete_action_training_mode="continuous_flow" # "continuous_flow" or "structured_temporal"
 ee_target_dataset_semantics="joint_control_inactive_interpolated"
 ee_supervision_source="control_action"
+ee_supervision_source_explicit=false
+ee_delta_reference="current_state"
 ee_delta_supervision_mode="all" # "active_only" or "all"
 gripper_target_representation="continuous_position"
 action_loss_schema="group_balanced_v2"
@@ -350,6 +352,8 @@ while (( $# > 0 )); do
     --action-history-ee-semantics=*) action_history_ee_semantics="${1#*=}" ;;
     --max-action-history-dim=*) max_action_history_dim="${1#*=}" ;;
     --history-pause-max-steps=*) history_pause_max_steps="${1#*=}" ;;
+    --ee-supervision-source=*) ee_supervision_source="${1#*=}"; ee_supervision_source_explicit=true ;;
+    --ee-delta-reference=*) ee_delta_reference="${1#*=}" ;;
     --training-rtc=*) training_rtc="${1#*=}"; training_rtc_explicit="true" ;;
     --training-rtc-simulated-delay=*) training_rtc_simulated_delay="${1#*=}"; training_rtc_simulated_delay_explicit="true" ;;
     --training-rtc-delay-distribution=*) training_rtc_delay_distribution="${1#*=}"; training_rtc_delay_distribution_explicit="true" ;;
@@ -585,12 +589,24 @@ if [[ -n "$video_backend" && "$video_backend" != "pyav" && "$video_backend" != "
   exit 2
 fi
 
+if [[ "$ee_supervision_source" != "control_action" && "$ee_supervision_source" != "recorded_action" ]]; then
+  echo "EE supervision source must be control_action or recorded_action." >&2
+  exit 2
+fi
+if [[ "$ee_delta_reference" != "current_state" && "$ee_delta_reference" != "previous_command" ]]; then
+  echo "EE delta reference must be current_state or previous_command." >&2
+  exit 2
+fi
+if [[ "$ee_delta_reference" == "previous_command" && ( "$action_history_enabled" != "true" || "$z1_action_representation" != "ee_state_delta" ) ]]; then
+  echo "previous_command EE reference requires action history and ee_state_delta." >&2
+  exit 2
+fi
 case "$action_semantics_profile" in
   joint_control_ee_v1)
-    expected_semantics=(false false true true continuous_flow joint_control_inactive_interpolated control_action all continuous_position uniform_valid)
+    expected_semantics=(false false true true continuous_flow joint_control_inactive_interpolated "$ee_supervision_source" all continuous_position uniform_valid)
     ;;
   joint_control_arm_mode_v2)
-    expected_semantics=(true true true true continuous_flow joint_control_inactive_interpolated control_action all continuous_position group_balanced_v2)
+    expected_semantics=(true true true true continuous_flow joint_control_inactive_interpolated "$ee_supervision_source" all continuous_position group_balanced_v2)
     ;;
   custom)
     expected_semantics=()
@@ -804,6 +820,7 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.discrete_action_training_mode="$discrete_action_training_mode"
     --policy.ee_target_dataset_semantics="$ee_target_dataset_semantics"
     --policy.ee_supervision_source="$ee_supervision_source"
+    --policy.ee_delta_reference="$ee_delta_reference"
     --policy.ee_delta_supervision_mode="$ee_delta_supervision_mode"
     --policy.gripper_target_representation="$gripper_target_representation"
     --policy.action_loss_schema="$action_loss_schema"
@@ -862,6 +879,15 @@ PY
   [[ "$predict_task_blocked_explicit" == "false" ]] || policy_io_args+=(--policy.action_predict_task_blocked="$predict_task_blocked")
 fi
 if [[ -n "$resume_checkpoint" ]]; then
+  if [[ "$ee_supervision_source_explicit" == true ]]; then
+    python3 - "$resume_config" "$ee_supervision_source" "$resume_new_run_name" "$resume_with_updated_dataset" "$resume_with_updated_training_objective" <<'PY_EE_SOURCE'
+import json, sys
+saved = json.load(open(sys.argv[1]))['policy'].get('ee_supervision_source', 'control_action')
+if saved != sys.argv[2] and not (sys.argv[3] and sys.argv[4:] == ['true', 'true']):
+    raise SystemExit('Changing EE supervision source requires a new fork run and explicit dataset/objective updates')
+PY_EE_SOURCE
+    policy_io_args+=(--policy.ee_supervision_source="$ee_supervision_source")
+  fi
   [[ "$action_loss_schema_explicit" == "false" ]] || policy_io_args+=(--policy.action_loss_schema="$action_loss_schema")
   [[ "$action_continuous_group_weight_explicit" == "false" ]] || policy_io_args+=(--policy.action_continuous_group_weight="$action_continuous_group_weight")
   [[ "$action_discrete_group_weight_explicit" == "false" ]] || policy_io_args+=(--policy.action_discrete_group_weight="$action_discrete_group_weight")

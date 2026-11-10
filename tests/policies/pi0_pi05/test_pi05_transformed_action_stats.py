@@ -34,7 +34,19 @@ from lerobot.policies.pi05.transformed_action_stats import (
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
-def test_transformed_stats_follow_episode_deltas_and_active_endpoint_mask(tmp_path) -> None:
+def test_updated_source_statistics_require_explicit_opt_in_and_same_schema():
+    from copy import deepcopy
+    saved = {'schema': {'ee_supervision_source': 'control_action', 'action_names': ['ee_x']}}
+    measured = deepcopy(saved)
+    measured['schema']['ee_supervision_source'] = 'recorded_action'
+    assert not transformed_action_schemas_equal(saved, measured)
+    assert transformed_action_schemas_equal(saved, measured, allow_ee_source_update=True)
+    measured['schema']['action_names'].append('extra')
+    assert not transformed_action_schemas_equal(saved, measured, allow_ee_source_update=True)
+
+
+@pytest.mark.parametrize("source,delta", [("control_action", 0.02), ("recorded_action", 0.01)])
+def test_transformed_stats_follow_episode_deltas_and_active_endpoint_mask(tmp_path, source, delta) -> None:
     actions = np.zeros((6, 16), dtype=np.float32)
     actions[:, 5] = 1.0
     actions[:, 9] = 1.0
@@ -45,6 +57,7 @@ def test_transformed_stats_follow_episode_deltas_and_active_endpoint_mask(tmp_pa
     stored_actions = np.zeros((6, 25), dtype=np.float32)
     stored_actions[:, :16] = actions
     stored_actions[:, 16:25] = actions[:, 5:14]
+    stored_actions[:, 22] *= 2
     hf_dataset = Dataset.from_dict(
         {
             ACTION: stored_actions.tolist(),
@@ -80,7 +93,7 @@ def test_transformed_stats_follow_episode_deltas_and_active_endpoint_mask(tmp_pa
         action_predict_task_blocked=False,
         dataset_action_feature_names=list(CONTROL_EXTENDED_DATASET_ACTION_NAMES),
         b2_global_pose_state_indices=None,
-        ee_supervision_source="control_action",
+        ee_supervision_source=source,
         ee_target_dataset_semantics="joint_control_inactive_interpolated",
         ee_delta_supervision_mode="active_only",
         gripper_target_representation="binary_position",
@@ -96,12 +109,16 @@ def test_transformed_stats_follow_episode_deltas_and_active_endpoint_mask(tmp_pa
     assert transformed_action_stats_ee_valid_count(payload) == 3
     names = payload["schema"]["action_names"]
     x_index = names.index("height_invariant_ee_delta_x")
-    assert payload["stats"][ACTION]["q01"][x_index] == pytest.approx(0.01, abs=1e-6)
-    assert payload["stats"][ACTION]["q99"][x_index] == pytest.approx(0.01, abs=1e-6)
+    assert payload["stats"][ACTION]["q01"][x_index] == pytest.approx(delta, abs=1e-6)
+    assert payload["stats"][ACTION]["q99"][x_index] == pytest.approx(delta, abs=1e-6)
 
     path = save_transformed_action_stats(payload, tmp_path / "stats.json")
     loaded = load_transformed_action_stats(path)
     validate_transformed_action_stats(loaded, dataset, config)
+    config.ee_supervision_source = "recorded_action" if source == "control_action" else "control_action"
+    with pytest.raises(ValueError, match="ee_supervision_source"):
+        validate_transformed_action_stats(loaded, dataset, config)
+    config.ee_supervision_source = source
     assert_transformed_action_stats_equal(loaded, payload)
 
     raw_stats = {
@@ -119,7 +136,7 @@ def test_transformed_stats_follow_episode_deltas_and_active_endpoint_mask(tmp_pa
         **action_schema_kwargs(config),
     )
     assert len(normalized_stats[ACTION]["q01"]) == 13
-    assert normalized_stats[ACTION]["q01"][x_index] == pytest.approx(0.01, abs=1e-6)
+    assert normalized_stats[ACTION]["q01"][x_index] == pytest.approx(delta, abs=1e-6)
 
 
 def test_transformed_stats_valid_count_supports_all_transition_schema() -> None:

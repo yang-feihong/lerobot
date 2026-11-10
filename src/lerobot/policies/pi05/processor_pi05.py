@@ -50,7 +50,7 @@ from lerobot.utils.constants import (
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
-from .action_history import RESET_HISTORY_KEY, RESET_TARGET_NAMES, action_history_schema
+from .action_history import RESET_HISTORY_KEY, RESET_TARGET_NAMES, action_history_schema, command_reference_anchor
 from .b2_action_transform import (
     CONTROL_EXTENDED_DATASET_ACTION_NAMES,
     DATASET_ACTION_NAMES,
@@ -67,6 +67,14 @@ from .b2_action_transform import (
 from .configuration_pi05 import PI05Config
 
 OBS_ACTION_HISTORY = "observation.action_history"
+
+
+def _ee_reference_kwargs(config):
+    indices = ()
+    if config.ee_delta_reference == "previous_command":
+        names = action_history_schema(config)[0]
+        indices = tuple(names.index(name) for name in DATASET_ACTION_NAMES[5:14])
+    return {"ee_delta_reference": config.ee_delta_reference, "ee_history_anchor_indices": indices}
 
 
 def _is_history_normalizer(step):
@@ -279,6 +287,8 @@ class Pi05ActionRepresentationProcessorStep(ProcessorStep):
     ee_delta_supervision_mode: str = "all"
     ee_supervision_source: str = "control_action"
     ee_state_anchor_indices: tuple[int, ...] = ()
+    ee_history_anchor_indices: tuple[int, ...] = ()
+    ee_delta_reference: str = "current_state"
     predict_arm_teleop_inactive: bool = True
     predict_arm_reset: bool = True
     predict_ee_pose: bool = True
@@ -377,6 +387,18 @@ class Pi05ActionRepresentationProcessorStep(ProcessorStep):
                 raise ValueError(
                     f"Cannot extract EE anchor from state={tuple(state.shape)}, action={tuple(action.shape)}"
                 )
+            if self.ee_delta_reference == "previous_command":
+                history = observations[OBS_ACTION_HISTORY]
+                if len(self.ee_history_anchor_indices) != 9 or history.shape[-2] < 1:
+                    raise ValueError("previous_command reference requires EE command history")
+                complementary = new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
+                valid = ~complementary[f"{OBS_ACTION_HISTORY}_is_pad"][..., -1].bool()
+                feature_pad = complementary.get(f"{OBS_ACTION_HISTORY}_feature_is_pad")
+                if feature_pad is not None:
+                    valid = valid & ~feature_pad[..., -1, list(self.ee_history_anchor_indices)].any(dim=-1)
+                ee_state_anchor = command_reference_anchor(
+                    ee_state_anchor, history[..., -1, list(self.ee_history_anchor_indices)], valid
+                )
         if not self.inverse and self.state_indices:
             observations = dict(new_transition.get(TransitionKey.OBSERVATION, {}))
             state = observations.get(OBS_STATE)
@@ -441,6 +463,8 @@ class Pi05ActionRepresentationProcessorStep(ProcessorStep):
             "ee_delta_rotation_representation": self.ee_delta_rotation_representation,
             "ee_delta_supervision_mode": self.ee_delta_supervision_mode,
             "ee_supervision_source": self.ee_supervision_source,
+            "ee_delta_reference": self.ee_delta_reference,
+            "ee_history_anchor_indices": list(self.ee_history_anchor_indices),
             "ee_state_anchor_indices": list(self.ee_state_anchor_indices),
             "predict_arm_teleop_inactive": self.predict_arm_teleop_inactive,
             "predict_arm_reset": self.predict_arm_reset,
@@ -482,6 +506,7 @@ def reconcile_pi05_action_representation_processors(
         postprocessor = hotswap_stats(postprocessor, transformed_stats)
 
     desired_pre_step = Pi05ActionRepresentationProcessorStep(
+        **_ee_reference_kwargs(config),
         dt=config.action_dt_seconds,
         state_indices=tuple(config.state_feature_indices or ()),
         state_history_length=(config.state_num_frames if config.state_action_encoding == "continuous" else 1),
@@ -716,6 +741,7 @@ def make_pi05_pre_post_processors(
         input_steps.insert(
             normalizer_index,
             Pi05ActionRepresentationProcessorStep(
+                **_ee_reference_kwargs(config),
                 dt=config.action_dt_seconds,
                 state_indices=tuple(config.state_feature_indices or ()),
                 state_history_length=(
