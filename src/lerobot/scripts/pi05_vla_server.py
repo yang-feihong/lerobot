@@ -216,6 +216,13 @@ def _to_execution_actions(
         raise ValueError(f"Invalid named postprocessed actions: shape={tuple(actions.shape)}, names={names}")
     columns = {name: actions[:, index] for index, name in enumerate(names)}
     output_names = execution_action_names(z1_action_representation)
+    if names == ("b2_vx", "b2_vy", "b2_omega_z"):
+        output = actions.new_zeros((len(actions), len(output_names)))
+        output[:, :3] = actions
+        for name in ("b2_active", "height_invariant_ee_delta_rot6d_col0_x",
+                     "height_invariant_ee_delta_rot6d_col1_y"):
+            output[:, output_names.index(name)] = 1.0
+        return output
     if z1_action_representation in {"ee_delta", "ee_state_delta"} and set(EE_DELTA_ROTVEC_NAMES).issubset(
         columns
     ):
@@ -795,7 +802,7 @@ def _decode_jpeg(encoded: np.ndarray, name: str, *, writable=True) -> np.ndarray
 
 @lru_cache(maxsize=1)
 def _image_decode_pool():
-    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="vla-image-decode")
+    return ThreadPoolExecutor(max_workers=8, thread_name_prefix="vla-image-decode")
 
 
 def _decode_jpeg_window(images, *, writable=True):
@@ -816,9 +823,11 @@ def _image_output_fields(history):
     return dict(model_image_history=np.frombuffer(history or b"", dtype=np.uint8))
 
 
-def decode_observation_packet(payload: bytes, max_state_dim: int = 4096, *, decode_current=True, decode_window=False, image_resources=None) -> ObservationPacket:
-    with open_arrays(payload) as source:
-        packet = {key: source[key] for key in source.files}
+def decode_observation_packet(payload: bytes, max_state_dim: int = 4096, *, decode_current=True, decode_window=False, image_resources=None, prepared_values=None) -> ObservationPacket:
+    from contextlib import nullcontext
+
+    with (nullcontext(None) if prepared_values is not None else open_arrays(payload)) as source:
+        packet = dict(prepared_values) if prepared_values is not None else {key: source[key] for key in source.files}
         version = int(packet["protocol_version"].item())
         if version != PROTOCOL_VERSION:
             raise ValueError(f"Protocol version {version} != {PROTOCOL_VERSION}")
@@ -932,7 +941,11 @@ def decode_observation_packet(payload: bytes, max_state_dim: int = 4096, *, deco
 
 
 def encode_action_packet(record: ActionRecord, *, binary_arrays=False) -> bytes:
-    return (encode_wire if binary_arrays else dump_action_arrays)(dict(
+    return (encode_wire if binary_arrays else dump_action_arrays)(action_packet_values(record))
+
+
+def action_packet_values(record: ActionRecord) -> dict[str, np.ndarray]:
+    return dict(
         **_image_output_fields(record.model_image_history),
         protocol_version=np.asarray(PROTOCOL_VERSION, dtype=np.int64),
         sequence=np.asarray(record.sequence, dtype=np.int64),
@@ -969,7 +982,7 @@ def encode_action_packet(record: ActionRecord, *, binary_arrays=False) -> bytes:
             record.velocity_smoothing_transition_step, dtype=np.int64
         ),
         sim_steps_per_wall_second=np.asarray(record.sim_steps_per_wall_second, dtype=np.float64),
-    ))
+    )
 
 
 @dataclass(frozen=True)
@@ -1927,6 +1940,11 @@ class AsyncRTCPolicy:
         packet: ObservationPacket,
     ) -> torch.Tensor:
         physical = self._apply_action_processor(self._action_unnormalizer, normalized_prefix)
+        if self.model_action_names == ("b2_delta_x", "b2_delta_y", "b2_delta_yaw"):
+            old_anchor = torch.as_tensor(record.b2_anchor, dtype=physical.dtype, device=physical.device)
+            new_anchor = torch.as_tensor(self._b2_global_pose(packet), dtype=physical.dtype, device=physical.device)
+            physical = _reanchor_b2_pose_delta(physical, old_anchor, new_anchor)
+            return self._apply_action_processor(self._action_normalizer, physical)
         b2_reanchor, ee_reanchor, ee_names, rotation_representation = self._rtc_reanchor_status()
         if b2_reanchor:
             b2_names = ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")
@@ -2577,22 +2595,28 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main() -> None:
+def main(runtime_factory=None) -> None:
     args = parse_args()
     init_logging()
     engine = AsyncRTCPolicy(args)
     server = ThreadingHTTPServer((args.host, args.port), VLARequestHandler)
     server.engine = engine  # type: ignore[attr-defined]
     server.max_payload_bytes = int(args.max_payload_mb * 1024 * 1024)  # type: ignore[attr-defined]
-    engine.start()
-    LOG.info("Listening on http://%s:%d", args.host, args.port)
+    runtime = None
     try:
+        engine.start()
+        runtime = runtime_factory(engine, args, server) if runtime_factory is not None else None
+        LOG.info("Listening on http://%s:%d", args.host, args.port)
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
         pass
     finally:
-        server.server_close()
-        engine.stop()
+        try:
+            if runtime is not None:
+                runtime.close()
+        finally:
+            server.server_close()
+            engine.stop()
 
 
 if __name__ == "__main__":
