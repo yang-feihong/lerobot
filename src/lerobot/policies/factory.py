@@ -564,6 +564,9 @@ def make_policy(
     ds_meta: LeRobotDatasetMetadata | None = None,
     env_cfg: EnvConfig | None = None,
     rename_map: dict[str, str] | None = None,
+    *,
+    verify_base_artifact_hashes: bool = True,
+    initialize_pretrained_backbone: bool = True,
 ) -> PreTrainedPolicy:
     """
     Instantiate a policy model.
@@ -582,6 +585,10 @@ def make_policy(
                  One of `ds_meta` or `env_cfg` must be provided.
         rename_map: Optional mapping of dataset or environment feature keys to match
                  expected policy feature names (e.g., `"left"` → `"camera1"`).
+        verify_base_artifact_hashes: Read and hash base artifacts before loading.
+                 Serving trusted local artifacts can disable this bulk I/O step.
+        initialize_pretrained_backbone: Initialize PI05 backbone weights before
+                 overwriting them from a checkpoint. Missing backbone keys fall back to initialized loading.
 
     Returns:
         An instantiated and device-placed policy model.
@@ -619,6 +626,8 @@ def make_policy(
         cfg.restore_pretrained_metadata(cfg.pretrained_path, revision=cfg.pretrained_revision)
 
     kwargs = {}
+    if isinstance(cfg, PI05Config) and cfg.pretrained_path:
+        kwargs["initialize_backbone"] = initialize_pretrained_backbone
     if checkpoint_only:
         features = {**cfg.input_features, **cfg.output_features}
     elif ds_meta is not None:
@@ -829,7 +838,9 @@ def make_policy(
 
         peft_pretrained_path = str(cfg.pretrained_path)
         peft_config = PeftConfig.from_pretrained(peft_pretrained_path)
-        resolved_bases = resolve_checkpoint_bases(peft_pretrained_path)
+        resolved_bases = resolve_checkpoint_bases(
+            peft_pretrained_path, verify_hash=verify_base_artifact_hashes
+        )
         if resolved_bases:
             peft_config.base_model_name_or_path = str(resolved_bases["policy_base"])
             if isinstance(cfg, PI05Config):

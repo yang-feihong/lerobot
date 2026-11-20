@@ -21,6 +21,7 @@ import os
 import re
 import types
 from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
@@ -737,6 +738,7 @@ class PaliGemmaWithExpertModel(
         mem_vit_num_frames: int = 1,
         mem_vit_temporal_every: int = 4,
         mem_vit_use_original_for_k1: bool = True,
+        initialize_backbone: bool = True,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -783,8 +785,12 @@ class PaliGemmaWithExpertModel(
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
         )
 
-        self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(config=vlm_config_hf)
-        self.gemma_expert = PiGemmaForCausalLM(config=action_expert_config_hf)
+        if not initialize_backbone:
+            from transformers.initialization import no_init_weights
+
+        with nullcontext() if initialize_backbone else no_init_weights():
+            self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(config=vlm_config_hf)
+            self.gemma_expert = PiGemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
         if self.mem_vit_enabled:
@@ -1031,7 +1037,10 @@ class PaliGemmaWithExpertModel(
 class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     """Core PI05 PyTorch model."""
 
-    def __init__(self, config: PI05Config, rtc_processor: RTCProcessor | None = None):
+    def __init__(
+        self, config: PI05Config, rtc_processor: RTCProcessor | None = None,
+        *, initialize_backbone: bool = True,
+    ):
         super().__init__()
         self.config = config
         self.rtc_processor = rtc_processor
@@ -1057,6 +1066,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             mem_vit_num_frames=config.mem_vit_num_frames,
             mem_vit_temporal_every=config.mem_vit_temporal_every,
             mem_vit_use_original_for_k1=config.mem_vit_use_original_for_k1,
+            initialize_backbone=initialize_backbone,
         )
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
@@ -1633,6 +1643,119 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return velocity
 
 
+def preprocess_pi05_images(batch, config, device, *, mem_vit_window_num_frames=None, mem_vit_memory_mask=None):
+    """Preprocess images for the model.
+
+    Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
+    PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
+    """
+    images = []
+    img_masks = []
+    image_memory_masks = []
+
+    present_img_keys = [key for key in config.image_features if key in batch]
+    missing_img_keys = [key for key in config.image_features if key not in batch]
+
+    if len(present_img_keys) == 0:
+        raise ValueError(
+            f"All image features are missing from the batch. At least one expected. "
+            f"(batch: {batch.keys()}) (image_features: {config.image_features})"
+        )
+
+    # Preprocess image features present in the batch
+    for key in present_img_keys:
+        img = batch[key]
+        if img.ndim not in (4, 5):
+            raise ValueError(
+                f"Expected image feature {key} to be 4D [B,C,H,W]/[B,H,W,C] or "
+                f"5D [B,K,C,H,W]/[B,K,H,W,C], got {tuple(img.shape)}"
+            )
+
+        original_batch_size = img.shape[0]
+        if img.ndim == 5:
+            num_frames = img.shape[1]
+            if not config.mem_vit_enabled:
+                img = img[:, -1]
+            elif mem_vit_window_num_frames is None or mem_vit_memory_mask is None:
+                raise ValueError(
+                    "mem_vit_window_num_frames and mem_vit_memory_mask must be provided "
+                    "when MEM-ViT image windows are used."
+                )
+            elif mem_vit_window_num_frames > num_frames:
+                raise ValueError(
+                    f"Requested {mem_vit_window_num_frames} MEM-ViT frames for image feature {key}, "
+                    f"but the batch only contains {num_frames} frames."
+                )
+            elif num_frames != mem_vit_window_num_frames:
+                img = img[:, -mem_vit_window_num_frames:]
+                num_frames = mem_vit_window_num_frames
+            if config.mem_vit_enabled and num_frames != mem_vit_window_num_frames:
+                raise ValueError(
+                    f"Image feature {key} has {num_frames} frames per sample, but "
+                    f"runtime window has {mem_vit_window_num_frames}."
+                )
+            if not (img.shape[2] == 3 or img.shape[-1] <= 4):
+                raise ValueError(
+                    f"Could not infer channel dimension for image feature {key}: {tuple(img.shape)}"
+                )
+
+        # Ensure tensor is on the same device as the model
+        if img.device != device:
+            img = img.to(device)
+
+        # Ensure float32 dtype for consistency
+        if img.dtype != torch.float32:
+            img = img.to(torch.float32)
+
+        restore_mem_window_shape = img.ndim == 5 and config.mem_vit_enabled
+        if restore_mem_window_shape:
+            window_shape = img.shape[:2]
+            img = img.flatten(0, 1)
+
+        # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
+        is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
+
+        if is_channels_first:
+            # Convert [B, C, H, W] to [B, H, W, C] for processing
+            img = img.permute(0, 2, 3, 1)
+
+        # from openpi preprocess_observation_pytorch: Resize with padding if needed
+        if img.shape[1:3] != config.image_resolution:
+            img = resize_with_pad_torch(img, *config.image_resolution)
+
+        # Normalize from [0,1] to [-1,1] as expected by siglip
+        img = img * 2.0 - 1.0
+
+        # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
+        if is_channels_first:
+            img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+
+        if restore_mem_window_shape:
+            img = img.view(*window_shape, *img.shape[1:])
+
+        images.append(img)
+        # Create mask (all ones for real images)
+        mask = torch.ones(original_batch_size, dtype=torch.bool, device=device)
+        img_masks.append(mask)
+        image_memory_masks.append(
+            mem_vit_memory_mask.to(device=device) if restore_mem_window_shape else None
+        )
+
+    # Create image features not present in the batch as fully 0 padded images
+    for _num_empty_cameras in range(len(missing_img_keys)):
+        img = torch.ones_like(img) * -1  # Padded with -1 for SigLIP
+        mask = torch.zeros_like(mask)  # Mask is zero for empty cameras
+        images.append(img)
+        img_masks.append(mask)
+        image_memory_masks.append(
+            mem_vit_memory_mask.to(device=device)
+            if config.mem_vit_enabled and img.ndim == 5 and mem_vit_memory_mask is not None
+            else None
+        )
+
+    return images, img_masks, image_memory_masks
+
+
 class PI05Policy(PreTrainedPolicy):
     """PI05 Policy for LeRobot."""
 
@@ -1642,6 +1765,7 @@ class PI05Policy(PreTrainedPolicy):
     def __init__(
         self,
         config: PI05Config,
+        initialize_backbone: bool = True,
         **kwargs,
     ):
         """
@@ -1655,7 +1779,9 @@ class PI05Policy(PreTrainedPolicy):
 
         # Initialize the core PI05 model
         self.init_rtc_processor()
-        self.model = PI05Pytorch(config, rtc_processor=self.rtc_processor)
+        self.model = PI05Pytorch(
+            config, rtc_processor=self.rtc_processor, initialize_backbone=initialize_backbone
+        )
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -1892,6 +2018,20 @@ class PI05Policy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+
+            if not kwargs.get("initialize_backbone", True) and any(
+                key.startswith((
+                    "model.paligemma_with_expert.paligemma.",
+                    "model.paligemma_with_expert.gemma_expert.",
+                ))
+                for key in missing_keys
+            ):
+                # Partial checkpoints still need initialized missing parameters.
+                # Rebuild normally rather than serving uninitialized tensors.
+                logging.warning("Incomplete backbone checkpoint; using initialized loading")
+                del model
+                model = cls(config, **{**kwargs, "initialize_backbone": True})
+                missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -2166,126 +2306,10 @@ class PI05Policy(PreTrainedPolicy):
             )
         return action_history[:, -window_num_frames:, :]
 
-    def _preprocess_images(
-        self,
-        batch: dict[str, Tensor],
-        *,
-        mem_vit_window_num_frames: int | None = None,
-        mem_vit_memory_mask: Tensor | None = None,
-    ) -> tuple[list[Tensor], list[Tensor], list[Tensor | None]]:
-        """Preprocess images for the model.
-
-        Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
-        PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
-        """
-        images = []
-        img_masks = []
-        image_memory_masks = []
-
-        # Get device from model parameters
-        device = next(self.parameters()).device
-
-        present_img_keys = [key for key in self.config.image_features if key in batch]
-        missing_img_keys = [key for key in self.config.image_features if key not in batch]
-
-        if len(present_img_keys) == 0:
-            raise ValueError(
-                f"All image features are missing from the batch. At least one expected. "
-                f"(batch: {batch.keys()}) (image_features: {self.config.image_features})"
-            )
-
-        # Preprocess image features present in the batch
-        for key in present_img_keys:
-            img = batch[key]
-            if img.ndim not in (4, 5):
-                raise ValueError(
-                    f"Expected image feature {key} to be 4D [B,C,H,W]/[B,H,W,C] or "
-                    f"5D [B,K,C,H,W]/[B,K,H,W,C], got {tuple(img.shape)}"
-                )
-
-            original_batch_size = img.shape[0]
-            if img.ndim == 5:
-                num_frames = img.shape[1]
-                if not self.config.mem_vit_enabled:
-                    img = img[:, -1]
-                elif mem_vit_window_num_frames is None or mem_vit_memory_mask is None:
-                    raise ValueError(
-                        "mem_vit_window_num_frames and mem_vit_memory_mask must be provided "
-                        "when MEM-ViT image windows are used."
-                    )
-                elif mem_vit_window_num_frames > num_frames:
-                    raise ValueError(
-                        f"Requested {mem_vit_window_num_frames} MEM-ViT frames for image feature {key}, "
-                        f"but the batch only contains {num_frames} frames."
-                    )
-                elif num_frames != mem_vit_window_num_frames:
-                    img = img[:, -mem_vit_window_num_frames:]
-                    num_frames = mem_vit_window_num_frames
-                if self.config.mem_vit_enabled and num_frames != mem_vit_window_num_frames:
-                    raise ValueError(
-                        f"Image feature {key} has {num_frames} frames per sample, but "
-                        f"runtime window has {mem_vit_window_num_frames}."
-                    )
-                if not (img.shape[2] == 3 or img.shape[-1] <= 4):
-                    raise ValueError(
-                        f"Could not infer channel dimension for image feature {key}: {tuple(img.shape)}"
-                    )
-
-            # Ensure tensor is on the same device as the model
-            if img.device != device:
-                img = img.to(device)
-
-            # Ensure float32 dtype for consistency
-            if img.dtype != torch.float32:
-                img = img.to(torch.float32)
-
-            restore_mem_window_shape = img.ndim == 5 and self.config.mem_vit_enabled
-            if restore_mem_window_shape:
-                window_shape = img.shape[:2]
-                img = img.flatten(0, 1)
-
-            # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
-            is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
-
-            if is_channels_first:
-                # Convert [B, C, H, W] to [B, H, W, C] for processing
-                img = img.permute(0, 2, 3, 1)
-
-            # from openpi preprocess_observation_pytorch: Resize with padding if needed
-            if img.shape[1:3] != self.config.image_resolution:
-                img = resize_with_pad_torch(img, *self.config.image_resolution)
-
-            # Normalize from [0,1] to [-1,1] as expected by siglip
-            img = img * 2.0 - 1.0
-
-            # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
-            if is_channels_first:
-                img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
-
-            if restore_mem_window_shape:
-                img = img.view(*window_shape, *img.shape[1:])
-
-            images.append(img)
-            # Create mask (all ones for real images)
-            mask = torch.ones(original_batch_size, dtype=torch.bool, device=device)
-            img_masks.append(mask)
-            image_memory_masks.append(
-                mem_vit_memory_mask.to(device=device) if restore_mem_window_shape else None
-            )
-
-        # Create image features not present in the batch as fully 0 padded images
-        for _num_empty_cameras in range(len(missing_img_keys)):
-            img = torch.ones_like(img) * -1  # Padded with -1 for SigLIP
-            mask = torch.zeros_like(mask)  # Mask is zero for empty cameras
-            images.append(img)
-            img_masks.append(mask)
-            image_memory_masks.append(
-                mem_vit_memory_mask.to(device=device)
-                if self.config.mem_vit_enabled and img.ndim == 5 and mem_vit_memory_mask is not None
-                else None
-            )
-
-        return images, img_masks, image_memory_masks
+    def _preprocess_images(self, batch, *, mem_vit_window_num_frames=None, mem_vit_memory_mask=None):
+        return preprocess_pi05_images(batch, self.config, next(self.parameters()).device,
+            mem_vit_window_num_frames=mem_vit_window_num_frames,
+            mem_vit_memory_mask=mem_vit_memory_mask)
 
     def prepare_action(self, batch):
         """Pad action"""

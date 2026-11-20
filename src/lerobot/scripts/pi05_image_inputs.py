@@ -25,6 +25,11 @@ def images_are_unchanged(preprocessor) -> bool:
     for step in preprocessor.steps:
         if type(step).__dict__.get("_registry_name") not in allowed:
             return False
+        if (type(step).__dict__.get("_registry_name") == "rename_observations_processor"
+                and any(source != target for source, target in step.rename_map.items())):
+            # Renaming can change camera ordering/availability. Reuse is safe
+            # only when the same image keys reach the policy unchanged.
+            return False
         if type(step).__dict__.get("_registry_name") == "device_processor" and step.float_dtype not in {
             None,
             "float",

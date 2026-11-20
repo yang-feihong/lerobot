@@ -21,6 +21,8 @@ from lerobot.policies.pi05.b2_action_transform import (
 )
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.rtc import RTCConfig, TrainingRTCConfig
+
+
 from lerobot.processor import NormalizerProcessorStep, UnnormalizerProcessorStep
 from lerobot.scripts.pi05_vla_server import (
     B2_EXECUTION_VELOCITY_NAMES,
@@ -53,6 +55,21 @@ from lerobot.scripts.pi05_vla_server import (
 )
 
 EXECUTION_ACTION_NAMES = execution_action_names("ee_delta")
+
+
+@pytest.mark.parametrize("mode,horizon,expected", [("inference", 10, 10), ("inference", 60, 60), ("training", 10, 50)])
+def test_warmup_rtc_prefix_matches_execution_shape(mode, horizon, expected):
+    engine = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    engine.device = torch.device("cpu")
+    engine.rtc_config = RTCConfig(mode=mode, execution_horizon=horizon)
+    actions = torch.arange(500, dtype=torch.float32).reshape(1, 50, 10)
+    prefix = engine._warmup_rtc_prefix(actions)
+    assert prefix.shape == (1, expected, 10)
+    assert torch.equal(prefix[:, :min(expected, 50)], actions[:, :min(expected, 50)])
+    if expected > 50:
+        assert not prefix[:, 50:].any()
+    prefix.zero_()
+    assert actions.any()  # No alias into reusable inference outputs.
 
 
 def _complete_packet(**changes):
@@ -226,6 +243,7 @@ def test_real_robot_jpeg_roles_reach_metadata_model_slots(wrist_first):
 def test_start_runs_compile_warmup_on_the_inference_worker() -> None:
     policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
     policy._stop = Event()
+    policy._worker_cleanup = None
     policy._warmup_requested = Event()
     policy._warmup_finished = Event()
     policy._warmup_error = None
@@ -255,6 +273,7 @@ def test_start_runs_compile_warmup_on_the_inference_worker() -> None:
 def test_inference_worker_immediately_consumes_an_observation_waiting_in_the_mailbox() -> None:
     policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
     policy._stop = Event()
+    policy._worker_cleanup = None
     policy._warmup_requested = Event()
     policy._warmup_finished = Event()
     policy._warmup_error = None

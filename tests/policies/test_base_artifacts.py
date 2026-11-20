@@ -93,6 +93,31 @@ def test_portable_checkpoint_requires_a_registry(tmp_path: Path, monkeypatch: py
         resolve_checkpoint_bases(checkpoint)
 
 
+def test_serving_resolution_skips_hash_reads_but_checks_paths(tmp_path, monkeypatch):
+    import lerobot.policies.base_artifacts as artifacts
+
+    checkpoint = tmp_path / "checkpoint"
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    weights = policy / "model.safetensors"
+    weights.write_bytes(b"local weights")
+    registry = tmp_path / "registry.json"
+    _write_registry(registry, policy, tmp_path / "unused.pt")
+    write_manifest(checkpoint, policy_artifact_id="policy-v1", policy_sha256="0" * 64)
+
+    def forbidden_hash(*args):
+        pytest.fail("Serving must not hash artifact contents")
+
+    monkeypatch.setattr(artifacts, "sha256_file", forbidden_hash)
+    monkeypatch.setattr(artifacts, "sha256_directory", forbidden_hash)
+    assert resolve_checkpoint_bases(checkpoint, registry_path=registry, verify_hash=False) == {
+        "policy_base": policy
+    }
+    weights.unlink()
+    with pytest.raises(FileNotFoundError, match="fingerprint file"):
+        resolve_checkpoint_bases(checkpoint, registry_path=registry, verify_hash=False)
+
+
 def test_manifest_rejects_unknown_fields(tmp_path: Path) -> None:
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()

@@ -43,6 +43,7 @@ from lerobot.policies.pi05.processor_pi05 import OBS_ACTION_HISTORY, Pi05Prepare
 from lerobot.policies.rtc import RTCConfig
 from lerobot.processor import NormalizerProcessorStep, UnnormalizerProcessorStep
 from lerobot.scripts.pi05_image_inputs import ImageTensorCache, images_are_unchanged
+from lerobot.scripts.pi05_cpu_images import rgb_window
 from lerobot.scripts.pi05_npz import dump_action_arrays, open_arrays
 from lerobot.scripts.pi05_array_wire import MAGIC as ARRAY_MAGIC, FORMAT as ARRAY_FORMAT
 from lerobot.scripts.pi05_array_wire import CONTENT_TYPE as ARRAY_CONTENT_TYPE, dump_arrays as encode_wire
@@ -383,6 +384,23 @@ def _smooth_b2_execution_velocity(
     if time_constant_s == 0 or len(actions) == 0:
         return smoothed
     alpha = -math.expm1(-dt / time_constant_s)
+    if (actions.device.type == "cpu" and actions.dtype == torch.float32
+            and not any(value is not None and (value.requires_grad or value.is_neg())
+                        for value in (actions, initial_velocity, prefix_velocity))):
+        # Keep the same float32 subtract/multiply/add order; avoid dispatching
+        # three tiny Torch operations for every row. Other channels are untouched.
+        source, output = actions.numpy(), smoothed.numpy()
+        filtered = initial_velocity.numpy()
+        prefix = None if prefix_velocity is None else prefix_velocity.numpy()
+        alpha32 = np.float32(alpha)
+        for step in range(len(output)):
+            if step < transition_start_step:
+                if prefix is not None and step < len(prefix):
+                    filtered = prefix[step]
+            else:
+                filtered = filtered + alpha32 * (source[step, velocity_indices] - filtered)
+            output[step, velocity_indices] = filtered
+        return smoothed
     filtered_velocity = initial_velocity
     for step in range(len(smoothed)):
         if step < transition_start_step:
@@ -785,11 +803,15 @@ def _checkpoint_hot_swap_signature(policy_path: Path) -> str:
 
 @lru_cache(maxsize=32)
 def _decode_jpeg_bytes(encoded: bytes) -> np.ndarray:
-    image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+    direct_rgb = hasattr(cv2, "IMREAD_COLOR_RGB")
+    image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8),
+                         cv2.IMREAD_COLOR_RGB if direct_rgb else cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("Could not decode JPEG")
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    return np.frombuffer(rgb.tobytes(), dtype=rgb.dtype).reshape(rgb.shape)
+    rgb = image if direct_rgb else cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    # A readonly memoryview retains the decoder's owner without a full-frame
+    # bytes copy, and cannot be made writable via numpy.setflags().
+    return np.frombuffer(memoryview(rgb).toreadonly(), dtype=rgb.dtype).reshape(rgb.shape)
 
 
 def _decode_jpeg(encoded: np.ndarray, name: str, *, writable=True) -> np.ndarray:
@@ -1277,8 +1299,9 @@ class InferenceBusyError(RuntimeError):
 
 class AsyncRTCPolicy:
     """Asynchronous inference worker with selectable RTC or synchronous scheduling."""
+    supported_scheduling_modes = ('RTC', 'SYNC')
 
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, *, policy_loader=None, processor_options=None):
         self.chunk_scheduling_mode = str(args.chunk_scheduling_mode)
         self.recorder = RolloutRecorder(args.rollout_dir)
         self.recorder.event(
@@ -1288,7 +1311,7 @@ class AsyncRTCPolicy:
         )
         policy_path = _resolve_policy_path(args.policy_path)
         self.policy_path = policy_path
-        self._hot_swap_signature = _checkpoint_hot_swap_signature(policy_path)
+        self._hot_swap_signature = _checkpoint_hot_swap_signature(policy_path) if policy_loader is None else None
         config = PreTrainedConfig.from_pretrained(policy_path)
         config.pretrained_path = policy_path
         config.device = args.device
@@ -1308,7 +1331,16 @@ class AsyncRTCPolicy:
         )
 
         LOG.info("Loading checkpoint-only policy=%s", policy_path)
-        self.policy = make_policy(config)
+        # Serving explicitly selected local artifacts must not reread GBs for
+        # content hashes on every worker restart. Keep config/weight checks.
+        self.policy = (
+            make_policy(config, verify_base_artifact_hashes=False, initialize_pretrained_backbone=False)
+            if policy_loader is None
+            else policy_loader(config)
+        )
+        self.supported_scheduling_modes = ("RTC", "SYNC") if policy_loader is None else self.policy.supported_scheduling_modes
+        if self.chunk_scheduling_mode not in self.supported_scheduling_modes:
+            raise ValueError(f"Backend supports scheduling modes {self.supported_scheduling_modes}")
         self.policy.eval()
         if hasattr(self.policy, "active_adapters") and hasattr(self.policy, "set_adapter"):
             active_adapters = list(self.policy.active_adapters)
@@ -1316,14 +1348,17 @@ class AsyncRTCPolicy:
                 raise ValueError(f"Expected one active PEFT adapter, got {active_adapters}")
             self._active_adapter_name = str(active_adapters[0])
             self.policy.set_adapter(self._active_adapter_name, inference_mode=True)
-        else:
+        elif policy_loader is None:
             raise TypeError("PI0.5 deployment requires a PEFT policy with adapter switching support")
+        else:
+            self._active_adapter_name = None
         if hasattr(self.policy, "gradient_checkpointing_disable"):
             self.policy.gradient_checkpointing_disable()
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             policy_cfg=config,
             pretrained_path=str(policy_path),
             pretrained_revision=getattr(config, "pretrained_revision", None),
+            **(processor_options or {}),
         )
         cache_tokenized_prompts(self.preprocessor)
         action_unnormalizers = [
@@ -1440,6 +1475,7 @@ class AsyncRTCPolicy:
         self._warmup_requested = Event()
         self._warmup_finished = Event()
         self._warmup_error: BaseException | None = None
+        self._worker_cleanup = None if policy_loader is None else self.policy.close
         self._worker = Thread(target=self._run, name="pi05-rtc-worker", daemon=True)
         self._last_error: str | None = None
         self._last_error_traceback: str | None = None
@@ -1541,6 +1577,9 @@ class AsyncRTCPolicy:
     def hot_swap_checkpoint(self, value: str | Path) -> dict[str, object]:
         """Replace compatible PEFT weights without reconstructing the base model."""
         from lerobot.policies.base_artifacts import resolve_checkpoint_bases
+
+        if self._hot_swap_signature is None:
+            return dict(accepted=False, hot_swap_supported=False, reason="Backend requires a full model reload")
 
         started = time.perf_counter()
         policy_path = _resolve_policy_path(value)
@@ -1674,6 +1713,18 @@ class AsyncRTCPolicy:
                 )
         return batch
 
+    def _warmup_rtc_prefix(self, actions: torch.Tensor) -> torch.Tensor:
+        prefix = actions.detach().cpu().clone().to(self.device)
+        if self.rtc_config.mode != "inference":
+            return prefix
+        horizon = self.rtc_config.execution_horizon
+        if prefix.shape[1] >= horizon:
+            return prefix[:, :horizon]
+        padded = torch.zeros((prefix.shape[0], horizon, prefix.shape[2]),
+                             dtype=prefix.dtype, device=prefix.device)
+        padded[:, :prefix.shape[1]] = prefix
+        return padded
+
     def _warmup(self) -> None:
         if self._warmup_inferences == 0:
             return
@@ -1696,10 +1747,11 @@ class AsyncRTCPolicy:
                 if warmup_index == 0 and self.chunk_scheduling_mode == "RTC" and self._warmup_inferences > 1:
                     # Keep the prefix independent from torch.compile's reusable CUDA graph
                     # outputs, then exercise RTC guidance before the service reports ready.
-                    rtc_prefix = actions.detach().cpu().clone().to(self.device)
+                    rtc_prefix = self._warmup_rtc_prefix(actions)
                 self.postprocessor(actions).detach().cpu()
                 completed += 1
-        if self.rtc_config.mode in {"inference", "training"} and not self.rtc_config.enabled:
+        if ("RTC" in self.supported_scheduling_modes
+                and self.rtc_config.mode in {"inference", "training"} and not self.rtc_config.enabled):
             self.rtc_config.enabled = True
             try:
                 batch = self.preprocessor(self._warmup_batch())
@@ -1710,7 +1762,7 @@ class AsyncRTCPolicy:
                         prev_chunk_left_over=None,
                     )
                     self.postprocessor(actions).detach().cpu()
-                    prefix = actions.detach().cpu().clone().to(self.device)
+                    prefix = self._warmup_rtc_prefix(actions)
                     actions = self.policy.predict_action_chunk(
                         batch,
                         inference_delay=(
@@ -1842,6 +1894,8 @@ class AsyncRTCPolicy:
             raise ValueError(
                 f"Unknown chunk scheduling mode {mode!r}; expected one of {CHUNK_SCHEDULING_MODES}"
             )
+        if mode not in self.supported_scheduling_modes:
+            raise ValueError(f"Backend supports scheduling modes {self.supported_scheduling_modes}")
         previous = self.chunk_scheduling_mode
         self.chunk_scheduling_mode = mode
         self.rtc_config.enabled = _rtc_enabled_for_chunk_scheduling(mode)
@@ -2140,10 +2194,12 @@ class AsyncRTCPolicy:
         decoded = [decoded_by_content[getattr(record, role).tobytes()] for _key, role in bindings for record in image_records]
         for camera_index, (key, role) in enumerate(bindings):
             images = decoded[camera_index * len(image_records):(camera_index + 1) * len(image_records)]
-            image_window = (
-                torch.from_numpy(np.stack(images)).permute(0, 3, 1, 2).contiguous()
-                .to(torch.float32).div_(255.0).unsqueeze(0)
-            )
+            image_window = rgb_window(images)
+            if image_window is None:
+                image_window = (
+                    torch.from_numpy(np.stack(images)).permute(0, 3, 1, 2).contiguous()
+                    .to(torch.float32).div_(255.0).unsqueeze(0)
+                )
             batch[key] = image_window if self.mem_enabled else image_window[:, -1]
             batch[f"{key}_is_pad"] = image_pad if self.mem_enabled else image_pad[:, -1]
 
@@ -2187,11 +2243,24 @@ class AsyncRTCPolicy:
         started = time.perf_counter()
         raw_batch = self._make_batch(packet)
         model_image_history = getattr(raw_batch, "model_image_history", None)
-        batch = self.preprocessor(raw_batch)
-        preprocessed = time.perf_counter()
-        inference_delay_steps = 0 if self.chunk_scheduling_mode == "SYNC" else packet.inference_delay_steps
-        sim_rate = packet.source_steps_per_wall_second
-        conditioning = self._rtc_conditioning(packet, inference_delay_steps)
+        prepared_images = None
+        if (hasattr(type(self.policy), "prepare_images_async")
+                and self.device.type == "cpu" and not self.mem_enabled
+                and self.policy.config.normalization_mapping.get(FeatureType.VISUAL) == NormalizationMode.IDENTITY
+                and images_are_unchanged(self.preprocessor)):
+            prepared_images = self.policy.prepare_images_async(raw_batch)
+        try:
+            batch = self.preprocessor(raw_batch)
+            preprocessed = time.perf_counter()
+            inference_delay_steps = 0 if self.chunk_scheduling_mode == "SYNC" else packet.inference_delay_steps
+            sim_rate = packet.source_steps_per_wall_second
+            conditioning = self._rtc_conditioning(packet, inference_delay_steps)
+        except BaseException:
+            if prepared_images is not None:
+                prepared_images.cancel()
+            raise
+        if prepared_images is not None:
+            conditioning["prepared_images"] = prepared_images
         diagnostic_flow_seed = getattr(packet, "diagnostic_flow_seed", None)
         if diagnostic_flow_seed is not None:
             generator = torch.Generator(device="cpu")
@@ -2306,6 +2375,13 @@ class AsyncRTCPolicy:
         return record
 
     def _run(self) -> None:
+        try:
+            self._run_loop()
+        finally:
+            if self._worker_cleanup is not None:
+                self._worker_cleanup()
+
+    def _run_loop(self) -> None:
         while not self._stop.is_set():
             if self._warmup_requested.is_set():
                 self._run_worker_warmup()
@@ -2595,10 +2671,10 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main(runtime_factory=None) -> None:
+def main(runtime_factory=None, engine_factory=None) -> None:
     args = parse_args()
     init_logging()
-    engine = AsyncRTCPolicy(args)
+    engine = AsyncRTCPolicy(args) if engine_factory is None else engine_factory(args)
     server = ThreadingHTTPServer((args.host, args.port), VLARequestHandler)
     server.engine = engine  # type: ignore[attr-defined]
     server.max_payload_bytes = int(args.max_payload_mb * 1024 * 1024)  # type: ignore[attr-defined]

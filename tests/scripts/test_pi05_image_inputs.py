@@ -177,6 +177,13 @@ def test_unknown_image_processors_disable_cache():
     assert not images_are_unchanged(SimpleNamespace(steps=[SimpleNamespace()]))
 
 
+def test_camera_renaming_disables_preprocessor_bypass():
+    pipeline = SimpleNamespace(steps=[RenameObservationsProcessorStep(rename_map={"base": "wrist", "wrist": "base"})])
+    assert not images_are_unchanged(pipeline)
+    pipeline.steps = [RenameObservationsProcessorStep(rename_map={"base": "base"})]
+    assert images_are_unchanged(pipeline)
+
+
 def test_async_uploads_and_cached_images_across_streams():
     check_gpu("cuda")
     cache = ImageTensorCache(

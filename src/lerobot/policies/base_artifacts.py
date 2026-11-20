@@ -148,6 +148,7 @@ def resolve_requirement(
     requirement: dict[str, Any],
     *,
     registry_path: str | Path | None = None,
+    verify_hash: bool = True,
 ) -> Path:
     registry = load_registry(registry_path)
     artifact_id = requirement["artifact_id"]
@@ -170,6 +171,8 @@ def resolve_requirement(
         fingerprint_path = artifact_path
     if kind != "directory_tree" and not fingerprint_path.is_file():
         raise FileNotFoundError(f"Artifact fingerprint file does not exist: {fingerprint_path}")
+    if not verify_hash:
+        return artifact_path
     actual = sha256_directory(fingerprint_path) if kind == "directory_tree" else sha256_file(fingerprint_path)
     expected = requirement["sha256"]
     if actual != expected:
@@ -184,12 +187,14 @@ def resolve_checkpoint_bases(
     checkpoint_dir: str | Path,
     *,
     registry_path: str | Path | None = None,
+    verify_hash: bool = True,
 ) -> dict[str, Path]:
+    """Resolve local bases; deployment may skip bulk hashing, not path/schema checks."""
     manifest = load_manifest(checkpoint_dir)
     if manifest is None:
         return {}
     return {
-        role: resolve_requirement(requirement, registry_path=registry_path)
+        role: resolve_requirement(requirement, registry_path=registry_path, verify_hash=verify_hash)
         for role, requirement in manifest["requirements"].items()
     }
 
