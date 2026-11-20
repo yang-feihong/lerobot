@@ -134,6 +134,7 @@ def test_policy_forward_adds_selector_loss_and_optimizer_tracks_head(monkeypatch
     nn.Module.__init__(policy)
     policy.config = SimpleNamespace(
         state_action_encoding="text",
+        image_frame_mask_probability=0.0,
         mem_vit_enabled=False,
         action_history_enabled=False,
         training_rtc_config=None,

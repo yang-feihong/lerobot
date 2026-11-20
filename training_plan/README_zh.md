@@ -229,8 +229,8 @@ reset selector 保持新初始化，不可静默丢失旧权重。普通 `fork-t
 本轮源码快照与传输、预检、验收记录存于
 `MEM_videos/workspace/codex_scratch/external_raw_3way_20261108.rglx38/`。
 三份 `src` 内容哈希相同；差异只来自 `.env` 的历史输入开关和 EE delta 基准。
-关闭历史输入时禁止 previous_command；有历史时指令基准取模型可见的最后一个历史槽，
-保持/reset/启动 padding 时按统一契约回退到当前实测 EE，不使用未来标签。
+关闭历史输入时禁止 previous_command；有历史时指令基准取模型可见窗口内最近的有效 EE 指令，
+整段窗口均无有效指令时回退到当前实测 EE，不使用未来标签或窗口外缓存。
 
 EE 来源由一个配置同时控制动作监督与历史动作输入（包括对应的归一化统计）：
 `EE_SUPERVISION_SOURCE=control_action`（默认）选择存储的 `action[16:25]`；
@@ -260,24 +260,33 @@ EE 来源由一个配置同时控制动作监督与历史动作输入（包括�
 新增的预处理运行模块已显式纳入源码快照清单（不依赖本地未跟踪文件），远程 dry-run
 还会先导入实际快照中的训练模块，避免本地测试通过而部署漏文件后才在模型加载末尾失败。
 
-固定基准 EE delta 支持 `EE_DELTA_REFERENCE=current_state|previous_command`，默认
-`current_state` 保持原实测 EE 基准。设为 `previous_command` 时，必须同时设置
+固定基准 EE delta 支持 `EE_DELTA_REFERENCE=current_state|previous_command`，后续所有任务、
+所有数据集的新训练统一默认 `previous_command`，并默认启用历史指令输入。
+显式设为 `current_state` 可使用原实测 EE 基准。使用 `previous_command` 时，必须同时设置
 `Z1_ACTION_REPRESENTATION=ee_state_delta`、`ACTION_HISTORY_ENABLED=true`，且历史字段包含完整 EE 9D；
 否则配置/启动直接报错。直接脚本参数为 `--ee-delta-reference=previous_command`，
 policy CLI 为 `--policy.ee_delta_reference=previous_command`。
-此模式用最后一个输入历史采样槽中的 EE 指令，作为整个未来块共同的绝对姿态基准，
+此模式用输入历史窗口中最近一条有效 EE 指令，作为整个未来块共同的绝对姿态基准，
 不是上次推理输出的 50 帧，也不是旧 `ee_delta` 的逐帧累加；默认历史间隔 40ms，
-因此该槽不一定等于 50Hz 控制器上一拍。基准来源跟随 `EE_SUPERVISION_SOURCE`。
-启动历史不足、该槽未知或 EE 被 inactive/reset feature mask 屏蔽时，训练与部署
-均回退到当前实测 EE，不使用被遮住的目标。暂停增强后的历史也使用同一规则。
-动作统计按同一历史槽/来源计算并锁定参考模式与采样间隔；不同模式不能复用统计。
+因此所选指令不一定等于 50Hz 控制器上一拍。基准来源跟随 `EE_SUPERVISION_SOURCE`。
+行 padding 以及 inactive/reset 的 EE feature mask 共同决定有效性；末槽无效时向前选取
+可见窗口内最近的有效指令。只有整段窗口均无有效 EE 指令时，训练与部署才回退到当前
+实测 EE；不使用被遮住的目标、未来标签或窗口外目标。暂停增强后的历史也使用同一规则。
+动作统计按同一窗口/来源计算，锁定参考选择规则、窗口长度及采样间隔。
+新规则的训练统计需重新计算，不能复用末槽规则的旧统计；现有权重及其归一化器不自动改写。
 checkpoint 保存该配置，SYNC 自动按对应基准解码；RTC 还会将旧前缀的绝对目标
 重新表达为本次基准下的 delta，避免换基准造成轨迹跳变。现有模型和普通 resume 不切换基准。
 
-历史动作输入默认关闭。新训练可在统一入口的环境配置中显式设置
-`ACTION_HISTORY_ENABLED=true`；普通 resume 始终继承 checkpoint，不在恢复时增删模型结构。
+历史动作输入在新训练中默认开启（`ACTION_HISTORY_ENABLED=true`），
+并使用 `EE_DELTA_REFERENCE=previous_command`；统一编排和直接训练脚本的默认值一致。
+直接脚本同时默认连续状态历史及 `ee_state_delta`，保证默认组合可用。
+普通 resume 始终继承 checkpoint，不在恢复时增删模型结构或切换基准；
+底层 `PI05Config` 的缺字段兼容值及历史 profile 参考契约保持不变，避免误读旧模型。
+如需无历史指令的对照实验，须显式同时设置 `ACTION_HISTORY_ENABLED=false`、
+`EE_DELTA_REFERENCE=current_state`（直接脚本使用对应的两个 kebab-case 参数）。
+本次只调整历史输入及 delta 基准，不更改 EE 监督来源、采样组合或暂停增强（默认仍为 0）。
 20261106 wholebodyF 的 `external_grasp_history_50k_jobs.json` 已用独立代码快照开启历史输入，
-暂停增强为 0；当前 `.env` 已为下一轮无历史指令训练关闭历史输入，不影响运行中的 F 任务。
+暂停增强为 0；该轮任务的配置快照不受后续新训练默认值调整影响。
 该 F 任务沿用 20261105 外部抓取任务的同一数据 artifact、四组合、八卡及
 50k 目标，从基座 0 步新训，不加载上一轮权重或训练状态；旧任务计划仍保留。
 `ACTION_HISTORY_FEATURE_NAMES` 可指定 JSON 字符串数组，默认 `null` 表示标准已执行命令：
@@ -300,6 +309,16 @@ reset 六维仅在 reset 时有效：训练按历史采样帧读取已审计 `re
 普通 resume 不切换；已有历史权重禁止用同形状掩盖语义变化。未来动作监督不受此 mask 影响。
 `MAX_ACTION_HISTORY_DIM`（默认 32）是独立输入投影容量，不使用输出的 `max_action_dim`。
 12 帧历史（默认）与 state 共享 25Hz 时钟，仅覆盖当前之前；语义 complete/hold 仅修改未来监督。
+`IMAGE_FRAME_MASK_PROBABILITY` 默认 `0`（完全关闭），范围 `[0,1]`。
+训练中每个样本、每个有效图像历史时刻，以该概率均匀选择一路有效相机，
+把整张图替换为逐像素独立均匀噪声（原始 RGB 等价范围 `[0,1]`）。
+例如 `0.2` 表示约 20% 的有效双相机时刻丢失一路，每路边际约 10%，不是各路分别 20%。
+同一时刻最多替换一路；仅有一路有效相机时不替换，缺失相机与历史 padding 不动。
+覆盖单帧和 MEM 多帧输入，不修改 attention mask、状态、历史指令或动作监督。
+仅在训练 forward 生效，验证/部署关闭；`0` 不消耗随机数，普通 resume 继承 checkpoint 配置。
+直接训练入口对应 `--image-frame-mask-probability=0.2`，底层配置为
+`--policy.image_frame_mask_probability=0.2`，随 `config.json` / `train_config.json` 保存。
+
 `HISTORY_PAUSE_MAX_STEPS` 默认 `0`，完全关闭暂停增强；正整数要求开启历史动作输入。
 训练每个样本均匀抽取 `0..最大值` 个历史步（每步默认 40ms，设为 5 即最多 0.2s），
 将短期状态与指令历史一起向更早槽位移动，截掉溢出历史，末端补理想保持。

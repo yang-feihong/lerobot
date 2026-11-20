@@ -735,7 +735,8 @@ def test_b2_rtc_pose_delta_prefix_is_reexpressed_in_new_inference_frame() -> Non
 
 
 @pytest.mark.parametrize("reference", ["current_state", "previous_command"])
-def test_z1_state_delta_rtc_prefix_is_reexpressed_from_selected_reference(reference) -> None:
+@pytest.mark.parametrize("wait_tail", [False, True])
+def test_z1_state_delta_rtc_prefix_is_reexpressed_from_selected_reference(reference, wait_tail) -> None:
     model_names = (*B2_EXECUTION_VELOCITY_NAMES, *EE_DELTA_ROTVEC_NAMES, *EE_DELTA_ACTION_NAMES[6:9])
     policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
     policy._action_unnormalizer = lambda transition: transition
@@ -756,9 +757,10 @@ def test_z1_state_delta_rtc_prefix_is_reexpressed_from_selected_reference(refere
         prefix,
         SimpleNamespace(ee_anchor=old_anchor),
         SimpleNamespace(actual_ee_state=new_anchor if reference == "current_state" else old_anchor,
-                        prepared_action_history=new_anchor[None],
-                        prepared_action_history_is_pad=np.zeros(1, dtype=bool),
-                        prepared_action_history_feature_is_pad=np.zeros((1, 9), dtype=bool)),
+                        prepared_action_history=np.stack((new_anchor, old_anchor)) if wait_tail else new_anchor[None],
+                        prepared_action_history_is_pad=np.zeros(2 if wait_tail else 1, dtype=bool),
+                        prepared_action_history_feature_is_pad=(np.array([[False] * 9, [True] * 9])
+                            if wait_tail else np.zeros((1, 9), dtype=bool))),
     )
 
     x_index = model_names.index("height_invariant_ee_delta_x")
@@ -780,6 +782,28 @@ def test_command_anchor_falls_back_when_last_input_slot_is_unavailable(padding, 
     kind, anchor = policy._ee_anchor(packet)
     assert kind == ("actual_ee_state" if padding or feature_padding else "history_ee_command")
     np.testing.assert_array_equal(anchor, actual if padding or feature_padding else command)
+
+
+@pytest.mark.parametrize("wait_slots", [1, 3])
+@pytest.mark.parametrize("mask", ["feature", "row", "row_without_feature_mask"])
+def test_command_anchor_uses_visible_command_before_sync_wait(wait_slots, mask):
+    policy = AsyncRTCPolicy.__new__(AsyncRTCPolicy)
+    policy.z1_action_representation = "ee_state_delta"
+    policy.ee_delta_reference = "previous_command"
+    policy.ee_history_anchor_indices = tuple(range(9))
+    actual = np.array([1., 0., 0., 0., 1., 0., .4, 0., -.5], dtype=np.float32)
+    commands = np.repeat(actual[None], wait_slots + 2, axis=0)
+    commands[0, -1], commands[1, -1] = -.55, -.6
+    feature_pad = np.zeros_like(commands, dtype=bool)
+    feature_pad[2:] = mask == "feature"
+    row_pad = np.zeros(len(commands), dtype=bool)
+    row_pad[2:] = mask != "feature"
+    packet = SimpleNamespace(actual_ee_state=actual, prepared_action_history=commands,
+        prepared_action_history_is_pad=row_pad,
+        prepared_action_history_feature_is_pad=None if mask == "row_without_feature_mask" else feature_pad)
+    kind, anchor = policy._ee_anchor(packet)
+    assert kind == "history_ee_command"
+    np.testing.assert_array_equal(anchor, commands[1])
 
 
 def test_rtc_reanchor_skips_coupled_b2_group_with_degenerate_quantile_scale() -> None:

@@ -1949,16 +1949,16 @@ class AsyncRTCPolicy:
         from lerobot.policies.pi05.action_history import command_reference_anchor
 
         indices = list(self.ee_history_anchor_indices)
-        valid = not bool(packet.prepared_action_history_is_pad[-1])
+        valid = ~packet.prepared_action_history_is_pad
         feature_pad = packet.prepared_action_history_feature_is_pad
         if feature_pad is not None:
-            valid = valid and not bool(feature_pad[-1, indices].any())
+            valid = valid & ~feature_pad[:, indices].any(axis=-1)
         anchor = command_reference_anchor(
             torch.as_tensor(packet.actual_ee_state),
-            torch.as_tensor(packet.prepared_action_history[-1, indices]),
-            torch.tensor(valid),
+            torch.as_tensor(packet.prepared_action_history[:, indices]),
+            torch.as_tensor(valid),
         ).numpy().copy()
-        return ("history_ee_command" if valid else "actual_ee_state"), anchor
+        return ("history_ee_command" if valid.any() else "actual_ee_state"), anchor
 
     def _rtc_reanchor_status(self) -> tuple[bool, bool, tuple[str, ...], str]:
         b2_names = ("b2_delta_x", "b2_delta_y", "b2_delta_yaw")

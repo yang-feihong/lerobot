@@ -25,7 +25,7 @@ state_use_b2_linear_velocity="false"
 state_use_b2_angular_velocity="false"
 b2_action_representation="velocity" # "velocity" or "pose_delta"
 model_ee_frame="" # Resolve fresh runs to physical; resume inherits its checkpoint.
-z1_action_representation="ee_delta" # "ee_delta" (adjacent target) or "ee_state_delta" (inference-time state anchor)
+z1_action_representation="ee_state_delta" # Fixed anchor; selected by ee_delta_reference below.
 ee_delta_rotation_representation="rotvec" # "rotvec" for new EE-delta checkpoints
 action_semantics_profile="joint_control_arm_mode_v2"
 predict_arm_teleop_inactive="true"
@@ -42,7 +42,7 @@ discrete_action_training_mode="continuous_flow" # "continuous_flow" or "structur
 ee_target_dataset_semantics="joint_control_inactive_interpolated"
 ee_supervision_source="control_action"
 ee_supervision_source_explicit=false
-ee_delta_reference="current_state"
+ee_delta_reference="previous_command" # New runs: last valid model-visible command, not feedback.
 ee_delta_supervision_mode="all" # "active_only" or "all"
 gripper_target_representation="continuous_position"
 action_loss_schema="group_balanced_v2"
@@ -218,16 +218,17 @@ mem_local_interval_std_seconds="0.05"
 mem_min_interval_seconds="0.25"
 mem_max_interval_seconds="1.0"
 # "text": current state in the prompt; "continuous": linear state-history tokens.
-state_action_encoding="text"
+state_action_encoding="continuous"
 # With 50 Hz data, 13 samples at 0.04 s intervals cover 0.48 s.
 state_num_frames="13"
 state_history_frame_interval_seconds="0.04"
 # Uses the state-history clock and excludes the current action.
-action_history_enabled="false"
+action_history_enabled="true"
 action_history_feature_names="null"
 action_history_ee_semantics="null"
 max_action_history_dim="32"
 history_pause_max_steps="0"
+image_frame_mask_probability="0"
 
 # Optional named overrides used by checked-in experiment launchers. Ordinary
 # single-run training can keep editing the user configuration above.
@@ -352,6 +353,7 @@ while (( $# > 0 )); do
     --action-history-ee-semantics=*) action_history_ee_semantics="${1#*=}" ;;
     --max-action-history-dim=*) max_action_history_dim="${1#*=}" ;;
     --history-pause-max-steps=*) history_pause_max_steps="${1#*=}" ;;
+    --image-frame-mask-probability=*) image_frame_mask_probability="${1#*=}" ;;
     --ee-supervision-source=*) ee_supervision_source="${1#*=}"; ee_supervision_source_explicit=true ;;
     --ee-delta-reference=*) ee_delta_reference="${1#*=}" ;;
     --training-rtc=*) training_rtc="${1#*=}"; training_rtc_explicit="true" ;;
@@ -930,6 +932,7 @@ if [[ -z "$resume_checkpoint" ]]; then
     --policy.action_history_ee_semantics="$action_history_ee_semantics"
     --policy.max_action_history_dim="$max_action_history_dim"
     --policy.history_pause_max_steps="$history_pause_max_steps"
+    --policy.image_frame_mask_probability="$image_frame_mask_probability"
   )
 fi
 

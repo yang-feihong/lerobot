@@ -12,14 +12,20 @@ DEFAULT_ACTION_HISTORY_NAMES = (*DATASET_ACTION_NAMES[:-1], *RESET_TARGET_NAMES)
 def command_reference_anchor(current_state, command_pose, valid):
     """Use the last visible historical EE command, otherwise the measured pose.
 
-    Invalid/reset/hold and startup padding must not introduce a hidden anchor.
+    Masked commands cannot supply an anchor; selection stays inside the visible window.
     All arguments are in the same unnormalized model tool frame.
     """
-    if command_pose.shape != current_state.shape or current_state.shape[-1] != 9:
-        raise ValueError("EE command reference requires matching 9D poses")
-    if valid.shape != current_state.shape[:-1]:
+    if (current_state.shape[-1] != 9 or command_pose.ndim != current_state.ndim + 1
+            or command_pose.shape[:-2] != current_state.shape[:-1]
+            or command_pose.shape[-1] != 9 or command_pose.shape[-2] < 1):
+        raise ValueError("EE command reference requires a nonempty history of matching 9D poses")
+    if valid.shape != command_pose.shape[:-1] or valid.dtype != torch.bool:
         raise ValueError("EE command reference validity shape mismatch")
-    return torch.where(valid[..., None], command_pose, current_state)
+    slots = torch.arange(command_pose.shape[-2], device=valid.device)
+    latest = torch.where(valid, slots, -1).amax(dim=-1)
+    indices = latest.clamp(min=0)[..., None, None].expand(*latest.shape, 1, 9)
+    selected = command_pose.gather(-2, indices).squeeze(-2)
+    return torch.where((latest >= 0)[..., None], selected, current_state)
 
 
 def action_history_schema(config):

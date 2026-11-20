@@ -70,6 +70,7 @@ from ..rtc.training_rtc import (
 )
 from .b2_action_transform import EE_DELTA_VALID_KEY
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
+from .image_frame_mask import mask_image_frames
 from .reset_preset_head import ResetPresetHead, reset_preset_loss
 
 
@@ -3074,6 +3075,13 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
+        images = mask_image_frames(
+            images,
+            img_masks,
+            image_memory_masks,
+            probability=self.config.image_frame_mask_probability,
+            training=self.training,
+        )
         flow_actions = self.model._zero_structured_discrete_channels(actions)
         state = self._prepare_state_history(batch, state_window_num_frames)
         action_history = None

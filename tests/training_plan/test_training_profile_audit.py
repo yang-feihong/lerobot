@@ -44,6 +44,23 @@ def test_ee_source_is_audited_as_an_explicit_run_choice(source):
     assert report["ee_supervision_source"] == source
 
 
+@pytest.mark.parametrize("probability", [0.0, 0.3, 1.0])
+def test_image_mask_is_recorded_run_choice_not_architecture_drift(probability):
+    training, policy = values()
+    policy["image_frame_mask_probability"] = probability
+    report = compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])
+    assert report["ok"]
+    assert report["image_frame_mask_probability"] == probability
+
+
+@pytest.mark.parametrize("probability", [-0.1, 1.1, float("nan")])
+def test_image_mask_profile_rejects_invalid_probability(probability):
+    training, policy = values()
+    policy["image_frame_mask_probability"] = probability
+    with pytest.raises(ValueError, match="image_frame_mask_probability"):
+        compare_profile(PROFILE, training, policy, PROFILE["adapter_schema"])
+
+
 def test_command_reference_is_audited_and_cannot_be_enabled_without_history():
     from lerobot.policies.pi05.b2_action_transform import DATASET_ACTION_NAMES
 

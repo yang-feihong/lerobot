@@ -154,6 +154,11 @@ def validate_transformed_action_stats(payload: dict[str, Any], dataset, config) 
         raise ValueError("Transformed-action statistics EE delta reference mismatch")
     if reference == "previous_command" and saved_schema.get("ee_reference_history_stride") != config.state_history_frame_stride:
         raise ValueError("Transformed-action statistics EE reference sampling interval mismatch")
+    if reference == "previous_command" and (
+        saved_schema.get("ee_reference_selection") != "last_valid_visible_v1"
+        or saved_schema.get("ee_reference_history_length") != config.state_num_frames - 1
+    ):
+        raise ValueError("Transformed-action statistics EE reference history selection mismatch")
     adapter = getattr(getattr(dataset, "reader", None), "ee_frame_adapter", None)
     saved_frame_hash = payload["dataset"].get("ee_frames_sha256")
     if saved_frame_hash is not None and (adapter is None or saved_frame_hash != adapter.metadata_sha256):
@@ -447,15 +452,16 @@ def compute_transformed_action_stats(
                         raise ValueError("ee_state_delta statistics require resolved EE state indices")
                     ee_state_anchor = torch.from_numpy(states_np[starts][:, config.ee_state_anchor_indices])
                     if getattr(config, "ee_delta_reference", "current_state") == "previous_command":
-                        previous = starts - config.state_history_frame_stride
+                        history_offsets = np.arange(config.state_num_frames - 1, 0, -1)
+                        previous = starts[:, None] - history_offsets[None, :] * config.state_history_frame_stride
                         historical = select_dataset_action_supervision(
                             torch.from_numpy(actions_np[np.maximum(previous, 0)]),
                             source=config.ee_supervision_source,
                         )
                         valid = torch.from_numpy(previous >= 0)
                         if config.action_history_ee_semantics in {"active_only_v1", "mode_reset_target_v2"}:
-                            valid = valid & (historical[:, 3:5] < .5).all(dim=-1)
-                        ee_state_anchor = command_reference_anchor(ee_state_anchor, historical[:, 5:14], valid)
+                            valid = valid & (historical[..., 3:5] < .5).all(dim=-1)
+                        ee_state_anchor = command_reference_anchor(ee_state_anchor, historical[..., 5:14], valid)
                 transformed = encode_b2_action_chunk(
                     raw,
                     dt=float(config.action_dt_seconds),
@@ -564,7 +570,9 @@ def compute_transformed_action_stats(
         "schema": {
             **schema,
             **({"ee_delta_reference": config.ee_delta_reference,
-                "ee_reference_history_stride": config.state_history_frame_stride}
+                "ee_reference_history_stride": config.state_history_frame_stride,
+                "ee_reference_history_length": config.state_num_frames - 1,
+                "ee_reference_selection": "last_valid_visible_v1"}
                if getattr(config, "ee_delta_reference", "current_state") == "previous_command" else {}),
             **({"model_ee_frame": config.model_ee_frame} if config.model_ee_frame is not None else {}),
             "ee_target_dataset_semantics": config.ee_target_dataset_semantics,

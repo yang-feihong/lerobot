@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -95,6 +96,10 @@ def canonical_policy(config: dict) -> dict:
         raise ValueError("history_pause_max_steps must be a nonnegative integer")
     if pause_steps and not config.get("action_history_enabled", False):
         raise ValueError("history_pause_max_steps requires action history")
+    # Pixel augmentation is an explicit run choice, not a model architecture change.
+    mask_probability = result.pop("image_frame_mask_probability", 0.0)
+    if not math.isfinite(mask_probability) or not 0 <= mask_probability <= 1:
+        raise ValueError("image_frame_mask_probability must be finite and in [0, 1]")
     # This is a resolved per-run representation choice, not an architecture
     # override. Checkpoint metadata and the resume gate lock its actual value.
     frame = result.pop("model_ee_frame", None)
@@ -174,6 +179,7 @@ def compare_profile(
         "model_ee_frame": policy.get("model_ee_frame") or "legacy",
         "ee_supervision_source": policy.get("ee_supervision_source", "control_action"),
         "ee_delta_reference": policy.get("ee_delta_reference", "current_state"),
+        "image_frame_mask_probability": policy.get("image_frame_mask_probability", 0.0),
     }
 
 

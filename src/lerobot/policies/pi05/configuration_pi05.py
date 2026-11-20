@@ -140,6 +140,9 @@ class PI05Config(PreTrainedConfig):
     # Add empty images. Used to add empty cameras when no image features are present.
     empty_cameras: int = 0
 
+    # Training only: per-time probability of replacing one valid camera by noise.
+    image_frame_mask_probability: float = 0.0
+
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -285,6 +288,10 @@ class PI05Config(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if not math.isfinite(self.image_frame_mask_probability) or not (
+            0 <= self.image_frame_mask_probability <= 1
+        ):
+            raise ValueError("image_frame_mask_probability must be finite and in [0, 1]")
         validate_reset_presets(self.reset_preset_catalog)
         if not math.isfinite(self.reset_preset_loss_weight) or self.reset_preset_loss_weight <= 0:
             raise ValueError("reset_preset_loss_weight must be positive")

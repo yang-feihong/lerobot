@@ -392,12 +392,12 @@ class Pi05ActionRepresentationProcessorStep(ProcessorStep):
                 if len(self.ee_history_anchor_indices) != 9 or history.shape[-2] < 1:
                     raise ValueError("previous_command reference requires EE command history")
                 complementary = new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
-                valid = ~complementary[f"{OBS_ACTION_HISTORY}_is_pad"][..., -1].bool()
+                valid = ~complementary[f"{OBS_ACTION_HISTORY}_is_pad"].bool()
                 feature_pad = complementary.get(f"{OBS_ACTION_HISTORY}_feature_is_pad")
                 if feature_pad is not None:
-                    valid = valid & ~feature_pad[..., -1, list(self.ee_history_anchor_indices)].any(dim=-1)
+                    valid = valid & ~feature_pad[..., list(self.ee_history_anchor_indices)].any(dim=-1)
                 ee_state_anchor = command_reference_anchor(
-                    ee_state_anchor, history[..., -1, list(self.ee_history_anchor_indices)], valid
+                    ee_state_anchor, history[..., list(self.ee_history_anchor_indices)], valid
                 )
         if not self.inverse and self.state_indices:
             observations = dict(new_transition.get(TransitionKey.OBSERVATION, {}))
